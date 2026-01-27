@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "webapp-cron",
+  "main": "cron-worker.js",
+  "compatibility_date": "2026-01-22",
+  "triggers": {
+    "crons": [
+      "0 0 * * *"
+    ]
+  }
+}
