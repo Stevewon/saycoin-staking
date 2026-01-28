@@ -713,6 +713,90 @@ app.delete('/api/admin/user/:userId', async (c) => {
   }
 })
 
+// 관리자: 사용자 일괄 삭제 (특정 이메일 제외)
+app.post('/api/admin/users/bulk-delete', async (c) => {
+  try {
+    const { keepEmails } = await c.req.json()
+    const db = c.env.DB
+
+    // 보호할 이메일 목록 (기본값: 관리자)
+    const protectedEmails = keepEmails || ['admin@saycoin.com']
+    
+    // 삭제할 사용자 목록 조회
+    const placeholders = protectedEmails.map(() => '?').join(',')
+    const usersToDelete = await db.prepare(`
+      SELECT id, name, email FROM users WHERE email NOT IN (${placeholders})
+    `).bind(...protectedEmails).all()
+
+    if (usersToDelete.results.length === 0) {
+      return c.json({ 
+        success: true, 
+        message: '삭제할 사용자가 없습니다',
+        deletedCount: 0,
+        keptEmails: protectedEmails
+      })
+    }
+
+    const userIds = usersToDelete.results.map(u => u.id)
+    let deletedCount = 0
+
+    // 각 사용자 삭제
+    for (const user of usersToDelete.results) {
+      try {
+        const userId = user.id
+
+        // 1. referral_rewards 삭제
+        try {
+          await db.prepare(`DELETE FROM referral_rewards WHERE referrer_id = ? OR referee_id = ?`).bind(userId, userId).run()
+        } catch (e) { }
+
+        // 2. daily_rewards 삭제
+        try {
+          await db.prepare(`DELETE FROM daily_rewards WHERE user_id = ?`).bind(userId).run()
+        } catch (e) { }
+
+        // 3. transactions 삭제
+        try {
+          await db.prepare(`DELETE FROM transactions WHERE user_id = ?`).bind(userId).run()
+        } catch (e) { }
+
+        // 4. withdrawals 삭제
+        try {
+          await db.prepare(`DELETE FROM withdrawals WHERE user_id = ?`).bind(userId).run()
+        } catch (e) { }
+
+        // 5. staking 삭제
+        try {
+          await db.prepare(`DELETE FROM staking WHERE user_id = ?`).bind(userId).run()
+        } catch (e) { }
+
+        // 6. 추천 관계 해제
+        try {
+          await db.prepare(`UPDATE users SET referrer_id = NULL WHERE referrer_id = ?`).bind(userId).run()
+        } catch (e) { }
+
+        // 7. 사용자 삭제
+        await db.prepare(`DELETE FROM users WHERE id = ?`).bind(userId).run()
+        
+        deletedCount++
+      } catch (error) {
+        console.error(`사용자 ${user.email} 삭제 실패:`, error)
+      }
+    }
+
+    return c.json({ 
+      success: true, 
+      message: `${deletedCount}명의 사용자가 삭제되었습니다`,
+      deletedCount: deletedCount,
+      deletedUsers: usersToDelete.results.map(u => ({ name: u.name, email: u.email })),
+      keptEmails: protectedEmails
+    })
+  } catch (error) {
+    console.error('일괄 삭제 오류:', error)
+    return c.json({ error: '일괄 삭제 중 오류가 발생했습니다' }, 500)
+  }
+})
+
 // 관리자: 회원가입 현황 조회
 app.get('/api/admin/signups', async (c) => {
   try {
