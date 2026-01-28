@@ -344,10 +344,9 @@ app.post('/api/staking/create', async (c) => {
 
     const db = c.env.DB
 
-    // 3% 보상 계산 (QTA:QX = 1:1)
-    const reward = amount * 0.03
-    const qtaReward = reward
-    const qxReward = reward
+    // 1,000만개당 QTA 10만개, QX 10만개 보상
+    const qtaReward = (amount / 10000000) * 100000
+    const qxReward = (amount / 10000000) * 100000
 
     // 스테이킹 생성 (관리자 승인 대기 상태)
     // start_date와 end_date는 승인 시 설정됨
@@ -1337,11 +1336,11 @@ app.get('/dashboard', (c) => {
                                 <p class="text-sm font-bold text-purple-800 mb-1">예상 보상 (관리자 승인 후 지급)</p>
                                 <div class="flex justify-between text-sm">
                                     <span class="text-gray-600">양자내성 암호화폐 코인 QTA :</span>
-                                    <span id="qtaRewardPreview" class="font-bold text-purple-600">300,000개</span>
+                                    <span id="qtaRewardPreview" class="font-bold text-purple-600">100,000개</span>
                                 </div>
                                 <div class="flex justify-between text-sm">
                                     <span class="text-gray-600">양자내성 코인거래소 QX :</span>
-                                    <span id="qxRewardPreview" class="font-bold text-purple-600">300,000개</span>
+                                    <span id="qxRewardPreview" class="font-bold text-purple-600">100,000개</span>
                                 </div>
                             </div>
                         </div>
@@ -1850,7 +1849,7 @@ app.get('/dashboard', (c) => {
             // 보상 미리보기 계산
             function calculateReward() {
                 const amount = parseFloat(document.getElementById('stakingAmount').value) || 10000000;
-                const reward = amount * 0.03;
+                const reward = (amount / 10000000) * 100000;
                 document.getElementById('qtaRewardPreview').textContent = reward.toLocaleString() + '개';
                 document.getElementById('qxRewardPreview').textContent = reward.toLocaleString() + '개';
             }
@@ -1886,7 +1885,7 @@ app.get('/dashboard', (c) => {
                     return;
                 }
                 
-                if (confirm(\`\${amount.toLocaleString()}개의 코인을 \${selectedPeriod}개월간 스테이킹하시겠습니까?\\n\\n관리자 승인 후 지급: QTA \${(amount * 0.03).toLocaleString()}개 + QX \${(amount * 0.03).toLocaleString()}개\`)) {
+                if (confirm(\`\${amount.toLocaleString()}개의 코인을 \${selectedPeriod}개월간 스테이킹하시겠습니까?\\n\\n관리자 승인 후 지급: QTA \${((amount / 10000000) * 100000).toLocaleString()}개 + QX \${((amount / 10000000) * 100000).toLocaleString()}개\`)) {
                     try {
                         const response = await axios.post('/api/staking/create', {
                             userId: currentUser.id,
