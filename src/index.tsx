@@ -637,11 +637,16 @@ app.delete('/api/admin/user/:userId', async (c) => {
 
     // 관련 데이터 삭제 (순서 중요: 외래키 제약조건)
     
-    // 1. 추천 보상 내역 삭제
-    await db.prepare(`
-      DELETE FROM referral_rewards 
-      WHERE referrer_id = ? OR referee_id = ?
-    `).bind(userId, userId).run()
+    // 1. 추천 보상 내역 삭제 (테이블이 없을 수도 있음)
+    try {
+      await db.prepare(`
+        DELETE FROM referral_rewards 
+        WHERE referrer_id = ? OR referee_id = ?
+      `).bind(userId, userId).run()
+    } catch (e) {
+      // referral_rewards 테이블이 없으면 무시
+      console.log('referral_rewards 테이블 없음 (무시)')
+    }
 
     // 2. 일일 보상 내역 삭제
     await db.prepare(`
