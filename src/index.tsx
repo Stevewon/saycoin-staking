@@ -30,9 +30,10 @@ app.post('/api/auth/register', async (c) => {
     // 이메일을 소문자로 변환 (대소문자 구분 제거)
     const normalizedEmail = email.toLowerCase().trim()
 
-    // 전화번호 형식 검증 (010 + 8자리 숫자)
-    if (!phone.match(/^010\d{8}$/)) {
-      return c.json({ error: '올바른 전화번호 형식이 아닙니다 (010 + 8자리 숫자)' }, 400)
+    // 전화번호에서 하이픈 제거 및 형식 검증 (010 + 8자리 숫자)
+    const cleanPhone = phone.replace(/-/g, '')
+    if (!cleanPhone.match(/^010\d{8}$/)) {
+      return c.json({ error: '올바른 전화번호 형식이 아닙니다 (010-XXXX-XXXX)' }, 400)
     }
 
     // 지갑주소 형식 간단 검증 (0x로 시작하는 40자리 16진수)
@@ -53,7 +54,7 @@ app.post('/api/auth/register', async (c) => {
 
     // 전화번호 중복 체크
     const existingPhone = await db.prepare('SELECT id FROM users WHERE phone = ?')
-      .bind(phone)
+      .bind(cleanPhone)
       .first()
 
     if (existingPhone) {
@@ -69,11 +70,11 @@ app.post('/api/auth/register', async (c) => {
       return c.json({ error: '이미 등록된 지갑주소입니다' }, 400)
     }
 
-    // 사용자 생성 (이메일을 소문자로 저장)
+    // 사용자 생성 (이메일을 소문자로 저장, 전화번호는 하이픈 제거)
     const result = await db.prepare(`
       INSERT INTO users (email, password, name, phone, wallet_address, qta_balance, qx_balance, usdt_balance)
       VALUES (?, ?, ?, ?, ?, 0, 0, 0)
-    `).bind(normalizedEmail, password, name, phone, walletAddress).run()
+    `).bind(normalizedEmail, password, name, cleanPhone, walletAddress).run()
 
     return c.json({ 
       success: true, 
