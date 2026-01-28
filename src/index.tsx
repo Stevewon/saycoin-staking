@@ -136,6 +136,15 @@ app.post('/api/auth/login', async (c) => {
       return c.json({ error: '이메일 또는 비밀번호가 일치하지 않습니다' }, 401)
     }
 
+    // referral_code가 없으면 생성
+    let referralCode = user.referral_code
+    if (!referralCode) {
+      referralCode = 'SAY' + Math.random().toString(36).substring(2, 7).toUpperCase()
+      await db.prepare(`
+        UPDATE users SET referral_code = ? WHERE id = ?
+      `).bind(referralCode, user.id).run()
+    }
+
     return c.json({ 
       success: true, 
       message: '로그인 성공',
@@ -147,7 +156,7 @@ app.post('/api/auth/login', async (c) => {
         qta_balance: user.qta_balance,
         qx_balance: user.qx_balance,
         usdt_balance: user.usdt_balance,
-        referral_code: user.referral_code,
+        referral_code: referralCode,
         created_at: user.created_at
       }
     })
