@@ -1135,7 +1135,7 @@ app.get('/', (c) => {
                 const email = emailId + '@' + emailDomain;
                 const phone1 = document.getElementById('registerPhone1').value;
                 const phone2 = document.getElementById('registerPhone2').value;
-                const phone = '010' + phone1 + phone2;
+                const phone = '010-' + phone1 + '-' + phone2;
                 const walletAddress = document.getElementById('registerWallet').value;
                 const password = document.getElementById('registerPassword').value;
                 const passwordConfirm = document.getElementById('registerPasswordConfirm').value;
@@ -1189,7 +1189,7 @@ app.get('/', (c) => {
                 const name = document.getElementById('findIdName').value;
                 const phone1 = document.getElementById('findIdPhone1').value;
                 const phone2 = document.getElementById('findIdPhone2').value;
-                const phone = '010' + phone1 + phone2;
+                const phone = '010-' + phone1 + '-' + phone2;
 
                 try {
                     const response = await axios.post('/api/auth/find-id', { name, phone });
@@ -1209,7 +1209,7 @@ app.get('/', (c) => {
                 const email = emailId + '@' + emailDomain;
                 const phone1 = document.getElementById('findPasswordPhone1').value;
                 const phone2 = document.getElementById('findPasswordPhone2').value;
-                const phone = '010' + phone1 + phone2;
+                const phone = '010-' + phone1 + '-' + phone2;
 
                 try {
                     const response = await axios.post('/api/auth/find-password', { email, phone });
