@@ -636,44 +636,64 @@ app.delete('/api/admin/user/:userId', async (c) => {
     }
 
     // 관련 데이터 삭제 (순서 중요: 외래키 제약조건)
+    // 모든 삭제 작업을 try-catch로 감싸서 안전하게 처리
     
-    // 1. 추천 보상 내역 삭제 (테이블이 없을 수도 있음)
+    // 1. 추천 보상 내역 삭제
     try {
       await db.prepare(`
         DELETE FROM referral_rewards 
         WHERE referrer_id = ? OR referee_id = ?
       `).bind(userId, userId).run()
     } catch (e) {
-      // referral_rewards 테이블이 없으면 무시
-      console.log('referral_rewards 테이블 없음 (무시)')
+      console.log('referral_rewards 삭제 실패 (테이블 없음 또는 데이터 없음)')
     }
 
     // 2. 일일 보상 내역 삭제
-    await db.prepare(`
-      DELETE FROM daily_rewards WHERE user_id = ?
-    `).bind(userId).run()
+    try {
+      await db.prepare(`
+        DELETE FROM daily_rewards WHERE user_id = ?
+      `).bind(userId).run()
+    } catch (e) {
+      console.log('daily_rewards 삭제 실패:', e)
+    }
 
     // 3. 거래 내역 삭제
-    await db.prepare(`
-      DELETE FROM transactions WHERE user_id = ?
-    `).bind(userId).run()
+    try {
+      await db.prepare(`
+        DELETE FROM transactions WHERE user_id = ?
+      `).bind(userId).run()
+    } catch (e) {
+      console.log('transactions 삭제 실패:', e)
+    }
 
     // 4. 출금 신청 내역 삭제
-    await db.prepare(`
-      DELETE FROM withdrawals WHERE user_id = ?
-    `).bind(userId).run()
+    try {
+      await db.prepare(`
+        DELETE FROM withdrawals WHERE user_id = ?
+      `).bind(userId).run()
+    } catch (e) {
+      console.log('withdrawals 삭제 실패:', e)
+    }
 
     // 5. 스테이킹 내역 삭제
-    await db.prepare(`
-      DELETE FROM staking WHERE user_id = ?
-    `).bind(userId).run()
+    try {
+      await db.prepare(`
+        DELETE FROM staking WHERE user_id = ?
+      `).bind(userId).run()
+    } catch (e) {
+      console.log('staking 삭제 실패:', e)
+    }
 
     // 6. 추천 관계 해제 (이 사용자를 추천인으로 가진 사용자들)
-    await db.prepare(`
-      UPDATE users SET referrer_id = NULL WHERE referrer_id = ?
-    `).bind(userId).run()
+    try {
+      await db.prepare(`
+        UPDATE users SET referrer_id = NULL WHERE referrer_id = ?
+      `).bind(userId).run()
+    } catch (e) {
+      console.log('referrer_id 업데이트 실패:', e)
+    }
 
-    // 7. 사용자 삭제
+    // 7. 사용자 삭제 (이것만은 반드시 성공해야 함)
     await db.prepare(`
       DELETE FROM users WHERE id = ?
     `).bind(userId).run()
