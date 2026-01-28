@@ -21,7 +21,7 @@ app.use('/static/*', serveStatic({ root: './public' }))
 // 회원가입
 app.post('/api/auth/register', async (c) => {
   try {
-    const { email, password, name, phone, walletAddress } = await c.req.json()
+    const { email, password, name, phone, walletAddress, referralCode } = await c.req.json()
 
     if (!email || !password || !name || !phone || !walletAddress) {
       return c.json({ error: '모든 필드를 입력해주세요' }, 400)
@@ -42,6 +42,19 @@ app.post('/api/auth/register', async (c) => {
     }
 
     const db = c.env.DB
+
+    // 추천인 코드 검증 (선택사항)
+    let referrerId = null
+    if (referralCode && referralCode.trim()) {
+      const referrer = await db.prepare('SELECT id FROM users WHERE referral_code = ?')
+        .bind(referralCode.trim().toUpperCase())
+        .first()
+      
+      if (!referrer) {
+        return c.json({ error: '유효하지 않은 추천인 코드입니다' }, 400)
+      }
+      referrerId = referrer.id
+    }
 
     // 이메일 중복 체크 (소문자로 비교)
     const existingEmail = await db.prepare('SELECT id FROM users WHERE LOWER(email) = ?')
@@ -70,16 +83,30 @@ app.post('/api/auth/register', async (c) => {
       return c.json({ error: '이미 등록된 지갑주소입니다' }, 400)
     }
 
-    // 사용자 생성 (이메일을 소문자로 저장, 전화번호는 하이픈 제거)
+    // 고유한 추천인 코드 생성 (SAY + 6자리 랜덤)
+    let newReferralCode = ''
+    let isUnique = false
+    while (!isUnique) {
+      newReferralCode = 'SAY' + Math.random().toString(36).substring(2, 8).toUpperCase()
+      const existing = await db.prepare('SELECT id FROM users WHERE referral_code = ?')
+        .bind(newReferralCode)
+        .first()
+      if (!existing) {
+        isUnique = true
+      }
+    }
+
+    // 사용자 생성
     const result = await db.prepare(`
-      INSERT INTO users (email, password, name, phone, wallet_address, qta_balance, qx_balance, usdt_balance)
-      VALUES (?, ?, ?, ?, ?, 0, 0, 0)
-    `).bind(normalizedEmail, password, name, cleanPhone, walletAddress).run()
+      INSERT INTO users (email, password, name, phone, wallet_address, qta_balance, qx_balance, usdt_balance, referral_code, referrer_id)
+      VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?)
+    `).bind(normalizedEmail, password, name, cleanPhone, walletAddress, newReferralCode, referrerId).run()
 
     return c.json({ 
       success: true, 
       message: '회원가입이 완료되었습니다',
-      userId: result.meta.last_row_id 
+      userId: result.meta.last_row_id,
+      referralCode: newReferralCode
     })
   } catch (error) {
     return c.json({ error: '회원가입 중 오류가 발생했습니다' }, 500)
@@ -101,7 +128,7 @@ app.post('/api/auth/login', async (c) => {
     const db = c.env.DB
 
     const user = await db.prepare(`
-      SELECT id, email, name, wallet_address, qta_balance, qx_balance, usdt_balance, created_at
+      SELECT id, email, name, wallet_address, qta_balance, qx_balance, usdt_balance, referral_code, created_at
       FROM users WHERE LOWER(email) = ? AND password = ?
     `).bind(normalizedEmail, password).first()
 
@@ -120,6 +147,7 @@ app.post('/api/auth/login', async (c) => {
         qta_balance: user.qta_balance,
         qx_balance: user.qx_balance,
         usdt_balance: user.usdt_balance,
+        referral_code: user.referral_code,
         created_at: user.created_at
       }
     })
@@ -726,6 +754,64 @@ app.post('/api/rewards/daily', async (c) => {
 
           rewardedCount++
           totalUsdtRewarded += usdtAmount
+
+          // 추천인 보상 지급
+          try {
+            // 1단계 추천인 (50%)
+            const level1Referrer = await db.prepare(`
+              SELECT referrer_id FROM users WHERE id = ?
+            `).bind(staking.user_id).first()
+
+            if (level1Referrer && level1Referrer.referrer_id) {
+              const level1Reward = usdtAmount * 0.5
+              
+              // 1단계 추천인 USDT 지급
+              await db.prepare(`
+                UPDATE users SET usdt_balance = usdt_balance + ? WHERE id = ?
+              `).bind(level1Reward, level1Referrer.referrer_id).run()
+
+              // 추천인 보상 기록
+              await db.prepare(`
+                INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
+                VALUES (?, ?, 1, ?, ?, ?)
+              `).bind(level1Referrer.referrer_id, staking.user_id, usdtAmount, level1Reward, today).run()
+
+              // 거래 내역 기록
+              await db.prepare(`
+                INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                VALUES (?, 'referral_reward', 'USDT', ?, ?)
+              `).bind(level1Referrer.referrer_id, level1Reward, `1단계 추천인 보상 (${usdtAmount.toFixed(2)} USDT의 50%)`).run()
+
+              // 2단계 추천인 (20%)
+              const level2Referrer = await db.prepare(`
+                SELECT referrer_id FROM users WHERE id = ?
+              `).bind(level1Referrer.referrer_id).first()
+
+              if (level2Referrer && level2Referrer.referrer_id) {
+                const level2Reward = usdtAmount * 0.2
+                
+                // 2단계 추천인 USDT 지급
+                await db.prepare(`
+                  UPDATE users SET usdt_balance = usdt_balance + ? WHERE id = ?
+                `).bind(level2Reward, level2Referrer.referrer_id).run()
+
+                // 추천인 보상 기록
+                await db.prepare(`
+                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
+                  VALUES (?, ?, 2, ?, ?, ?)
+                `).bind(level2Referrer.referrer_id, staking.user_id, usdtAmount, level2Reward, today).run()
+
+                // 거래 내역 기록
+                await db.prepare(`
+                  INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                  VALUES (?, 'referral_reward', 'USDT', ?, ?)
+                `).bind(level2Referrer.referrer_id, level2Reward, `2단계 추천인 보상 (${usdtAmount.toFixed(2)} USDT의 20%)`).run()
+              }
+            }
+          } catch (referralError) {
+            console.error(`Failed to process referral rewards for user ${staking.user_id}:`, referralError)
+            // 추천인 보상 실패는 메인 보상에 영향을 주지 않음
+          }
         }
       } catch (err) {
         console.error(`Failed to reward user ${staking.user_id}:`, err)
@@ -825,6 +911,60 @@ app.get('/api/transactions/:userId', async (c) => {
     })
   } catch (error) {
     return c.json({ error: '거래 내역 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 추천인 현황 조회
+app.get('/api/referrals/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId')
+    const db = c.env.DB
+
+    // 1단계 추천인 (직접 추천)
+    const level1 = await db.prepare(`
+      SELECT id, name, email, created_at, 
+             (SELECT COUNT(*) FROM staking WHERE user_id = users.id AND status = 'active') as staking_count,
+             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = users.id AND status = 'active') as total_staking
+      FROM users
+      WHERE referrer_id = ?
+      ORDER BY created_at DESC
+    `).bind(userId).all()
+
+    // 2단계 추천인 (간접 추천)
+    const level2 = await db.prepare(`
+      SELECT u2.id, u2.name, u2.email, u2.created_at,
+             (SELECT COUNT(*) FROM staking WHERE user_id = u2.id AND status = 'active') as staking_count,
+             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = u2.id AND status = 'active') as total_staking
+      FROM users u1
+      JOIN users u2 ON u2.referrer_id = u1.id
+      WHERE u1.referrer_id = ?
+      ORDER BY u2.created_at DESC
+    `).bind(userId).all()
+
+    // 추천 보상 총액 계산
+    const rewardStats = await db.prepare(`
+      SELECT 
+        COALESCE(SUM(CASE WHEN description LIKE '%1단계 추천인 보상%' THEN amount ELSE 0 END), 0) as level1_rewards,
+        COALESCE(SUM(CASE WHEN description LIKE '%2단계 추천인 보상%' THEN amount ELSE 0 END), 0) as level2_rewards
+      FROM transactions
+      WHERE user_id = ? AND type = 'referral_reward'
+    `).bind(userId).first()
+
+    return c.json({
+      success: true,
+      level1: level1.results || [],
+      level2: level2.results || [],
+      stats: {
+        level1Count: level1.results?.length || 0,
+        level2Count: level2.results?.length || 0,
+        level1Rewards: rewardStats?.level1_rewards || 0,
+        level2Rewards: rewardStats?.level2_rewards || 0,
+        totalRewards: (rewardStats?.level1_rewards || 0) + (rewardStats?.level2_rewards || 0)
+      }
+    })
+  } catch (error) {
+    console.error('추천인 조회 오류:', error)
+    return c.json({ error: '추천인 현황 조회 중 오류가 발생했습니다' }, 500)
   }
 })
 
@@ -961,6 +1101,15 @@ app.get('/', (c) => {
                                 placeholder="0x1234567890123456789012345678901234567890"
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base break-all">
                             <p class="text-xs text-red-600 mt-1 font-medium">BNB기반 지갑주소를 입력하십시요</p>
+                        </div>
+                        <div class="mb-4 sm:mb-6">
+                            <label class="block text-gray-700 text-sm font-bold mb-2">추천인 코드 (선택사항)</label>
+                            <input type="text" id="registerReferralCode"
+                                placeholder="SAY123456"
+                                maxlength="9"
+                                style="text-transform: uppercase"
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                            <p class="text-xs text-gray-500 mt-1">추천인이 있다면 추천인 코드를 입력하세요</p>
                         </div>
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-2 sm:py-3 rounded-lg font-bold hover:bg-purple-700 transition text-sm sm:text-base">
@@ -1138,8 +1287,9 @@ app.get('/', (c) => {
                 const walletAddress = document.getElementById('registerWallet').value;
                 const password = document.getElementById('registerPassword').value;
                 const passwordConfirm = document.getElementById('registerPasswordConfirm').value;
+                const referralCode = document.getElementById('registerReferralCode').value.trim().toUpperCase();
 
-                console.log('입력값:', { name, email, phone, walletAddress, password, passwordConfirm });
+                console.log('입력값:', { name, email, phone, walletAddress, password, passwordConfirm, referralCode });
 
                 // 비밀번호 확인 검증
                 if (password !== passwordConfirm) {
@@ -1160,12 +1310,13 @@ app.get('/', (c) => {
                         email,
                         phone,
                         password, 
-                        walletAddress 
+                        walletAddress,
+                        referralCode: referralCode || null
                     });
                     console.log('API 응답:', response.data);
                     
                     if (response.data.success) {
-                        alert('회원가입 성공! 로그인해주세요.');
+                        alert('회원가입 성공!\\n\\n내 추천인 코드: ' + response.data.referralCode + '\\n\\n로그인해주세요.');
                         showLogin();
                         // 폼 초기화
                         document.getElementById('registerName').value = '';
@@ -1463,6 +1614,70 @@ app.get('/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- Referral Section -->
+                <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                        <i class="fas fa-user-friends mr-2 text-indigo-600"></i>추천인 현황
+                    </h2>
+                    
+                    <!-- 내 추천인 코드 -->
+                    <div class="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl p-6 mb-6">
+                        <div class="text-white">
+                            <p class="text-sm opacity-90 mb-2">내 추천인 코드</p>
+                            <div class="flex items-center gap-3">
+                                <p class="text-3xl font-bold tracking-wider" id="myReferralCode">-</p>
+                                <button onclick="copyReferralCode()" 
+                                    class="bg-white bg-opacity-20 hover:bg-opacity-30 text-white px-4 py-2 rounded-lg transition">
+                                    <i class="fas fa-copy mr-1"></i>복사
+                                </button>
+                            </div>
+                            <p class="text-xs opacity-75 mt-2">이 코드로 친구를 초대하고 보상을 받으세요!</p>
+                        </div>
+                    </div>
+
+                    <!-- 추천 보상 통계 -->
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <div class="bg-blue-50 rounded-lg p-4 border border-blue-200">
+                            <p class="text-sm text-gray-600 mb-1">1단계 추천인</p>
+                            <p class="text-2xl font-bold text-blue-600" id="level1Count">0명</p>
+                        </div>
+                        <div class="bg-purple-50 rounded-lg p-4 border border-purple-200">
+                            <p class="text-sm text-gray-600 mb-1">2단계 추천인</p>
+                            <p class="text-2xl font-bold text-purple-600" id="level2Count">0명</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-4 border border-green-200">
+                            <p class="text-sm text-gray-600 mb-1">총 추천 보상</p>
+                            <p class="text-2xl font-bold text-green-600" id="totalRewards">0 USDT</p>
+                        </div>
+                    </div>
+
+                    <!-- 추천인 목록 탭 -->
+                    <div class="mb-4">
+                        <div class="flex gap-2 border-b">
+                            <button onclick="showReferralTab('level1')" 
+                                id="tab-level1"
+                                class="px-6 py-3 font-medium text-blue-600 border-b-2 border-blue-600">
+                                1단계 추천인
+                            </button>
+                            <button onclick="showReferralTab('level2')" 
+                                id="tab-level2"
+                                class="px-6 py-3 font-medium text-gray-500 hover:text-gray-700">
+                                2단계 추천인
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 1단계 추천인 목록 -->
+                    <div id="level1-list" class="space-y-3">
+                        <p class="text-gray-500 text-center py-8">로딩 중...</p>
+                    </div>
+
+                    <!-- 2단계 추천인 목록 (기본 숨김) -->
+                    <div id="level2-list" class="space-y-3 hidden">
+                        <p class="text-gray-500 text-center py-8">로딩 중...</p>
+                    </div>
+                </div>
+
                 <!-- My Stakings -->
                 <div class="bg-white rounded-xl shadow-lg p-6">
                     <h2 class="text-2xl font-bold text-gray-800 mb-6">
@@ -1496,6 +1711,10 @@ app.get('/dashboard', (c) => {
                 if (!currentUser) return;
 
                 document.getElementById('userName').textContent = currentUser.name;
+                // 추천인 코드 표시
+                if (currentUser.referral_code) {
+                    document.getElementById('myReferralCode').textContent = currentUser.referral_code;
+                }
                 // 지갑주소 표시 (앞 6자리...뒤 4자리)
                 if (currentUser.wallet_address) {
                     const wallet = currentUser.wallet_address;
@@ -1509,6 +1728,7 @@ app.get('/dashboard', (c) => {
                 
                 await loadUserInfo();
                 await loadStakings();
+                await loadReferrals();
             }
 
             // 사용자 정보 로드
@@ -2061,6 +2281,107 @@ app.get('/dashboard', (c) => {
                     }
                 } catch (error) {
                     alert(error.response?.data?.error || '프로필 업데이트 실패');
+                }
+            }
+
+            // 추천인 현황 로드
+            async function loadReferrals() {
+                try {
+                    const response = await axios.get('/api/referrals/' + currentUser.id);
+                    if (response.data.success) {
+                        const { level1, level2, stats } = response.data;
+                        
+                        // 통계 업데이트
+                        document.getElementById('level1Count').textContent = stats.level1Count + '명';
+                        document.getElementById('level2Count').textContent = stats.level2Count + '명';
+                        document.getElementById('totalRewards').textContent = stats.totalRewards.toFixed(2) + ' USDT';
+                        
+                        // 1단계 추천인 목록 렌더링
+                        const level1List = document.getElementById('level1-list');
+                        if (level1.length === 0) {
+                            level1List.innerHTML = '<div class="text-center py-8 text-gray-500">' +
+                                '<i class="fas fa-users text-4xl mb-3 opacity-50"></i>' +
+                                '<p>아직 1단계 추천인이 없습니다</p>' +
+                                '<p class="text-sm mt-2">친구에게 추천 코드를 공유해보세요!</p>' +
+                                '</div>';
+                        } else {
+                            level1List.innerHTML = level1.map(function(user) {
+                                return '<div class="bg-blue-50 border border-blue-200 rounded-lg p-4">' +
+                                    '<div class="flex justify-between items-start">' +
+                                        '<div>' +
+                                            '<p class="font-bold text-gray-800">' + user.name + '</p>' +
+                                            '<p class="text-sm text-gray-600">' + user.email + '</p>' +
+                                            '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
+                                        '</div>' +
+                                        '<div class="text-right">' +
+                                            '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
+                                            '<p class="text-sm font-bold text-blue-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
+                                        '</div>' +
+                                    '</div>' +
+                                '</div>';
+                            }).join('');
+                        }
+                        
+                        // 2단계 추천인 목록 렌더링
+                        const level2List = document.getElementById('level2-list');
+                        if (level2.length === 0) {
+                            level2List.innerHTML = '<div class="text-center py-8 text-gray-500">' +
+                                '<i class="fas fa-users text-4xl mb-3 opacity-50"></i>' +
+                                '<p>아직 2단계 추천인이 없습니다</p>' +
+                                '<p class="text-sm mt-2">1단계 추천인이 새로운 회원을 추천하면 표시됩니다</p>' +
+                                '</div>';
+                        } else {
+                            level2List.innerHTML = level2.map(function(user) {
+                                return '<div class="bg-purple-50 border border-purple-200 rounded-lg p-4">' +
+                                    '<div class="flex justify-between items-start">' +
+                                        '<div>' +
+                                            '<p class="font-bold text-gray-800">' + user.name + '</p>' +
+                                            '<p class="text-sm text-gray-600">' + user.email + '</p>' +
+                                            '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
+                                        '</div>' +
+                                        '<div class="text-right">' +
+                                            '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
+                                            '<p class="text-sm font-bold text-purple-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
+                                        '</div>' +
+                                    '</div>' +
+                                '</div>';
+                            }).join('');
+                        }
+                    }
+                } catch (error) {
+                    console.error('Failed to load referrals:', error);
+                }
+            }
+
+            // 추천인 코드 복사
+            function copyReferralCode() {
+                const code = document.getElementById('myReferralCode').textContent;
+                if (code && code !== '-') {
+                    navigator.clipboard.writeText(code).then(() => {
+                        alert('추천인 코드가 복사되었습니다!');
+                    }).catch(() => {
+                        alert('복사에 실패했습니다. 다시 시도해주세요.');
+                    });
+                }
+            }
+
+            // 추천인 탭 전환
+            function showReferralTab(level) {
+                const level1Tab = document.getElementById('tab-level1');
+                const level2Tab = document.getElementById('tab-level2');
+                const level1List = document.getElementById('level1-list');
+                const level2List = document.getElementById('level2-list');
+
+                if (level === 'level1') {
+                    level1Tab.className = 'px-6 py-3 font-medium text-blue-600 border-b-2 border-blue-600';
+                    level2Tab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700';
+                    level1List.classList.remove('hidden');
+                    level2List.classList.add('hidden');
+                } else {
+                    level1Tab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700';
+                    level2Tab.className = 'px-6 py-3 font-medium text-purple-600 border-b-2 border-purple-600';
+                    level1List.classList.add('hidden');
+                    level2List.classList.remove('hidden');
                 }
             }
 
