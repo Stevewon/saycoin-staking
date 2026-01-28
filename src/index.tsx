@@ -598,6 +598,87 @@ app.get('/api/admin/users', async (c) => {
   }
 })
 
+// 관리자: 사용자 강제 탈퇴
+app.delete('/api/admin/user/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId')
+    const db = c.env.DB
+
+    // 사용자 존재 확인
+    const user = await db.prepare(`
+      SELECT id, name, email FROM users WHERE id = ?
+    `).bind(userId).first()
+
+    if (!user) {
+      return c.json({ error: '존재하지 않는 사용자입니다' }, 404)
+    }
+
+    // 진행 중인 스테이킹 확인
+    const activeStaking = await db.prepare(`
+      SELECT COUNT(*) as count FROM staking 
+      WHERE user_id = ? AND status = 'active'
+    `).bind(userId).first()
+
+    if (activeStaking && activeStaking.count > 0) {
+      return c.json({ 
+        error: '진행 중인 스테이킹이 있는 사용자는 탈퇴시킬 수 없습니다',
+        activeStakingCount: activeStaking.count
+      }, 400)
+    }
+
+    // 관련 데이터 삭제 (순서 중요: 외래키 제약조건)
+    
+    // 1. 추천 보상 내역 삭제
+    await db.prepare(`
+      DELETE FROM referral_rewards 
+      WHERE referrer_id = ? OR referee_id = ?
+    `).bind(userId, userId).run()
+
+    // 2. 일일 보상 내역 삭제
+    await db.prepare(`
+      DELETE FROM daily_rewards WHERE user_id = ?
+    `).bind(userId).run()
+
+    // 3. 거래 내역 삭제
+    await db.prepare(`
+      DELETE FROM transactions WHERE user_id = ?
+    `).bind(userId).run()
+
+    // 4. 출금 신청 내역 삭제
+    await db.prepare(`
+      DELETE FROM withdrawals WHERE user_id = ?
+    `).bind(userId).run()
+
+    // 5. 스테이킹 내역 삭제
+    await db.prepare(`
+      DELETE FROM staking WHERE user_id = ?
+    `).bind(userId).run()
+
+    // 6. 추천 관계 해제 (이 사용자를 추천인으로 가진 사용자들)
+    await db.prepare(`
+      UPDATE users SET referrer_id = NULL WHERE referrer_id = ?
+    `).bind(userId).run()
+
+    // 7. 사용자 삭제
+    await db.prepare(`
+      DELETE FROM users WHERE id = ?
+    `).bind(userId).run()
+
+    return c.json({ 
+      success: true, 
+      message: '사용자가 성공적으로 탈퇴 처리되었습니다',
+      deletedUser: {
+        id: user.id,
+        name: user.name,
+        email: user.email
+      }
+    })
+  } catch (error) {
+    console.error('사용자 탈퇴 처리 오류:', error)
+    return c.json({ error: '사용자 탈퇴 처리 중 오류가 발생했습니다' }, 500)
+  }
+})
+
 // 관리자: 회원가입 현황 조회
 app.get('/api/admin/signups', async (c) => {
   try {
@@ -2924,6 +3005,13 @@ app.get('/admin/dashboard', (c) => {
                                     <p class="font-bold text-orange-600">\${u.staking_amount.toLocaleString()}</p>
                                 </div>
                             </div>
+
+                            <div class="mt-4 pt-4 border-t flex justify-end">
+                                <button onclick="deleteUser(\${u.id}, '\${u.name}', '\${u.email}', \${u.staking_amount})" 
+                                    class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition duration-200">
+                                    <i class="fas fa-user-times mr-2"></i>사용자 강제 탈퇴
+                                </button>
+                            </div>
                         </div>
                     \`).join('');
                 } catch (error) {
@@ -3013,6 +3101,50 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 일일 보상 지급 실행
+            // 사용자 강제 탈퇴
+            async function deleteUser(userId, userName, userEmail, stakingAmount) {
+                // 진행 중인 스테이킹이 있는지 확인
+                if (stakingAmount > 0) {
+                    alert('진행 중인 스테이킹이 있는 사용자는 탈퇴시킬 수 없습니다.\\n\\n' + 
+                          '사용자: ' + userName + '\\n' +
+                          '이메일: ' + userEmail + '\\n' +
+                          '스테이킹 수량: ' + stakingAmount.toLocaleString() + '개');
+                    return;
+                }
+
+                if (!confirm('정말로 이 사용자를 강제 탈퇴시키겠습니까?\\n\\n' + 
+                             '사용자: ' + userName + '\\n' +
+                             '이메일: ' + userEmail + '\\n\\n' +
+                             '이 작업은 되돌릴 수 없습니다!')) {
+                    return;
+                }
+
+                // 두 번째 확인
+                if (!confirm('마지막 확인입니다.\\n\\n사용자의 모든 데이터(스테이킹 내역, 거래 내역, 보상 내역 등)가 영구적으로 삭제됩니다.\\n\\n계속하시겠습니까?')) {
+                    return;
+                }
+
+                try {
+                    const response = await axios.delete('/api/admin/user/' + userId);
+                    if (response.data.success) {
+                        alert('사용자가 성공적으로 탈퇴 처리되었습니다.\\n\\n' +
+                              '이름: ' + response.data.deletedUser.name + '\\n' +
+                              '이메일: ' + response.data.deletedUser.email);
+                        await loadUsers();
+                        await loadSignups();
+                    }
+                } catch (error) {
+                    console.error('사용자 탈퇴 처리 실패:', error);
+                    if (error.response && error.response.data && error.response.data.error) {
+                        alert('탈퇴 처리 실패: ' + error.response.data.error + 
+                              (error.response.data.activeStakingCount ? 
+                               '\\n진행 중인 스테이킹: ' + error.response.data.activeStakingCount + '건' : ''));
+                    } else {
+                        alert('사용자 탈퇴 처리 중 오류가 발생했습니다.');
+                    }
+                }
+            }
+
             // 스테이킹 승인
             async function approveStaking(stakingId) {
                 if (!confirm('이 스테이킹을 승인하시겠습니까? 코인이 즉시 지급됩니다.')) {
