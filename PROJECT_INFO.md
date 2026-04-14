@@ -1,10 +1,10 @@
-# SAYCOIN STAKING - 프로젝트 정보
+# QUANTARIUM STAKING - 프로젝트 정보
 
 ## 📦 최신 백업 파일
 
 **백업 URL**: https://www.genspark.ai/api/files/s/0EqPNHCA  
 **백업 날짜**: 2026-01-28  
-**파일명**: `saycoin-staking-production-final.tar.gz`  
+**파일명**: `quantarium-staking-production-final.tar.gz`  
 **크기**: 1.6 MB  
 
 ---
@@ -12,18 +12,18 @@
 ## 🌐 배포 정보
 
 ### 프로덕션 URL
-- **메인**: https://staking.saycoin.net/
-- **관리자**: https://staking.saycoin.net/admin
-- **백업**: https://saycoin-staking-prod.pages.dev
+- **메인**: https://staking.quantarium.net/
+- **관리자**: https://staking.quantarium.net/admin
+- **백업**: https://quantarium-staking-prod.pages.dev
 
 ### Cloudflare Pages 프로젝트
-- **프로젝트명**: `saycoin-staking-prod`
+- **프로젝트명**: `quantarium-staking-prod`
 - **계정 ID**: `37814a078a2d8ab3c20f85ec0640950b`
-- **Production branch**: `saycoin-staking-platform`
+- **Production branch**: `quantarium-staking-platform`
 
 ### GitHub 저장소
-- **저장소**: https://github.com/Stevewon/saycoin-staking
-- **브랜치**: `saycoin-staking-platform`
+- **저장소**: https://github.com/Stevewon/quantarium-staking
+- **브랜치**: `quantarium-staking-platform`
 - **계정**: Stevewon
 
 ---
@@ -31,7 +31,7 @@
 ## 🗄️ 데이터베이스
 
 ### Cloudflare D1 Database
-- **이름**: `saycoin-staking-production`
+- **이름**: `quantarium-staking-production`
 - **Database ID**: `5a3ba471-4bba-413f-9af9-b6c94ef102d7`
 - **바인딩**: `DB`
 
@@ -46,7 +46,7 @@
 
 ## 🔐 관리자 정보
 
-- **로그인 URL**: https://staking.saycoin.net/admin
+- **로그인 URL**: https://staking.quantarium.net/admin
 - **아이디**: `admin`
 - **비밀번호**: `admin1234`
 
@@ -111,9 +111,9 @@ webapp/
 │   └── renderer.tsx           # SSR 렌더러
 ├── public/
 │   ├── static/
-│   │   ├── saycoin-logo.png  # 로고 이미지
+│   │   ├── quantarium-logo.png  # 로고 이미지
 │   │   └── style.css         # 커스텀 CSS
-│   └── saycoin-logo.png      # 루트 로고
+│   └── quantarium-logo.png      # 루트 로고
 ├── migrations/
 │   ├── 0001_initial_schema.sql
 │   ├── 0002_add_wallet_address.sql
@@ -145,7 +145,7 @@ webapp/
 2. **압축 해제**:
    ```bash
    cd /home/user
-   tar -xzf saycoin-staking-production-final.tar.gz
+   tar -xzf quantarium-staking-production-final.tar.gz
    cd webapp
    ```
 
@@ -168,9 +168,9 @@ webapp/
 2. **저장소 클론**:
    ```bash
    cd /home/user
-   git clone https://github.com/Stevewon/saycoin-staking.git webapp
+   git clone https://github.com/Stevewon/quantarium-staking.git webapp
    cd webapp
-   git checkout saycoin-staking-platform
+   git checkout quantarium-staking-platform
    ```
 
 3. **의존성 설치**:
@@ -189,7 +189,7 @@ webapp/
 이미 작업하던 세션이라면:
 ```bash
 cd /home/user/webapp
-git pull origin saycoin-staking-platform
+git pull origin quantarium-staking-platform
 npm install
 npm run build
 pm2 restart webapp
@@ -222,12 +222,12 @@ cd /home/user/webapp
 
 git add .
 git commit -m "설명: 수정 내용"
-git push origin saycoin-staking-platform
+git push origin quantarium-staking-platform
 ```
 
 ### 3. 자동 배포 확인
 - GitHub 푸시 → Cloudflare Pages 자동 빌드 → 자동 배포
-- 배포 상태: https://dash.cloudflare.com → Workers & Pages → saycoin-staking-prod → Deployments
+- 배포 상태: https://dash.cloudflare.com → Workers & Pages → quantarium-staking-prod → Deployments
 
 ---
 
@@ -272,10 +272,10 @@ pm2 start ecosystem.config.cjs
 ### D1 데이터베이스 연결 오류
 ```bash
 # 로컬 마이그레이션 재적용
-npx wrangler d1 migrations apply saycoin-staking-production --local
+npx wrangler d1 migrations apply quantarium-staking-production --local
 
 # 프로덕션 마이그레이션 확인
-npx wrangler d1 migrations apply saycoin-staking-production --remote
+npx wrangler d1 migrations apply quantarium-staking-production --remote
 ```
 
 ### GitHub 푸시 실패
@@ -284,11 +284,11 @@ npx wrangler d1 migrations apply saycoin-staking-production --remote
 # AI Developer #github 탭에서 재인증
 
 # 강제 푸시 (주의!)
-git push -f origin saycoin-staking-platform
+git push -f origin quantarium-staking-platform
 ```
 
 ### Cloudflare 배포 실패
-1. Cloudflare Dashboard → Workers & Pages → saycoin-staking-prod
+1. Cloudflare Dashboard → Workers & Pages → quantarium-staking-prod
 2. Deployments 탭 → 실패한 배포 클릭
 3. "View build logs" 에서 오류 확인
 4. Settings → Functions → D1 database bindings 확인
@@ -355,7 +355,7 @@ git push -f origin saycoin-staking-platform
 - Account ID: 37814a078a2d8ab3c20f85ec0640950b
 
 ### GitHub
-- 저장소: https://github.com/Stevewon/saycoin-staking
+- 저장소: https://github.com/Stevewon/quantarium-staking
 - 계정: Stevewon
 
 ### 문서
@@ -367,4 +367,4 @@ git push -f origin saycoin-staking-platform
 
 **마지막 업데이트**: 2026-01-28  
 **프로젝트 상태**: ✅ 프로덕션 배포 완료  
-**배포 URL**: https://staking.saycoin.net/
+**배포 URL**: https://staking.quantarium.net/

@@ -11,7 +11,7 @@
 1. https://dash.cloudflare.com/profile/api-tokens 접속
 2. **Create Token** 클릭
 3. **Custom token** 선택
-4. 이름: `SAYCOIN-Deploy-Token`
+4. 이름: `QUANTARIUM-Deploy-Token`
 5. 권한 추가:
    - `Account` - `D1` - `Edit`
    - `Account` - `Cloudflare Pages` - `Edit`
@@ -26,7 +26,7 @@
 ```bash
 export CLOUDFLARE_API_TOKEN="여기에-새로-생성한-토큰-붙여넣기"
 cd /home/user/webapp
-npx wrangler d1 create saycoin-staking-production
+npx wrangler d1 create quantarium-staking-production
 ```
 
 ### 3. Database ID 복사
@@ -34,7 +34,7 @@ npx wrangler d1 create saycoin-staking-production
 출력 결과에서 Database ID를 찾아 복사:
 
 ```
-✅ Successfully created DB 'saycoin-staking-production'!
+✅ Successfully created DB 'quantarium-staking-production'!
 
 Database ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
           ↑
@@ -55,7 +55,7 @@ nano wrangler.jsonc
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "saycoin-staking-production",
+      "database_name": "quantarium-staking-production",
       "database_id": "여기에-Database-ID-입력"
     }
   ]
@@ -67,13 +67,13 @@ nano wrangler.jsonc
 ```bash
 export CLOUDFLARE_API_TOKEN="여기에-새로-생성한-토큰-붙여넣기"
 cd /home/user/webapp
-npx wrangler d1 execute saycoin-staking-production --remote --file=./migrations/ALL_MIGRATIONS.sql
+npx wrangler d1 execute quantarium-staking-production --remote --file=./migrations/ALL_MIGRATIONS.sql
 ```
 
 ### 6. 데이터 확인
 
 ```bash
-npx wrangler d1 execute saycoin-staking-production --remote --command="SELECT COUNT(*) FROM users"
+npx wrangler d1 execute quantarium-staking-production --remote --command="SELECT COUNT(*) FROM users"
 ```
 
 출력:

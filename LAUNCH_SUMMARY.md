@@ -1,4 +1,4 @@
-# 🎉 SAYCOIN STAKING 웹사이트 런칭 완료!
+# 🎉 QUANTARIUM STAKING 웹사이트 런칭 완료!
 
 ---
 
@@ -34,13 +34,13 @@
 
 ### 패키지 내용
 ```
-saycoin-staking-final-deployment.tar.gz (1.4MB)
+quantarium-staking-final-deployment.tar.gz (1.4MB)
 ├── src/                    # 소스코드
 │   └── index.tsx          # Hono 백엔드 (151KB)
 ├── dist/                  # 프로덕션 빌드
 │   ├── _worker.js         # Cloudflare Worker (148KB)
 │   ├── _routes.json       # 라우팅 설정
-│   ├── saycoin-logo.png   # 로고 (163KB)
+│   ├── quantarium-logo.png   # 로고 (163KB)
 │   └── static/            # 정적 파일
 ├── migrations/            # 데이터베이스 마이그레이션
 │   ├── 0001_create_users.sql
@@ -75,7 +75,7 @@ saycoin-staking-final-deployment.tar.gz (1.4MB)
 #### **Step 1: D1 데이터베이스 생성 (2분)**
 1. https://dash.cloudflare.com → 로그인
 2. Workers & Pages > D1 SQL Database → Create database
-3. Name: `saycoin-staking-production`
+3. Name: `quantarium-staking-production`
 4. Database ID 복사
 
 #### **Step 2: 데이터베이스 초기화 (1분)**
@@ -86,11 +86,11 @@ saycoin-staking-final-deployment.tar.gz (1.4MB)
 
 #### **Step 3: Pages 배포 (2분)**
 1. Workers & Pages → Create application → Pages → Upload assets
-2. Project name: `saycoin-staking`
+2. Project name: `quantarium-staking`
 3. `dist/` 폴더 모든 파일 업로드
 4. Settings → Functions → D1 database bindings
    - Variable: `DB`
-   - Database: `saycoin-staking-production`
+   - Database: `quantarium-staking-production`
 5. Save
 
 ---
@@ -98,10 +98,10 @@ saycoin-staking-final-deployment.tar.gz (1.4MB)
 ## 🌐 배포 후 URL
 
 ### 프로덕션 URL
-**https://saycoin-staking.pages.dev**
+**https://quantarium-staking.pages.dev**
 
 ### 관리자 페이지
-**https://saycoin-staking.pages.dev/admin**
+**https://quantarium-staking.pages.dev/admin**
 - ID: `admin`
 - PW: `admin1234` (⚠️ 배포 후 즉시 변경 필요)
 
@@ -288,7 +288,7 @@ saycoin-staking-final-deployment.tar.gz (1.4MB)
 
 ## 🎊 축하합니다!
 
-**SAYCOIN STAKING** 플랫폼이 성공적으로 준비되었습니다!
+**QUANTARIUM STAKING** 플랫폼이 성공적으로 준비되었습니다!
 
 이제 Cloudflare 대시보드에서 위 배포 단계를 진행하면 실제 서비스를 시작할 수 있습니다! 🚀
 

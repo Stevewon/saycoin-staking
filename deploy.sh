@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# SAYCOIN STAKING 배포 스크립트
+# QUANTARIUM STAKING 배포 스크립트
 # 이 스크립트는 Cloudflare Pages에 프로젝트를 배포합니다
 
-echo "🚀 SAYCOIN STAKING 배포 시작..."
+echo "🚀 QUANTARIUM STAKING 배포 시작..."
 echo ""
 
 # 프로젝트 디렉토리로 이동
@@ -56,28 +56,28 @@ echo ""
 # 5. 배포
 echo "🚀 5단계: Cloudflare Pages 배포..."
 echo ""
-echo "프로젝트 이름: saycoin-staking"
+echo "프로젝트 이름: quantarium-staking"
 echo "배포 디렉토리: dist/"
 echo ""
 
-npx wrangler pages deploy dist --project-name saycoin-staking
+npx wrangler pages deploy dist --project-name quantarium-staking
 
 if [ $? -eq 0 ]; then
     echo ""
     echo "✅ 배포 완료!"
     echo ""
     echo "📊 배포 확인:"
-    echo "- 프로덕션 URL: https://saycoin-staking.pages.dev"
-    echo "- 관리자 페이지: https://saycoin-staking.pages.dev/admin"
+    echo "- 프로덕션 URL: https://quantarium-staking.pages.dev"
+    echo "- 관리자 페이지: https://quantarium-staking.pages.dev/admin"
     echo ""
     echo "🔧 다음 단계:"
     echo "1. Cloudflare Pages 대시보드에서 D1 바인딩 설정"
     echo "   - Settings → Functions → D1 database bindings"
     echo "   - Variable name: DB"
-    echo "   - D1 database: saycoin-staking-production"
+    echo "   - D1 database: quantarium-staking-production"
     echo ""
     echo "2. 프로덕션 데이터베이스 마이그레이션:"
-    echo "   npx wrangler d1 migrations apply saycoin-staking-production --remote"
+    echo "   npx wrangler d1 migrations apply quantarium-staking-production --remote"
     echo ""
     echo "3. 배포된 사이트 테스트"
     echo ""

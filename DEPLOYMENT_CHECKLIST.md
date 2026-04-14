@@ -1,4 +1,4 @@
-# ✅ SAYCOIN STAKING 배포 체크리스트
+# ✅ QUANTARIUM STAKING 배포 체크리스트
 
 ## 📋 배포 전 준비사항
 
@@ -9,7 +9,7 @@
 ### 2️⃣ D1 데이터베이스 생성
 - [ ] Workers & Pages > D1 SQL Database 접속
 - [ ] Create database 클릭
-- [ ] Database name: `saycoin-staking-production` 입력
+- [ ] Database name: `quantarium-staking-production` 입력
 - [ ] Database ID 복사 및 저장
 - [ ] 예: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 
@@ -25,18 +25,18 @@
 ### 4️⃣ Cloudflare Pages 프로젝트 생성
 - [ ] Workers & Pages > Create application 클릭
 - [ ] Pages 탭 > Upload assets 선택
-- [ ] Project name: `saycoin-staking` 입력
+- [ ] Project name: `quantarium-staking` 입력
 - [ ] dist 폴더의 모든 파일 업로드
   - [ ] `_worker.js`
   - [ ] `_routes.json`
-  - [ ] `saycoin-logo.png`
+  - [ ] `quantarium-logo.png`
   - [ ] `static/` 폴더
 
 ### 5️⃣ D1 바인딩 설정
-- [ ] saycoin-staking 프로젝트 > Settings > Functions 접속
+- [ ] quantarium-staking 프로젝트 > Settings > Functions 접속
 - [ ] D1 database bindings > Add binding 클릭
 - [ ] Variable name: `DB` 입력
-- [ ] D1 database: `saycoin-staking-production` 선택
+- [ ] D1 database: `quantarium-staking-production` 선택
 - [ ] Save 클릭
 
 ---
@@ -44,7 +44,7 @@
 ## 🧪 배포 후 테스트
 
 ### 사용자 페이지 테스트
-- [ ] https://saycoin-staking.pages.dev 접속
+- [ ] https://quantarium-staking.pages.dev 접속
 - [ ] 회원가입 기능 테스트
 - [ ] 로그인 기능 테스트
 - [ ] 대시보드 표시 확인
@@ -53,7 +53,7 @@
 - [ ] 모바일 반응형 확인
 
 ### 관리자 페이지 테스트
-- [ ] https://saycoin-staking.pages.dev/admin 접속
+- [ ] https://quantarium-staking.pages.dev/admin 접속
 - [ ] 관리자 로그인 (admin / admin1234)
 - [ ] 대시보드 통계 확인
 - [ ] 스테이킹 승인 기능 테스트
@@ -86,8 +86,8 @@
 ## 📊 최종 확인
 
 ### URL 확인
-- [ ] 프로덕션 URL: https://saycoin-staking.pages.dev
-- [ ] 관리자 URL: https://saycoin-staking.pages.dev/admin
+- [ ] 프로덕션 URL: https://quantarium-staking.pages.dev
+- [ ] 관리자 URL: https://quantarium-staking.pages.dev/admin
 
 ### 기능 확인
 - [ ] 회원가입/로그인 정상 작동
@@ -107,7 +107,7 @@
 ## 📞 문제 발생 시
 
 ### 로그 확인
-1. Cloudflare 대시보드 > saycoin-staking 프로젝트
+1. Cloudflare 대시보드 > quantarium-staking 프로젝트
 2. Functions > Logs 탭
 3. 에러 메시지 확인
 
@@ -128,9 +128,9 @@ SELECT COUNT(*) FROM staking;
 
 ## 🎉 배포 완료!
 
-모든 체크리스트를 완료하면 **SAYCOIN STAKING** 플랫폼이 정상적으로 운영됩니다!
+모든 체크리스트를 완료하면 **QUANTARIUM STAKING** 플랫폼이 정상적으로 운영됩니다!
 
-**프로덕션 URL**: https://saycoin-staking.pages.dev
+**프로덕션 URL**: https://quantarium-staking.pages.dev
 
 **관리자 로그인**:
 - ID: `admin`

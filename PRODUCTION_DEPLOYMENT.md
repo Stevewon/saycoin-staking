@@ -1,4 +1,4 @@
-# 🎉 SAYCOIN STAKING - 프로덕션 배포 최종 가이드
+# 🎉 QUANTARIUM STAKING - 프로덕션 배포 최종 가이드
 
 ## ✅ 준비 완료!
 
@@ -28,7 +28,7 @@
 1. https://dash.cloudflare.com 접속
 2. **Workers & Pages** → **D1 SQL Database** 클릭
 3. **Create database** 클릭
-4. Database name: `saycoin-staking-production`
+4. Database name: `quantarium-staking-production`
 5. **Create** 클릭
 6. **Database ID** 복사 (예: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
 
@@ -36,7 +36,7 @@
 ```bash
 # 배포 패키지 다운로드 (위 URL에서)
 # 압축 해제
-tar -xzf saycoin-staking-production-ready.tar.gz
+tar -xzf quantarium-staking-production-ready.tar.gz
 cd webapp
 
 # wrangler.jsonc 파일 열기
@@ -49,7 +49,7 @@ nano wrangler.jsonc
 #### Step 3: 데이터베이스 마이그레이션
 ```bash
 cd webapp
-npx wrangler d1 migrations apply saycoin-staking-production --remote
+npx wrangler d1 migrations apply quantarium-staking-production --remote
 ```
 
 #### Step 4: Cloudflare Pages 프로젝트 생성
@@ -57,14 +57,14 @@ npx wrangler d1 migrations apply saycoin-staking-production --remote
 2. **Workers & Pages** → **Create application** 클릭
 3. **Pages** 탭 선택
 4. **Upload assets** 선택
-5. Project name: `saycoin-staking`
+5. Project name: `quantarium-staking`
 6. Production branch: `main`
 7. **Create project** 클릭
 
 #### Step 5: 배포
 ```bash
 cd webapp
-npx wrangler pages deploy dist --project-name saycoin-staking
+npx wrangler pages deploy dist --project-name quantarium-staking
 ```
 
 또는 대시보드에서:
@@ -78,12 +78,12 @@ npx wrangler pages deploy dist --project-name saycoin-staking
 3. **D1 database bindings** 섹션
 4. **Add binding** 클릭
 5. Variable name: `DB`
-6. D1 database: `saycoin-staking-production` 선택
+6. D1 database: `quantarium-staking-production` 선택
 7. **Save** 클릭
 
 #### Step 7: 배포 확인
-- 프로덕션 URL: `https://saycoin-staking.pages.dev`
-- 관리자 페이지: `https://saycoin-staking.pages.dev/admin`
+- 프로덕션 URL: `https://quantarium-staking.pages.dev`
+- 관리자 페이지: `https://quantarium-staking.pages.dev/admin`
 
 ---
 
@@ -109,7 +109,7 @@ cd webapp
 ## 🧪 배포 후 테스트
 
 ### 1. 회원가입 테스트
-- URL: https://saycoin-staking.pages.dev
+- URL: https://quantarium-staking.pages.dev
 - 회원가입 진행
 - 로그인 확인
 
@@ -119,7 +119,7 @@ cd webapp
 - 신청 완료
 
 ### 3. 관리자 승인
-- URL: https://saycoin-staking.pages.dev/admin
+- URL: https://quantarium-staking.pages.dev/admin
 - ID: `admin` / PW: `admin1234`
 - 승인 대기 목록 확인
 - 스테이킹 승인
@@ -163,8 +163,8 @@ cd webapp
 ## 📊 주요 URL
 
 ### 프로덕션
-- **메인**: https://saycoin-staking.pages.dev
-- **관리자**: https://saycoin-staking.pages.dev/admin
+- **메인**: https://quantarium-staking.pages.dev
+- **관리자**: https://quantarium-staking.pages.dev/admin
 
 ### Cloudflare 대시보드
 - **Pages**: https://dash.cloudflare.com → Workers & Pages
@@ -179,19 +179,19 @@ cd webapp
 ✅ **해결**: D1 바인딩 설정 확인
 - Settings → Functions → D1 database bindings
 - Variable name: `DB`
-- Database: `saycoin-staking-production`
+- Database: `quantarium-staking-production`
 
 ### 정적 파일 404 오류
 ✅ **해결**: dist 폴더 재배포
 ```bash
 npm run build
-npx wrangler pages deploy dist --project-name saycoin-staking
+npx wrangler pages deploy dist --project-name quantarium-staking
 ```
 
 ### 마이그레이션 실패
 ✅ **해결**: 마이그레이션 재적용
 ```bash
-npx wrangler d1 migrations apply saycoin-staking-production --remote
+npx wrangler d1 migrations apply quantarium-staking-production --remote
 ```
 
 ---
@@ -210,7 +210,7 @@ npx wrangler d1 migrations apply saycoin-staking-production --remote
 
 ## 🎉 축하합니다!
 
-SAYCOIN STAKING 플랫폼 배포가 완료되었습니다!
+QUANTARIUM STAKING 플랫폼 배포가 완료되었습니다!
 위 단계를 따라 진행하시면 실제 서비스를 시작하실 수 있습니다.
 
 **성공적인 런칭을 기원합니다!** 🚀

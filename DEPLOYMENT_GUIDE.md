@@ -1,8 +1,8 @@
-# 🚀 SAYCOIN STAKING 프로덕션 배포 가이드
+# 🚀 QUANTARIUM STAKING 프로덕션 배포 가이드
 
 ## 📋 배포 개요
 
-이 가이드는 SAYCOIN STAKING 플랫폼을 Cloudflare Pages에 배포하는 전체 과정을 안내합니다.
+이 가이드는 QUANTARIUM STAKING 플랫폼을 Cloudflare Pages에 배포하는 전체 과정을 안내합니다.
 
 ---
 
@@ -22,7 +22,7 @@ API 토큰 권한 제한으로 인해 **Cloudflare 대시보드에서 직접 설
 1. 좌측 메뉴에서 **"Workers & Pages"** 클릭
 2. 상단 탭에서 **"D1 SQL Database"** 선택
 3. **"Create database"** 클릭
-4. Database name: `saycoin-staking-production`
+4. Database name: `quantarium-staking-production`
 5. **"Create"** 클릭
 
 ### 1-3. Database ID 복사
@@ -39,7 +39,7 @@ API 토큰 권한 제한으로 인해 **Cloudflare 대시보드에서 직접 설
 ```jsonc
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "saycoin-staking",
+  "name": "quantarium-staking",
   "compatibility_date": "2026-01-22",
   "compatibility_flags": ["nodejs_compat"],
   "pages_build_output_dir": "./dist",
@@ -47,7 +47,7 @@ API 토큰 권한 제한으로 인해 **Cloudflare 대시보드에서 직접 설
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "saycoin-staking-production",
+      "database_name": "quantarium-staking-production",
       "database_id": "여기에-복사한-Database-ID-입력"
     }
   ]
@@ -63,7 +63,7 @@ API 토큰 권한 제한으로 인해 **Cloudflare 대시보드에서 직접 설
 
 ```bash
 cd /home/user/webapp
-npx wrangler d1 migrations apply saycoin-staking-production --remote
+npx wrangler d1 migrations apply quantarium-staking-production --remote
 ```
 
 ### 3-2. 시드 데이터 입력 (선택사항)
@@ -71,7 +71,7 @@ npx wrangler d1 migrations apply saycoin-staking-production --remote
 
 ```bash
 cd /home/user/webapp
-npx wrangler d1 execute saycoin-staking-production --remote --file=./seed.sql
+npx wrangler d1 execute quantarium-staking-production --remote --file=./seed.sql
 ```
 
 ---
@@ -86,7 +86,7 @@ npx wrangler d1 execute saycoin-staking-production --remote --file=./seed.sql
 5. **"Upload assets"** 선택 (또는 GitHub 연결)
 
 ### 4-2. 프로젝트 설정
-- **Project name**: `saycoin-staking`
+- **Project name**: `quantarium-staking`
 - **Production branch**: `main`
 
 ---
@@ -102,7 +102,7 @@ npm run build
 ### 5-2. Cloudflare Pages 배포
 ```bash
 cd /home/user/webapp
-npx wrangler pages deploy dist --project-name saycoin-staking
+npx wrangler pages deploy dist --project-name quantarium-staking
 ```
 
 **또는 대시보드에서 직접 업로드:**
@@ -120,7 +120,7 @@ npx wrangler pages deploy dist --project-name saycoin-staking
 3. **"D1 database bindings"** 섹션
 4. **"Add binding"** 클릭
 5. Variable name: `DB`
-6. D1 database: `saycoin-staking-production` 선택
+6. D1 database: `quantarium-staking-production` 선택
 7. **"Save"** 클릭
 
 ---
@@ -142,7 +142,7 @@ npx wrangler pages deploy dist --project-name saycoin-staking
 
 ### 8-1. 배포 URL 확인
 - Cloudflare Pages 프로젝트 페이지에서 배포 URL 확인
-- 예: `https://saycoin-staking.pages.dev`
+- 예: `https://quantarium-staking.pages.dev`
 
 ### 8-2. 기능 테스트
 1. **회원가입**: 새 계정 생성
@@ -161,7 +161,7 @@ npx wrangler pages deploy dist --project-name saycoin-staking
 1. Cloudflare Pages 프로젝트 페이지
 2. **"Custom domains"** 탭
 3. **"Set up a custom domain"** 클릭
-4. 도메인 입력 (예: `staking.saycoin.com`)
+4. 도메인 입력 (예: `staking.quantarium.com`)
 5. DNS 레코드 자동 설정
 
 ### 9-2. SSL 인증서
@@ -173,8 +173,8 @@ npx wrangler pages deploy dist --project-name saycoin-staking
 ## 📊 주요 URL
 
 ### 프로덕션 환경
-- **메인 페이지**: https://saycoin-staking.pages.dev
-- **관리자 페이지**: https://saycoin-staking.pages.dev/admin
+- **메인 페이지**: https://quantarium-staking.pages.dev
+- **관리자 페이지**: https://quantarium-staking.pages.dev/admin
 - **관리자 계정**: admin / admin1234
 
 ### Cloudflare 대시보드
@@ -194,14 +194,14 @@ npx wrangler pages deploy dist --project-name saycoin-staking
 ### 문제 2: 마이그레이션 실패
 **해결**: 로컬에서 다시 적용
 ```bash
-npx wrangler d1 migrations apply saycoin-staking-production --remote
+npx wrangler d1 migrations apply quantarium-staking-production --remote
 ```
 
 ### 문제 3: 정적 파일 404 오류
 **해결**: 빌드 재실행 및 재배포
 ```bash
 npm run build
-npx wrangler pages deploy dist --project-name saycoin-staking
+npx wrangler pages deploy dist --project-name quantarium-staking
 ```
 
 ### 문제 4: API 토큰 권한 오류
@@ -236,7 +236,7 @@ npx wrangler pages deploy dist --project-name saycoin-staking
 
 ## 🎉 배포 완료!
 
-모든 단계가 완료되면 SAYCOIN STAKING 플랫폼이 프로덕션 환경에서 실행됩니다!
+모든 단계가 완료되면 QUANTARIUM STAKING 플랫폼이 프로덕션 환경에서 실행됩니다!
 
 **다음 단계:**
 1. 실제 운영 전 충분한 테스트

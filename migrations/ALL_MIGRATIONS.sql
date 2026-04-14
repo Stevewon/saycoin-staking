@@ -1,5 +1,5 @@
 -- ========================================
--- SAYCOIN STAKING 프로덕션 데이터베이스 전체 마이그레이션
+-- QUANTARIUM STAKING 프로덕션 데이터베이스 전체 마이그레이션
 -- 실행 방법: Cloudflare D1 Console에서 전체 복사 후 실행
 -- ========================================
 
@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT NOT NULL,
   phone TEXT,
   wallet_address TEXT UNIQUE NOT NULL,
+  usdt_wallet_address TEXT DEFAULT '',
   qta_balance INTEGER DEFAULT 0,
   qx_balance INTEGER DEFAULT 0,
   usdt_balance REAL DEFAULT 0,
@@ -104,7 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status);
 INSERT OR IGNORE INTO users (email, password, name, phone, wallet_address, qta_balance, qx_balance, usdt_balance)
 VALUES 
   ('test@example.com', 'password123', '테스트유저', '01012345678', '0x1234567890123456789012345678901234567890', 300000, 300000, 15),
-  ('admin@saycoin.com', 'admin1234', '관리자', '01087654321', '0xABCDEF1234567890123456789012345678901234', 0, 0, 0),
+  ('admin@quantarium.com', 'admin1234', '관리자', '01087654321', '0xABCDEF1234567890123456789012345678901234', 0, 0, 0),
   ('user1@gmail.com', 'user1234', '사용자1', '01011112222', '0x1111111111111111111111111111111111111111', 500000, 500000, 30),
   ('user2@naver.com', 'user2234', '사용자2', '01022223333', '0x2222222222222222222222222222222222222222', 1000000, 1000000, 75);
 
