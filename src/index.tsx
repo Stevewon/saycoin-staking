@@ -358,6 +358,82 @@ app.get('/api/withdrawal/list/:userId', async (c) => {
 })
 
 // ============================================
+// API Routes - Swap (QKEY → USDT)
+// ============================================
+
+// QKEY → USDT 스왑 (1:1 비율, 최소 100 USDT, 100 단위)
+app.post('/api/swap/qkey-to-usdt', async (c) => {
+  try {
+    const { userId, amount } = await c.req.json()
+
+    if (!userId || !amount) {
+      return c.json({ error: '필수 정보를 입력해주세요' }, 400)
+    }
+
+    // 최소 100 USDT 검증
+    if (amount < 100) {
+      return c.json({ error: '최소 스왑 수량은 100 USDT입니다' }, 400)
+    }
+
+    // 100 단위 검증
+    if (amount % 100 !== 0) {
+      return c.json({ error: '스왑 수량은 100 단위로만 가능합니다 (예: 100, 200, 300...)' }, 400)
+    }
+
+    const db = c.env.DB
+
+    // 사용자 QKEY 잔액 확인
+    const user = await db.prepare(`
+      SELECT qkey_balance FROM users WHERE id = ?
+    `).bind(userId).first()
+
+    if (!user) {
+      return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
+    }
+
+    const qkeyBalance = user.qkey_balance || 0
+
+    // QKEY 잔액 부족 체크 (1:1 비율이므로 amount만큼 필요)
+    if (qkeyBalance < amount) {
+      return c.json({ error: `QKEY 잔액이 부족합니다 (보유: ${qkeyBalance.toLocaleString()} QKEY, 필요: ${amount.toLocaleString()} QKEY)` }, 400)
+    }
+
+    // QKEY 차감 & USDT 증가 (1:1 비율)
+    await db.prepare(`
+      UPDATE users 
+      SET qkey_balance = qkey_balance - ?,
+          usdt_balance = usdt_balance + ?
+      WHERE id = ?
+    `).bind(amount, amount, userId).run()
+
+    // 거래 내역 기록 (QKEY 차감)
+    await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+      VALUES (?, 'swap_out', 'QKEY', ?, ?)
+    `).bind(userId, amount, `QKEY → USDT 스왑 (${amount.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
+
+    // 거래 내역 기록 (USDT 증가)
+    await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+      VALUES (?, 'swap_in', 'USDT', ?, ?)
+    `).bind(userId, amount, `QKEY → USDT 스왑 (${amount.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
+
+    return c.json({ 
+      success: true, 
+      message: `${amount.toLocaleString()} QKEY가 ${amount.toLocaleString()} USDT로 스왑되었습니다`,
+      swap: {
+        from: 'QKEY',
+        to: 'USDT',
+        amount: amount
+      }
+    })
+  } catch (error) {
+    console.error('Swap error:', error)
+    return c.json({ error: '스왑 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// ============================================
 // API Routes - Staking
 // ============================================
 
@@ -1792,6 +1868,41 @@ app.get('/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- Swap Section (QKEY → USDT) -->
+                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
+                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
+                        <i class="fas fa-exchange-alt mr-2 text-green-600"></i>QKEY → USDT 스왑
+                    </h2>
+                    <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
+                        <div class="flex items-start gap-2">
+                            <i class="fas fa-info-circle text-green-600 text-lg mt-0.5"></i>
+                            <div>
+                                <p class="text-sm text-green-800 font-medium">보유한 QKEY를 USDT로 스왑할 수 있습니다</p>
+                                <p class="text-xs text-green-700 mt-1">교환 비율: 1 QKEY = 1 USDT | 최소 100 USDT | 100 단위</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+                        <div>
+                            <label class="block text-gray-700 font-bold mb-2 text-sm">스왑 가능 QKEY 잔액</label>
+                            <p class="text-2xl font-bold text-yellow-600" id="swapQkeyBalance">0</p>
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 font-bold mb-2 text-sm">스왑 수량 (USDT)</label>
+                            <div class="flex gap-2">
+                                <input type="number" id="swapAmount" 
+                                    min="100" step="100" placeholder="최소 100, 100 단위"
+                                    class="flex-1 px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-green-500 text-sm sm:text-base">
+                                <button type="button" onclick="handleSwap()"
+                                    class="px-4 py-2 sm:px-6 sm:py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold transition text-sm sm:text-base whitespace-nowrap">
+                                    <i class="fas fa-exchange-alt mr-1"></i>스왑
+                                </button>
+                            </div>
+                            <p class="text-xs text-gray-500 mt-1">100 단위로 입력 (예: 100, 200, 300...)</p>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Staking Section -->
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
@@ -2191,6 +2302,10 @@ app.get('/dashboard', (c) => {
                         document.getElementById('qxBalance').textContent = user.qx_balance.toLocaleString();
                         document.getElementById('qkeyBalance').textContent = (user.qkey_balance || 0).toLocaleString();
                         document.getElementById('usdtBalance').textContent = user.usdt_balance.toFixed(2);
+                        
+                        // 스왑 가능 QKEY 잔액 업데이트
+                        const swapEl = document.getElementById('swapQkeyBalance');
+                        if (swapEl) swapEl.textContent = (user.qkey_balance || 0).toLocaleString();
                         
                         // 로컬 스토리지 업데이트
                         localStorage.setItem('user', JSON.stringify(user));
@@ -2952,6 +3067,52 @@ app.get('/dashboard', (c) => {
                     console.error('Failed to load referral rewards:', error);
                     document.getElementById('rewards-table-body').innerHTML = 
                         '<tr><td colspan="4" class="px-4 py-8 text-center text-red-500">보상 내역을 불러오는데 실패했습니다</td></tr>';
+                }
+            }
+
+            // QKEY → USDT 스왑
+            async function handleSwap() {
+                const amountInput = document.getElementById('swapAmount');
+                const amount = parseInt(amountInput.value);
+
+                if (!amount || isNaN(amount)) {
+                    alert('스왑 수량을 입력해주세요');
+                    return;
+                }
+
+                if (amount < 100) {
+                    alert('⚠️ 최소 스왑 수량은 100 USDT입니다\\n\\n입력하신 수량: ' + amount);
+                    return;
+                }
+
+                if (amount % 100 !== 0) {
+                    alert('⚠️ 스왑 수량은 100 단위로만 가능합니다\\n\\n입력하신 수량: ' + amount + '\\n\\n올바른 예시: 100, 200, 300, 400...');
+                    return;
+                }
+
+                const qkeyBalance = parseInt((document.getElementById('swapQkeyBalance').textContent || '0').replace(/,/g, ''));
+                if (amount > qkeyBalance) {
+                    alert('⚠️ QKEY 잔액이 부족합니다\\n\\n보유 QKEY: ' + qkeyBalance.toLocaleString() + '\\n필요 QKEY: ' + amount.toLocaleString());
+                    return;
+                }
+
+                if (!confirm(amount.toLocaleString() + ' QKEY를 ' + amount.toLocaleString() + ' USDT로 스왑하시겠습니까?\\n\\n교환 비율: 1 QKEY = 1 USDT')) {
+                    return;
+                }
+
+                try {
+                    const response = await axios.post('/api/swap/qkey-to-usdt', {
+                        userId: currentUser.id,
+                        amount: amount
+                    });
+
+                    if (response.data.success) {
+                        alert('✅ 스왑 완료!\\n\\n' + amount.toLocaleString() + ' QKEY → ' + amount.toLocaleString() + ' USDT');
+                        amountInput.value = '';
+                        await loadUserInfo();
+                    }
+                } catch (error) {
+                    alert(error.response?.data?.error || '스왑 처리 중 오류가 발생했습니다');
                 }
             }
 
