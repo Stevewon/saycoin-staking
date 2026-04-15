@@ -2347,9 +2347,12 @@ app.get('/dashboard', (c) => {
                 // QR 코드 생성
                 generateQRCode();
                 
-                await loadUserInfo();
-                await loadStakings();
-                await loadReferrals();
+                // 병렬 로딩 (빠른 로드)
+                await Promise.allSettled([
+                    loadUserInfo(),
+                    loadStakings(),
+                    loadReferrals()
+                ]);
             }
 
             // 사용자 정보 로드
@@ -2492,6 +2495,8 @@ app.get('/dashboard', (c) => {
                     }
                 } catch (error) {
                     console.error('Failed to load stakings:', error);
+                    var listEl = document.getElementById('stakingList');
+                    if (listEl) listEl.innerHTML = '<p class="text-gray-500 text-center py-8">스테이킹 내역이 없습니다</p>';
                 }
             }
             
@@ -3006,6 +3011,10 @@ app.get('/dashboard', (c) => {
                     }
                 } catch (error) {
                     console.error('Failed to load referrals:', error);
+                    var l1 = document.getElementById('level1-list');
+                    var l2 = document.getElementById('level2-list');
+                    if (l1) l1.innerHTML = '<div class="text-center py-8 text-gray-500"><i class="fas fa-users text-4xl mb-3 opacity-50"></i><p>추천인이 없습니다</p></div>';
+                    if (l2) l2.innerHTML = '<div class="text-center py-8 text-gray-500"><i class="fas fa-users text-4xl mb-3 opacity-50"></i><p>추천인이 없습니다</p></div>';
                 }
             }
 
