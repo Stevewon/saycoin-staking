@@ -103,8 +103,8 @@ app.post('/api/auth/register', async (c) => {
 
     // 사용자 생성
     const result = await db.prepare(`
-      INSERT INTO users (email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, usdt_balance, referral_code, referrer_id)
-      VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)
+      INSERT INTO users (email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, referrer_id)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)
     `).bind(normalizedEmail, password, name, cleanPhone, walletAddress, usdtWalletAddress, newReferralCode, referrerId).run()
 
     return c.json({ 
@@ -764,13 +764,14 @@ app.get('/api/admin/users', async (c) => {
         u.usdt_wallet_address,
         u.qta_balance, 
         u.qx_balance, 
+        u.qkey_balance,
         u.usdt_balance, 
         u.created_at,
         COALESCE(SUM(CASE WHEN s.status = 'active' THEN s.amount ELSE 0 END), 0) as staking_amount
       FROM users u
       LEFT JOIN staking s ON u.id = s.user_id
       GROUP BY u.id, u.name, u.email, u.phone, u.wallet_address, u.usdt_wallet_address,
-               u.qta_balance, u.qx_balance, u.usdt_balance, u.created_at
+               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance, u.created_at
       ORDER BY u.created_at DESC
     `).all()
 
@@ -1285,8 +1286,8 @@ app.get('/api/referrals/:userId', async (c) => {
     // 추천 보상 총액 계산
     const rewardStats = await db.prepare(`
       SELECT 
-        COALESCE(SUM(CASE WHEN description LIKE '%1단계 추천인 보상%' THEN amount ELSE 0 END), 0) as level1_rewards,
-        COALESCE(SUM(CASE WHEN description LIKE '%2단계 추천인 보상%' THEN amount ELSE 0 END), 0) as level2_rewards
+        COALESCE(SUM(CASE WHEN description LIKE '%1대%' THEN amount ELSE 0 END), 0) as level1_rewards,
+        COALESCE(SUM(CASE WHEN description LIKE '%2대%' THEN amount ELSE 0 END), 0) as level2_rewards
       FROM transactions
       WHERE user_id = ? AND type = 'referral_reward'
     `).bind(userId).first()
@@ -1390,6 +1391,7 @@ app.get('/', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>QUANTARIUM STAKING</title>
+        <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <style>
@@ -1397,6 +1399,9 @@ app.get('/', (c) => {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
           }
+          html, body { overflow-x: hidden; max-width: 100vw; }
+          * { box-sizing: border-box; }
+          button, a, input, select { min-height: 36px; }
         </style>
     </head>
     <body>
@@ -1815,6 +1820,7 @@ app.get('/dashboard', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>대시보드 - QUANTARIUM STAKING</title>
+        <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
@@ -2148,11 +2154,11 @@ app.get('/dashboard', (c) => {
                             </button>
                         </div>
                         
-                        <!-- QKEY 출금 -->
+                        <!-- USDT 출금 -->
                         <div class="border-2 border-green-200 rounded-lg p-3 sm:p-4 hover:border-green-400 transition">
                             <div class="flex items-center justify-between mb-2 sm:mb-3">
-                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">QKEY</h3>
-                                <i class="fas fa-key text-green-600 text-lg sm:text-2xl"></i>
+                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">USDT</h3>
+                                <i class="fas fa-dollar-sign text-green-600 text-lg sm:text-2xl"></i>
                             </div>
                             <p class="text-xs sm:text-sm text-gray-600 mb-1">보유량</p>
                             <p class="text-lg sm:text-2xl font-bold text-green-600 mb-3 sm:mb-4" id="withdrawUsdtBalance">0</p>
@@ -2406,7 +2412,7 @@ app.get('/dashboard', (c) => {
                         // 기간 종료된 스테이킹이 있는지 체크
                         const now = new Date();
                         const hasCompletedStaking = stakings.some(s => {
-                            if (s.status !== 'active') return false;
+                            if (s.status !== 'active' || !s.end_date) return false;
                             const endDate = new Date(s.end_date);
                             return endDate <= now;
                         });
@@ -2427,10 +2433,10 @@ app.get('/dashboard', (c) => {
                         }
 
                         listEl.innerHTML = stakings.map(s => {
-                            const startDate = new Date(s.start_date).toLocaleDateString('ko-KR');
-                            const endDate = new Date(s.end_date).toLocaleDateString('ko-KR');
-                            const endDateTime = new Date(s.end_date);
-                            const isCompleted = s.status === 'active' && endDateTime <= now;
+                            const startDate = s.start_date ? new Date(s.start_date).toLocaleDateString('ko-KR') : '-';
+                            const endDate = s.end_date ? new Date(s.end_date).toLocaleDateString('ko-KR') : '-';
+                            const endDateTime = s.end_date ? new Date(s.end_date) : null;
+                            const isCompleted = s.status === 'active' && endDateTime && endDateTime <= now;
                             
                             let statusColor, statusText;
                             if (s.status === 'pending') {
@@ -3295,34 +3301,24 @@ app.get('/admin', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>관리자 로그인 - QUANTARIUM STAKING</title>
+        <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <style>
             body {
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             }
+            html, body { overflow-x: hidden; max-width: 100vw; }
+            * { box-sizing: border-box; }
+            button, a, input, select { min-height: 36px; }
         </style>
     </head>
-    <body class="min-h-screen flex items-center justify-center p-4">
-        <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md">
+    <body class="min-h-screen flex items-center justify-center p-2 sm:p-4">
+        <div class="bg-white rounded-2xl shadow-2xl p-4 sm:p-8 w-full max-w-md">
             <div class="text-center mb-8">
                 <img src="/static/quantarium-logo.png" alt="QUANTARIUM Logo" class="w-24 h-24 mx-auto mb-4" onerror="this.style.display='none'">
                 <h1 class="text-3xl font-bold text-gray-800 mb-2">관리자 로그인</h1>
                 <p class="text-gray-600">QUANTARIUM STAKING 관리자 페이지</p>
-            </div>
-
-            <!-- 관리자 로그인 정보 안내 -->
-            <div class="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
-                <div class="flex items-start">
-                    <i class="fas fa-info-circle text-blue-600 text-xl mr-3 mt-1"></i>
-                    <div class="flex-1">
-                        <p class="font-bold text-blue-900 mb-2">관리자 로그인 정보</p>
-                        <div class="space-y-1 text-sm text-blue-800">
-                            <p><strong>ID:</strong> <code class="bg-white px-2 py-1 rounded">admin</code></p>
-                            <p><strong>비밀번호:</strong> <code class="bg-white px-2 py-1 rounded">admin1234</code></p>
-                        </div>
-                    </div>
-                </div>
             </div>
 
             <form id="adminLoginForm" onsubmit="handleAdminLogin(event)" class="space-y-4">
@@ -3330,14 +3326,14 @@ app.get('/admin', (c) => {
                     <label class="block text-gray-700 font-medium mb-2">관리자 ID</label>
                     <input type="text" id="adminId" required 
                         class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500"
-                        placeholder="admin" value="admin">
+                        placeholder="관리자 ID를 입력하세요">
                 </div>
 
                 <div>
                     <label class="block text-gray-700 font-medium mb-2">비밀번호</label>
                     <input type="password" id="adminPassword" required 
                         class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500"
-                        placeholder="admin1234">
+                        placeholder="비밀번호를 입력하세요">
                 </div>
 
                 <button type="submit" 
@@ -3384,6 +3380,7 @@ app.get('/admin/dashboard', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>관리자 대시보드 - QUANTARIUM STAKING</title>
+        <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <style>
@@ -3840,22 +3837,26 @@ app.get('/admin/dashboard', (c) => {
                                 </div>
                             </div>
 
-                            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 mt-3 sm:mt-4 pt-3 sm:pt-4 border-t">
+                            <div class="grid grid-cols-3 sm:grid-cols-5 gap-2 sm:gap-3 mt-3 sm:mt-4 pt-3 sm:pt-4 border-t">
                                 <div class="text-center">
                                     <p class="text-xs text-gray-600 mb-1">QTA</p>
-                                    <p class="font-bold text-blue-600">\${u.qta_balance.toLocaleString()}</p>
+                                    <p class="font-bold text-blue-600 text-sm">\${u.qta_balance.toLocaleString()}</p>
                                 </div>
                                 <div class="text-center">
                                     <p class="text-xs text-gray-600 mb-1">QX</p>
-                                    <p class="font-bold text-purple-600">\${u.qx_balance.toLocaleString()}</p>
+                                    <p class="font-bold text-purple-600 text-sm">\${u.qx_balance.toLocaleString()}</p>
                                 </div>
                                 <div class="text-center">
-                                    <p class="text-xs text-gray-600 mb-1">QKEY(배당)</p>
-                                    <p class="font-bold text-green-600">\${u.usdt_balance.toFixed(2)}</p>
+                                    <p class="text-xs text-gray-600 mb-1">QKEY</p>
+                                    <p class="font-bold text-yellow-600 text-sm">\${(u.qkey_balance || 0).toLocaleString()}</p>
                                 </div>
                                 <div class="text-center">
-                                    <p class="text-xs text-gray-600 mb-1">수탁 수량</p>
-                                    <p class="font-bold text-orange-600">\${u.staking_amount.toLocaleString()}</p>
+                                    <p class="text-xs text-gray-600 mb-1">USDT</p>
+                                    <p class="font-bold text-green-600 text-sm">\${(u.usdt_balance || 0).toFixed(2)}</p>
+                                </div>
+                                <div class="text-center">
+                                    <p class="text-xs text-gray-600 mb-1">투자금액</p>
+                                    <p class="font-bold text-orange-600 text-sm">$\${u.staking_amount.toLocaleString()}</p>
                                 </div>
                             </div>
 
