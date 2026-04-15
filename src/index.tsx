@@ -361,10 +361,11 @@ app.get('/api/withdrawal/list/:userId', async (c) => {
 // API Routes - Swap (QKEY → USDT)
 // ============================================
 
-// QKEY → USDT 스왑 (1:1 비율, 최소 100 USDT, 100 단위)
+// QKEY → USDT 스왑 (150 QKEY = 1 USDT, 최소 100 USDT, 100 단위)
 app.post('/api/swap/qkey-to-usdt', async (c) => {
   try {
-    const { userId, amount } = await c.req.json()
+    const { userId, amount } = await c.req.json() // amount = 받고 싶은 USDT 수량
+    const QKEY_PER_USDT = 150 // 150 QKEY = 1 USDT
 
     if (!userId || !amount) {
       return c.json({ error: '필수 정보를 입력해주세요' }, 400)
@@ -380,6 +381,8 @@ app.post('/api/swap/qkey-to-usdt', async (c) => {
       return c.json({ error: '스왑 수량은 100 단위로만 가능합니다 (예: 100, 200, 300...)' }, 400)
     }
 
+    const requiredQkey = amount * QKEY_PER_USDT // 필요한 QKEY 수량
+
     const db = c.env.DB
 
     // 사용자 QKEY 잔액 확인
@@ -393,38 +396,39 @@ app.post('/api/swap/qkey-to-usdt', async (c) => {
 
     const qkeyBalance = user.qkey_balance || 0
 
-    // QKEY 잔액 부족 체크 (1:1 비율이므로 amount만큼 필요)
-    if (qkeyBalance < amount) {
-      return c.json({ error: `QKEY 잔액이 부족합니다 (보유: ${qkeyBalance.toLocaleString()} QKEY, 필요: ${amount.toLocaleString()} QKEY)` }, 400)
+    // QKEY 잔액 부족 체크
+    if (qkeyBalance < requiredQkey) {
+      return c.json({ error: `QKEY 잔액이 부족합니다 (보유: ${qkeyBalance.toLocaleString()} QKEY, 필요: ${requiredQkey.toLocaleString()} QKEY)` }, 400)
     }
 
-    // QKEY 차감 & USDT 증가 (1:1 비율)
+    // QKEY 차감 & USDT 증가 (150 QKEY = 1 USDT)
     await db.prepare(`
       UPDATE users 
       SET qkey_balance = qkey_balance - ?,
           usdt_balance = usdt_balance + ?
       WHERE id = ?
-    `).bind(amount, amount, userId).run()
+    `).bind(requiredQkey, amount, userId).run()
 
     // 거래 내역 기록 (QKEY 차감)
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'swap_out', 'QKEY', ?, ?)
-    `).bind(userId, amount, `QKEY → USDT 스왑 (${amount.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
+    `).bind(userId, requiredQkey, `QKEY → USDT 스왑 (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
 
     // 거래 내역 기록 (USDT 증가)
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'swap_in', 'USDT', ?, ?)
-    `).bind(userId, amount, `QKEY → USDT 스왑 (${amount.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
+    `).bind(userId, amount, `QKEY → USDT 스왑 (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
 
     return c.json({ 
       success: true, 
-      message: `${amount.toLocaleString()} QKEY가 ${amount.toLocaleString()} USDT로 스왑되었습니다`,
+      message: `${requiredQkey.toLocaleString()} QKEY가 ${amount.toLocaleString()} USDT로 스왑되었습니다`,
       swap: {
         from: 'QKEY',
         to: 'USDT',
-        amount: amount
+        qkeyUsed: requiredQkey,
+        usdtReceived: amount
       }
     })
   } catch (error) {
@@ -1918,7 +1922,7 @@ app.get('/dashboard', (c) => {
                             <i class="fas fa-info-circle text-green-600 text-lg mt-0.5"></i>
                             <div>
                                 <p class="text-sm text-green-800 font-medium">보유한 QKEY를 USDT로 스왑할 수 있습니다</p>
-                                <p class="text-xs text-green-700 mt-1">교환 비율: 1 QKEY = 1 USDT | 최소 100 USDT | 100 단위</p>
+                                <p class="text-xs text-green-700 mt-1">교환 비율: 150 QKEY = 1 USDT | 최소 100 USDT | 100 단위</p>
                             </div>
                         </div>
                     </div>
@@ -3233,12 +3237,13 @@ app.get('/dashboard', (c) => {
                 }
 
                 const qkeyBalance = parseInt((document.getElementById('swapQkeyBalance').textContent || '0').replace(/,/g, ''));
-                if (amount > qkeyBalance) {
-                    alert('⚠️ QKEY 잔액이 부족합니다\\n\\n보유 QKEY: ' + qkeyBalance.toLocaleString() + '\\n필요 QKEY: ' + amount.toLocaleString());
+                var requiredQkey = amount * 150;
+                if (requiredQkey > qkeyBalance) {
+                    alert('⚠️ QKEY 잔액이 부족합니다\\n\\n보유 QKEY: ' + qkeyBalance.toLocaleString() + '\\n필요 QKEY: ' + requiredQkey.toLocaleString() + ' (150 QKEY × ' + amount + ' USDT)');
                     return;
                 }
 
-                if (!confirm(amount.toLocaleString() + ' QKEY를 ' + amount.toLocaleString() + ' USDT로 스왑하시겠습니까?\\n\\n교환 비율: 1 QKEY = 1 USDT')) {
+                if (!confirm(requiredQkey.toLocaleString() + ' QKEY를 ' + amount.toLocaleString() + ' USDT로 스왑하시겠습니까?\\n\\n교환 비율: 150 QKEY = 1 USDT')) {
                     return;
                 }
 
@@ -3249,7 +3254,7 @@ app.get('/dashboard', (c) => {
                     });
 
                     if (response.data.success) {
-                        alert('✅ 스왑 완료!\\n\\n' + amount.toLocaleString() + ' QKEY → ' + amount.toLocaleString() + ' USDT');
+                        alert('✅ 스왑 완료!\\n\\n' + requiredQkey.toLocaleString() + ' QKEY → ' + amount.toLocaleString() + ' USDT');
                         amountInput.value = '';
                         await loadUserInfo();
                     }
