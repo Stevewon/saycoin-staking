@@ -515,6 +515,33 @@ app.post('/api/staking/create', async (c) => {
   }
 })
 
+// TXID 저장 API
+app.post('/api/staking/txid', async (c) => {
+  try {
+    const { stakingId, txid } = await c.req.json()
+    
+    if (!stakingId || !txid) {
+      return c.json({ error: 'TXID를 입력해주세요' }, 400)
+    }
+
+    // TXID 형식 검증 (0x로 시작하는 64자리 hex + 0x = 66자)
+    const txidTrimmed = txid.trim()
+    if (!/^0x[a-fA-F0-9]{64}$/.test(txidTrimmed)) {
+      return c.json({ error: '올바른 TXID 형식이 아닙니다 (0x로 시작하는 66자리)' }, 400)
+    }
+
+    const db = c.env.DB
+
+    await db.prepare(`
+      UPDATE staking SET txid = ? WHERE id = ?
+    `).bind(txidTrimmed, stakingId).run()
+
+    return c.json({ success: true, message: 'TXID가 등록되었습니다' })
+  } catch (error) {
+    return c.json({ error: 'TXID 저장 중 오류가 발생했습니다' }, 500)
+  }
+})
+
 // 사용자별 스테이킹 목록 조회
 app.get('/api/staking/list/:userId', async (c) => {
   try {
@@ -522,7 +549,7 @@ app.get('/api/staking/list/:userId', async (c) => {
     const db = c.env.DB
 
     const stakings = await db.prepare(`
-      SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, created_at
+      SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, txid, created_at
       FROM staking
       WHERE user_id = ?
       ORDER BY created_at DESC
@@ -1910,7 +1937,7 @@ app.get('/dashboard', (c) => {
                     </h2>
                     <form onsubmit="handleStaking(event)" class="space-y-4">
                         <div>
-                            <label class="block text-gray-700 font-bold mb-2 text-sm sm:text-base">위탁 수량 ($1,000 단위로 클릭하세요)</label>
+                            <label class="block text-gray-700 font-bold mb-2 text-sm sm:text-base">구매 수량 ($1,000 단위로 클릭하세요)</label>
                             
                             <!-- 현재 누적 금액 표시 -->
                             <div id="accumulatedDisplay" class="mb-3 p-4 bg-gradient-to-r from-purple-50 to-indigo-50 rounded-xl border-2 border-purple-300 shadow-sm">
@@ -2009,7 +2036,7 @@ app.get('/dashboard', (c) => {
                                 <i class="fas fa-info-circle text-blue-600 text-lg sm:text-xl mt-1"></i>
                                 <div class="flex-1 min-w-0">
                                     <p class="font-bold text-gray-800 mb-1 text-sm sm:text-base">입금 안내</p>
-                                    <p class="text-xs sm:text-sm text-gray-700 mb-2">아래 회사 지갑주소로 위탁 수량을 입금해주세요</p>
+                                    <p class="text-xs sm:text-sm text-gray-700 mb-2">아래 회사 지갑주소로 구매 수량을 입금해주세요 <br><span class="text-xs font-bold text-orange-600">⚠️ USDT(BEP-20 / BNB Chain) 기반으로 입금하세요</span></p>
                                 </div>
                             </div>
                             
@@ -2027,9 +2054,9 @@ app.get('/dashboard', (c) => {
                                             <i class="fas fa-copy mr-1"></i>복사
                                         </button>
                                     </div>
-                                    <button type="button" onclick="checkDeposit()" 
+                                    <button type="button" onclick="openTxidInput()" 
                                         class="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded font-medium transition">
-                                        <i class="fas fa-search mr-1"></i>입금 확인
+                                        <i class="fas fa-receipt mr-1"></i>입금 확인 (TXID 입력)
                                     </button>
                                 </div>
 
@@ -2334,6 +2361,7 @@ app.get('/dashboard', (c) => {
                     const response = await axios.get(\`/api/staking/list/\${currentUser.id}\`);
                     if (response.data.success) {
                         const stakings = response.data.stakings;
+                        userStakings = stakings; // TXID 입력용 저장
                         const listEl = document.getElementById('stakingList');
                         
                         // 스테이킹 현황 업데이트
@@ -2398,6 +2426,7 @@ app.get('/dashboard', (c) => {
                                         </span>
                                     </div>
                                     \${isCompleted ? '<p class="text-sm text-blue-600 font-medium mb-2"><i class="fas fa-check-circle mr-1"></i>출금 신청이 가능합니다</p>' : ''}
+                                    \${s.status === 'pending' ? '<div class="mb-2 p-2 rounded-lg ' + (s.txid ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200') + '"><p class="text-xs font-medium ' + (s.txid ? 'text-green-700' : 'text-red-700') + '"><i class="fas ' + (s.txid ? 'fa-check-circle' : 'fa-exclamation-circle') + ' mr-1"></i>TXID: ' + (s.txid ? s.txid.substring(0, 20) + '...' : '미등록 - 입금 확인 버튼을 눌러 TXID를 입력하세요') + '</p></div>' : ''}
                                     <div class="grid grid-cols-3 gap-3 text-sm mt-4">
                                         <div>
                                             <p class="text-gray-600">QTA</p>
@@ -2546,82 +2575,100 @@ app.get('/dashboard', (c) => {
                 });
             }
 
-            // 입금 확인 (QUANTARIUM Explorer API 사용)
-            async function checkDeposit() {
-                const companyWallet = '0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e';
-                const userWallet = currentUser.wallet_address;
-                
-                if (!userWallet) {
-                    alert('사용자 지갑주소가 등록되어 있지 않습니다.');
+            // TXID 입력 팝업 열기
+            function openTxidInput() {
+                // 최근 pending 스테이킹 찾기
+                const pendingStaking = userStakings.find(s => s.status === 'pending');
+                if (!pendingStaking) {
+                    alert('⚠️ TXID를 등록할 스테이킹 신청이 없습니다.\\n\\n먼저 스테이킹을 신청해주세요.');
                     return;
                 }
 
-                const confirmCheck = confirm(
-                    '입금 확인을 시작합니다.\\n\\n' +
-                    '사용자 지갑: ' + userWallet + '\\n' +
-                    '회사 지갑: ' + companyWallet + '\\n\\n' +
-                    'QUANTARIUM Explorer로 최근 거래내역을 조회합니다.'
-                );
+                const modal = document.createElement('div');
+                modal.id = 'txidModal';
+                modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4';
+                modal.innerHTML = \`
+                    <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-lg font-bold text-gray-800">
+                                <i class="fas fa-receipt mr-2 text-green-600"></i>TXID 입력
+                            </h3>
+                            <button onclick="document.getElementById('txidModal').remove()" 
+                                class="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+                        </div>
+                        
+                        <div class="bg-orange-50 border border-orange-200 rounded-lg p-3 mb-4">
+                            <p class="text-xs text-orange-800 font-medium">
+                                <i class="fas fa-exclamation-triangle mr-1"></i>
+                                USDT(BEP-20 / BNB Chain) 입금 후 받은 Transaction Hash(TXID)를 입력하세요
+                            </p>
+                            <p class="text-xs text-orange-700 mt-1">
+                                BscScan에서 거래 확인 후 TXID를 복사하세요
+                            </p>
+                        </div>
 
-                if (!confirmCheck) return;
+                        <div class="mb-4">
+                            <label class="block text-sm font-bold text-gray-700 mb-2">스테이킹 신청</label>
+                            <p class="text-sm text-purple-600 font-bold">$\${pendingStaking.amount.toLocaleString()} (승인대기)</p>
+                        </div>
+
+                        <div class="mb-4">
+                            <label class="block text-sm font-bold text-gray-700 mb-2">Transaction Hash (TXID)</label>
+                            <input type="text" id="txidInput" 
+                                placeholder="0x..." 
+                                class="w-full px-3 py-3 border-2 border-gray-300 rounded-lg font-mono text-xs focus:border-green-500 focus:outline-none"
+                                \${pendingStaking.txid ? 'value="' + pendingStaking.txid + '"' : ''}>
+                            <p class="text-xs text-gray-500 mt-1">0x로 시작하는 66자리 해시값</p>
+                        </div>
+
+                        <div class="flex gap-3">
+                            <button onclick="submitTxid(\${pendingStaking.id})" 
+                                class="flex-1 bg-green-600 hover:bg-green-700 text-white py-3 rounded-lg font-bold transition">
+                                <i class="fas fa-check mr-2"></i>TXID 등록
+                            </button>
+                            <button onclick="document.getElementById('txidModal').remove()" 
+                                class="flex-1 bg-gray-300 hover:bg-gray-400 text-gray-700 py-3 rounded-lg font-bold transition">
+                                취소
+                            </button>
+                        </div>
+                    </div>
+                \`;
+                document.body.appendChild(modal);
+                document.getElementById('txidInput').focus();
+            }
+
+            // TXID 서버 전송
+            async function submitTxid(stakingId) {
+                const txid = document.getElementById('txidInput').value.trim();
+                
+                if (!txid) {
+                    alert('TXID를 입력해주세요');
+                    return;
+                }
+
+                if (!/^0x[a-fA-F0-9]{64}$/.test(txid)) {
+                    alert('⚠️ 올바른 TXID 형식이 아닙니다\\n\\n0x로 시작하는 66자리 해시값을 입력해주세요\\n\\n예시: 0x1a2b3c4d...');
+                    return;
+                }
 
                 try {
-                    // QUANTARIUM Explorer API 엔드포인트
-                    const apiUrl = \`https://explorer.quantarium.io/api?module=account&action=txlist&address=\${companyWallet}&startblock=0&endblock=99999999&page=1&offset=100&sort=desc&apikey=YourApiKeyToken\`;
-                    
-                    alert('입금 확인 중입니다...\\n\\n블록체인 조회에는 몇 초가 소요될 수 있습니다.');
+                    const response = await axios.post('/api/staking/txid', {
+                        stakingId: stakingId,
+                        txid: txid
+                    });
 
-                    const response = await fetch(apiUrl);
-                    const data = await response.json();
-
-                    if (data.status === '1' && data.result) {
-                        // 사용자 지갑에서 회사 지갑으로의 거래 찾기
-                        const userTransactions = data.result.filter(tx => 
-                            tx.from.toLowerCase() === userWallet.toLowerCase() &&
-                            tx.to.toLowerCase() === companyWallet.toLowerCase()
-                        );
-
-                        if (userTransactions.length > 0) {
-                            // 가장 최근 거래
-                            const latestTx = userTransactions[0];
-                            const amount = (parseInt(latestTx.value) / 1e18).toFixed(4); // to QTA
-                            const date = new Date(parseInt(latestTx.timeStamp) * 1000).toLocaleString('ko-KR');
-                            
-                            alert(
-                                '✅ 입금이 확인되었습니다!\\n\\n' +
-                                '거래 해시: ' + latestTx.hash.substring(0, 20) + '...\\n' +
-                                '금액: ' + amount + ' QTA\\n' +
-                                '날짜: ' + date + '\\n' +
-                                '총 거래 수: ' + userTransactions.length + '건\\n\\n' +
-                                'QUANTARIUM Explorer에서 확인: https://explorer.quantarium.io/tx/' + latestTx.hash
-                            );
-                        } else {
-                            alert(
-                                '⚠️ 입금 내역을 찾을 수 없습니다.\\n\\n' +
-                                '사용자 지갑: ' + userWallet + '\\n' +
-                                '회사 지갑: ' + companyWallet + '\\n\\n' +
-                                '아직 입금하지 않았거나, 거래가 블록체인에 기록되지 않았을 수 있습니다.\\n' +
-                                '거래 후 몇 분 정도 기다려주세요.'
-                            );
-                        }
-                    } else {
-                        alert(
-                            'ℹ️ QUANTARIUM Explorer 조회 실패\\n\\n' +
-                            'API 키 제한으로 조회가 제한될 수 있습니다.\\n' +
-                            '직접 QUANTARIUM Explorer에서 확인해주세요:\\n\\n' +
-                            'https://explorer.quantarium.io/address/' + companyWallet
-                        );
+                    if (response.data.success) {
+                        alert('✅ TXID가 성공적으로 등록되었습니다!\\n\\n관리자가 입금을 확인한 후 스테이킹이 승인됩니다.');
+                        document.getElementById('txidModal').remove();
+                        await loadStakings();
                     }
                 } catch (error) {
-                    console.error('입금 확인 오류:', error);
-                    alert(
-                        '❌ 입금 확인 중 오류가 발생했습니다.\\n\\n' +
-                        '수동으로 QUANTARIUM Explorer에서 확인해주세요:\\n' +
-                        'https://explorer.quantarium.io/address/' + companyWallet + '\\n\\n' +
-                        '오류: ' + error.message
-                    );
+                    alert(error.response?.data?.error || 'TXID 저장 중 오류가 발생했습니다');
                 }
             }
+
+            // 유저 스테이킹 목록 저장용
+            let userStakings = [];
 
             // 금액별 정책 정보 반환
             function getPolicy(amount) {
@@ -2694,13 +2741,13 @@ app.get('/dashboard', (c) => {
                 const amount = accumulatedAmount;
                 
                 if (!amount || amount <= 0) {
-                    alert('⚠️ $1,000 추가 버튼을 클릭하여 위탁 수량을 선택해주세요.');
+                    alert('⚠️ $1,000 추가 버튼을 클릭하여 구매 수량을 선택해주세요.');
                     return;
                 }
 
                 // 입력값 검증: $1,000 미만 체크
                 if (amount < 1000) {
-                    alert('⚠️ 신청 불가\\n\\n최소 위탁 수량은 $1,000입니다.');
+                    alert('⚠️ 신청 불가\\n\\n최소 구매 수량은 $1,000입니다.');
                     return;
                 }
                 
@@ -3516,6 +3563,23 @@ app.get('/admin/dashboard', (c) => {
                                 </div>
                             </div>
 
+                            <!-- TXID 표시 -->
+                            <div class="mb-3 p-3 rounded-lg \${s.txid ? 'bg-green-50 border border-green-300' : 'bg-red-50 border border-red-300'}">
+                                <div class="flex items-center justify-between">
+                                    <div class="flex-1 min-w-0">
+                                        <p class="text-xs font-bold \${s.txid ? 'text-green-800' : 'text-red-800'} mb-1">
+                                            <i class="fas \${s.txid ? 'fa-check-circle' : 'fa-exclamation-triangle'} mr-1"></i>
+                                            TXID (BNB Chain)
+                                        </p>
+                                        \${s.txid 
+                                            ? '<a href="https://bscscan.com/tx/' + s.txid + '" target="_blank" class="text-xs font-mono text-green-700 hover:underline break-all">' + s.txid + '</a>'
+                                            : '<p class="text-xs text-red-700">미등록 - 사용자가 아직 TXID를 입력하지 않음</p>'
+                                        }
+                                    </div>
+                                    \${s.txid ? '<a href="https://bscscan.com/tx/' + s.txid + '" target="_blank" class="ml-2 px-3 py-1 bg-green-600 text-white rounded text-xs font-bold hover:bg-green-700 whitespace-nowrap"><i class=\\"fas fa-external-link-alt mr-1\\"></i>BscScan</a>' : ''}
+                                </div>
+                            </div>
+
                             <div class="flex gap-3">
                                 <button onclick="approveStaking(\${s.id})" 
                                     class="flex-1 bg-green-600 hover:bg-green-700 text-white py-3 rounded-lg font-bold transition duration-200">
@@ -3610,6 +3674,12 @@ app.get('/admin/dashboard', (c) => {
                                         <p class="text-gray-600">종료일</p>
                                         <p class="font-bold">\${new Date(s.end_date).toLocaleDateString('ko-KR')}</p>
                                     </div>
+                                </div>
+                                <div class="mt-2 pt-2 border-t border-gray-200">
+                                    <p class="text-xs \${s.txid ? 'text-green-700' : 'text-gray-400'}">
+                                        <i class="fas \${s.txid ? 'fa-check-circle text-green-600' : 'fa-minus-circle'} mr-1"></i>
+                                        TXID: \${s.txid ? '<a href="https://bscscan.com/tx/' + s.txid + '" target="_blank" class="font-mono hover:underline">' + s.txid.substring(0, 30) + '...</a>' : '미등록'}
+                                    </p>
                                 </div>
                             </div>
                         \`;
