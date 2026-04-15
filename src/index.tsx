@@ -3055,7 +3055,7 @@ app.get('/dashboard', (c) => {
                     '<div class="flex items-center gap-2 bg-white rounded-lg p-2 border border-gray-200">' +
                         '<i class="fas fa-wallet text-' + color + '-400 text-xs"></i>' +
                         '<span class="text-xs font-mono text-gray-600 flex-1 truncate" title="' + wallet + '">' + walletShort + '</span>' +
-                        (wallet ? '<button onclick="copyWallet(\'' + wallet + '\')" class="px-2 py-1 bg-' + color + '-100 hover:bg-' + color + '-200 text-' + color + '-700 rounded text-xs font-medium transition whitespace-nowrap"><i class="fas fa-copy mr-1"></i>복사</button>' : '') +
+                        (wallet ? '<button data-wallet="' + wallet + '" onclick="copyWallet(this.getAttribute(&apos;data-wallet&apos;))" class="px-2 py-1 bg-' + color + '-100 hover:bg-' + color + '-200 text-' + color + '-700 rounded text-xs font-medium transition whitespace-nowrap"><i class="fas fa-copy mr-1"></i>복사</button>' : '') +
                     '</div>' +
                 '</div>';
             }
