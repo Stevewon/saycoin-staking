@@ -21,9 +21,9 @@ app.use('/static/*', serveStatic({ root: './public' }))
 // 회원가입
 app.post('/api/auth/register', async (c) => {
   try {
-    const { email, password, name, phone, walletAddress, referralCode } = await c.req.json()
+    const { email, password, name, phone, walletAddress, usdtWalletAddress, referralCode } = await c.req.json()
 
-    if (!email || !password || !name || !phone || !walletAddress) {
+    if (!email || !password || !name || !phone || !walletAddress || !usdtWalletAddress) {
       return c.json({ error: '모든 필드를 입력해주세요' }, 400)
     }
 
@@ -36,9 +36,14 @@ app.post('/api/auth/register', async (c) => {
       return c.json({ error: '올바른 전화번호 형식이 아닙니다 (010-XXXX-XXXX)' }, 400)
     }
 
-    // 지갑주소 형식 간단 검증 (0x로 시작하는 40자리 16진수)
+    // QKEY 지갑주소 형식 검증 (0x로 시작하는 42자리)
     if (!walletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
-      return c.json({ error: '올바른 지갑주소 형식이 아닙니다 (예: 0x1234...abcd)' }, 400)
+      return c.json({ error: '올바른 QKEY 지갑주소 형식이 아닙니다 (예: 0xE0c1...f0e)' }, 400)
+    }
+
+    // USDT 지갑주소 형식 검증 (0x로 시작하는 42자리)
+    if (!usdtWalletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+      return c.json({ error: '올바른 USDT 지갑주소 형식이 아닙니다 (예: 0xE0c1...f0e)' }, 400)
     }
 
     const db = c.env.DB
@@ -87,7 +92,7 @@ app.post('/api/auth/register', async (c) => {
     let newReferralCode = ''
     let isUnique = false
     while (!isUnique) {
-      newReferralCode = 'SAY' + Math.random().toString(36).substring(2, 8).toUpperCase()
+      newReferralCode = 'QTA' + Math.random().toString(36).substring(2, 8).toUpperCase()
       const existing = await db.prepare('SELECT id FROM users WHERE referral_code = ?')
         .bind(newReferralCode)
         .first()
@@ -98,9 +103,9 @@ app.post('/api/auth/register', async (c) => {
 
     // 사용자 생성
     const result = await db.prepare(`
-      INSERT INTO users (email, password, name, phone, wallet_address, qta_balance, qx_balance, usdt_balance, referral_code, referrer_id)
-      VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?)
-    `).bind(normalizedEmail, password, name, cleanPhone, walletAddress, newReferralCode, referrerId).run()
+      INSERT INTO users (email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, usdt_balance, referral_code, referrer_id)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)
+    `).bind(normalizedEmail, password, name, cleanPhone, walletAddress, usdtWalletAddress, newReferralCode, referrerId).run()
 
     return c.json({ 
       success: true, 
@@ -128,7 +133,7 @@ app.post('/api/auth/login', async (c) => {
     const db = c.env.DB
 
     const user = await db.prepare(`
-      SELECT id, email, name, wallet_address, qta_balance, qx_balance, usdt_balance, referral_code, created_at
+      SELECT id, email, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, created_at
       FROM users WHERE LOWER(email) = ? AND password = ?
     `).bind(normalizedEmail, password).first()
 
@@ -139,7 +144,7 @@ app.post('/api/auth/login', async (c) => {
     // referral_code가 없으면 생성
     let referralCode = user.referral_code
     if (!referralCode) {
-      referralCode = 'SAY' + Math.random().toString(36).substring(2, 7).toUpperCase()
+      referralCode = 'QTA' + Math.random().toString(36).substring(2, 7).toUpperCase()
       await db.prepare(`
         UPDATE users SET referral_code = ? WHERE id = ?
       `).bind(referralCode, user.id).run()
@@ -152,9 +157,12 @@ app.post('/api/auth/login', async (c) => {
         id: user.id,
         email: user.email,
         name: user.name,
+        phone: user.phone,
         wallet_address: user.wallet_address,
+        usdt_wallet_address: user.usdt_wallet_address || '',
         qta_balance: user.qta_balance,
         qx_balance: user.qx_balance,
+        qkey_balance: user.qkey_balance,
         usdt_balance: user.usdt_balance,
         referral_code: referralCode,
         created_at: user.created_at
@@ -278,7 +286,7 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: '필수 정보를 입력해주세요' }, 400)
     }
 
-    if (!['QTA', 'QX', 'USDT'].includes(coinType)) {
+    if (!['QTA', 'QX', 'QKEY', 'USDT'].includes(coinType)) {
       return c.json({ error: '유효하지 않은 코인 타입입니다' }, 400)
     }
 
@@ -290,7 +298,7 @@ app.post('/api/withdrawal/request', async (c) => {
 
     // 사용자 잔액 확인
     const user = await db.prepare(`
-      SELECT qta_balance, qx_balance, usdt_balance FROM users WHERE id = ?
+      SELECT qta_balance, qx_balance, qkey_balance, usdt_balance FROM users WHERE id = ?
     `).bind(userId).first()
 
     if (!user) {
@@ -299,7 +307,8 @@ app.post('/api/withdrawal/request', async (c) => {
 
     // 잔액 확인
     const balanceField = coinType === 'QTA' ? 'qta_balance' : 
-                         coinType === 'QX' ? 'qx_balance' : 'usdt_balance'
+                         coinType === 'QX' ? 'qx_balance' : 
+                         coinType === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
     const currentBalance = user[balanceField]
 
     if (currentBalance < amount) {
@@ -352,64 +361,81 @@ app.get('/api/withdrawal/list/:userId', async (c) => {
 // API Routes - Staking
 // ============================================
 
+// 투자금액별 일일 배당률 계산
+function getDailyRate(amount: number): number {
+  if (amount >= 10000) return 0.01    // $10,000 이상: 1.0%
+  if (amount >= 5000) return 0.007    // $5,000~$9,000: 0.7%
+  if (amount >= 3000) return 0.005    // $3,000~$4,000: 0.5%
+  return 0.003                         // $1,000~$2,000: 0.3%
+}
+
+// 투자금액별 자동 거치기간 결정
+function getAutoPeriodDays(amount: number): number {
+  if (amount >= 10000) return 180     // $10,000 이상: 180일
+  if (amount >= 5000) return 120      // $5,000~$9,000: 120일
+  if (amount >= 3000) return 90       // $3,000~$4,000: 90일
+  return 60                            // $1,000~$2,000: 60일
+}
+
 // 스테이킹 생성
 app.post('/api/staking/create', async (c) => {
   try {
-    const { userId, amount, periodMonths } = await c.req.json()
+    const { userId, amount } = await c.req.json()
 
-    if (!userId || !amount || !periodMonths) {
+    if (!userId || !amount) {
       return c.json({ error: '필수 정보를 입력해주세요' }, 400)
     }
 
-    if (periodMonths !== 6 && periodMonths !== 12) {
-      return c.json({ error: '스테이킹 기간은 6개월 또는 12개월만 가능합니다' }, 400)
-    }
-
     if (amount <= 0) {
-      return c.json({ error: '유효한 수량을 입력해주세요' }, 400)
+      return c.json({ error: '유효한 금액을 입력해주세요' }, 400)
     }
 
-    // 최소 위탁 수량 검증 (1,000만개)
-    if (amount < 10000000) {
-      return c.json({ error: '최소 위탁 수량은 1,000만개입니다' }, 400)
+    // 최소 투자금액 검증 ($1,000)
+    if (amount < 1000) {
+      return c.json({ error: '최소 투자금액은 $1,000입니다' }, 400)
     }
 
-    // 100만개 단위 검증
-    if (amount % 1000000 !== 0) {
-      return c.json({ error: '위탁 수량은 100만개 단위로만 입력 가능합니다' }, 400)
+    // $1,000 단위 검증
+    if (amount % 1000 !== 0) {
+      return c.json({ error: '투자금액은 $1,000 단위로만 입력 가능합니다' }, 400)
     }
+
+    // 금액에 따라 거치기간 자동 결정
+    const periodDays = getAutoPeriodDays(amount)
 
     const db = c.env.DB
 
-    // 1,000만개당 QTA 10만개, QX 10만개 보상
-    const qtaReward = (amount / 10000000) * 100000
-    const qxReward = (amount / 10000000) * 100000
+    // 코인 지급 수량 계산: $1,000 기준 QTA 15만개, QX 2만개, QKEY 5천개
+    const qtaReward = (amount / 1000) * 150000
+    const qxReward = (amount / 1000) * 20000
+    const qkeyReward = (amount / 1000) * 5000
+
+    // 일일 배당률 계산
+    const dailyRate = getDailyRate(amount)
 
     // 스테이킹 생성 (관리자 승인 대기 상태)
-    // start_date와 end_date는 승인 시 설정됨
     const stakingResult = await db.prepare(`
-      INSERT INTO staking (user_id, amount, period_months, qta_reward, qx_reward, start_date, end_date, status)
-      VALUES (?, ?, ?, ?, ?, '', '', 'pending')
-    `).bind(userId, amount, periodMonths, qtaReward, qxReward).run()
+      INSERT INTO staking (user_id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status)
+      VALUES (?, ?, 0, ?, ?, ?, ?, ?, '', '', 'pending')
+    `).bind(userId, amount, periodDays, qtaReward, qxReward, qkeyReward, dailyRate).run()
 
     const stakingId = stakingResult.meta.last_row_id
 
-    // 관리자 승인 후 지급되므로 즉시 지급 로직 제거
-    // 잔액 업데이트와 거래 내역은 관리자 승인 시 처리됩니다
-
     return c.json({ 
       success: true, 
-      message: '스테이킹 신청이 완료되었습니다. 관리자 승인 후 코인이 지급됩니다.',
+      message: '투자 신청이 완료되었습니다. 관리자 승인 후 코인이 지급됩니다.',
       staking: {
         id: stakingId,
         amount,
-        periodMonths,
+        periodDays,
+        dailyRate: (dailyRate * 100).toFixed(1) + '%',
         qtaReward,
-        qxReward
+        qxReward,
+        qkeyReward
       }
     })
   } catch (error) {
-    return c.json({ error: '스테이킹 중 오류가 발생했습니다' }, 500)
+    return c.json({ error: '투자 신청 중 오류가 발생했습니다' }, 500)
   }
 })
 
@@ -420,7 +446,7 @@ app.get('/api/staking/list/:userId', async (c) => {
     const db = c.env.DB
 
     const stakings = await db.prepare(`
-      SELECT id, amount, period_months, qta_reward, qx_reward, start_date, end_date, status, created_at
+      SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, created_at
       FROM staking
       WHERE user_id = ?
       ORDER BY created_at DESC
@@ -435,25 +461,26 @@ app.get('/api/staking/list/:userId', async (c) => {
   }
 })
 
-// 관리자: 스테이킹 승인 (코인 지급)
+// 관리자: 투자 승인 (코인 지급)
 app.post('/api/admin/staking/approve/:stakingId', async (c) => {
   try {
     const db = c.env.DB
     const stakingId = c.req.param('stakingId')
 
-    // 스테이킹 정보 조회
+    // 투자 정보 조회
     const staking = await db.prepare(`
       SELECT * FROM staking WHERE id = ? AND status = 'pending'
     `).bind(stakingId).first()
 
     if (!staking) {
-      return c.json({ error: '승인 대기 중인 스테이킹을 찾을 수 없습니다' }, 404)
+      return c.json({ error: '승인 대기 중인 투자를 찾을 수 없습니다' }, 404)
     }
 
-    // 승인 시점에 시작일과 종료일 설정
+    // 승인 시점에 시작일과 종료일 설정 (거치기간: 일 단위)
     const startDate = new Date()
     const endDate = new Date(startDate)
-    endDate.setMonth(endDate.getMonth() + staking.period_months)
+    const periodDays = staking.period_days || (staking.period_months * 30)
+    endDate.setDate(endDate.getDate() + periodDays)
 
     // 스테이킹 상태를 active로 변경하고 날짜 설정
     await db.prepare(`
@@ -464,40 +491,81 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
       WHERE id = ?
     `).bind(startDate.toISOString(), endDate.toISOString(), stakingId).run()
 
-    // 사용자 잔액 업데이트 (QTA, QX 지급)
+    // 사용자 잔액 업데이트 (QTA, QX, QKEY 지급)
+    const qkeyReward = staking.qkey_reward || 0
     await db.prepare(`
       UPDATE users 
       SET qta_balance = qta_balance + ?, 
-          qx_balance = qx_balance + ?
+          qx_balance = qx_balance + ?,
+          qkey_balance = qkey_balance + ?
       WHERE id = ?
-    `).bind(staking.qta_reward, staking.qx_reward, staking.user_id).run()
+    `).bind(staking.qta_reward, staking.qx_reward, qkeyReward, staking.user_id).run()
 
     // 거래 내역 기록 (QTA)
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'staking_reward', 'QTA', ?, ?)
-    `).bind(staking.user_id, staking.qta_reward, `스테이킹 보상 승인 (${staking.period_months}개월)`).run()
+    `).bind(staking.user_id, staking.qta_reward, `투자 보상 승인 (거치 ${periodDays}일)`).run()
 
     // 거래 내역 기록 (QX)
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'staking_reward', 'QX', ?, ?)
-    `).bind(staking.user_id, staking.qx_reward, `스테이킹 보상 승인 (${staking.period_months}개월)`).run()
+    `).bind(staking.user_id, staking.qx_reward, `투자 보상 승인 (거치 ${periodDays}일)`).run()
+
+    // 거래 내역 기록 (QKEY)
+    if (qkeyReward > 0) {
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'staking_reward', 'QKEY', ?, ?)
+      `).bind(staking.user_id, qkeyReward, `투자 보상 승인 (거치 ${periodDays}일)`).run()
+    }
+
+    // 직접추천수당 지급 (1회성, 매출의 10%, QKEY로 지급)
+    // 환율: 1 USD = 1,500 KRW, 1 QKEY = 10 KRW → 1 USD = 150 QKEY
+    try {
+      const referrer = await db.prepare(`
+        SELECT referrer_id FROM users WHERE id = ?
+      `).bind(staking.user_id).first()
+
+      if (referrer && referrer.referrer_id) {
+        const USD_TO_QKEY = 150
+        const directBonusUsd = staking.amount * 0.10 // 매출의 10% (USD)
+        const directBonusQkey = Math.round(directBonusUsd * USD_TO_QKEY) // QKEY로 변환
+        
+        await db.prepare(`
+          UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+        `).bind(directBonusQkey, referrer.referrer_id).run()
+
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'direct_referral', 'QKEY', ?, ?)
+        `).bind(referrer.referrer_id, directBonusQkey, `직접추천수당 ($${staking.amount.toLocaleString()} 투자의 10% = ${directBonusQkey.toLocaleString()} QKEY, 1회성)`).run()
+
+        await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
+          VALUES (?, ?, 0, ?, ?, date('now'))
+        `).bind(referrer.referrer_id, staking.user_id, staking.amount, directBonusQkey).run()
+      }
+    } catch (e) {
+      console.error('직접추천수당 지급 오류:', e)
+    }
 
     return c.json({ 
       success: true, 
-      message: '스테이킹이 승인되었습니다. 코인이 지급되었습니다.',
+      message: '투자가 승인되었습니다. 코인이 지급되었습니다.',
       staking: {
         id: stakingId,
         userId: staking.user_id,
         qtaReward: staking.qta_reward,
         qxReward: staking.qx_reward,
+        qkeyReward: qkeyReward,
         startDate: startDate.toISOString(),
         endDate: endDate.toISOString()
       }
     })
   } catch (error) {
-    return c.json({ error: '스테이킹 승인 중 오류가 발생했습니다' }, 500)
+    return c.json({ error: '투자 승인 중 오류가 발생했습니다' }, 500)
   }
 })
 
@@ -586,6 +654,7 @@ app.get('/api/admin/users', async (c) => {
         u.email, 
         u.phone, 
         u.wallet_address, 
+        u.usdt_wallet_address,
         u.qta_balance, 
         u.qx_balance, 
         u.usdt_balance, 
@@ -593,7 +662,7 @@ app.get('/api/admin/users', async (c) => {
         COALESCE(SUM(CASE WHEN s.status = 'active' THEN s.amount ELSE 0 END), 0) as staking_amount
       FROM users u
       LEFT JOIN staking s ON u.id = s.user_id
-      GROUP BY u.id, u.name, u.email, u.phone, u.wallet_address, 
+      GROUP BY u.id, u.name, u.email, u.phone, u.wallet_address, u.usdt_wallet_address,
                u.qta_balance, u.qx_balance, u.usdt_balance, u.created_at
       ORDER BY u.created_at DESC
     `).all()
@@ -720,7 +789,7 @@ app.post('/api/admin/users/bulk-delete', async (c) => {
     const db = c.env.DB
 
     // 보호할 이메일 목록 (기본값: 관리자)
-    const protectedEmails = keepEmails || ['admin@saycoin.com']
+    const protectedEmails = keepEmails || ['admin@quantarium.com']
     
     // 삭제할 사용자 목록 조회
     const placeholders = protectedEmails.map(() => '?').join(',')
@@ -825,7 +894,7 @@ app.get('/api/admin/signups', async (c) => {
 
     // 최근 가입자 목록 (최근 50명)
     const recentUsers = await db.prepare(`
-      SELECT id, name, email, phone, wallet_address, created_at
+      SELECT id, name, email, phone, wallet_address, usdt_wallet_address, created_at
       FROM users
       ORDER BY created_at DESC
       LIMIT 50
@@ -847,23 +916,25 @@ app.get('/api/admin/signups', async (c) => {
 // API Routes - Daily Rewards
 // ============================================
 
-// 일일 USDT 보상 지급 (하루 1회 자동 지급)
-// 정책: 승인일 익일부터, 매월 20회만 지급 (날짜 무관), 하루 1회씩 지급
+// 일일 배당금 지급 (하루 1회 자동 지급)
+// 정책: 승인일 익일부터, 거치기간 내 매일 지급, 금액별 차등 배당률
 app.post('/api/rewards/daily', async (c) => {
   try {
     const db = c.env.DB
     const now = new Date()
-    const today = now.toISOString().split('T')[0] // YYYY-MM-DD
+    const today = now.toISOString().split('T')[0]
 
-    // 활성 스테이킹이 있는 모든 사용자 조회 (승인일 익일부터 지급)
+    // 활성 투자 조회 (승인일 익일부터 거치기간 종료일까지)
     const activeStakings = await db.prepare(`
       SELECT 
         s.user_id, 
         s.id as staking_id, 
         s.amount,
+        s.period_days,
         s.period_months,
+        s.daily_rate,
         s.start_date,
-        date(s.start_date, '+1 day') as first_reward_date,
+        s.end_date,
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count
       FROM staking s
       WHERE s.status = 'active' 
@@ -874,49 +945,25 @@ app.post('/api/rewards/daily', async (c) => {
     if (activeStakings.results.length === 0) {
       return c.json({ 
         success: true, 
-        message: '활성 스테이킹이 없거나 아직 첫 지급일이 아닙니다',
+        message: '활성 투자가 없거나 아직 첫 지급일이 아닙니다',
         rewarded: 0 
       })
     }
 
-    // 보상 계산 기준: 100만 세이코인당 0.75 USDT
-    const usdtPer1Million = 0.75
-
     let rewardedCount = 0
-    let totalUsdtRewarded = 0
+    let totalQkeyRewarded = 0
     let skippedCount = 0
-    let monthLimitCount = 0
+
+    // 환율: 1 USD = 1,500 KRW, 1 QKEY = 10 KRW → 1 USD = 150 QKEY
+    const USD_TO_QKEY = 150
 
     for (const staking of activeStakings.results) {
       try {
-        // 총 지급 횟수 제한: 6개월 = 120회, 12개월 = 240회
-        const maxRewards = staking.period_months * 20 // 매월 20회
+        const periodDays = staking.period_days || (staking.period_months * 30)
         
-        if (staking.rewarded_count >= maxRewards) {
+        // 총 지급 횟수 제한: 거치기간 일수
+        if (staking.rewarded_count >= periodDays) {
           skippedCount++
-          continue
-        }
-
-        // 승인일 기준으로 현재 몇 개월째인지 계산
-        const startDate = new Date(staking.start_date)
-        const monthsPassed = Math.floor((now - startDate) / (1000 * 60 * 60 * 24 * 30.44))
-        
-        // 현재 월에 이미 20회 지급했는지 확인
-        const currentMonthStart = new Date(startDate)
-        currentMonthStart.setMonth(currentMonthStart.getMonth() + monthsPassed)
-        const currentMonthEnd = new Date(currentMonthStart)
-        currentMonthEnd.setMonth(currentMonthEnd.getMonth() + 1)
-        
-        const monthRewards = await db.prepare(`
-          SELECT COUNT(*) as count
-          FROM daily_rewards
-          WHERE staking_id = ? 
-            AND reward_date >= date(?)
-            AND reward_date < date(?)
-        `).bind(staking.staking_id, currentMonthStart.toISOString().split('T')[0], currentMonthEnd.toISOString().split('T')[0]).first()
-
-        if (monthRewards.count >= 20) {
-          monthLimitCount++
           continue
         }
 
@@ -927,115 +974,103 @@ app.post('/api/rewards/daily', async (c) => {
         `).bind(staking.user_id, staking.staking_id, today).first()
 
         if (todayRewards.count === 0) {
-          // 수탁 금액에 따른 USDT 보상 계산
-          const usdtAmount = (staking.amount / 1000000) * usdtPer1Million
+          // 금액별 차등 배당률 적용
+          const dailyRate = staking.daily_rate || getDailyRate(staking.amount)
+          const usdAmount = staking.amount * dailyRate
+          // USD를 QKEY로 변환 (1 USD = 150 QKEY)
+          const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
 
-          // 일일 보상 기록
+          // 일일 보상 기록 (usdt_amount 컬럼에 QKEY 수량 저장)
           await db.prepare(`
             INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date)
             VALUES (?, ?, ?, ?)
-          `).bind(staking.user_id, staking.staking_id, usdtAmount, today).run()
+          `).bind(staking.user_id, staking.staking_id, qkeyAmount, today).run()
 
-          // 사용자 USDT 잔액 업데이트
+          // 사용자 QKEY 잔액 업데이트
           await db.prepare(`
-            UPDATE users 
-            SET usdt_balance = usdt_balance + ?
-            WHERE id = ?
-          `).bind(usdtAmount, staking.user_id).run()
+            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+          `).bind(qkeyAmount, staking.user_id).run()
 
-          // 거래 내역 기록
           const newCount = staking.rewarded_count + 1
-          const currentMonthCount = monthRewards.count + 1
           await db.prepare(`
             INSERT INTO transactions (user_id, type, coin_type, amount, description)
-            VALUES (?, 'daily_usdt', 'USDT', ?, ?)
-          `).bind(staking.user_id, usdtAmount, `일일 USDT 보상 (수탁: ${staking.amount.toLocaleString()}, ${newCount}/${maxRewards}회, 이번달: ${currentMonthCount}/20회)`).run()
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+          `).bind(staking.user_id, qkeyAmount, `일일 배당금 ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}일)`).run()
 
           rewardedCount++
-          totalUsdtRewarded += usdtAmount
+          totalQkeyRewarded += qkeyAmount
 
-          // 추천인 보상 지급
+          // 매칭추천수당 지급 (QKEY)
           try {
-            // 1단계 추천인 (50%)
+            // 1대 매칭추천수당 (20%)
             const level1Referrer = await db.prepare(`
               SELECT referrer_id FROM users WHERE id = ?
             `).bind(staking.user_id).first()
 
             if (level1Referrer && level1Referrer.referrer_id) {
-              const level1Reward = usdtAmount * 0.5
+              const level1Reward = Math.round(qkeyAmount * 0.20)
               
-              // 1단계 추천인 USDT 지급
               await db.prepare(`
-                UPDATE users SET usdt_balance = usdt_balance + ? WHERE id = ?
+                UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
               `).bind(level1Reward, level1Referrer.referrer_id).run()
 
-              // 추천인 보상 기록
               await db.prepare(`
                 INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
                 VALUES (?, ?, 1, ?, ?, ?)
-              `).bind(level1Referrer.referrer_id, staking.user_id, usdtAmount, level1Reward, today).run()
+              `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, today).run()
 
-              // 거래 내역 기록
               await db.prepare(`
                 INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                VALUES (?, 'referral_reward', 'USDT', ?, ?)
-              `).bind(level1Referrer.referrer_id, level1Reward, `1단계 추천인 보상 (${usdtAmount.toFixed(2)} USDT의 50%)`).run()
+                VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+              `).bind(level1Referrer.referrer_id, level1Reward, `1대 매칭추천수당 (${qkeyAmount.toLocaleString()} QKEY의 20%)`).run()
 
-              // 2단계 추천인 (20%)
+              // 2대 매칭추천수당 (10%)
               const level2Referrer = await db.prepare(`
                 SELECT referrer_id FROM users WHERE id = ?
               `).bind(level1Referrer.referrer_id).first()
 
               if (level2Referrer && level2Referrer.referrer_id) {
-                const level2Reward = usdtAmount * 0.2
+                const level2Reward = Math.round(qkeyAmount * 0.10)
                 
-                // 2단계 추천인 USDT 지급
                 await db.prepare(`
-                  UPDATE users SET usdt_balance = usdt_balance + ? WHERE id = ?
+                  UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
                 `).bind(level2Reward, level2Referrer.referrer_id).run()
 
-                // 추천인 보상 기록
                 await db.prepare(`
                   INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
                   VALUES (?, ?, 2, ?, ?, ?)
-                `).bind(level2Referrer.referrer_id, staking.user_id, usdtAmount, level2Reward, today).run()
+                `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, today).run()
 
-                // 거래 내역 기록
                 await db.prepare(`
                   INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                  VALUES (?, 'referral_reward', 'USDT', ?, ?)
-                `).bind(level2Referrer.referrer_id, level2Reward, `2단계 추천인 보상 (${usdtAmount.toFixed(2)} USDT의 20%)`).run()
+                  VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                `).bind(level2Referrer.referrer_id, level2Reward, `2대 매칭추천수당 (${qkeyAmount.toLocaleString()} QKEY의 10%)`).run()
               }
             }
           } catch (referralError) {
-            console.error(`Failed to process referral rewards for user ${staking.user_id}:`, referralError)
-            // 추천인 보상 실패는 메인 보상에 영향을 주지 않음
+            console.error(`매칭추천수당 처리 오류 (user ${staking.user_id}):`, referralError)
           }
         }
       } catch (err) {
-        console.error(`Failed to reward user ${staking.user_id}:`, err)
+        console.error(`보상 지급 오류 (user ${staking.user_id}):`, err)
       }
     }
 
-    let message = `${rewardedCount}명에게 일일 보상을 지급했습니다 (총 ${totalUsdtRewarded.toFixed(2)} USDT)`
+    let message = `${rewardedCount}명에게 일일 배당금을 지급했습니다 (총 ${totalQkeyRewarded.toLocaleString()} QKEY)`
     if (skippedCount > 0) {
-      message += ` | ${skippedCount}건은 전체 지급 완료`
-    }
-    if (monthLimitCount > 0) {
-      message += ` | ${monthLimitCount}건은 이번 달 20회 완료`
+      message += ` | ${skippedCount}건은 거치기간 완료`
     }
 
     return c.json({ 
       success: true, 
       message: message,
       rewarded: rewardedCount,
-      totalUsdt: totalUsdtRewarded,
-      skipped: skippedCount,
-      monthLimit: monthLimitCount
+      totalQkey: totalQkeyRewarded,
+      skipped: skippedCount
     })
   } catch (error) {
     console.error('Daily reward error:', error)
-    return c.json({ error: '일일 보상 지급 중 오류가 발생했습니다' }, 500)
+    return c.json({ error: '일일 배당금 지급 중 오류가 발생했습니다' }, 500)
   }
 })
 
@@ -1073,7 +1108,7 @@ app.get('/api/user/:userId', async (c) => {
     const db = c.env.DB
 
     const user = await db.prepare(`
-      SELECT id, email, name, wallet_address, qta_balance, qx_balance, usdt_balance, created_at
+      SELECT id, email, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, created_at
       FROM users WHERE id = ?
     `).bind(userId).first()
 
@@ -1234,7 +1269,7 @@ app.get('/', (c) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SAYCOIN STAKING</title>
+        <title>QUANTARIUM STAKING</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <style>
@@ -1248,8 +1283,8 @@ app.get('/', (c) => {
         <div class="min-h-screen flex items-center justify-center p-2 sm:p-4">
             <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-4 sm:p-8 overflow-hidden">
                 <div class="text-center mb-6 sm:mb-8">
-                    <img src="/static/saycoin-logo.png" alt="SAYCOIN Logo" class="w-24 h-24 sm:w-32 sm:h-32 mx-auto mb-4" onerror="this.style.display='none'">
-                    <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 mb-2">SAYCOIN STAKING</h1>
+                    <img src="/static/quantarium-logo.png" alt="QUANTARIUM Logo" class="w-24 h-24 sm:w-32 sm:h-32 mx-auto mb-4" onerror="this.style.display='none'">
+                    <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 mb-2">QUANTARIUM STAKING</h1>
                     <p class="text-sm sm:text-base text-gray-600">안전한 코인 스테이킹 플랫폼</p>
                 </div>
 
@@ -1341,25 +1376,36 @@ app.get('/', (c) => {
                             <label class="block text-gray-700 text-sm font-bold mb-2">비밀번호</label>
                             <input type="password" id="registerPassword" required
                                 minlength="4"
+                                placeholder="비밀번호 입력"
+                                autocomplete="new-password"
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
                         </div>
                         <div class="mb-3 sm:mb-4">
                             <label class="block text-gray-700 text-sm font-bold mb-2">비밀번호 확인</label>
                             <input type="password" id="registerPasswordConfirm" required
                                 minlength="4"
+                                placeholder="비밀번호 재입력"
+                                autocomplete="new-password"
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
                         </div>
                         <div class="mb-4 sm:mb-6">
-                            <label class="block text-gray-700 text-sm font-bold mb-2">지갑주소</label>
+                            <label class="block text-gray-700 text-sm font-bold mb-2">QKEY 지갑주소</label>
                             <input type="text" id="registerWallet" required
-                                placeholder="0x1234567890123456789012345678901234567890"
+                                placeholder="0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e"
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base break-all">
-                            <p class="text-xs text-red-600 mt-1 font-medium">BNB기반 지갑주소를 입력하십시요</p>
+                            <p class="text-xs text-red-600 mt-1 font-medium">퀀타리움(QUANTARIUM) 지갑주소를 입력하십시요</p>
+                        </div>
+                        <div class="mb-4 sm:mb-6">
+                            <label class="block text-gray-700 text-sm font-bold mb-2">USDT 지갑주소</label>
+                            <input type="text" id="registerUsdtWallet" required
+                                placeholder="0x..."
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base break-all">
+                            <p class="text-xs text-red-600 mt-1 font-medium">바이낸스(BINANCE) 지갑주소를 입력하십시요</p>
                         </div>
                         <div class="mb-4 sm:mb-6">
                             <label class="block text-gray-700 text-sm font-bold mb-2">추천인 코드 (선택사항)</label>
                             <input type="text" id="registerReferralCode"
-                                placeholder="SAY123456"
+                                placeholder="QTA123456"
                                 maxlength="9"
                                 style="text-transform: uppercase"
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
@@ -1539,11 +1585,12 @@ app.get('/', (c) => {
                 const phone2 = document.getElementById('registerPhone2').value;
                 const phone = '010-' + phone1 + '-' + phone2;
                 const walletAddress = document.getElementById('registerWallet').value;
+                const usdtWalletAddress = document.getElementById('registerUsdtWallet').value;
                 const password = document.getElementById('registerPassword').value;
                 const passwordConfirm = document.getElementById('registerPasswordConfirm').value;
                 const referralCode = document.getElementById('registerReferralCode').value.trim().toUpperCase();
 
-                console.log('입력값:', { name, email, phone, walletAddress, password, passwordConfirm, referralCode });
+                console.log('입력값:', { name, email, phone, walletAddress, usdtWalletAddress, password, passwordConfirm, referralCode });
 
                 // 비밀번호 확인 검증
                 if (password !== passwordConfirm) {
@@ -1551,9 +1598,15 @@ app.get('/', (c) => {
                     return;
                 }
 
-                // 지갑주소 형식 검증
+                // QKEY 지갑주소 형식 검증
                 if (!walletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
-                    alert('올바른 지갑주소 형식이 아닙니다\\n(예: 0x1234567890123456789012345678901234567890)');
+                    alert('올바른 QKEY 지갑주소 형식이 아닙니다\\n(예: 0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e)');
+                    return;
+                }
+
+                // USDT 지갑주소 형식 검증
+                if (!usdtWalletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+                    alert('올바른 USDT 지갑주소 형식이 아닙니다\\n(예: 0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e)');
                     return;
                 }
 
@@ -1565,6 +1618,7 @@ app.get('/', (c) => {
                         phone,
                         password, 
                         walletAddress,
+                        usdtWalletAddress,
                         referralCode: referralCode || null
                     });
                     console.log('API 응답:', response.data);
@@ -1579,6 +1633,7 @@ app.get('/', (c) => {
                         document.getElementById('registerPhone1').value = '';
                         document.getElementById('registerPhone2').value = '';
                         document.getElementById('registerWallet').value = '';
+                        document.getElementById('registerUsdtWallet').value = '';
                         document.getElementById('registerPassword').value = '';
                         document.getElementById('registerPasswordConfirm').value = '';
                     }
@@ -1639,23 +1694,29 @@ app.get('/dashboard', (c) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>대시보드 - SAYCOIN STAKING</title>
+        <title>대시보드 - QUANTARIUM STAKING</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
         <style>
           body { background-color: #f3f4f6; }
+          html, body { overflow-x: hidden; max-width: 100vw; }
+          * { box-sizing: border-box; }
+          /* Touch-friendly targets */
+          button, a, input, select { min-height: 36px; }
+          /* Prevent text overflow */
+          .font-mono { word-break: break-all; }
         </style>
     </head>
     <body>
         <div class="min-h-screen">
             <!-- Header -->
             <header class="bg-white shadow-sm">
-                <div class="max-w-7xl mx-auto px-4 py-4">
+                <div class="max-w-7xl mx-auto px-3 sm:px-4 py-3 sm:py-4">
                     <div class="flex justify-between items-center mb-2">
                         <div class="flex items-center gap-2">
-                            <img src="/static/saycoin-logo.png" alt="SAYCOIN Logo" class="w-8 h-8 sm:w-10 sm:h-10" onerror="this.style.display='none'">
-                            <h1 class="text-lg sm:text-2xl font-bold text-purple-600">SAYCOIN</h1>
+                            <img src="/static/quantarium-logo.png" alt="QUANTARIUM Logo" class="w-8 h-8 sm:w-10 sm:h-10" onerror="this.style.display='none'">
+                            <h1 class="text-lg sm:text-2xl font-bold text-purple-600">QUANTARIUM</h1>
                         </div>
                         <div class="flex items-center gap-2 sm:gap-3">
                             <button onclick="showProfileSettings()" 
@@ -1681,94 +1742,175 @@ app.get('/dashboard', (c) => {
             </header>
 
             <!-- Main Content -->
-            <main class="max-w-7xl mx-auto px-4 py-8">
+            <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8">
                 <!-- Balance Cards -->
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-                    <!-- 세이코인 스테이킹 현황 (첫 번째) -->
-                    <div class="bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-6 text-white shadow-lg">
-                        <div class="flex items-center justify-between mb-2">
-                            <span class="text-sm opacity-90">세이코인 스테이킹 현황</span>
-                            <i class="fas fa-chart-line text-2xl"></i>
+                <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-4 mb-6 sm:mb-8">
+                    <!-- 퀀타리움 스테이킹 현황 (첫 번째 - full width) -->
+                    <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
+                        <div class="flex items-center justify-between mb-1 sm:mb-2">
+                            <span class="text-xs sm:text-sm opacity-90">퀀타리움 스테이킹 현황</span>
+                            <i class="fas fa-chart-line text-xl sm:text-2xl"></i>
                         </div>
-                        <p class="text-3xl font-bold" id="stakingStatus">0개</p>
+                        <p class="text-2xl sm:text-3xl font-bold" id="stakingStatus">0개</p>
                         <p class="text-xs opacity-75 mt-1" id="stakingCount">진행중: 0건</p>
                     </div>
                     
-                    <!-- USDT Balance (두 번째) -->
-                    <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-6 text-white shadow-lg">
-                        <div class="flex items-center justify-between mb-2">
-                            <span class="text-sm opacity-90">USDT Balance</span>
-                            <i class="fas fa-dollar-sign text-2xl"></i>
+                    <!-- QKEY Balance (두 번째) -->
+                    <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
+                        <div class="flex items-center justify-between mb-1 sm:mb-2">
+                            <span class="text-xs sm:text-sm opacity-90">QKEY Balance</span>
+                            <i class="fas fa-key text-xl sm:text-2xl"></i>
                         </div>
-                        <p class="text-3xl font-bold" id="usdtBalance">0</p>
+                        <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
                     </div>
                     
                     <!-- QTA (세 번째) -->
-                    <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-6 text-white shadow-lg">
-                        <div class="flex items-center justify-between mb-2">
-                            <span class="text-sm opacity-90">양자내성 암호화폐 코인 QTA</span>
-                            <i class="fas fa-coins text-2xl"></i>
+                    <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
+                        <div class="flex items-center justify-between mb-1 sm:mb-2">
+                            <span class="text-xs sm:text-sm opacity-90">QTA 코인</span>
+                            <i class="fas fa-coins text-xl sm:text-2xl"></i>
                         </div>
-                        <p class="text-3xl font-bold" id="qtaBalance">0</p>
+                        <p class="text-xl sm:text-3xl font-bold" id="qtaBalance">0</p>
                     </div>
                     
                     <!-- QX (네 번째) -->
-                    <div class="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-6 text-white shadow-lg">
-                        <div class="flex items-center justify-between mb-2">
-                            <span class="text-sm opacity-90">양자내성 코인거래소 QX</span>
-                            <i class="fas fa-coins text-2xl"></i>
+                    <div class="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
+                        <div class="flex items-center justify-between mb-1 sm:mb-2">
+                            <span class="text-xs sm:text-sm opacity-90">QX 코인</span>
+                            <i class="fas fa-coins text-xl sm:text-2xl"></i>
                         </div>
-                        <p class="text-3xl font-bold" id="qxBalance">0</p>
+                        <p class="text-xl sm:text-3xl font-bold" id="qxBalance">0</p>
+                    </div>
+                    
+                    <!-- QKEY (다섯 번째 - full width on mobile) -->
+                    <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-yellow-500 to-yellow-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
+                        <div class="flex items-center justify-between mb-1 sm:mb-2">
+                            <span class="text-xs sm:text-sm opacity-90">QKEY 코인</span>
+                            <i class="fas fa-key text-xl sm:text-2xl"></i>
+                        </div>
+                        <p class="text-xl sm:text-3xl font-bold" id="qkeyBalance">0</p>
                     </div>
                 </div>
 
                 <!-- Staking Section -->
-                <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
-                    <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
+                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
                         <i class="fas fa-lock mr-2 text-purple-600"></i>새로운 스테이킹
                     </h2>
                     <form onsubmit="handleStaking(event)" class="space-y-4">
                         <div>
-                            <label class="block text-gray-700 font-bold mb-2">위탁 수량</label>
-                            <input type="text" id="stakingAmountDisplay" required
-                                value="10,000,000"
-                                placeholder="100만 단위로 입력 (최소 1,000만)"
-                                oninput="formatStakingAmount(this)"
-                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500">
-                            <input type="hidden" id="stakingAmount" value="10000000">
-                            <p class="text-sm text-gray-500 mt-1">100만 단위로 입력 가능 (예: 10,000,000 / 11,000,000 / 12,000,000...)</p>
-                            <div id="rewardPreview" class="mt-3 p-3 bg-purple-50 rounded-lg border border-purple-200">
+                            <label class="block text-gray-700 font-bold mb-2 text-sm sm:text-base">위탁 수량 ($1,000 단위로 클릭하세요)</label>
+                            
+                            <!-- 현재 누적 금액 표시 -->
+                            <div id="accumulatedDisplay" class="mb-3 p-4 bg-gradient-to-r from-purple-50 to-indigo-50 rounded-xl border-2 border-purple-300 shadow-sm">
+                                <div class="flex justify-between items-center mb-2">
+                                    <span class="text-sm font-bold text-purple-800">현재 선택 금액</span>
+                                    <button type="button" onclick="resetAmount()" 
+                                        class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-600 rounded-lg text-xs font-bold transition">
+                                        <i class="fas fa-undo mr-1"></i>초기화
+                                    </button>
+                                </div>
+                                <p class="text-3xl sm:text-4xl font-bold text-purple-700" id="accumulatedAmountText">$0</p>
+                                <div class="grid grid-cols-2 gap-2 mt-3">
+                                    <div class="bg-white rounded-lg p-2 text-center">
+                                        <p class="text-xs text-gray-500">일일 배당률</p>
+                                        <p class="text-lg font-bold text-green-600" id="autoRateDisplay">-</p>
+                                    </div>
+                                    <div class="bg-white rounded-lg p-2 text-center">
+                                        <p class="text-xs text-gray-500">거치기간</p>
+                                        <p class="text-lg font-bold text-blue-600" id="autoPeriodDisplay">-</p>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- $1,000 클릭 버튼 -->
+                            <div class="mb-3">
+                                <button type="button" onclick="addAmount(1000)"
+                                    class="w-full border-2 border-purple-400 bg-purple-50 rounded-xl py-4 sm:py-5 text-center font-bold text-purple-700 hover:border-purple-600 hover:bg-purple-100 active:bg-purple-200 transition cursor-pointer text-lg sm:text-xl shadow-sm">
+                                    <i class="fas fa-plus-circle mr-2"></i>$1,000 추가
+                                </button>
+                            </div>
+
+                            <!-- 정책 안내 테이블 -->
+                            <div class="mb-3 bg-gray-50 rounded-lg border border-gray-200 overflow-hidden">
+                                <table class="w-full text-xs sm:text-sm">
+                                    <thead class="bg-gray-200">
+                                        <tr>
+                                            <th class="px-2 sm:px-3 py-2 text-left text-gray-700">투자금액</th>
+                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700">배당률</th>
+                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700">거치기간</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-gray-200">
+                                        <tr id="policyRow1" class="">
+                                            <td class="px-2 sm:px-3 py-2 font-medium">$1,000 ~ $2,000</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">0.3%</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">60일</td>
+                                        </tr>
+                                        <tr id="policyRow2" class="">
+                                            <td class="px-2 sm:px-3 py-2 font-medium">$3,000 ~ $4,000</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">0.5%</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">90일</td>
+                                        </tr>
+                                        <tr id="policyRow3" class="">
+                                            <td class="px-2 sm:px-3 py-2 font-medium">$5,000 ~ $9,000</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">0.7%</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">120일</td>
+                                        </tr>
+                                        <tr id="policyRow4" class="">
+                                            <td class="px-2 sm:px-3 py-2 font-medium">$10,000 이상</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">1.0%</td>
+                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">180일</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <input type="hidden" id="stakingAmount" value="0">
+                            <div id="rewardPreview" class="mt-3 p-3 bg-purple-50 rounded-lg border border-purple-200 hidden">
                                 <p class="text-sm font-bold text-purple-800 mb-1">예상 보상 (관리자 승인 후 지급)</p>
                                 <div class="flex justify-between text-sm">
-                                    <span class="text-gray-600">양자내성 암호화폐 코인 QTA :</span>
-                                    <span id="qtaRewardPreview" class="font-bold text-purple-600">100,000개</span>
+                                    <span class="text-gray-600">양자내성 암호화폐 QTA :</span>
+                                    <span id="qtaRewardPreview" class="font-bold text-blue-600">0개</span>
                                 </div>
                                 <div class="flex justify-between text-sm">
                                     <span class="text-gray-600">양자내성 코인거래소 QX :</span>
-                                    <span id="qxRewardPreview" class="font-bold text-purple-600">100,000개</span>
+                                    <span id="qxRewardPreview" class="font-bold text-purple-600">0개</span>
+                                </div>
+                                <div class="flex justify-between text-sm">
+                                    <span class="text-gray-600">양자암호 키코인 QKEY :</span>
+                                    <span id="qkeyRewardPreview" class="font-bold text-yellow-600">0개</span>
+                                </div>
+                                <div class="flex justify-between text-sm mt-1 pt-1 border-t border-purple-200">
+                                    <span class="text-gray-600">일일 배당률 :</span>
+                                    <span id="dailyRatePreview" class="font-bold text-green-600">0%</span>
+                                </div>
+                                <div class="flex justify-between text-sm mt-1 pt-1 border-t border-purple-200">
+                                    <span class="text-gray-600">거치기간 :</span>
+                                    <span id="periodPreview" class="font-bold text-blue-600">-</span>
                                 </div>
                             </div>
                         </div>
 
                         <!-- 회사 지갑주소 -->
-                        <div class="bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-blue-200 rounded-lg p-4 shadow-sm">
+                        <div class="bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-blue-200 rounded-lg p-3 sm:p-4 shadow-sm">
                             <div class="flex items-start gap-2 mb-2">
-                                <i class="fas fa-info-circle text-blue-600 text-xl mt-1"></i>
-                                <div class="flex-1">
-                                    <p class="font-bold text-gray-800 mb-1">입금 안내</p>
-                                    <p class="text-sm text-gray-700 mb-2">아래 회사 지갑주소로 위탁 수량을 입금해주세요</p>
+                                <i class="fas fa-info-circle text-blue-600 text-lg sm:text-xl mt-1"></i>
+                                <div class="flex-1 min-w-0">
+                                    <p class="font-bold text-gray-800 mb-1 text-sm sm:text-base">입금 안내</p>
+                                    <p class="text-xs sm:text-sm text-gray-700 mb-2">아래 회사 지갑주소로 위탁 수량을 입금해주세요</p>
                                 </div>
                             </div>
                             
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <!-- 지갑주소 입력 -->
                                 <div class="bg-white rounded-lg p-3 border border-blue-200 shadow-sm">
-                                    <label class="block text-xs text-gray-600 mb-1 font-medium">회사 지갑주소 (BNB 기반)</label>
+                                    <label class="block text-xs text-gray-600 mb-1 font-medium">회사 지갑주소 (QUANTARIUM)</label>
                                     <div class="flex items-center gap-2 mb-2">
                                         <input type="text" id="companyWallet" 
-                                            value="0xa929D03edbBD468b7bD4A9da8D7098015B417Abe" 
+                                            value="0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e" 
                                             readonly
-                                            class="flex-1 px-3 py-2 bg-gray-50 border border-gray-300 rounded font-mono text-sm">
+                                            class="flex-1 min-w-0 px-2 py-2 bg-gray-50 border border-gray-300 rounded font-mono text-xs sm:text-sm truncate">
                                         <button type="button" onclick="copyCompanyWallet()" 
                                             class="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded font-medium transition">
                                             <i class="fas fa-copy mr-1"></i>복사
@@ -1789,97 +1931,96 @@ app.get('/dashboard', (c) => {
                             </div>
                         </div>
 
-                        <div>
-                            <label class="block text-gray-700 font-bold mb-2">스테이킹 기간</label>
-                            <div class="grid grid-cols-2 gap-4">
-                                <button type="button" onclick="selectPeriod(6)" 
-                                    class="period-btn border-2 border-gray-300 rounded-lg py-4 hover:border-purple-500 transition">
-                                    <i class="fas fa-calendar-alt text-purple-600 text-2xl mb-2"></i>
-                                    <p class="font-bold text-gray-800">6개월</p>
-                                </button>
-                                <button type="button" onclick="selectPeriod(12)" 
-                                    class="period-btn border-2 border-gray-300 rounded-lg py-4 hover:border-purple-500 transition">
-                                    <i class="fas fa-calendar-alt text-purple-600 text-2xl mb-2"></i>
-                                    <p class="font-bold text-gray-800">12개월</p>
-                                </button>
-                            </div>
-                        </div>
                         <button type="submit" 
-                            class="w-full bg-purple-600 text-white py-4 rounded-lg font-bold text-lg hover:bg-purple-700 transition">
+                            class="w-full bg-purple-600 text-white py-3 sm:py-4 rounded-lg font-bold text-base sm:text-lg hover:bg-purple-700 transition">
                             <i class="fas fa-paper-plane mr-2"></i>스테이킹 신청
                         </button>
                     </form>
                 </div>
 
                 <!-- Withdrawal Section (스테이킹 기간 종료 시 표시) -->
-                <div id="withdrawalSection" class="bg-white rounded-xl shadow-lg p-6 mb-8" style="display: none;">
-                    <h2 class="text-2xl font-bold text-gray-800 mb-4">
+                <div id="withdrawalSection" class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8" style="display: none;">
+                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4">
                         <i class="fas fa-money-bill-wave mr-2 text-green-600"></i>코인 출금 신청
                     </h2>
                     <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
                         <p class="text-sm text-green-800">
                             <i class="fas fa-check-circle mr-2"></i>
-                            스테이킹 기간이 종료되었습니다. 보유하신 코인을 출금 신청하실 수 있습니다.
+                            거치기간이 종료되었습니다. 보유하신 코인을 출금 신청하실 수 있습니다.
                         </p>
                     </div>
                     
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
                         <!-- QTA 출금 -->
-                        <div class="border-2 border-blue-200 rounded-lg p-4 hover:border-blue-400 transition">
-                            <div class="flex items-center justify-between mb-3">
-                                <h3 class="font-bold text-gray-800">QTA 코인</h3>
-                                <i class="fas fa-coins text-blue-600 text-2xl"></i>
+                        <div class="border-2 border-blue-200 rounded-lg p-3 sm:p-4 hover:border-blue-400 transition">
+                            <div class="flex items-center justify-between mb-2 sm:mb-3">
+                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">QTA</h3>
+                                <i class="fas fa-coins text-blue-600 text-lg sm:text-2xl"></i>
                             </div>
-                            <p class="text-sm text-gray-600 mb-2">보유량</p>
-                            <p class="text-2xl font-bold text-blue-600 mb-4" id="withdrawQtaBalance">0</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">보유량</p>
+                            <p class="text-lg sm:text-2xl font-bold text-blue-600 mb-3 sm:mb-4" id="withdrawQtaBalance">0</p>
                             <button onclick="requestWithdrawal('QTA')" 
-                                class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-medium transition">
-                                <i class="fas fa-paper-plane mr-2"></i>출금 신청
+                                class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                                <i class="fas fa-paper-plane mr-1"></i>출금
                             </button>
                         </div>
                         
                         <!-- QX 출금 -->
-                        <div class="border-2 border-purple-200 rounded-lg p-4 hover:border-purple-400 transition">
-                            <div class="flex items-center justify-between mb-3">
-                                <h3 class="font-bold text-gray-800">QX 코인</h3>
-                                <i class="fas fa-coins text-purple-600 text-2xl"></i>
+                        <div class="border-2 border-purple-200 rounded-lg p-3 sm:p-4 hover:border-purple-400 transition">
+                            <div class="flex items-center justify-between mb-2 sm:mb-3">
+                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">QX</h3>
+                                <i class="fas fa-coins text-purple-600 text-lg sm:text-2xl"></i>
                             </div>
-                            <p class="text-sm text-gray-600 mb-2">보유량</p>
-                            <p class="text-2xl font-bold text-purple-600 mb-4" id="withdrawQxBalance">0</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">보유량</p>
+                            <p class="text-lg sm:text-2xl font-bold text-purple-600 mb-3 sm:mb-4" id="withdrawQxBalance">0</p>
                             <button onclick="requestWithdrawal('QX')" 
-                                class="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg font-medium transition">
-                                <i class="fas fa-paper-plane mr-2"></i>출금 신청
+                                class="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                                <i class="fas fa-paper-plane mr-1"></i>출금
                             </button>
                         </div>
                         
-                        <!-- USDT 출금 -->
-                        <div class="border-2 border-green-200 rounded-lg p-4 hover:border-green-400 transition">
-                            <div class="flex items-center justify-between mb-3">
-                                <h3 class="font-bold text-gray-800">USDT</h3>
-                                <i class="fas fa-dollar-sign text-green-600 text-2xl"></i>
+                        <!-- QKEY 출금 -->
+                        <div class="border-2 border-yellow-200 rounded-lg p-3 sm:p-4 hover:border-yellow-400 transition">
+                            <div class="flex items-center justify-between mb-2 sm:mb-3">
+                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">QKEY</h3>
+                                <i class="fas fa-key text-yellow-600 text-lg sm:text-2xl"></i>
                             </div>
-                            <p class="text-sm text-gray-600 mb-2">보유량</p>
-                            <p class="text-2xl font-bold text-green-600 mb-4" id="withdrawUsdtBalance">0</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">보유량</p>
+                            <p class="text-lg sm:text-2xl font-bold text-yellow-600 mb-3 sm:mb-4" id="withdrawQkeyBalance">0</p>
+                            <button onclick="requestWithdrawal('QKEY')" 
+                                class="w-full bg-yellow-600 hover:bg-yellow-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                                <i class="fas fa-paper-plane mr-1"></i>출금
+                            </button>
+                        </div>
+                        
+                        <!-- QKEY 출금 -->
+                        <div class="border-2 border-green-200 rounded-lg p-3 sm:p-4 hover:border-green-400 transition">
+                            <div class="flex items-center justify-between mb-2 sm:mb-3">
+                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">QKEY</h3>
+                                <i class="fas fa-key text-green-600 text-lg sm:text-2xl"></i>
+                            </div>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">보유량</p>
+                            <p class="text-lg sm:text-2xl font-bold text-green-600 mb-3 sm:mb-4" id="withdrawUsdtBalance">0</p>
                             <button onclick="requestWithdrawal('USDT')" 
-                                class="w-full bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-medium transition">
-                                <i class="fas fa-paper-plane mr-2"></i>출금 신청
+                                class="w-full bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                                <i class="fas fa-paper-plane mr-1"></i>출금
                             </button>
                         </div>
                     </div>
                 </div>
 
                 <!-- Referral Section -->
-                <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
-                    <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
+                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
                         <i class="fas fa-user-friends mr-2 text-indigo-600"></i>추천인 현황
                     </h2>
                     
                     <!-- 내 추천인 코드 -->
-                    <div class="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl p-6 mb-6">
+                    <div class="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
                         <div class="text-white">
-                            <p class="text-sm opacity-90 mb-2">내 추천인 코드</p>
-                            <div class="flex items-center gap-3">
-                                <p class="text-3xl font-bold tracking-wider" id="myReferralCode">-</p>
+                            <p class="text-xs sm:text-sm opacity-90 mb-2">내 추천인 코드</p>
+                            <div class="flex items-center gap-2 sm:gap-3">
+                                <p class="text-2xl sm:text-3xl font-bold tracking-wider" id="myReferralCode">-</p>
                                 <button onclick="copyReferralCode()" 
                                     class="bg-white bg-opacity-20 hover:bg-opacity-30 text-white px-4 py-2 rounded-lg transition">
                                     <i class="fas fa-copy mr-1"></i>복사
@@ -1890,37 +2031,37 @@ app.get('/dashboard', (c) => {
                     </div>
 
                     <!-- 추천 보상 통계 -->
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                        <div class="bg-blue-50 rounded-lg p-4 border border-blue-200">
-                            <p class="text-sm text-gray-600 mb-1">1단계 추천인</p>
-                            <p class="text-2xl font-bold text-blue-600" id="level1Count">0명</p>
+                    <div class="grid grid-cols-3 gap-2 sm:gap-4 mb-4 sm:mb-6">
+                        <div class="bg-blue-50 rounded-lg p-3 sm:p-4 border border-blue-200">
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">1단계 추천인</p>
+                            <p class="text-lg sm:text-2xl font-bold text-blue-600" id="level1Count">0명</p>
                         </div>
-                        <div class="bg-purple-50 rounded-lg p-4 border border-purple-200">
-                            <p class="text-sm text-gray-600 mb-1">2단계 추천인</p>
-                            <p class="text-2xl font-bold text-purple-600" id="level2Count">0명</p>
+                        <div class="bg-purple-50 rounded-lg p-3 sm:p-4 border border-purple-200">
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">2단계 추천인</p>
+                            <p class="text-lg sm:text-2xl font-bold text-purple-600" id="level2Count">0명</p>
                         </div>
-                        <div class="bg-green-50 rounded-lg p-4 border border-green-200">
-                            <p class="text-sm text-gray-600 mb-1">총 추천 보상</p>
-                            <p class="text-2xl font-bold text-green-600" id="totalRewards">0 USDT</p>
+                        <div class="bg-green-50 rounded-lg p-3 sm:p-4 border border-green-200">
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">총 추천 보상</p>
+                            <p class="text-lg sm:text-2xl font-bold text-green-600" id="totalRewards">0 QKEY</p>
                         </div>
                     </div>
 
                     <!-- 추천인 목록 탭 -->
                     <div class="mb-4">
-                        <div class="flex gap-2 border-b overflow-x-auto">
+                        <div class="flex gap-1 sm:gap-2 border-b overflow-x-auto -mx-2 px-2">
                             <button onclick="showReferralTab('level1')" 
                                 id="tab-level1"
-                                class="px-6 py-3 font-medium text-blue-600 border-b-2 border-blue-600 whitespace-nowrap">
+                                class="px-3 sm:px-6 py-2 sm:py-3 font-medium text-blue-600 border-b-2 border-blue-600 whitespace-nowrap text-sm sm:text-base">
                                 1단계 추천인
                             </button>
                             <button onclick="showReferralTab('level2')" 
                                 id="tab-level2"
-                                class="px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap">
+                                class="px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base">
                                 2단계 추천인
                             </button>
                             <button onclick="showReferralTab('rewards')" 
                                 id="tab-rewards"
-                                class="px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap">
+                                class="px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base">
                                 <i class="fas fa-coins mr-1"></i>보상 내역
                             </button>
                         </div>
@@ -1944,7 +2085,7 @@ app.get('/dashboard', (c) => {
                                 <div class="flex justify-between items-center">
                                     <div>
                                         <p class="text-sm text-gray-700 mb-1">1단계 보상</p>
-                                        <p class="text-2xl font-bold text-blue-700" id="reward-level1-total">0 USDT</p>
+                                        <p class="text-2xl font-bold text-blue-700" id="reward-level1-total">0 QKEY</p>
                                         <p class="text-xs text-gray-600 mt-1"><span id="reward-level1-count">0</span>건</p>
                                     </div>
                                     <div class="text-4xl text-blue-400">
@@ -1956,7 +2097,7 @@ app.get('/dashboard', (c) => {
                                 <div class="flex justify-between items-center">
                                     <div>
                                         <p class="text-sm text-gray-700 mb-1">2단계 보상</p>
-                                        <p class="text-2xl font-bold text-purple-700" id="reward-level2-total">0 USDT</p>
+                                        <p class="text-2xl font-bold text-purple-700" id="reward-level2-total">0 QKEY</p>
                                         <p class="text-xs text-gray-600 mt-1"><span id="reward-level2-count">0</span>건</p>
                                     </div>
                                     <div class="text-4xl text-purple-400">
@@ -1988,8 +2129,8 @@ app.get('/dashboard', (c) => {
                 </div>
 
                 <!-- My Stakings -->
-                <div class="bg-white rounded-xl shadow-lg p-6">
-                    <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6">
+                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
                         <i class="fas fa-list mr-2 text-purple-600"></i>내 스테이킹 목록
                     </h2>
                     <div id="stakingList" class="space-y-4">
@@ -2002,7 +2143,7 @@ app.get('/dashboard', (c) => {
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
         <script>
             let currentUser = null;
-            let selectedPeriod = null;
+            let accumulatedAmount = 0;
 
             // 로그인 체크
             function checkAuth() {
@@ -2048,6 +2189,7 @@ app.get('/dashboard', (c) => {
                         const user = response.data.user;
                         document.getElementById('qtaBalance').textContent = user.qta_balance.toLocaleString();
                         document.getElementById('qxBalance').textContent = user.qx_balance.toLocaleString();
+                        document.getElementById('qkeyBalance').textContent = (user.qkey_balance || 0).toLocaleString();
                         document.getElementById('usdtBalance').textContent = user.usdt_balance.toFixed(2);
                         
                         // 로컬 스토리지 업데이트
@@ -2067,7 +2209,7 @@ app.get('/dashboard', (c) => {
                 const totalAmount = activeStakings.reduce((sum, s) => sum + s.amount, 0);
                 
                 // 스테이킹 현황 카드 업데이트
-                document.getElementById('stakingStatus').textContent = totalAmount.toLocaleString() + '개';
+                document.getElementById('stakingStatus').textContent = '$' + totalAmount.toLocaleString();
                 document.getElementById('stakingCount').textContent = \`진행중: \${activeStakings.length}건\`;
             }
 
@@ -2133,22 +2275,30 @@ app.get('/dashboard', (c) => {
                                 <div class="border border-gray-200 rounded-lg p-4 \${isCompleted ? 'bg-blue-50 border-blue-300' : ''}">
                                     <div class="flex justify-between items-start mb-2">
                                         <div>
-                                            <p class="font-bold text-lg text-gray-800">\${s.amount.toLocaleString()} 코인</p>
-                                            <p class="text-sm text-gray-600">\${s.period_months}개월 스테이킹</p>
+                                            <p class="font-bold text-lg text-gray-800">$\${s.amount.toLocaleString()}</p>
+                                            <p class="text-sm text-gray-600">\${s.period_days || (s.period_months * 30)}일 거치</p>
                                         </div>
                                         <span class="px-3 py-1 bg-\${statusColor}-100 text-\${statusColor}-700 rounded-full text-sm font-medium">
                                             \${statusText}
                                         </span>
                                     </div>
                                     \${isCompleted ? '<p class="text-sm text-blue-600 font-medium mb-2"><i class="fas fa-check-circle mr-1"></i>출금 신청이 가능합니다</p>' : ''}
-                                    <div class="grid grid-cols-2 gap-4 text-sm mt-4">
+                                    <div class="grid grid-cols-3 gap-3 text-sm mt-4">
                                         <div>
-                                            <p class="text-gray-600">QTA 보상</p>
+                                            <p class="text-gray-600">QTA</p>
                                             <p class="font-bold text-blue-600">\${s.qta_reward.toLocaleString()}</p>
                                         </div>
                                         <div>
-                                            <p class="text-gray-600">QX 보상</p>
+                                            <p class="text-gray-600">QX</p>
                                             <p class="font-bold text-purple-600">\${s.qx_reward.toLocaleString()}</p>
+                                        </div>
+                                        <div>
+                                            <p class="text-gray-600">QKEY</p>
+                                            <p class="font-bold text-yellow-600">\${(s.qkey_reward || 0).toLocaleString()}</p>
+                                        </div>
+                                        <div>
+                                            <p class="text-gray-600">일일 배당률</p>
+                                            <p class="font-bold text-green-600">\${s.daily_rate ? (s.daily_rate * 100).toFixed(1) + '%' : '-'}</p>
                                         </div>
                                         <div>
                                             <p class="text-gray-600">시작일</p>
@@ -2176,6 +2326,7 @@ app.get('/dashboard', (c) => {
                         const user = response.data.user;
                         document.getElementById('withdrawQtaBalance').textContent = user.qta_balance.toLocaleString();
                         document.getElementById('withdrawQxBalance').textContent = user.qx_balance.toLocaleString();
+                        document.getElementById('withdrawQkeyBalance').textContent = (user.qkey_balance || 0).toLocaleString();
                         document.getElementById('withdrawUsdtBalance').textContent = user.usdt_balance.toFixed(2);
                     }
                 } catch (error) {
@@ -2188,6 +2339,7 @@ app.get('/dashboard', (c) => {
                 const balances = {
                     'QTA': parseFloat(document.getElementById('withdrawQtaBalance').textContent.replace(/,/g, '')),
                     'QX': parseFloat(document.getElementById('withdrawQxBalance').textContent.replace(/,/g, '')),
+                    'QKEY': parseFloat(document.getElementById('withdrawQkeyBalance').textContent.replace(/,/g, '')),
                     'USDT': parseFloat(document.getElementById('withdrawUsdtBalance').textContent)
                 };
                 
@@ -2214,13 +2366,16 @@ app.get('/dashboard', (c) => {
                     return;
                 }
                 
-                if (confirm(\`\${coinType} \${amount.toLocaleString()}개를 출금 신청하시겠습니까?\\n\\n지갑주소: \${currentUser.wallet_address}\`)) {
+                // USDT는 USDT 지갑주소 사용, 나머지는 QKEY 지갑주소 사용
+                const withdrawWallet = (coinType === 'USDT') ? (currentUser.usdt_wallet_address || currentUser.wallet_address) : currentUser.wallet_address;
+                const walletLabel = (coinType === 'USDT') ? 'USDT 지갑주소' : 'QKEY 지갑주소';
+                if (confirm(\`\${coinType} \${amount.toLocaleString()}개를 출금 신청하시겠습니까?\\n\\n\${walletLabel}: \${withdrawWallet}\`)) {
                     try {
                         const response = await axios.post('/api/withdrawal/request', {
                             userId: currentUser.id,
                             coinType: coinType,
                             amount: amount,
-                            walletAddress: currentUser.wallet_address
+                            walletAddress: withdrawWallet
                         });
                         
                         if (response.data.success) {
@@ -2256,26 +2411,29 @@ app.get('/dashboard', (c) => {
 
             // QR 코드 생성
             function generateQRCode() {
-                const companyWallet = '0xa929D03edbBD468b7bD4A9da8D7098015B417Abe';
+                const companyWallet = '0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e';
                 const qrcodeContainer = document.getElementById('qrcode');
                 
                 // 기존 QR 코드 제거
                 qrcodeContainer.innerHTML = '';
                 
+                // 모바일에서는 더 작은 QR 코드
+                const qrSize = window.innerWidth < 640 ? 120 : 150;
+                
                 // QR 코드 생성
                 new QRCode(qrcodeContainer, {
                     text: companyWallet,
-                    width: 150,
-                    height: 150,
+                    width: qrSize,
+                    height: qrSize,
                     colorDark: '#000000',
                     colorLight: '#ffffff',
                     correctLevel: QRCode.CorrectLevel.H
                 });
             }
 
-            // 입금 확인 (BSCScan API 사용)
+            // 입금 확인 (QUANTARIUM Explorer API 사용)
             async function checkDeposit() {
-                const companyWallet = '0xa929D03edbBD468b7bD4A9da8D7098015B417Abe';
+                const companyWallet = '0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e';
                 const userWallet = currentUser.wallet_address;
                 
                 if (!userWallet) {
@@ -2287,14 +2445,14 @@ app.get('/dashboard', (c) => {
                     '입금 확인을 시작합니다.\\n\\n' +
                     '사용자 지갑: ' + userWallet + '\\n' +
                     '회사 지갑: ' + companyWallet + '\\n\\n' +
-                    'BSCScan API로 최근 거래내역을 조회합니다.'
+                    'QUANTARIUM Explorer로 최근 거래내역을 조회합니다.'
                 );
 
                 if (!confirmCheck) return;
 
                 try {
-                    // BSCScan API 엔드포인트
-                    const apiUrl = \`https://api.bscscan.com/api?module=account&action=txlist&address=\${companyWallet}&startblock=0&endblock=99999999&page=1&offset=100&sort=desc&apikey=YourApiKeyToken\`;
+                    // QUANTARIUM Explorer API 엔드포인트
+                    const apiUrl = \`https://explorer.quantarium.io/api?module=account&action=txlist&address=\${companyWallet}&startblock=0&endblock=99999999&page=1&offset=100&sort=desc&apikey=YourApiKeyToken\`;
                     
                     alert('입금 확인 중입니다...\\n\\n블록체인 조회에는 몇 초가 소요될 수 있습니다.');
 
@@ -2311,16 +2469,16 @@ app.get('/dashboard', (c) => {
                         if (userTransactions.length > 0) {
                             // 가장 최근 거래
                             const latestTx = userTransactions[0];
-                            const amount = (parseInt(latestTx.value) / 1e18).toFixed(4); // Wei to BNB
+                            const amount = (parseInt(latestTx.value) / 1e18).toFixed(4); // to QTA
                             const date = new Date(parseInt(latestTx.timeStamp) * 1000).toLocaleString('ko-KR');
                             
                             alert(
                                 '✅ 입금이 확인되었습니다!\\n\\n' +
                                 '거래 해시: ' + latestTx.hash.substring(0, 20) + '...\\n' +
-                                '금액: ' + amount + ' BNB\\n' +
+                                '금액: ' + amount + ' QTA\\n' +
                                 '날짜: ' + date + '\\n' +
                                 '총 거래 수: ' + userTransactions.length + '건\\n\\n' +
-                                'BSCScan에서 확인: https://bscscan.com/tx/' + latestTx.hash
+                                'QUANTARIUM Explorer에서 확인: https://explorer.quantarium.io/tx/' + latestTx.hash
                             );
                         } else {
                             alert(
@@ -2333,104 +2491,121 @@ app.get('/dashboard', (c) => {
                         }
                     } else {
                         alert(
-                            'ℹ️ BSCScan API 조회 실패\\n\\n' +
-                            '무료 API 키 제한으로 조회가 제한될 수 있습니다.\\n' +
-                            '직접 BSCScan에서 확인해주세요:\\n\\n' +
-                            'https://bscscan.com/address/' + companyWallet
+                            'ℹ️ QUANTARIUM Explorer 조회 실패\\n\\n' +
+                            'API 키 제한으로 조회가 제한될 수 있습니다.\\n' +
+                            '직접 QUANTARIUM Explorer에서 확인해주세요:\\n\\n' +
+                            'https://explorer.quantarium.io/address/' + companyWallet
                         );
                     }
                 } catch (error) {
                     console.error('입금 확인 오류:', error);
                     alert(
                         '❌ 입금 확인 중 오류가 발생했습니다.\\n\\n' +
-                        '수동으로 BSCScan에서 확인해주세요:\\n' +
-                        'https://bscscan.com/address/' + companyWallet + '\\n\\n' +
+                        '수동으로 QUANTARIUM Explorer에서 확인해주세요:\\n' +
+                        'https://explorer.quantarium.io/address/' + companyWallet + '\\n\\n' +
                         '오류: ' + error.message
                     );
                 }
             }
 
-            // 위탁 수량 포맷팅 (1,000 단위 콤마)
-            function formatStakingAmount(input) {
-                // 숫자만 추출
-                let value = input.value.replace(/[^0-9]/g, '');
+            // 금액별 정책 정보 반환
+            function getPolicy(amount) {
+                if (amount >= 10000) return { rate: '1.0%', rateNum: 0.01, period: 180, periodText: '180일' };
+                if (amount >= 5000) return { rate: '0.7%', rateNum: 0.007, period: 120, periodText: '120일' };
+                if (amount >= 3000) return { rate: '0.5%', rateNum: 0.005, period: 90, periodText: '90일' };
+                return { rate: '0.3%', rateNum: 0.003, period: 60, periodText: '60일' };
+            }
+
+            // $1,000 추가 (누적)
+            function addAmount(step) {
+                accumulatedAmount += step;
+                updateAccumulatedDisplay();
+            }
+
+            // 초기화
+            function resetAmount() {
+                accumulatedAmount = 0;
+                updateAccumulatedDisplay();
+            }
+
+            // 누적 금액 표시 업데이트
+            function updateAccumulatedDisplay() {
+                document.getElementById('stakingAmount').value = accumulatedAmount;
+                document.getElementById('accumulatedAmountText').textContent = '$' + accumulatedAmount.toLocaleString();
                 
-                // 빈 값 처리
-                if (!value) {
-                    document.getElementById('stakingAmount').value = '';
+                // 정책 테이블 하이라이트 초기화
+                ['policyRow1', 'policyRow2', 'policyRow3', 'policyRow4'].forEach(id => {
+                    document.getElementById(id).className = '';
+                });
+
+                if (accumulatedAmount <= 0) {
+                    document.getElementById('autoRateDisplay').textContent = '-';
+                    document.getElementById('autoPeriodDisplay').textContent = '-';
+                    document.getElementById('rewardPreview').classList.add('hidden');
                     return;
                 }
-                
-                // 숫자로 변환
-                const numValue = parseInt(value);
-                
-                // 1,000 단위로 콤마 추가
-                input.value = numValue.toLocaleString();
-                
-                // hidden input에 실제 숫자 저장
-                document.getElementById('stakingAmount').value = numValue;
-                
-                // 보상 미리보기 업데이트
-                calculateReward();
-            }
 
-            // 기간 선택
-            // 보상 미리보기 계산
-            function calculateReward() {
-                const amount = parseFloat(document.getElementById('stakingAmount').value) || 10000000;
-                const reward = (amount / 10000000) * 100000;
-                document.getElementById('qtaRewardPreview').textContent = reward.toLocaleString() + '개';
-                document.getElementById('qxRewardPreview').textContent = reward.toLocaleString() + '개';
-            }
+                const policy = getPolicy(accumulatedAmount);
+                document.getElementById('autoRateDisplay').textContent = policy.rate;
+                document.getElementById('autoPeriodDisplay').textContent = policy.periodText;
 
-            function selectPeriod(months) {
-                selectedPeriod = months;
-                document.querySelectorAll('.period-btn').forEach(btn => {
-                    btn.classList.remove('border-purple-500', 'bg-purple-50');
-                });
-                event.target.closest('.period-btn').classList.add('border-purple-500', 'bg-purple-50');
+                // 해당 정책 행 하이라이트
+                if (accumulatedAmount >= 10000) {
+                    document.getElementById('policyRow4').className = 'bg-purple-100 font-bold';
+                } else if (accumulatedAmount >= 5000) {
+                    document.getElementById('policyRow3').className = 'bg-purple-100 font-bold';
+                } else if (accumulatedAmount >= 3000) {
+                    document.getElementById('policyRow2').className = 'bg-purple-100 font-bold';
+                } else {
+                    document.getElementById('policyRow1').className = 'bg-purple-100 font-bold';
+                }
+
+                // 보상 미리보기
+                const qtaReward = (accumulatedAmount / 1000) * 150000;
+                const qxReward = (accumulatedAmount / 1000) * 20000;
+                const qkeyReward = (accumulatedAmount / 1000) * 5000;
+                document.getElementById('qtaRewardPreview').textContent = qtaReward.toLocaleString() + '개';
+                document.getElementById('qxRewardPreview').textContent = qxReward.toLocaleString() + '개';
+                document.getElementById('qkeyRewardPreview').textContent = qkeyReward.toLocaleString() + '개';
+                document.getElementById('dailyRatePreview').textContent = policy.rate;
+                document.getElementById('periodPreview').textContent = policy.periodText;
+                document.getElementById('rewardPreview').classList.remove('hidden');
             }
 
             // 스테이킹 처리
             async function handleStaking(e) {
                 e.preventDefault();
+
+                const amount = accumulatedAmount;
                 
-                if (!selectedPeriod) {
-                    alert('스테이킹 기간을 선택해주세요');
+                if (!amount || amount <= 0) {
+                    alert('⚠️ $1,000 추가 버튼을 클릭하여 위탁 수량을 선택해주세요.');
                     return;
                 }
 
-                const amount = parseFloat(document.getElementById('stakingAmount').value);
-                
-                // 입력값 검증: 1000만개 미만 체크
-                if (amount < 10000000) {
-                    alert('⚠️ 신청 불가\\n\\n최소 위탁 수량은 1,000만개입니다.\\n\\n입력하신 수량: ' + amount.toLocaleString() + '개\\n최소 수량: 10,000,000개');
+                // 입력값 검증: $1,000 미만 체크
+                if (amount < 1000) {
+                    alert('⚠️ 신청 불가\\n\\n최소 위탁 수량은 $1,000입니다.');
                     return;
                 }
                 
-                // 입력값 검증: 100만개 단위 체크
-                if (amount % 1000000 !== 0) {
-                    alert('⚠️ 신청 불가\\n\\n위탁 수량은 100만개 단위로만 입력 가능합니다.\\n\\n입력하신 수량: ' + amount.toLocaleString() + '개\\n\\n올바른 예시:\\n- 10,000,000개 (1,000만)\\n- 11,000,000개 (1,100만)\\n- 12,000,000개 (1,200만)');
-                    return;
-                }
+                const policy = getPolicy(amount);
+                const qtaReward = (amount / 1000) * 150000;
+                const qxReward = (amount / 1000) * 20000;
+                const qkeyReward = (amount / 1000) * 5000;
                 
-                if (confirm(\`\${amount.toLocaleString()}개의 코인을 \${selectedPeriod}개월간 스테이킹하시겠습니까?\\n\\n관리자 승인 후 지급: QTA \${((amount / 10000000) * 100000).toLocaleString()}개 + QX \${((amount / 10000000) * 100000).toLocaleString()}개\`)) {
+                if (confirm('$' + amount.toLocaleString() + '을 ' + policy.periodText + '간 투자하시겠습니까?\\n\\n일일 배당률: ' + policy.rate + '\\n거치기간: ' + policy.periodText + '\\n\\n관리자 승인 후 지급:\\n• QTA ' + qtaReward.toLocaleString() + '개\\n• QX ' + qxReward.toLocaleString() + '개\\n• QKEY ' + qkeyReward.toLocaleString() + '개')) {
                     try {
                         const response = await axios.post('/api/staking/create', {
                             userId: currentUser.id,
-                            amount: amount,
-                            periodMonths: selectedPeriod
+                            amount: amount
                         });
 
                         if (response.data.success) {
                             alert(response.data.message || '스테이킹 신청이 완료되었습니다! 관리자 승인 후 코인이 지급됩니다.');
-                            document.getElementById('stakingAmount').value = '10000000';
-                            document.getElementById('stakingAmountDisplay').value = '10,000,000';
-                            calculateReward(); // 보상 미리보기 초기화
-                            selectedPeriod = null;
-                            document.querySelectorAll('.period-btn').forEach(btn => {
-                                btn.classList.remove('border-purple-500', 'bg-purple-50');
-                            });
+                            // 초기화
+                            accumulatedAmount = 0;
+                            updateAccumulatedDisplay();
                             await loadUserInfo();
                             await loadStakings();
                         }
@@ -2486,10 +2661,10 @@ app.get('/dashboard', (c) => {
                                     class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500">
                             </div>
                             
-                            <!-- 지갑주소 (읽기 전용) -->
+                            <!-- QKEY 지갑주소 (읽기 전용) -->
                             <div>
                                 <label class="block text-gray-700 font-medium mb-2">
-                                    <i class="fas fa-wallet mr-2"></i>지갑주소
+                                    <i class="fas fa-wallet mr-2"></i>지갑주소 (QKEY)
                                 </label>
                                 <div class="relative">
                                     <input type="text" value="\${currentUser.wallet_address}" readonly
@@ -2502,6 +2677,25 @@ app.get('/dashboard', (c) => {
                                 <p class="text-xs text-red-500 mt-1">
                                     <i class="fas fa-exclamation-triangle mr-1"></i>
                                     지갑주소 변경은 관리자에게 문의하세요
+                                </p>
+                            </div>
+                            
+                            <!-- USDT 지갑주소 (읽기 전용) -->
+                            <div>
+                                <label class="block text-gray-700 font-medium mb-2">
+                                    <i class="fas fa-wallet mr-2"></i>지갑주소 (USDT)
+                                </label>
+                                <div class="relative">
+                                    <input type="text" value="\${currentUser.usdt_wallet_address || ''}" readonly
+                                        class="w-full px-4 py-3 pr-12 border border-gray-300 rounded-lg bg-gray-100 cursor-not-allowed font-mono text-sm">
+                                    <button type="button" onclick="alertWalletChange()" 
+                                        class="absolute right-2 top-1/2 transform -translate-y-1/2 text-purple-600 hover:text-purple-700">
+                                        <i class="fas fa-info-circle text-xl"></i>
+                                    </button>
+                                </div>
+                                <p class="text-xs text-gray-500 mt-1">
+                                    <i class="fas fa-info-circle mr-1"></i>
+                                    바이낸스(BINANCE) USDT 지갑주소
                                 </p>
                             </div>
                             
@@ -2543,7 +2737,7 @@ app.get('/dashboard', (c) => {
             
             // 지갑주소 변경 경고
             function alertWalletChange() {
-                alert('⚠️ 지갑주소 변경 안내\\n\\n지갑주소는 보안상의 이유로 직접 변경하실 수 없습니다.\\n\\n지갑주소 변경이 필요하신 경우 관리자에게 문의해주시기 바랍니다.\\n\\n📞 관리자 문의: admin@saycoin.com');
+                alert('⚠️ 지갑주소 변경 안내\\n\\n지갑주소는 보안상의 이유로 직접 변경하실 수 없습니다.\\n\\n지갑주소 변경이 필요하신 경우 관리자에게 문의해주시기 바랍니다.\\n\\n📞 관리자 문의: admin@quantarium.com');
             }
             
             // 프로필 업데이트
@@ -2603,7 +2797,7 @@ app.get('/dashboard', (c) => {
                         // 통계 업데이트
                         document.getElementById('level1Count').textContent = stats.level1Count + '명';
                         document.getElementById('level2Count').textContent = stats.level2Count + '명';
-                        document.getElementById('totalRewards').textContent = stats.totalRewards.toFixed(2) + ' USDT';
+                        document.getElementById('totalRewards').textContent = Math.round(stats.totalRewards).toLocaleString() + ' QKEY';
                         
                         // 1단계 추천인 목록 렌더링
                         const level1List = document.getElementById('level1-list');
@@ -2684,23 +2878,23 @@ app.get('/dashboard', (c) => {
                 const rewardsList = document.getElementById('rewards-list');
 
                 if (level === 'level1') {
-                    level1Tab.className = 'px-6 py-3 font-medium text-blue-600 border-b-2 border-blue-600 whitespace-nowrap';
-                    level2Tab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap';
-                    rewardsTab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap';
+                    level1Tab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-blue-600 border-b-2 border-blue-600 whitespace-nowrap text-sm sm:text-base';
+                    level2Tab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base';
+                    rewardsTab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base';
                     level1List.classList.remove('hidden');
                     level2List.classList.add('hidden');
                     rewardsList.classList.add('hidden');
                 } else if (level === 'level2') {
-                    level1Tab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap';
-                    level2Tab.className = 'px-6 py-3 font-medium text-purple-600 border-b-2 border-purple-600 whitespace-nowrap';
-                    rewardsTab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap';
+                    level1Tab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base';
+                    level2Tab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-purple-600 border-b-2 border-purple-600 whitespace-nowrap text-sm sm:text-base';
+                    rewardsTab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base';
                     level1List.classList.add('hidden');
                     level2List.classList.remove('hidden');
                     rewardsList.classList.add('hidden');
                 } else if (level === 'rewards') {
-                    level1Tab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap';
-                    level2Tab.className = 'px-6 py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap';
-                    rewardsTab.className = 'px-6 py-3 font-medium text-green-600 border-b-2 border-green-600 whitespace-nowrap';
+                    level1Tab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base';
+                    level2Tab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base';
+                    rewardsTab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-green-600 border-b-2 border-green-600 whitespace-nowrap text-sm sm:text-base';
                     level1List.classList.add('hidden');
                     level2List.classList.add('hidden');
                     rewardsList.classList.remove('hidden');
@@ -2717,8 +2911,8 @@ app.get('/dashboard', (c) => {
                         const { rewards, stats } = response.data;
                         
                         // 통계 업데이트
-                        document.getElementById('reward-level1-total').textContent = stats.level1Total.toFixed(2) + ' USDT';
-                        document.getElementById('reward-level2-total').textContent = stats.level2Total.toFixed(2) + ' USDT';
+                        document.getElementById('reward-level1-total').textContent = Math.round(stats.level1Total).toLocaleString() + ' QKEY';
+                        document.getElementById('reward-level2-total').textContent = Math.round(stats.level2Total).toLocaleString() + ' QKEY';
                         document.getElementById('reward-level1-count').textContent = stats.level1Count;
                         document.getElementById('reward-level2-count').textContent = stats.level2Count;
                         
@@ -2748,7 +2942,7 @@ app.get('/dashboard', (c) => {
                                     '<td class="px-4 py-3">' + levelBadge + '</td>' +
                                     '<td class="px-4 py-3 text-sm text-gray-700">' + reward.description + '</td>' +
                                     '<td class="px-4 py-3 text-right text-sm font-bold ' + amountColor + '">+' + 
-                                        reward.amount.toFixed(2) + ' USDT' +
+                                        Math.round(reward.amount).toLocaleString() + ' QKEY' +
                                     '</td>' +
                                 '</tr>';
                             }).join('');
@@ -2783,7 +2977,7 @@ app.get('/admin', (c) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>관리자 로그인 - SAYCOIN STAKING</title>
+        <title>관리자 로그인 - QUANTARIUM STAKING</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <style>
@@ -2795,9 +2989,9 @@ app.get('/admin', (c) => {
     <body class="min-h-screen flex items-center justify-center p-4">
         <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md">
             <div class="text-center mb-8">
-                <img src="/static/saycoin-logo.png" alt="SAYCOIN Logo" class="w-24 h-24 mx-auto mb-4" onerror="this.style.display='none'">
+                <img src="/static/quantarium-logo.png" alt="QUANTARIUM Logo" class="w-24 h-24 mx-auto mb-4" onerror="this.style.display='none'">
                 <h1 class="text-3xl font-bold text-gray-800 mb-2">관리자 로그인</h1>
-                <p class="text-gray-600">SAYCOIN STAKING 관리자 페이지</p>
+                <p class="text-gray-600">QUANTARIUM STAKING 관리자 페이지</p>
             </div>
 
             <!-- 관리자 로그인 정보 안내 -->
@@ -2872,107 +3066,111 @@ app.get('/admin/dashboard', (c) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>관리자 대시보드 - SAYCOIN STAKING</title>
+        <title>관리자 대시보드 - QUANTARIUM STAKING</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
         <style>
             body { background-color: #f3f4f6; }
+            html, body { overflow-x: hidden; max-width: 100vw; }
+            * { box-sizing: border-box; }
+            button, a, input, select { min-height: 36px; }
+            .font-mono { word-break: break-all; }
         </style>
     </head>
     <body>
         <div class="min-h-screen">
             <!-- Header -->
             <header class="bg-white shadow-sm">
-                <div class="max-w-7xl mx-auto px-4 py-4">
+                <div class="max-w-7xl mx-auto px-3 sm:px-4 py-3 sm:py-4">
                     <div class="flex justify-between items-center">
-                        <div class="flex items-center gap-3">
-                            <img src="/static/saycoin-logo.png" alt="SAYCOIN Logo" class="w-10 h-10" onerror="this.style.display='none'">
-                            <div>
-                                <h1 class="text-2xl font-bold text-purple-600">SAYCOIN STAKING</h1>
-                                <p class="text-sm text-gray-600">관리자 대시보드</p>
+                        <div class="flex items-center gap-2 sm:gap-3 min-w-0">
+                            <img src="/static/quantarium-logo.png" alt="QUANTARIUM Logo" class="w-8 h-8 sm:w-10 sm:h-10 flex-shrink-0" onerror="this.style.display='none'">
+                            <div class="min-w-0">
+                                <h1 class="text-lg sm:text-2xl font-bold text-purple-600 truncate">QUANTARIUM</h1>
+                                <p class="text-xs sm:text-sm text-gray-600">관리자 대시보드</p>
                             </div>
                         </div>
-                        <button onclick="handleLogout()" class="text-red-600 hover:text-red-700">
-                            <i class="fas fa-sign-out-alt mr-1"></i>로그아웃
+                        <button onclick="handleLogout()" class="text-red-600 hover:text-red-700 flex-shrink-0 text-sm sm:text-base">
+                            <i class="fas fa-sign-out-alt mr-1"></i><span class="hidden sm:inline">로그아웃</span>
                         </button>
                     </div>
                 </div>
             </header>
 
             <!-- Main Content -->
-            <main class="max-w-7xl mx-auto px-4 py-8">
+            <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8">
                 <!-- 통계 카드 -->
-                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
-                    <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 sm:gap-4 mb-6 sm:mb-8">
+                    <div class="bg-white rounded-lg shadow-md p-3 sm:p-6">
                         <div class="flex items-center justify-between">
                             <div>
-                                <p class="text-gray-600 text-sm">승인 대기</p>
-                                <p id="pendingCount" class="text-3xl font-bold text-yellow-600">0</p>
+                                <p class="text-gray-600 text-xs sm:text-sm">승인 대기</p>
+                                <p id="pendingCount" class="text-2xl sm:text-3xl font-bold text-yellow-600">0</p>
                             </div>
-                            <i class="fas fa-clock text-4xl text-yellow-600 opacity-20"></i>
+                            <i class="fas fa-clock text-2xl sm:text-4xl text-yellow-600 opacity-20"></i>
                         </div>
                     </div>
 
-                    <div class="bg-white rounded-lg shadow-md p-6">
+                    <div class="bg-white rounded-lg shadow-md p-3 sm:p-6">
                         <div class="flex items-center justify-between">
                             <div>
-                                <p class="text-gray-600 text-sm">진행 중</p>
-                                <p id="activeCount" class="text-3xl font-bold text-green-600">0</p>
+                                <p class="text-gray-600 text-xs sm:text-sm">진행 중</p>
+                                <p id="activeCount" class="text-2xl sm:text-3xl font-bold text-green-600">0</p>
                             </div>
-                            <i class="fas fa-check-circle text-4xl text-green-600 opacity-20"></i>
+                            <i class="fas fa-check-circle text-2xl sm:text-4xl text-green-600 opacity-20"></i>
                         </div>
                     </div>
 
-                    <div class="bg-white rounded-lg shadow-md p-6">
+                    <div class="bg-white rounded-lg shadow-md p-3 sm:p-6">
                         <div class="flex items-center justify-between">
                             <div>
-                                <p class="text-gray-600 text-sm">거절됨</p>
-                                <p id="rejectedCount" class="text-3xl font-bold text-red-600">0</p>
+                                <p class="text-gray-600 text-xs sm:text-sm">거절됨</p>
+                                <p id="rejectedCount" class="text-2xl sm:text-3xl font-bold text-red-600">0</p>
                             </div>
-                            <i class="fas fa-times-circle text-4xl text-red-600 opacity-20"></i>
+                            <i class="fas fa-times-circle text-2xl sm:text-4xl text-red-600 opacity-20"></i>
                         </div>
                     </div>
 
-                    <div class="bg-white rounded-lg shadow-md p-6">
+                    <div class="bg-white rounded-lg shadow-md p-3 sm:p-6">
                         <div class="flex items-center justify-between">
                             <div>
-                                <p class="text-gray-600 text-sm">총 사용자</p>
-                                <p id="totalUsers" class="text-3xl font-bold text-purple-600">0</p>
+                                <p class="text-gray-600 text-xs sm:text-sm">총 사용자</p>
+                                <p id="totalUsers" class="text-2xl sm:text-3xl font-bold text-purple-600">0</p>
                             </div>
-                            <i class="fas fa-users text-4xl text-purple-600 opacity-20"></i>
+                            <i class="fas fa-users text-2xl sm:text-4xl text-purple-600 opacity-20"></i>
                         </div>
                     </div>
 
-                    <div class="bg-white rounded-lg shadow-md p-6">
+                    <div class="col-span-2 sm:col-span-1 bg-white rounded-lg shadow-md p-3 sm:p-6">
                         <div class="flex items-center justify-between">
                             <div>
-                                <p class="text-gray-600 text-sm">신규 가입</p>
-                                <p id="newUsersToday" class="text-3xl font-bold text-blue-600">0</p>
+                                <p class="text-gray-600 text-xs sm:text-sm">신규 가입</p>
+                                <p id="newUsersToday" class="text-2xl sm:text-3xl font-bold text-blue-600">0</p>
                                 <p class="text-xs text-gray-500 mt-1">오늘</p>
                             </div>
-                            <i class="fas fa-user-plus text-4xl text-blue-600 opacity-20"></i>
+                            <i class="fas fa-user-plus text-2xl sm:text-4xl text-blue-600 opacity-20"></i>
                         </div>
                     </div>
                 </div>
 
                 <!-- 탭 메뉴 -->
-                <div class="bg-white rounded-lg shadow-md mb-6">
-                    <div class="flex border-b">
+                <div class="bg-white rounded-lg shadow-md mb-4 sm:mb-6">
+                    <div class="flex border-b overflow-x-auto -webkit-overflow-scrolling-touch">
                         <button onclick="showTab('pending')" id="tab-pending" 
-                            class="px-6 py-4 font-medium text-purple-600 border-b-2 border-purple-600">
-                            <i class="fas fa-clock mr-2"></i>승인 대기
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-purple-600 border-b-2 border-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-clock mr-1 sm:mr-2"></i>승인 대기
                         </button>
                         <button onclick="showTab('all')" id="tab-all" 
-                            class="px-6 py-4 font-medium text-gray-600 hover:text-purple-600">
-                            <i class="fas fa-list mr-2"></i>전체 목록
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-list mr-1 sm:mr-2"></i>전체 목록
                         </button>
                         <button onclick="showTab('users')" id="tab-users" 
-                            class="px-6 py-4 font-medium text-gray-600 hover:text-purple-600">
-                            <i class="fas fa-users mr-2"></i>사용자 관리
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-users mr-1 sm:mr-2"></i>사용자
                         </button>
                         <button onclick="showTab('signups')" id="tab-signups" 
-                            class="px-6 py-4 font-medium text-gray-600 hover:text-purple-600">
-                            <i class="fas fa-user-plus mr-2"></i>가입 현황
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-user-plus mr-1 sm:mr-2"></i>가입
                         </button>
                     </div>
                 </div>
@@ -3012,18 +3210,18 @@ app.get('/admin/dashboard', (c) => {
                     <h2 class="text-xl font-bold text-gray-800 mb-4">
                         <i class="fas fa-user-plus text-blue-600 mr-2"></i>회원가입 현황
                     </h2>
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-                        <div class="bg-blue-50 rounded-lg p-4 border border-blue-200">
-                            <p class="text-sm text-gray-600 mb-1">오늘 가입</p>
-                            <p id="signupsToday" class="text-2xl font-bold text-blue-600">0명</p>
+                    <div class="grid grid-cols-3 gap-2 sm:gap-6 mb-4 sm:mb-6">
+                        <div class="bg-blue-50 rounded-lg p-3 sm:p-4 border border-blue-200">
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">오늘</p>
+                            <p id="signupsToday" class="text-lg sm:text-2xl font-bold text-blue-600">0명</p>
                         </div>
-                        <div class="bg-green-50 rounded-lg p-4 border border-green-200">
-                            <p class="text-sm text-gray-600 mb-1">이번 주 가입</p>
-                            <p id="signupsWeek" class="text-2xl font-bold text-green-600">0명</p>
+                        <div class="bg-green-50 rounded-lg p-3 sm:p-4 border border-green-200">
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">이번 주</p>
+                            <p id="signupsWeek" class="text-lg sm:text-2xl font-bold text-green-600">0명</p>
                         </div>
-                        <div class="bg-purple-50 rounded-lg p-4 border border-purple-200">
-                            <p class="text-sm text-gray-600 mb-1">이번 달 가입</p>
-                            <p id="signupsMonth" class="text-2xl font-bold text-purple-600">0명</p>
+                        <div class="bg-purple-50 rounded-lg p-3 sm:p-4 border border-purple-200">
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1">이번 달</p>
+                            <p id="signupsMonth" class="text-lg sm:text-2xl font-bold text-purple-600">0명</p>
                         </div>
                     </div>
                     <div id="signupsList" class="space-y-4">
@@ -3126,26 +3324,34 @@ app.get('/admin/dashboard', (c) => {
                                     </div>
                                     <h3 class="text-xl font-bold text-gray-800 mb-1">\${s.name}</h3>
                                     <p class="text-sm text-gray-600"><i class="fas fa-envelope mr-1"></i>\${s.email}</p>
-                                    <p class="text-sm text-gray-600 font-mono"><i class="fas fa-wallet mr-1"></i>\${s.wallet_address}</p>
+                                    <p class="text-xs sm:text-sm text-gray-600 font-mono truncate"><i class="fas fa-wallet mr-1"></i>\${s.wallet_address}</p>
                                 </div>
                             </div>
 
-                            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 p-4 bg-white rounded-lg">
+                            <div class="grid grid-cols-2 sm:grid-cols-3 gap-2 sm:gap-3 mb-3 sm:mb-4 p-3 sm:p-4 bg-white rounded-lg">
                                 <div>
-                                    <p class="text-xs text-gray-600 mb-1">위탁 수량</p>
-                                    <p class="font-bold text-purple-600">\${s.amount.toLocaleString()}개</p>
+                                    <p class="text-xs text-gray-600 mb-1">투자금액</p>
+                                    <p class="font-bold text-purple-600">$\${s.amount.toLocaleString()}</p>
                                 </div>
                                 <div>
-                                    <p class="text-xs text-gray-600 mb-1">기간</p>
-                                    <p class="font-bold text-gray-800">\${s.period_months}개월</p>
+                                    <p class="text-xs text-gray-600 mb-1">거치기간</p>
+                                    <p class="font-bold text-gray-800">\${s.period_days || (s.period_months * 30)}일</p>
                                 </div>
                                 <div>
-                                    <p class="text-xs text-gray-600 mb-1">QTA 보상</p>
-                                    <p class="font-bold text-blue-600">\${s.qta_reward.toLocaleString()}개</p>
+                                    <p class="text-xs text-gray-600 mb-1">일일 배당률</p>
+                                    <p class="font-bold text-green-600">\${s.daily_rate ? (s.daily_rate * 100).toFixed(1) + '%' : '-'}</p>
                                 </div>
                                 <div>
-                                    <p class="text-xs text-gray-600 mb-1">QX 보상</p>
-                                    <p class="font-bold text-purple-600">\${s.qx_reward.toLocaleString()}개</p>
+                                    <p class="text-xs text-gray-600 mb-1">QTA</p>
+                                    <p class="font-bold text-blue-600">\${s.qta_reward.toLocaleString()}</p>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-gray-600 mb-1">QX</p>
+                                    <p class="font-bold text-purple-600">\${s.qx_reward.toLocaleString()}</p>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-gray-600 mb-1">QKEY</p>
+                                    <p class="font-bold text-yellow-600">\${(s.qkey_reward || 0).toLocaleString()}</p>
                                 </div>
                             </div>
 
@@ -3218,14 +3424,14 @@ app.get('/admin/dashboard', (c) => {
                                     </div>
                                 </div>
 
-                                <div class="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+                                <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2 sm:gap-3 text-sm">
                                     <div>
-                                        <p class="text-gray-600">위탁 수량</p>
-                                        <p class="font-bold">\${s.amount.toLocaleString()}개</p>
+                                        <p class="text-gray-600">투자금액</p>
+                                        <p class="font-bold">$\${s.amount.toLocaleString()}</p>
                                     </div>
                                     <div>
-                                        <p class="text-gray-600">기간</p>
-                                        <p class="font-bold">\${s.period_months}개월</p>
+                                        <p class="text-gray-600">거치기간</p>
+                                        <p class="font-bold">\${s.period_days || (s.period_months * 30)}일</p>
                                     </div>
                                     <div>
                                         <p class="text-gray-600">QTA</p>
@@ -3234,6 +3440,10 @@ app.get('/admin/dashboard', (c) => {
                                     <div>
                                         <p class="text-gray-600">QX</p>
                                         <p class="font-bold text-purple-600">\${s.qx_reward.toLocaleString()}</p>
+                                    </div>
+                                    <div>
+                                        <p class="text-gray-600">QKEY</p>
+                                        <p class="font-bold text-yellow-600">\${(s.qkey_reward || 0).toLocaleString()}</p>
                                     </div>
                                     <div>
                                         <p class="text-gray-600">종료일</p>
@@ -3267,13 +3477,21 @@ app.get('/admin/dashboard', (c) => {
                                     <h3 class="text-lg font-bold text-gray-800 mb-1">\${u.name}</h3>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${u.email}</p>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${u.phone || 'N/A'}</p>
-                                    <div class="flex items-center gap-2">
-                                        <p class="text-xs text-gray-500 font-mono"><i class="fas fa-wallet mr-1"></i>\${u.wallet_address}</p>
+                                    <div class="flex items-center gap-1 sm:gap-2 min-w-0 mb-1">
+                                        <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${u.wallet_address}</p>
                                         <button onclick="copyWalletAddress('\${u.wallet_address}')" 
-                                            class="px-2 py-1 bg-purple-100 hover:bg-purple-200 text-purple-700 rounded text-xs transition duration-200"
-                                            title="지갑주소 복사">
-                                            <i class="fas fa-copy"></i> 복사
+                                            class="flex-shrink-0 px-2 py-1 bg-purple-100 hover:bg-purple-200 text-purple-700 rounded text-xs transition duration-200"
+                                            title="QKEY 지갑주소 복사">
+                                            <i class="fas fa-copy"></i>
                                         </button>
+                                    </div>
+                                    <div class="flex items-center gap-1 sm:gap-2 min-w-0">
+                                        <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-green-600 font-semibold">USDT</span> \${u.usdt_wallet_address || 'N/A'}</p>
+                                        \${u.usdt_wallet_address ? \`<button onclick="copyWalletAddress('\${u.usdt_wallet_address}')" 
+                                            class="flex-shrink-0 px-2 py-1 bg-green-100 hover:bg-green-200 text-green-700 rounded text-xs transition duration-200"
+                                            title="USDT 지갑주소 복사">
+                                            <i class="fas fa-copy"></i>
+                                        </button>\` : ''}
                                     </div>
                                 </div>
                                 <div class="text-right">
@@ -3282,7 +3500,7 @@ app.get('/admin/dashboard', (c) => {
                                 </div>
                             </div>
 
-                            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 pt-4 border-t">
+                            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 mt-3 sm:mt-4 pt-3 sm:pt-4 border-t">
                                 <div class="text-center">
                                     <p class="text-xs text-gray-600 mb-1">QTA</p>
                                     <p class="font-bold text-blue-600">\${u.qta_balance.toLocaleString()}</p>
@@ -3292,7 +3510,7 @@ app.get('/admin/dashboard', (c) => {
                                     <p class="font-bold text-purple-600">\${u.qx_balance.toLocaleString()}</p>
                                 </div>
                                 <div class="text-center">
-                                    <p class="text-xs text-gray-600 mb-1">USDT</p>
+                                    <p class="text-xs text-gray-600 mb-1">QKEY(배당)</p>
                                     <p class="font-bold text-green-600">\${u.usdt_balance.toFixed(2)}</p>
                                 </div>
                                 <div class="text-center">
@@ -3301,10 +3519,10 @@ app.get('/admin/dashboard', (c) => {
                                 </div>
                             </div>
 
-                            <div class="mt-4 pt-4 border-t flex justify-end">
+                            <div class="mt-3 sm:mt-4 pt-3 sm:pt-4 border-t flex justify-end">
                                 <button onclick="deleteUser(\${u.id}, '\${u.name}', '\${u.email}', \${u.staking_amount})" 
-                                    class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition duration-200">
-                                    <i class="fas fa-user-times mr-2"></i>사용자 강제 탈퇴
+                                    class="px-3 sm:px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
+                                    <i class="fas fa-user-times mr-1 sm:mr-2"></i>강제 탈퇴
                                 </button>
                             </div>
                         </div>
@@ -3340,7 +3558,8 @@ app.get('/admin/dashboard', (c) => {
                                     <h3 class="text-lg font-bold text-gray-800 mb-1">\${u.name}</h3>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${u.email}</p>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${u.phone || 'N/A'}</p>
-                                    <p class="text-xs text-gray-500 font-mono"><i class="fas fa-wallet mr-1"></i>\${u.wallet_address}</p>
+                                    <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${u.wallet_address}</p>
+                                    <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-green-600 font-semibold">USDT</span> \${u.usdt_wallet_address || 'N/A'}</p>
                                 </div>
                                 <div class="text-right">
                                     <p class="text-xs text-gray-600 mb-1">가입일</p>

@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "saycoin-staking",
+  "name": "quantarium-staking",
   "compatibility_date": "2026-01-22",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
@@ -24,7 +24,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "saycoin-staking-production",
+      "database_name": "quantarium-staking-production",
       "database_id": "5a3ba471-4bba-413f-9af9-b6c94ef102d7"
     }
   ],

@@ -1,10 +1,10 @@
-# SAYCOIN STAKING
+# QUANTARIUM STAKING
 
 모바일 웹 기반 코인 스테이킹 플랫폼
 
 ## 📱 프로젝트 개요
 
-**SAYCOIN STAKING**은 사용자가 코인을 위탁하고 보상을 받을 수 있는 모바일 최적화 웹 애플리케이션입니다.
+**QUANTARIUM STAKING**은 사용자가 코인을 위탁하고 보상을 받을 수 있는 모바일 최적화 웹 애플리케이션입니다.
 
 ### 주요 기능
 
@@ -219,8 +219,8 @@
 ## 📦 배포 상태
 
 **플랫폼**: Cloudflare Pages  
-**프로젝트 이름**: saycoin-staking  
-**프로덕션 URL**: https://saycoin-staking.pages.dev  
+**프로젝트 이름**: quantarium-staking  
+**프로덕션 URL**: https://quantarium-staking.pages.dev  
 **마지막 업데이트**: 2026-01-22
 
 ### 배포 방법
@@ -235,7 +235,7 @@ cd /home/user/webapp
 ```bash
 cd /home/user/webapp
 npm run build
-npx wrangler pages deploy dist --project-name saycoin-staking
+npx wrangler pages deploy dist --project-name quantarium-staking
 ```
 
 **상세 가이드**: [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md) 참조
@@ -262,24 +262,24 @@ curl http://localhost:3000
 
 ## 🗄️ 프로덕션 데이터베이스
 
-**데이터베이스**: Cloudflare D1 (saycoin-staking-production)
+**데이터베이스**: Cloudflare D1 (quantarium-staking-production)
 
 **마이그레이션 적용**:
 ```bash
 # 프로덕션 마이그레이션
-npx wrangler d1 migrations apply saycoin-staking-production --remote
+npx wrangler d1 migrations apply quantarium-staking-production --remote
 
 # 로컬 마이그레이션
-npx wrangler d1 migrations apply saycoin-staking-production --local
+npx wrangler d1 migrations apply quantarium-staking-production --local
 ```
 
 **데이터베이스 관리**:
 ```bash
 # 프로덕션 DB 쿼리
-npx wrangler d1 execute saycoin-staking-production --remote --command="SELECT COUNT(*) FROM users"
+npx wrangler d1 execute quantarium-staking-production --remote --command="SELECT COUNT(*) FROM users"
 
 # 로컬 DB 쿼리
-npx wrangler d1 execute saycoin-staking-production --local --command="SELECT COUNT(*) FROM users"
+npx wrangler d1 execute quantarium-staking-production --local --command="SELECT COUNT(*) FROM users"
 
 # 데이터베이스 리셋 (로컬만)
 npm run db:reset

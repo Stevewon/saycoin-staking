@@ -1,4 +1,4 @@
-# 🚀 SAYCOIN STAKING 빠른 배포 가이드
+# 🚀 QUANTARIUM STAKING 빠른 배포 가이드
 
 ---
 
@@ -22,7 +22,7 @@
 1. https://dash.cloudflare.com 접속 → 로그인
 2. **Workers & Pages** > **D1 SQL Database** 클릭
 3. **Create database** 클릭
-4. Database name: `saycoin-staking-production` 입력
+4. Database name: `quantarium-staking-production` 입력
 5. **Create** 클릭
 6. **Database ID** 복사 (예: `xxxx-xxxx-xxxx-xxxx`)
 
@@ -38,21 +38,21 @@
 
 1. **Workers & Pages** > **Create application** 클릭
 2. **Pages** 탭 > **Upload assets** 선택
-3. Project name: `saycoin-staking` 입력
+3. Project name: `quantarium-staking` 입력
 4. **`dist/`** 폴더의 모든 파일 업로드 (드래그 앤 드롭)
 5. **Deploy site** 클릭
 6. **Settings** > **Functions** > **D1 database bindings**
    - Variable name: `DB`
-   - D1 database: `saycoin-staking-production` 선택
+   - D1 database: `quantarium-staking-production` 선택
    - **Save** 클릭
 
 ---
 
 ## 🎉 배포 완료!
 
-**프로덕션 URL**: https://saycoin-staking.pages.dev
+**프로덕션 URL**: https://quantarium-staking.pages.dev
 
-**관리자 페이지**: https://saycoin-staking.pages.dev/admin
+**관리자 페이지**: https://quantarium-staking.pages.dev/admin
 - ID: `admin`
 - PW: `admin1234`
 
@@ -64,7 +64,7 @@
 
 ## ✅ 배포 확인
 
-1. ✅ 사용자 페이지 접속: https://saycoin-staking.pages.dev
+1. ✅ 사용자 페이지 접속: https://quantarium-staking.pages.dev
 2. ✅ 회원가입 테스트
 3. ✅ 로그인 테스트
 4. ✅ 스테이킹 신청 테스트
@@ -128,11 +128,11 @@ SELECT COUNT(*) FROM users;
 
 ## 🎊 축하합니다!
 
-**SAYCOIN STAKING** 플랫폼이 정상적으로 배포되었습니다!
+**QUANTARIUM STAKING** 플랫폼이 정상적으로 배포되었습니다!
 
 이제 실제 서비스를 시작할 수 있습니다! 🚀
 
-**프로덕션 URL**: https://saycoin-staking.pages.dev
+**프로덕션 URL**: https://quantarium-staking.pages.dev
 
 ---
 

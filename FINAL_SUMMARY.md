@@ -1,12 +1,12 @@
-# SAYCOIN STAKING - 최종 완료 보고서
+# QUANTARIUM STAKING - 최종 완료 보고서
 
 ## 🎉 프로젝트 완료 (2026-01-28)
 
 ### 📌 프로젝트 정보
-- **프로젝트명**: SAYCOIN STAKING
-- **프로덕션 URL**: https://staking.saycoin.net
-- **GitHub**: https://github.com/Stevewon/saycoin-staking
-- **관리자 URL**: https://staking.saycoin.net/admin
+- **프로젝트명**: QUANTARIUM STAKING
+- **프로덕션 URL**: https://staking.quantarium.net
+- **GitHub**: https://github.com/Stevewon/quantarium-staking
+- **관리자 URL**: https://staking.quantarium.net/admin
 
 ---
 
@@ -25,7 +25,7 @@
 - ✅ 보상 계산: 1,000만개당 QTA 10만 + QX 10만
 - ✅ 관리자 승인 시스템
 - ✅ 승인 후 즉시 QTA/QX 지급
-- ✅ 일일 USDT 보상 (0.75 USDT per 100만 세이코인)
+- ✅ 일일 USDT 보상 (0.75 USDT per 100만 퀀타리움)
 
 ### 3. 추천인 시스템 ⭐
 - ✅ 2단계 추천 구조
@@ -117,13 +117,13 @@
 ## 🚀 배포 정보
 
 ### 프로덕션 환경
-- **URL**: https://staking.saycoin.net
-- **Cloudflare Project**: saycoin-staking-prod
-- **Branch**: saycoin-staking-platform
-- **Database**: saycoin-staking-production
+- **URL**: https://staking.quantarium.net
+- **Cloudflare Project**: quantarium-staking-prod
+- **Branch**: quantarium-staking-platform
+- **Database**: quantarium-staking-production
 
 ### 관리자 계정
-- **URL**: https://staking.saycoin.net/admin
+- **URL**: https://staking.quantarium.net/admin
 - **ID**: admin
 - **비밀번호**: admin1234
 
@@ -235,7 +235,7 @@ webapp/
 │   ├── index.tsx           # 메인 애플리케이션 (Hono)
 │   └── renderer.tsx        # 렌더링 설정
 ├── public/
-│   └── saycoin-logo.png    # 로고 이미지
+│   └── quantarium-logo.png    # 로고 이미지
 ├── migrations/             # 데이터베이스 마이그레이션
 │   ├── 0001_initial_schema.sql
 │   ├── 0002_add_wallet_address.sql
@@ -268,7 +268,7 @@ webapp/
 
 ### 배포
 - ✅ GitHub 푸시 시 자동 배포
-- ✅ Branch: saycoin-staking-platform
+- ✅ Branch: quantarium-staking-platform
 - ✅ Cloudflare Pages가 자동 감지
 
 ---
@@ -299,8 +299,8 @@ webapp/
 
 ## 📞 문의
 
-- **GitHub**: https://github.com/Stevewon/saycoin-staking
-- **프로덕션**: https://staking.saycoin.net
+- **GitHub**: https://github.com/Stevewon/quantarium-staking
+- **프로덕션**: https://staking.quantarium.net
 
 ---
 
@@ -329,6 +329,6 @@ webapp/
 
 모든 기능이 정상적으로 작동하며, 프로덕션 환경에 배포되었습니다.
 
-**배포 URL**: https://staking.saycoin.net
+**배포 URL**: https://staking.quantarium.net
 
 감사합니다! 🚀
