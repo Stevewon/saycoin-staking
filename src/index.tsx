@@ -2366,7 +2366,7 @@ app.get('/dashboard', (c) => {
                 const totalAmount = activeStakings.reduce((sum, s) => sum + s.amount, 0);
                 
                 // 스테이킹 현황 카드 업데이트
-                document.getElementById('stakingStatus').textContent = '$' + totalAmount.toLocaleString();
+                document.getElementById('stakingStatus').textContent = totalAmount.toLocaleString() + '개';
                 document.getElementById('stakingCount').textContent = \`진행중: \${activeStakings.length}건\`;
             }
 
