@@ -1259,7 +1259,7 @@ app.get('/api/referrals/:userId', async (c) => {
 
     // 1단계 추천인 (직접 추천)
     const level1 = await db.prepare(`
-      SELECT id, name, email, created_at, 
+      SELECT id, name, email, wallet_address, created_at, 
              (SELECT COUNT(*) FROM staking WHERE user_id = users.id AND status = 'active') as staking_count,
              (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = users.id AND status = 'active') as total_staking
       FROM users
@@ -1269,7 +1269,7 @@ app.get('/api/referrals/:userId', async (c) => {
 
     // 2단계 추천인 (간접 추천)
     const level2 = await db.prepare(`
-      SELECT u2.id, u2.name, u2.email, u2.created_at,
+      SELECT u2.id, u2.name, u2.email, u2.wallet_address, u2.created_at,
              (SELECT COUNT(*) FROM staking WHERE user_id = u2.id AND status = 'active') as staking_count,
              (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = u2.id AND status = 'active') as total_staking
       FROM users u1
@@ -2996,57 +2996,9 @@ app.get('/dashboard', (c) => {
                         document.getElementById('level2Count').textContent = stats.level2Count + '명';
                         document.getElementById('totalRewards').textContent = Math.round(stats.totalRewards).toLocaleString() + ' QKEY';
                         
-                        // 1단계 추천인 목록 렌더링
-                        const level1List = document.getElementById('level1-list');
-                        if (level1.length === 0) {
-                            level1List.innerHTML = '<div class="text-center py-8 text-gray-500">' +
-                                '<i class="fas fa-users text-4xl mb-3 opacity-50"></i>' +
-                                '<p>아직 1단계 추천인이 없습니다</p>' +
-                                '<p class="text-sm mt-2">친구에게 추천 코드를 공유해보세요!</p>' +
-                                '</div>';
-                        } else {
-                            level1List.innerHTML = level1.map(function(user) {
-                                return '<div class="bg-blue-50 border border-blue-200 rounded-lg p-4">' +
-                                    '<div class="flex justify-between items-start">' +
-                                        '<div>' +
-                                            '<p class="font-bold text-gray-800">' + user.name + '</p>' +
-                                            '<p class="text-sm text-gray-600">' + user.email + '</p>' +
-                                            '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
-                                        '</div>' +
-                                        '<div class="text-right">' +
-                                            '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
-                                            '<p class="text-sm font-bold text-blue-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
-                                        '</div>' +
-                                    '</div>' +
-                                '</div>';
-                            }).join('');
-                        }
-                        
-                        // 2단계 추천인 목록 렌더링
-                        const level2List = document.getElementById('level2-list');
-                        if (level2.length === 0) {
-                            level2List.innerHTML = '<div class="text-center py-8 text-gray-500">' +
-                                '<i class="fas fa-users text-4xl mb-3 opacity-50"></i>' +
-                                '<p>아직 2단계 추천인이 없습니다</p>' +
-                                '<p class="text-sm mt-2">1단계 추천인이 새로운 회원을 추천하면 표시됩니다</p>' +
-                                '</div>';
-                        } else {
-                            level2List.innerHTML = level2.map(function(user) {
-                                return '<div class="bg-purple-50 border border-purple-200 rounded-lg p-4">' +
-                                    '<div class="flex justify-between items-start">' +
-                                        '<div>' +
-                                            '<p class="font-bold text-gray-800">' + user.name + '</p>' +
-                                            '<p class="text-sm text-gray-600">' + user.email + '</p>' +
-                                            '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
-                                        '</div>' +
-                                        '<div class="text-right">' +
-                                            '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
-                                            '<p class="text-sm font-bold text-purple-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
-                                        '</div>' +
-                                    '</div>' +
-                                '</div>';
-                            }).join('');
-                        }
+                        // 1단계 / 2단계 추천인 목록 렌더링
+                        renderLevel1List(level1);
+                        renderLevel2List(level2);
                     }
                 } catch (error) {
                     console.error('Failed to load referrals:', error);
@@ -3072,54 +3024,59 @@ app.get('/dashboard', (c) => {
                 }
             }
 
+            function renderReferralCard(user, color) {
+                var wallet = user.wallet_address || '';
+                var walletShort = wallet ? (wallet.substring(0, 8) + '...' + wallet.substring(wallet.length - 6)) : '미등록';
+                var staking = Number(user.total_staking || 0);
+                return '<div class="bg-' + color + '-50 border border-' + color + '-200 rounded-lg p-3 sm:p-4">' +
+                    '<div class="flex justify-between items-start mb-2">' +
+                        '<div>' +
+                            '<p class="font-bold text-gray-800 text-sm sm:text-base">' + user.name + '</p>' +
+                            '<p class="text-xs text-gray-500">가입: ' + new Date(user.created_at).toLocaleDateString('ko-KR') + '</p>' +
+                        '</div>' +
+                        '<div class="text-right">' +
+                            '<p class="text-xs text-gray-500">진입금액</p>' +
+                            '<p class="text-sm sm:text-base font-bold text-' + color + '-600">$' + staking.toLocaleString() + '</p>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="flex items-center gap-2 bg-white rounded-lg p-2 border border-gray-200">' +
+                        '<i class="fas fa-wallet text-' + color + '-400 text-xs"></i>' +
+                        '<span class="text-xs font-mono text-gray-600 flex-1 truncate" title="' + wallet + '">' + walletShort + '</span>' +
+                        (wallet ? '<button onclick="copyWallet(\'' + wallet + '\')" class="px-2 py-1 bg-' + color + '-100 hover:bg-' + color + '-200 text-' + color + '-700 rounded text-xs font-medium transition whitespace-nowrap"><i class="fas fa-copy mr-1"></i>복사</button>' : '') +
+                    '</div>' +
+                '</div>';
+            }
+
             function renderLevel1List(list) {
                 var el = document.getElementById('level1-list');
                 if (list.length === 0) {
+                    var q = document.getElementById('referralSearchInput').value;
                     el.innerHTML = '<div class="text-center py-8 text-gray-500">' +
-                        '<i class="fas fa-search text-4xl mb-3 opacity-50"></i>' +
-                        '<p>검색 결과가 없습니다</p></div>';
+                        '<i class="fas fa-' + (q ? 'search' : 'users') + ' text-4xl mb-3 opacity-50"></i>' +
+                        '<p>' + (q ? '검색 결과가 없습니다' : '아직 1단계 추천인이 없습니다') + '</p></div>';
                 } else {
-                    el.innerHTML = list.map(function(user) {
-                        return '<div class="bg-blue-50 border border-blue-200 rounded-lg p-4">' +
-                            '<div class="flex justify-between items-start">' +
-                                '<div>' +
-                                    '<p class="font-bold text-gray-800">' + user.name + '</p>' +
-                                    '<p class="text-sm text-gray-600">' + user.email + '</p>' +
-                                    '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
-                                '</div>' +
-                                '<div class="text-right">' +
-                                    '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
-                                    '<p class="text-sm font-bold text-blue-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
-                                '</div>' +
-                            '</div>' +
-                        '</div>';
-                    }).join('');
+                    el.innerHTML = list.map(function(user) { return renderReferralCard(user, 'blue'); }).join('');
                 }
             }
 
             function renderLevel2List(list) {
                 var el = document.getElementById('level2-list');
                 if (list.length === 0) {
+                    var q = document.getElementById('referralSearchInput').value;
                     el.innerHTML = '<div class="text-center py-8 text-gray-500">' +
-                        '<i class="fas fa-search text-4xl mb-3 opacity-50"></i>' +
-                        '<p>검색 결과가 없습니다</p></div>';
+                        '<i class="fas fa-' + (q ? 'search' : 'users') + ' text-4xl mb-3 opacity-50"></i>' +
+                        '<p>' + (q ? '검색 결과가 없습니다' : '아직 2단계 추천인이 없습니다') + '</p></div>';
                 } else {
-                    el.innerHTML = list.map(function(user) {
-                        return '<div class="bg-purple-50 border border-purple-200 rounded-lg p-4">' +
-                            '<div class="flex justify-between items-start">' +
-                                '<div>' +
-                                    '<p class="font-bold text-gray-800">' + user.name + '</p>' +
-                                    '<p class="text-sm text-gray-600">' + user.email + '</p>' +
-                                    '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
-                                '</div>' +
-                                '<div class="text-right">' +
-                                    '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
-                                    '<p class="text-sm font-bold text-purple-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
-                                '</div>' +
-                            '</div>' +
-                        '</div>';
-                    }).join('');
+                    el.innerHTML = list.map(function(user) { return renderReferralCard(user, 'purple'); }).join('');
                 }
+            }
+
+            function copyWallet(address) {
+                navigator.clipboard.writeText(address).then(function() {
+                    alert('✅ 지갑주소가 복사되었습니다!\\n\\n' + address);
+                }).catch(function() {
+                    prompt('지갑주소를 복사하세요:', address);
+                });
             }
 
             // 추천인 코드 복사
