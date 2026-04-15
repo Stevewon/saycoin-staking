@@ -1755,11 +1755,11 @@ app.get('/dashboard', (c) => {
                         <p class="text-xs opacity-75 mt-1" id="stakingCount">진행중: 0건</p>
                     </div>
                     
-                    <!-- USDT Balance (두 번째) -->
+                    <!-- QKEY Balance (두 번째) -->
                     <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90">USDT Balance</span>
-                            <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
+                            <span class="text-xs sm:text-sm opacity-90">QKEY Balance</span>
+                            <i class="fas fa-key text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
                     </div>
@@ -1993,11 +1993,11 @@ app.get('/dashboard', (c) => {
                             </button>
                         </div>
                         
-                        <!-- USDT 출금 -->
+                        <!-- QKEY 출금 -->
                         <div class="border-2 border-green-200 rounded-lg p-3 sm:p-4 hover:border-green-400 transition">
                             <div class="flex items-center justify-between mb-2 sm:mb-3">
-                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">USDT</h3>
-                                <i class="fas fa-dollar-sign text-green-600 text-lg sm:text-2xl"></i>
+                                <h3 class="font-bold text-gray-800 text-sm sm:text-base">QKEY</h3>
+                                <i class="fas fa-key text-green-600 text-lg sm:text-2xl"></i>
                             </div>
                             <p class="text-xs sm:text-sm text-gray-600 mb-1">보유량</p>
                             <p class="text-lg sm:text-2xl font-bold text-green-600 mb-3 sm:mb-4" id="withdrawUsdtBalance">0</p>
@@ -3510,7 +3510,7 @@ app.get('/admin/dashboard', (c) => {
                                     <p class="font-bold text-purple-600">\${u.qx_balance.toLocaleString()}</p>
                                 </div>
                                 <div class="text-center">
-                                    <p class="text-xs text-gray-600 mb-1">USDT</p>
+                                    <p class="text-xs text-gray-600 mb-1">QKEY(배당)</p>
                                     <p class="font-bold text-green-600">\${u.usdt_balance.toFixed(2)}</p>
                                 </div>
                                 <div class="text-center">
