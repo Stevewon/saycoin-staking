@@ -2197,7 +2197,7 @@ app.get('/dashboard', (c) => {
                         </div>
                     </div>
 
-                    <!-- 추천인 목록 탭 -->
+                    <!-- 추천인 목록 탭 + 검색 -->
                     <div class="mb-4">
                         <div class="flex gap-1 sm:gap-2 border-b overflow-x-auto -mx-2 px-2">
                             <button onclick="showReferralTab('level1')" 
@@ -2215,6 +2215,20 @@ app.get('/dashboard', (c) => {
                                 class="px-3 sm:px-6 py-2 sm:py-3 font-medium text-gray-500 hover:text-gray-700 whitespace-nowrap text-sm sm:text-base">
                                 <i class="fas fa-coins mr-1"></i>보상 내역
                             </button>
+                        </div>
+                        <!-- 추천인 검색창 -->
+                        <div id="referralSearchBox" class="mt-3">
+                            <div class="relative">
+                                <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm"></i>
+                                <input type="text" id="referralSearchInput" 
+                                    placeholder="이름 또는 이메일로 검색..." 
+                                    oninput="filterReferralList()"
+                                    class="w-full pl-9 pr-8 py-2 border border-gray-300 rounded-lg text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500">
+                                <button onclick="document.getElementById('referralSearchInput').value=''; filterReferralList();" 
+                                    class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                            </div>
                         </div>
                     </div>
 
@@ -2965,11 +2979,17 @@ app.get('/dashboard', (c) => {
             }
 
             // 추천인 현황 로드
+            // 추천인 데이터 저장 (검색 필터용)
+            let allLevel1Referrals = [];
+            let allLevel2Referrals = [];
+
             async function loadReferrals() {
                 try {
                     const response = await axios.get('/api/referrals/' + currentUser.id);
                     if (response.data.success) {
                         const { level1, level2, stats } = response.data;
+                        allLevel1Referrals = level1;
+                        allLevel2Referrals = level2;
                         
                         // 통계 업데이트
                         document.getElementById('level1Count').textContent = stats.level1Count + '명';
@@ -3033,6 +3053,75 @@ app.get('/dashboard', (c) => {
                 }
             }
 
+            // 추천인 검색 필터
+            function filterReferralList() {
+                var query = (document.getElementById('referralSearchInput').value || '').toLowerCase().trim();
+                var currentTab = document.getElementById('tab-level1').className.indexOf('border-b-2') >= 0 ? 'level1' : 
+                                 document.getElementById('tab-level2').className.indexOf('border-b-2') >= 0 ? 'level2' : 'rewards';
+                
+                if (currentTab === 'level1') {
+                    var filtered = query ? allLevel1Referrals.filter(function(u) {
+                        return u.name.toLowerCase().indexOf(query) >= 0 || u.email.toLowerCase().indexOf(query) >= 0;
+                    }) : allLevel1Referrals;
+                    renderLevel1List(filtered);
+                } else if (currentTab === 'level2') {
+                    var filtered = query ? allLevel2Referrals.filter(function(u) {
+                        return u.name.toLowerCase().indexOf(query) >= 0 || u.email.toLowerCase().indexOf(query) >= 0;
+                    }) : allLevel2Referrals;
+                    renderLevel2List(filtered);
+                }
+            }
+
+            function renderLevel1List(list) {
+                var el = document.getElementById('level1-list');
+                if (list.length === 0) {
+                    el.innerHTML = '<div class="text-center py-8 text-gray-500">' +
+                        '<i class="fas fa-search text-4xl mb-3 opacity-50"></i>' +
+                        '<p>검색 결과가 없습니다</p></div>';
+                } else {
+                    el.innerHTML = list.map(function(user) {
+                        return '<div class="bg-blue-50 border border-blue-200 rounded-lg p-4">' +
+                            '<div class="flex justify-between items-start">' +
+                                '<div>' +
+                                    '<p class="font-bold text-gray-800">' + user.name + '</p>' +
+                                    '<p class="text-sm text-gray-600">' + user.email + '</p>' +
+                                    '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
+                                '</div>' +
+                                '<div class="text-right">' +
+                                    '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
+                                    '<p class="text-sm font-bold text-blue-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
+                                '</div>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('');
+                }
+            }
+
+            function renderLevel2List(list) {
+                var el = document.getElementById('level2-list');
+                if (list.length === 0) {
+                    el.innerHTML = '<div class="text-center py-8 text-gray-500">' +
+                        '<i class="fas fa-search text-4xl mb-3 opacity-50"></i>' +
+                        '<p>검색 결과가 없습니다</p></div>';
+                } else {
+                    el.innerHTML = list.map(function(user) {
+                        return '<div class="bg-purple-50 border border-purple-200 rounded-lg p-4">' +
+                            '<div class="flex justify-between items-start">' +
+                                '<div>' +
+                                    '<p class="font-bold text-gray-800">' + user.name + '</p>' +
+                                    '<p class="text-sm text-gray-600">' + user.email + '</p>' +
+                                    '<p class="text-xs text-gray-500 mt-1">가입일: ' + new Date(user.created_at).toLocaleDateString() + '</p>' +
+                                '</div>' +
+                                '<div class="text-right">' +
+                                    '<p class="text-sm text-gray-600">스테이킹: ' + user.staking_count + '건</p>' +
+                                    '<p class="text-sm font-bold text-purple-600">' + Number(user.total_staking || 0).toLocaleString() + ' 개</p>' +
+                                '</div>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('');
+                }
+            }
+
             // 추천인 코드 복사
             function copyReferralCode() {
                 const code = document.getElementById('myReferralCode').textContent;
@@ -3053,6 +3142,16 @@ app.get('/dashboard', (c) => {
                 const level1List = document.getElementById('level1-list');
                 const level2List = document.getElementById('level2-list');
                 const rewardsList = document.getElementById('rewards-list');
+                const searchBox = document.getElementById('referralSearchBox');
+
+                // 검색창: 1단계/2단계에서만 보이고, 보상내역에서는 숨김
+                if (level === 'rewards') {
+                    searchBox.style.display = 'none';
+                } else {
+                    searchBox.style.display = 'block';
+                }
+                // 탭 전환 시 검색어 초기화
+                document.getElementById('referralSearchInput').value = '';
 
                 if (level === 'level1') {
                     level1Tab.className = 'px-3 sm:px-6 py-2 sm:py-3 font-medium text-blue-600 border-b-2 border-blue-600 whitespace-nowrap text-sm sm:text-base';
