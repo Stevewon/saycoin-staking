@@ -1824,7 +1824,7 @@ app.get('/dashboard', (c) => {
                     <!-- 퀀타리움 스테이킹 현황 (첫 번째 - full width) -->
                     <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90">퀀타리움 스테이킹 현황</span>
+                            <span class="text-xs sm:text-sm opacity-90">퀀타리움 구매지갑 전송 수량</span>
                             <i class="fas fa-chart-line text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-2xl sm:text-3xl font-bold" id="stakingStatus">0개</p>
@@ -1906,7 +1906,7 @@ app.get('/dashboard', (c) => {
                 <!-- Staking Section -->
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
-                        <i class="fas fa-lock mr-2 text-purple-600"></i>새로운 스테이킹
+                        <i class="fas fa-lock mr-2 text-purple-600"></i>QTA 구매 스테이킹
                     </h2>
                     <form onsubmit="handleStaking(event)" class="space-y-4">
                         <div>
