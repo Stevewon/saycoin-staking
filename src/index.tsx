@@ -1311,52 +1311,65 @@ app.get('/api/referral-rewards/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
-    // 추천인 보상 상세 내역 (transactions 테이블에서 조회)
+    // 전체 보상 내역 (배당금 + 직접판매 + 매칭추천수당 + 누적)
     const rewards = await db.prepare(`
       SELECT 
         t.id,
+        t.type,
+        t.coin_type,
         t.amount,
         t.description,
         t.created_at,
         CASE 
-          WHEN t.description LIKE '%1단계%' THEN 1
-          WHEN t.description LIKE '%2단계%' THEN 2
-          ELSE 0
-        END as level
+          WHEN t.type = 'daily_qkey' THEN '배당금'
+          WHEN t.type = 'direct_referral' THEN '직접판매'
+          WHEN t.type = 'referral_reward' AND t.description LIKE '%1대%' THEN '직접판매성과금(1대)'
+          WHEN t.type = 'referral_reward' AND t.description LIKE '%2대%' THEN '직접판매성과금(2대)'
+          WHEN t.type = 'referral_reward' THEN '직접판매성과금'
+          ELSE t.type
+        END as reward_category
       FROM transactions t
-      WHERE t.user_id = ? AND t.type = 'referral_reward'
+      WHERE t.user_id = ? AND t.type IN ('daily_qkey', 'direct_referral', 'referral_reward')
       ORDER BY t.created_at DESC
-      LIMIT 100
+      LIMIT 200
     `).bind(userId).all()
 
-    // 통계 계산
+    // 카테고리별 통계 계산
     const stats = await db.prepare(`
       SELECT 
-        COUNT(*) as total_count,
-        COALESCE(SUM(amount), 0) as total_amount,
-        COALESCE(SUM(CASE WHEN description LIKE '%1단계%' THEN amount ELSE 0 END), 0) as level1_total,
-        COALESCE(SUM(CASE WHEN description LIKE '%2단계%' THEN amount ELSE 0 END), 0) as level2_total,
-        COALESCE(SUM(CASE WHEN description LIKE '%1단계%' THEN 1 ELSE 0 END), 0) as level1_count,
-        COALESCE(SUM(CASE WHEN description LIKE '%2단계%' THEN 1 ELSE 0 END), 0) as level2_count
+        COALESCE(SUM(CASE WHEN type = 'daily_qkey' THEN amount ELSE 0 END), 0) as daily_total,
+        COALESCE(SUM(CASE WHEN type = 'daily_qkey' THEN 1 ELSE 0 END), 0) as daily_count,
+        COALESCE(SUM(CASE WHEN type = 'direct_referral' THEN amount ELSE 0 END), 0) as direct_total,
+        COALESCE(SUM(CASE WHEN type = 'direct_referral' THEN 1 ELSE 0 END), 0) as direct_count,
+        COALESCE(SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%1대%' THEN amount ELSE 0 END), 0) as level1_total,
+        COALESCE(SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%1대%' THEN 1 ELSE 0 END), 0) as level1_count,
+        COALESCE(SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%2대%' THEN amount ELSE 0 END), 0) as level2_total,
+        COALESCE(SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%2대%' THEN 1 ELSE 0 END), 0) as level2_count,
+        COALESCE(SUM(amount), 0) as grand_total,
+        COUNT(*) as total_count
       FROM transactions
-      WHERE user_id = ? AND type = 'referral_reward'
+      WHERE user_id = ? AND type IN ('daily_qkey', 'direct_referral', 'referral_reward')
     `).bind(userId).first()
 
     return c.json({
       success: true,
       rewards: rewards.results || [],
       stats: {
-        totalCount: stats?.total_count || 0,
-        totalAmount: stats?.total_amount || 0,
+        dailyTotal: stats?.daily_total || 0,
+        dailyCount: stats?.daily_count || 0,
+        directTotal: stats?.direct_total || 0,
+        directCount: stats?.direct_count || 0,
         level1Total: stats?.level1_total || 0,
         level2Total: stats?.level2_total || 0,
         level1Count: stats?.level1_count || 0,
-        level2Count: stats?.level2_count || 0
+        level2Count: stats?.level2_count || 0,
+        grandTotal: stats?.grand_total || 0,
+        totalCount: stats?.total_count || 0
       }
     })
   } catch (error) {
-    console.error('추천인 보상 내역 조회 오류:', error)
-    return c.json({ error: '추천인 보상 내역 조회 중 오류가 발생했습니다' }, 500)
+    console.error('보상 내역 조회 오류:', error)
+    return c.json({ error: '보상 내역 조회 중 오류가 발생했습니다' }, 500)
   }
 })
 
@@ -2217,43 +2230,45 @@ app.get('/dashboard', (c) => {
 
                     <!-- 보상 내역 (기본 숨김) -->
                     <div id="rewards-list" class="hidden">
-                        <!-- 보상 통계 카드 -->
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-                            <div class="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-4 border-2 border-blue-300">
-                                <div class="flex justify-between items-center">
-                                    <div>
-                                        <p class="text-sm text-gray-700 mb-1">1단계 보상</p>
-                                        <p class="text-2xl font-bold text-blue-700" id="reward-level1-total">0 QKEY</p>
-                                        <p class="text-xs text-gray-600 mt-1"><span id="reward-level1-count">0</span>건</p>
-                                    </div>
-                                    <div class="text-4xl text-blue-400">
-                                        <i class="fas fa-hand-holding-usd"></i>
-                                    </div>
-                                </div>
+                        <!-- 보상 통계 카드 (4개) -->
+                        <div class="grid grid-cols-2 gap-2 sm:gap-3 mb-4">
+                            <div class="bg-gradient-to-br from-green-50 to-green-100 rounded-lg p-3 border border-green-300">
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-coins mr-1 text-green-500"></i>배당금</p>
+                                <p class="text-lg font-bold text-green-700" id="reward-daily-total">0 QKEY</p>
+                                <p class="text-xs text-gray-500"><span id="reward-daily-count">0</span>건</p>
                             </div>
-                            <div class="bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg p-4 border-2 border-purple-300">
-                                <div class="flex justify-between items-center">
-                                    <div>
-                                        <p class="text-sm text-gray-700 mb-1">2단계 보상</p>
-                                        <p class="text-2xl font-bold text-purple-700" id="reward-level2-total">0 QKEY</p>
-                                        <p class="text-xs text-gray-600 mt-1"><span id="reward-level2-count">0</span>건</p>
-                                    </div>
-                                    <div class="text-4xl text-purple-400">
-                                        <i class="fas fa-gifts"></i>
-                                    </div>
-                                </div>
+                            <div class="bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg p-3 border border-orange-300">
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-handshake mr-1 text-orange-500"></i>직접판매</p>
+                                <p class="text-lg font-bold text-orange-700" id="reward-direct-total">0 QKEY</p>
+                                <p class="text-xs text-gray-500"><span id="reward-direct-count">0</span>건</p>
                             </div>
+                            <div class="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-3 border border-blue-300">
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-hand-holding-usd mr-1 text-blue-500"></i>성과금(1대)</p>
+                                <p class="text-lg font-bold text-blue-700" id="reward-level1-total">0 QKEY</p>
+                                <p class="text-xs text-gray-500"><span id="reward-level1-count">0</span>건</p>
+                            </div>
+                            <div class="bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg p-3 border border-purple-300">
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-gifts mr-1 text-purple-500"></i>성과금(2대)</p>
+                                <p class="text-lg font-bold text-purple-700" id="reward-level2-total">0 QKEY</p>
+                                <p class="text-xs text-gray-500"><span id="reward-level2-count">0</span>건</p>
+                            </div>
+                        </div>
+
+                        <!-- 누적 총 보상 -->
+                        <div class="bg-gradient-to-r from-yellow-50 to-yellow-100 rounded-lg p-3 mb-4 border border-yellow-300 text-center">
+                            <p class="text-xs text-gray-600 mb-1">누적 총 보상</p>
+                            <p class="text-xl font-bold text-yellow-700" id="reward-grand-total">0 QKEY</p>
                         </div>
 
                         <!-- 보상 내역 테이블 -->
                         <div class="overflow-x-auto">
-                            <table class="w-full">
+                            <table class="w-full text-xs sm:text-sm">
                                 <thead class="bg-gray-100">
                                     <tr>
-                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase">날짜</th>
-                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase">구분</th>
-                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase">내용</th>
-                                        <th class="px-4 py-3 text-right text-xs font-medium text-gray-700 uppercase">금액</th>
+                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700">날짜</th>
+                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700">구분</th>
+                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700">내용</th>
+                                        <th class="px-2 sm:px-4 py-2 text-right text-xs font-medium text-gray-700">금액</th>
                                     </tr>
                                 </thead>
                                 <tbody id="rewards-table-body" class="divide-y divide-gray-200">
@@ -3065,7 +3080,7 @@ app.get('/dashboard', (c) => {
                 }
             }
 
-            // 추천인 보상 내역 로드
+            // 전체 보상 내역 로드 (배당금 + 직접판매 + 성과금)
             async function loadReferralRewards() {
                 try {
                     const response = await axios.get('/api/referral-rewards/' + currentUser.id);
@@ -3073,37 +3088,61 @@ app.get('/dashboard', (c) => {
                         const { rewards, stats } = response.data;
                         
                         // 통계 업데이트
+                        document.getElementById('reward-daily-total').textContent = Math.round(stats.dailyTotal).toLocaleString() + ' QKEY';
+                        document.getElementById('reward-daily-count').textContent = stats.dailyCount;
+                        document.getElementById('reward-direct-total').textContent = Math.round(stats.directTotal).toLocaleString() + ' QKEY';
+                        document.getElementById('reward-direct-count').textContent = stats.directCount;
                         document.getElementById('reward-level1-total').textContent = Math.round(stats.level1Total).toLocaleString() + ' QKEY';
-                        document.getElementById('reward-level2-total').textContent = Math.round(stats.level2Total).toLocaleString() + ' QKEY';
                         document.getElementById('reward-level1-count').textContent = stats.level1Count;
+                        document.getElementById('reward-level2-total').textContent = Math.round(stats.level2Total).toLocaleString() + ' QKEY';
                         document.getElementById('reward-level2-count').textContent = stats.level2Count;
+                        document.getElementById('reward-grand-total').textContent = Math.round(stats.grandTotal).toLocaleString() + ' QKEY';
+
+                        // 총 추천 보상 (상단 카드) 업데이트
+                        var totalRewardsEl = document.getElementById('totalRewards');
+                        if (totalRewardsEl) totalRewardsEl.textContent = Math.round(stats.grandTotal).toLocaleString() + ' QKEY';
                         
                         // 테이블 렌더링
-                        const tableBody = document.getElementById('rewards-table-body');
+                        var tableBody = document.getElementById('rewards-table-body');
                         if (rewards.length === 0) {
                             tableBody.innerHTML = '<tr><td colspan="4" class="px-4 py-8 text-center text-gray-500">' +
-                                '<i class="fas fa-inbox text-4xl mb-3 opacity-50"></i>' +
-                                '<p>아직 받은 추천 보상이 없습니다</p>' +
+                                '<i class="fas fa-inbox text-4xl mb-3 opacity-50 block"></i>' +
+                                '<p>아직 받은 보상이 없습니다</p>' +
                                 '</td></tr>';
                         } else {
                             tableBody.innerHTML = rewards.map(function(reward) {
-                                var levelBadge = '';
+                                var badgeClass = '';
+                                var badgeText = reward.reward_category || reward.type;
                                 var amountColor = '';
-                                if (reward.level === 1) {
-                                    levelBadge = '<span class="px-2 py-1 bg-blue-100 text-blue-700 rounded text-xs font-medium">1단계</span>';
-                                    amountColor = 'text-blue-600';
-                                } else if (reward.level === 2) {
-                                    levelBadge = '<span class="px-2 py-1 bg-purple-100 text-purple-700 rounded text-xs font-medium">2단계</span>';
-                                    amountColor = 'text-purple-600';
+                                
+                                if (reward.type === 'daily_qkey') {
+                                    badgeClass = 'bg-green-100 text-green-700';
+                                    badgeText = '배당금';
+                                    amountColor = 'text-green-600';
+                                } else if (reward.type === 'direct_referral') {
+                                    badgeClass = 'bg-orange-100 text-orange-700';
+                                    badgeText = '직접판매';
+                                    amountColor = 'text-orange-600';
+                                } else if (reward.type === 'referral_reward') {
+                                    if (reward.description && reward.description.indexOf('1대') >= 0) {
+                                        badgeClass = 'bg-blue-100 text-blue-700';
+                                        badgeText = '성과금(1대)';
+                                        amountColor = 'text-blue-600';
+                                    } else {
+                                        badgeClass = 'bg-purple-100 text-purple-700';
+                                        badgeText = '성과금(2대)';
+                                        amountColor = 'text-purple-600';
+                                    }
                                 }
                                 
                                 return '<tr class="hover:bg-gray-50">' +
-                                    '<td class="px-4 py-3 text-sm text-gray-600">' + 
-                                        new Date(reward.created_at).toLocaleDateString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) +
+                                    '<td class="px-2 sm:px-4 py-2 text-xs text-gray-600 whitespace-nowrap">' + 
+                                        new Date(reward.created_at).toLocaleDateString('ko-KR', { month: '2-digit', day: '2-digit' }) +
+                                        ' ' + new Date(reward.created_at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) +
                                     '</td>' +
-                                    '<td class="px-4 py-3">' + levelBadge + '</td>' +
-                                    '<td class="px-4 py-3 text-sm text-gray-700">' + reward.description + '</td>' +
-                                    '<td class="px-4 py-3 text-right text-sm font-bold ' + amountColor + '">+' + 
+                                    '<td class="px-2 sm:px-4 py-2"><span class="px-2 py-0.5 ' + badgeClass + ' rounded text-xs font-medium whitespace-nowrap">' + badgeText + '</span></td>' +
+                                    '<td class="px-2 sm:px-4 py-2 text-xs text-gray-700 truncate max-w-[120px]" title="' + (reward.description || '') + '">' + (reward.description || '-') + '</td>' +
+                                    '<td class="px-2 sm:px-4 py-2 text-right text-xs font-bold ' + amountColor + ' whitespace-nowrap">+' + 
                                         Math.round(reward.amount).toLocaleString() + ' QKEY' +
                                     '</td>' +
                                 '</tr>';
@@ -3111,7 +3150,7 @@ app.get('/dashboard', (c) => {
                         }
                     }
                 } catch (error) {
-                    console.error('Failed to load referral rewards:', error);
+                    console.error('Failed to load rewards:', error);
                     document.getElementById('rewards-table-body').innerHTML = 
                         '<tr><td colspan="4" class="px-4 py-8 text-center text-red-500">보상 내역을 불러오는데 실패했습니다</td></tr>';
                 }
