@@ -6,14 +6,22 @@
 const I18N = {
   _currentLang: 'ko',
   _translations: {},
+  _isKoreaIP: false,
 
   // Get current language
   getLang() {
     return this._currentLang;
   },
 
+  // Check if user is from Korea
+  isKoreaIP() {
+    return this._isKoreaIP;
+  },
+
   // Set language and apply
   setLang(lang) {
+    // 한국 IP에서는 한국어 외 변경 불가
+    if (this._isKoreaIP) lang = 'ko';
     if (!this._translations[lang]) lang = 'ko';
     this._currentLang = lang;
     localStorage.setItem('quantarium_lang', lang);
@@ -23,13 +31,24 @@ const I18N = {
 
   // Initialize
   init() {
-    const saved = localStorage.getItem('quantarium_lang');
-    if (saved && this._translations[saved]) {
-      this._currentLang = saved;
+    // 서버에서 전달한 국가 정보 확인
+    const countryMeta = document.querySelector('meta[name="user-country"]');
+    const userCountry = countryMeta ? countryMeta.getAttribute('content').toUpperCase() : '';
+    this._isKoreaIP = (userCountry === 'KR');
+
+    if (this._isKoreaIP) {
+      // 한국 IP: 무조건 한국어, localStorage도 강제
+      this._currentLang = 'ko';
+      localStorage.setItem('quantarium_lang', 'ko');
     } else {
-      // Auto-detect from browser
-      const browserLang = (navigator.language || navigator.userLanguage || 'ko').substring(0, 2);
-      this._currentLang = this._translations[browserLang] ? browserLang : 'ko';
+      const saved = localStorage.getItem('quantarium_lang');
+      if (saved && this._translations[saved]) {
+        this._currentLang = saved;
+      } else {
+        // Auto-detect from browser
+        const browserLang = (navigator.language || navigator.userLanguage || 'ko').substring(0, 2);
+        this._currentLang = this._translations[browserLang] ? browserLang : 'ko';
+      }
     }
     document.documentElement.lang = this._currentLang;
     this.applyAll();
@@ -80,6 +99,13 @@ const I18N = {
 function createLangSelector(containerId) {
   const container = document.getElementById(containerId);
   if (!container) return;
+
+  // 한국 IP에서는 언어 선택기 완전히 숨김
+  if (I18N.isKoreaIP()) {
+    container.innerHTML = '';
+    container.style.display = 'none';
+    return;
+  }
 
   const langs = [
     { code: 'ko', label: '\ud55c\uad6d\uc5b4', flag: '\ud83c\uddf0\ud83c\uddf7' },
