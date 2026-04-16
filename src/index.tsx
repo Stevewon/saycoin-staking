@@ -8,10 +8,21 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
+// No-cache for HTML pages (prevent stale browser cache)
+app.use('*', async (c, next) => {
+  await next()
+  const ct = c.res.headers.get('content-type') || ''
+  if (ct.includes('text/html')) {
+    c.res.headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
+    c.res.headers.set('Pragma', 'no-cache')
+    c.res.headers.set('Expires', '0')
+  }
+})
+
 // Enable CORS
 app.use('/api/*', cors())
 
-// Serve static files
+// Serve static files with long cache
 app.use('/static/*', serveStatic({ root: './public' }))
 
 // ============================================
