@@ -3908,7 +3908,7 @@ app.get('/dashboard', (c) => {
                                     <div class="flex justify-between items-start mb-2">
                                         <div>
                                             <p class="font-bold text-lg text-gray-800">$\${s.amount.toLocaleString()}</p>
-                                            <p class="text-sm text-gray-600">\${s.period_days || (s.period_months * 30)}${I18N.t('dash.days')} ${I18N.t('dash.staking_term')}</p>
+                                            <p class="text-sm text-gray-600">\${s.period_days || (s.period_months * 30)}\${I18N.t('dash.days')} \${I18N.t('dash.staking_term')}</p>
                                         </div>
                                         <span class="px-3 py-1 bg-\${statusColor}-100 text-\${statusColor}-700 rounded-full text-sm font-medium">
                                             \${statusText}
@@ -3930,15 +3930,15 @@ app.get('/dashboard', (c) => {
                                             <p class="font-bold text-yellow-600">\${(s.qkey_reward || 0).toLocaleString()}</p>
                                         </div>
                                         <div>
-                                            <p class="text-gray-600">${I18N.t('dash.daily_rate')}</p>
+                                            <p class="text-gray-600">\${I18N.t('dash.daily_rate')}</p>
                                             <p class="font-bold text-green-600">\${s.daily_rate ? (s.daily_rate * 100).toFixed(1) + '%' : '-'}</p>
                                         </div>
                                         <div>
-                                            <p class="text-gray-600">${I18N.t('dash.start_date')}</p>
+                                            <p class="text-gray-600">\${I18N.t('dash.start_date')}</p>
                                             <p class="font-medium">\${startDate}</p>
                                         </div>
                                         <div>
-                                            <p class="text-gray-600">${I18N.t('dash.end_date')}</p>
+                                            <p class="text-gray-600">\${I18N.t('dash.end_date')}</p>
                                             <p class="font-medium">\${endDate}</p>
                                         </div>
                                     </div>
