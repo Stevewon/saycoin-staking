@@ -33,6 +33,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.invalid_phone': '올바른 전화번호 형식이 아닙니다 (010-XXXX-XXXX)',
     'auth.invalid_qkey_wallet': '올바른 QKEY 지갑주소 형식이 아닙니다 (예: 0xE0c1...f0e)',
     'auth.invalid_usdt_wallet': '올바른 USDT 지갑주소 형식이 아닙니다 (예: 0xE0c1...f0e)',
+    'auth.referral_required': '추천인 코드는 필수입니다',
     'auth.invalid_referral': '유효하지 않은 추천인 코드입니다',
     'auth.email_exists': '이미 존재하는 이메일입니다',
     'auth.phone_exists': '이미 등록된 전화번호입니다',
@@ -143,6 +144,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.invalid_phone': 'Invalid phone number format (010-XXXX-XXXX)',
     'auth.invalid_qkey_wallet': 'Invalid QKEY wallet address format (e.g., 0xE0c1...f0e)',
     'auth.invalid_usdt_wallet': 'Invalid USDT wallet address format (e.g., 0xE0c1...f0e)',
+    'auth.referral_required': 'Referral code is required',
     'auth.invalid_referral': 'Invalid referral code',
     'auth.email_exists': 'Email already exists',
     'auth.phone_exists': 'Phone number already registered',
@@ -253,6 +255,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.invalid_phone': '正しい電話番号形式ではありません (010-XXXX-XXXX)',
     'auth.invalid_qkey_wallet': '正しいQKEYウォレットアドレス形式ではありません (例: 0xE0c1...f0e)',
     'auth.invalid_usdt_wallet': '正しいUSDTウォレットアドレス形式ではありません (例: 0xE0c1...f0e)',
+    'auth.referral_required': '紹介コードは必須です',
     'auth.invalid_referral': '無効な紹介コードです',
     'auth.email_exists': 'すでに存在するメールアドレスです',
     'auth.phone_exists': 'すでに登録されている電話番号です',
@@ -363,6 +366,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.invalid_phone': '电话号码格式不正确 (010-XXXX-XXXX)',
     'auth.invalid_qkey_wallet': 'QKEY钱包地址格式不正确 (例: 0xE0c1...f0e)',
     'auth.invalid_usdt_wallet': 'USDT钱包地址格式不正确 (例: 0xE0c1...f0e)',
+    'auth.referral_required': '推荐码为必填项',
     'auth.invalid_referral': '无效的推荐码',
     'auth.email_exists': '该邮箱已存在',
     'auth.phone_exists': '该电话号码已注册',
@@ -473,6 +477,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.invalid_phone': 'Định dạng số điện thoại không hợp lệ (010-XXXX-XXXX)',
     'auth.invalid_qkey_wallet': 'Định dạng địa chỉ ví QKEY không hợp lệ (VD: 0xE0c1...f0e)',
     'auth.invalid_usdt_wallet': 'Định dạng địa chỉ ví USDT không hợp lệ (VD: 0xE0c1...f0e)',
+    'auth.referral_required': 'Mã giới thiệu là bắt buộc',
     'auth.invalid_referral': 'Mã giới thiệu không hợp lệ',
     'auth.email_exists': 'Email đã tồn tại',
     'auth.phone_exists': 'Số điện thoại đã được đăng ký',
@@ -583,6 +588,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.invalid_phone': 'รูปแบบหมายเลขโทรศัพท์ไม่ถูกต้อง (010-XXXX-XXXX)',
     'auth.invalid_qkey_wallet': 'รูปแบบที่อยู่กระเป๋า QKEY ไม่ถูกต้อง (เช่น 0xE0c1...f0e)',
     'auth.invalid_usdt_wallet': 'รูปแบบที่อยู่กระเป๋า USDT ไม่ถูกต้อง (เช่น 0xE0c1...f0e)',
+    'auth.referral_required': 'ต้องระบุรหัสแนะนำ',
     'auth.invalid_referral': 'รหัสแนะนำไม่ถูกต้อง',
     'auth.email_exists': 'อีเมลนี้มีอยู่แล้ว',
     'auth.phone_exists': 'หมายเลขโทรศัพท์นี้ลงทะเบียนแล้ว',
@@ -829,18 +835,19 @@ app.post('/api/auth/register', async (c) => {
 
     const db = c.env.DB
 
-    // 추천인 코드 검증 (선택사항)
-    let referrerId = null
-    if (referralCode && referralCode.trim()) {
-      const referrer = await db.prepare('SELECT id FROM users WHERE referral_code = ?')
-        .bind(referralCode.trim().toUpperCase())
-        .first()
-      
-      if (!referrer) {
-        return c.json({ error: t(c, 'auth.invalid_referral') }, 400)
-      }
-      referrerId = referrer.id
+    // 추천인 코드 검증 (필수)
+    if (!referralCode || !referralCode.trim()) {
+      return c.json({ error: t(c, 'auth.referral_required') }, 400)
     }
+    let referrerId = null
+    const referrer = await db.prepare('SELECT id FROM users WHERE referral_code = ?')
+      .bind(referralCode.trim().toUpperCase())
+      .first()
+    
+    if (!referrer) {
+      return c.json({ error: t(c, 'auth.invalid_referral') }, 400)
+    }
+    referrerId = referrer.id
 
     // 이메일 중복 체크 (소문자로 비교)
     const existingEmail = await db.prepare('SELECT id FROM users WHERE LOWER(email) = ?')
@@ -2972,13 +2979,13 @@ app.get('/', (c) => {
                             </div>
                         </div>
                         <div class="mb-4 sm:mb-6">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.referral_code">추천인 코드 (선택사항)</label>
-                            <input type="text" id="registerReferralCode"
+                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.referral_code">추천인 코드</label>
+                            <input type="text" id="registerReferralCode" required
                                 placeholder="QTA123456"
                                 maxlength="9"
                                 style="text-transform: uppercase"
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
-                            <p class="text-xs text-gray-500 mt-1" data-i18n="register.referral_hint">추천인이 있다면 추천인 코드를 입력하세요</p>
+                            <p class="text-xs text-red-500 mt-1" data-i18n="register.referral_required">추천인 코드는 필수입니다</p>
                         </div>
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-2 sm:py-3 rounded-lg font-bold hover:bg-purple-700 transition text-sm sm:text-base" data-i18n="common.register">
@@ -3164,6 +3171,13 @@ app.get('/', (c) => {
 
                 console.log('입력값:', { name, email, phone, walletAddress, usdtWalletAddress, password, passwordConfirm, referralCode, country, language });
 
+                // 추천인 코드 필수 검증
+                if (!referralCode) {
+                    alert(I18N.t('register.referral_required_alert'));
+                    document.getElementById('registerReferralCode').focus();
+                    return;
+                }
+
                 // 비밀번호 확인 검증
                 if (password !== passwordConfirm) {
                     alert(I18N.t('register.password_mismatch'));
@@ -3191,7 +3205,7 @@ app.get('/', (c) => {
                         password, 
                         walletAddress,
                         usdtWalletAddress,
-                        referralCode: referralCode || null,
+                        referralCode: referralCode,
                         country,
                         language
                     });
@@ -3238,6 +3252,22 @@ app.get('/', (c) => {
             // Initialize i18n
             I18N.init();
             createLangSelector('langSelector');
+
+            // URL ?ref=CODE 파라미터로 추천인 자동 입력 + 회원가입 폼 표시
+            (function() {
+                var params = new URLSearchParams(window.location.search);
+                var refCode = params.get('ref');
+                if (refCode) {
+                    var refInput = document.getElementById('registerReferralCode');
+                    if (refInput) {
+                        refInput.value = refCode.toUpperCase();
+                        refInput.readOnly = true;
+                        refInput.style.backgroundColor = '#f3f4f6';
+                        refInput.style.cursor = 'not-allowed';
+                    }
+                    showRegister();
+                }
+            })();
 
             async function handleFindPassword(e) {
                 e.preventDefault();
@@ -3638,10 +3668,10 @@ app.get('/dashboard', (c) => {
                                 <p class="text-2xl sm:text-3xl font-bold tracking-wider" id="myReferralCode">-</p>
                                 <button onclick="copyReferralCode()" 
                                     class="bg-white bg-opacity-20 hover:bg-opacity-30 text-white px-4 py-2 rounded-lg transition">
-                                    <i class="fas fa-copy mr-1"></i><span data-i18n="common.copy">Copy</span>
+                                    <i class="fas fa-link mr-1"></i><span data-i18n="dash.copy_referral_link">추천링크 복사</span>
                                 </button>
                             </div>
-                            <p class="text-xs opacity-75 mt-2" data-i18n="dash.referral_invite">이 코드로 친구를 초대하고 보상을 받으세요!</p>
+                            <p class="text-xs opacity-75 mt-2" data-i18n="dash.referral_invite">추천링크를 공유하고 보상을 받으세요!</p>
                         </div>
                     </div>
 
@@ -4553,14 +4583,22 @@ app.get('/dashboard', (c) => {
                 });
             }
 
-            // 추천인 코드 복사
+            // 추천인 링크 복사
             function copyReferralCode() {
                 const code = document.getElementById('myReferralCode').textContent;
                 if (code && code !== '-') {
-                    navigator.clipboard.writeText(code).then(() => {
-                        alert(I18N.t('alert.referral_copied'));
+                    var referralLink = window.location.origin + '/?ref=' + code;
+                    navigator.clipboard.writeText(referralLink).then(() => {
+                        alert(I18N.t('alert.referral_link_copied'));
                     }).catch(() => {
-                        alert(I18N.t('alert.copy_fail'));
+                        // fallback for older browsers
+                        var tmp = document.createElement('textarea');
+                        tmp.value = referralLink;
+                        document.body.appendChild(tmp);
+                        tmp.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(tmp);
+                        alert(I18N.t('alert.referral_link_copied'));
                     });
                 }
             }
