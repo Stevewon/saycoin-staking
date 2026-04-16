@@ -6426,4 +6426,106 @@ app.get('/admin/dashboard', (c) => {
   `)
 })
 
+// SSL/Connection diagnostic page
+app.get('/check', (c) => {
+  const cfRay = c.req.header('CF-Ray') || 'N/A';
+  const cfCountry = c.req.header('CF-IPCountry') || 'N/A';
+  const cfConnectingIP = c.req.header('CF-Connecting-IP') || 'N/A';
+  const cfVisitor = c.req.header('CF-Visitor') || 'N/A';
+  const proto = c.req.header('X-Forwarded-Proto') || 'N/A';
+  const tlsVersion = c.req.header('CF-TLS-Version') || 'N/A';
+  const tlsCipher = c.req.header('CF-TLS-Cipher') || 'N/A';
+  const ua = c.req.header('User-Agent') || 'N/A';
+  
+  return c.html(`<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Connection Check</title>
+<style>
+body { font-family: -apple-system, sans-serif; padding: 20px; background: #f0f0f0; }
+.card { background: white; border-radius: 12px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+.ok { color: #16a34a; font-weight: bold; }
+.warn { color: #ea580c; font-weight: bold; }
+.err { color: #dc2626; font-weight: bold; }
+h1 { font-size: 1.5em; text-align: center; }
+h2 { font-size: 1.1em; margin-top: 0; border-bottom: 1px solid #eee; padding-bottom: 8px; }
+.row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f5f5f5; }
+.label { color: #666; font-size: 0.9em; }
+.value { font-weight: 500; font-size: 0.9em; text-align: right; max-width: 60%; word-break: break-all; }
+#js-results .row { opacity: 0; animation: fadeIn 0.3s forwards; }
+@keyframes fadeIn { to { opacity: 1; } }
+</style>
+</head>
+<body>
+<h1>QUANTARIUM Connection Check</h1>
+<div class="card">
+  <h2>Server Info</h2>
+  <div class="row"><span class="label">Status</span><span class="value ok">Connected OK</span></div>
+  <div class="row"><span class="label">Protocol</span><span class="value">${proto}</span></div>
+  <div class="row"><span class="label">TLS Version</span><span class="value">${tlsVersion || 'N/A'}</span></div>
+  <div class="row"><span class="label">Country</span><span class="value">${cfCountry}</span></div>
+  <div class="row"><span class="label">CF-Ray</span><span class="value">${cfRay}</span></div>
+  <div class="row"><span class="label">Visitor</span><span class="value">${cfVisitor}</span></div>
+</div>
+<div class="card">
+  <h2>Client Info</h2>
+  <div class="row"><span class="label">IP</span><span class="value">${cfConnectingIP}</span></div>
+  <div class="row"><span class="label">User-Agent</span><span class="value" style="font-size:0.75em">${ua}</span></div>
+</div>
+<div class="card" id="js-results">
+  <h2>Browser SSL Check</h2>
+  <div id="ssl-status"><span class="label">Checking...</span></div>
+</div>
+<div class="card">
+  <h2>Help</h2>
+  <p style="font-size:0.85em; color:#555; line-height:1.6;">
+    If you see this page, your connection to QUANTARIUM is <span class="ok">working correctly</span>.<br><br>
+    If the main page shows a security warning:<br>
+    1. Chrome > Settings > Privacy > Clear browsing data > All time > Delete<br>
+    2. Turn airplane mode ON for 5 sec, then OFF<br>
+    3. Try again: <a href="https://quantarium.co.kr/">quantarium.co.kr</a>
+  </p>
+</div>
+<script>
+(function(){
+  var el = document.getElementById('ssl-status');
+  var html = '';
+  
+  // Check if page loaded over HTTPS
+  var isHttps = location.protocol === 'https:';
+  html += '<div class="row"><span class="label">HTTPS</span><span class="value ' + (isHttps ? 'ok' : 'err') + '">' + (isHttps ? 'YES' : 'NO') + '</span></div>';
+  
+  // Check page load time
+  if (window.performance) {
+    var nav = performance.getEntriesByType('navigation')[0];
+    if (nav) {
+      var dns = Math.round(nav.domainLookupEnd - nav.domainLookupStart);
+      var ssl = Math.round(nav.secureConnectionStart > 0 ? nav.connectEnd - nav.secureConnectionStart : 0);
+      var ttfb = Math.round(nav.responseStart - nav.requestStart);
+      var total = Math.round(nav.loadEventEnd - nav.startTime);
+      html += '<div class="row"><span class="label">DNS</span><span class="value">' + dns + 'ms</span></div>';
+      html += '<div class="row"><span class="label">SSL Handshake</span><span class="value">' + ssl + 'ms</span></div>';
+      html += '<div class="row"><span class="label">TTFB</span><span class="value">' + ttfb + 'ms</span></div>';
+      html += '<div class="row"><span class="label">Total Load</span><span class="value">' + total + 'ms</span></div>';
+    }
+  }
+  
+  // Test fetch to main page
+  fetch('/', {method: 'HEAD'}).then(function(r) {
+    html += '<div class="row"><span class="label">Fetch Test</span><span class="value ' + (r.ok ? 'ok' : 'err') + '">' + r.status + '</span></div>';
+    el.innerHTML = html;
+  }).catch(function(e) {
+    html += '<div class="row"><span class="label">Fetch Error</span><span class="value err">' + e.message + '</span></div>';
+    el.innerHTML = html;
+  });
+  
+  setTimeout(function(){ if(!el.innerHTML.includes('Fetch')) el.innerHTML = html || '<div class="row"><span class="value warn">Timeout</span></div>'; }, 5000);
+})();
+</script>
+</body>
+</html>`);
+})
+
 export default app
