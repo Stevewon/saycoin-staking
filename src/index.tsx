@@ -48,6 +48,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.find_id_error': '아이디 찾기 중 오류가 발생했습니다',
     'auth.email_phone_required': '이메일과 전화번호를 입력해주세요',
     'auth.temp_password_issued': '임시 비밀번호가 발급되었습니다. 로그인 후 반드시 비밀번호를 변경해주세요.',
+    'auth.wallet_required': 'QKEY 지갑주소를 입력해주세요',
     'auth.find_pw_error': '비밀번호 찾기 중 오류가 발생했습니다',
     'profile.required_fields': '필수 정보를 입력해주세요',
     'profile.update_success': '프로필이 업데이트되었습니다',
@@ -159,6 +160,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.find_id_error': 'An error occurred while finding ID',
     'auth.email_phone_required': 'Please enter email and phone number',
     'auth.temp_password_issued': 'Temporary password has been issued. Please change your password after login.',
+    'auth.wallet_required': 'Please enter your QKEY wallet address',
     'auth.find_pw_error': 'An error occurred while finding password',
     'profile.required_fields': 'Required fields are missing',
     'profile.update_success': 'Profile has been updated',
@@ -270,6 +272,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.find_id_error': 'ID検索中にエラーが発生しました',
     'auth.email_phone_required': 'メールアドレスと電話番号を入力してください',
     'auth.temp_password_issued': '仮パスワードが発行されました。ログイン後、必ずパスワードを変更してください。',
+    'auth.wallet_required': 'QKEYウォレットアドレスを入力してください',
     'auth.find_pw_error': 'パスワード検索中にエラーが発生しました',
     'profile.required_fields': '必須情報を入力してください',
     'profile.update_success': 'プロフィールが更新されました',
@@ -381,6 +384,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.find_id_error': '查找ID时发生错误',
     'auth.email_phone_required': '请输入邮箱和电话号码',
     'auth.temp_password_issued': '临时密码已发放。请登录后务必更改密码。',
+    'auth.wallet_required': '请输入QKEY钱包地址',
     'auth.find_pw_error': '查找密码时发生错误',
     'profile.required_fields': '请输入必填信息',
     'profile.update_success': '个人资料已更新',
@@ -492,6 +496,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.find_id_error': 'Đã xảy ra lỗi khi tìm ID',
     'auth.email_phone_required': 'Vui lòng nhập email và số điện thoại',
     'auth.temp_password_issued': 'Mật khẩu tạm thời đã được cấp. Vui lòng đổi mật khẩu sau khi đăng nhập.',
+    'auth.wallet_required': 'Vui lòng nhập địa chỉ ví QKEY',
     'auth.find_pw_error': 'Đã xảy ra lỗi khi tìm mật khẩu',
     'profile.required_fields': 'Vui lòng nhập thông tin bắt buộc',
     'profile.update_success': 'Hồ sơ đã được cập nhật',
@@ -603,6 +608,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'auth.find_id_error': 'เกิดข้อผิดพลาดในการค้นหา ID',
     'auth.email_phone_required': 'กรุณากรอกอีเมลและหมายเลขโทรศัพท์',
     'auth.temp_password_issued': 'รหัสผ่านชั่วคราวถูกออกแล้ว กรุณาเปลี่ยนรหัสผ่านหลังเข้าสู่ระบบ',
+    'auth.wallet_required': 'กรุณากรอกที่อยู่กระเป๋า QKEY',
     'auth.find_pw_error': 'เกิดข้อผิดพลาดในการค้นหารหัสผ่าน',
     'profile.required_fields': 'กรุณากรอกข้อมูลที่จำเป็น',
     'profile.update_success': 'โปรไฟล์ได้รับการอัปเดตแล้ว',
@@ -981,17 +987,21 @@ app.post('/api/auth/login', async (c) => {
 // 아이디 찾기 (이름 + 전화번호)
 app.post('/api/auth/find-id', async (c) => {
   try {
-    const { name, phone } = await c.req.json()
+    const { walletAddress } = await c.req.json()
 
-    if (!name || !phone) {
-      return c.json({ error: t(c, 'auth.name_phone_required') }, 400)
+    if (!walletAddress) {
+      return c.json({ error: t(c, 'auth.wallet_required') }, 400)
+    }
+
+    if (!walletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+      return c.json({ error: t(c, 'auth.invalid_qkey_wallet') }, 400)
     }
 
     const db = c.env.DB
 
     const user = await db.prepare(`
-      SELECT email FROM users WHERE name = ? AND phone = ?
-    `).bind(name, phone).first()
+      SELECT email FROM users WHERE wallet_address = ?
+    `).bind(walletAddress).first()
 
     if (!user) {
       return c.json({ error: t(c, 'auth.account_not_found') }, 404)
@@ -1006,20 +1016,24 @@ app.post('/api/auth/find-id', async (c) => {
   }
 })
 
-// 비밀번호 찾기 (이메일 + 전화번호)
+// 비밀번호 찾기 (QKEY 지갑주소)
 app.post('/api/auth/find-password', async (c) => {
   try {
-    const { email, phone } = await c.req.json()
+    const { walletAddress } = await c.req.json()
 
-    if (!email || !phone) {
-      return c.json({ error: t(c, 'auth.email_phone_required') }, 400)
+    if (!walletAddress) {
+      return c.json({ error: t(c, 'auth.wallet_required') }, 400)
+    }
+
+    if (!walletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+      return c.json({ error: t(c, 'auth.invalid_qkey_wallet') }, 400)
     }
 
     const db = c.env.DB
 
     const user = await db.prepare(`
-      SELECT id FROM users WHERE email = ? AND phone = ?
-    `).bind(email, phone).first()
+      SELECT id FROM users WHERE wallet_address = ?
+    `).bind(walletAddress).first()
 
     if (!user) {
       return c.json({ error: t(c, 'auth.account_not_found') }, 404)
@@ -2968,18 +2982,13 @@ app.get('/', (c) => {
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6" data-i18n="login.title">로그인</h2>
                     <form onsubmit="handleLogin(event)">
                         <div class="mb-4">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="login.email">이메일</label>
-                            <div class="flex gap-1 items-center w-full">
-                                <input type="text" id="loginEmailId" required
-                                    placeholder="example"
-                                    class="flex-1 min-w-0 px-2 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                <span class="text-gray-600 text-sm">@</span>
-                                <select id="loginEmailDomain" required
-                                    class="flex-1 min-w-0 px-1 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                    <option value="gmail.com" selected>gmail.com</option>
-                                    <option value="naver.com">naver.com</option>
-                                </select>
-                            </div>
+                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="login.id">아이디</label>
+                            <input type="text" id="loginId" required
+                                placeholder="example123"
+                                pattern="[a-zA-Z][a-zA-Z0-9]*"
+                                oninput="this.value = this.value.replace(/[^a-zA-Z0-9]/g, '')"
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                            <p class="text-xs text-gray-500 mt-1" data-i18n="login.id_hint">영문 또는 영문+숫자</p>
                         </div>
                         <div class="mb-4 sm:mb-6">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="login.password">비밀번호</label>
@@ -3012,18 +3021,31 @@ app.get('/', (c) => {
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
                         </div>
                         <div class="mb-3 sm:mb-4">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.email">이메일</label>
-                            <div class="flex gap-1 items-center w-full">
-                                <input type="text" id="registerEmailId" required
-                                    placeholder="example"
-                                    class="flex-1 min-w-0 px-2 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                <span class="text-gray-600 text-sm">@</span>
-                                <select id="registerEmailDomain" required
-                                    class="flex-1 min-w-0 px-1 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                    <option value="gmail.com" selected>gmail.com</option>
-                                    <option value="naver.com">naver.com</option>
-                                </select>
-                            </div>
+                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.id">아이디</label>
+                            <input type="text" id="registerId" required
+                                placeholder="example123"
+                                pattern="[a-zA-Z][a-zA-Z0-9]*"
+                                oninput="this.value = this.value.replace(/[^a-zA-Z0-9]/g, '')"
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                            <p class="text-xs text-gray-500 mt-1" data-i18n="register.id_hint">영문 또는 영문+숫자</p>
+                        </div>
+                        <div class="mb-3 sm:mb-4">
+                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.password">비밀번호</label>
+                            <input type="password" id="registerPassword" required
+                                minlength="4"
+                                data-i18n-placeholder="register.password_input"
+                                placeholder="비밀번호 입력"
+                                autocomplete="new-password"
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                        </div>
+                        <div class="mb-3 sm:mb-4">
+                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.password_confirm">비밀번호 확인</label>
+                            <input type="password" id="registerPasswordConfirm" required
+                                minlength="4"
+                                data-i18n-placeholder="register.password_reinput"
+                                placeholder="비밀번호 재입력"
+                                autocomplete="new-password"
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
                         </div>
                         <div class="mb-3 sm:mb-4">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.phone">전화번호</label>
@@ -3046,24 +3068,6 @@ app.get('/', (c) => {
                                     class="w-1/3 px-2 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-center text-sm sm:text-base">
                             </div>
                             <p class="text-xs text-gray-500 mt-1" data-i18n="register.phone_hint">숫자만 입력하세요 (예: 010-1234-5678)</p>
-                        </div>
-                        <div class="mb-3 sm:mb-4">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.password">비밀번호</label>
-                            <input type="password" id="registerPassword" required
-                                minlength="4"
-                                data-i18n-placeholder="register.password_input"
-                                placeholder="비밀번호 입력"
-                                autocomplete="new-password"
-                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
-                        </div>
-                        <div class="mb-3 sm:mb-4">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.password_confirm">비밀번호 확인</label>
-                            <input type="password" id="registerPasswordConfirm" required
-                                minlength="4"
-                                data-i18n-placeholder="register.password_reinput"
-                                placeholder="비밀번호 재입력"
-                                autocomplete="new-password"
-                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
                         </div>
                         <div class="mb-4 sm:mb-6">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.qkey_wallet">QKEY 지갑주소</label>
@@ -3117,31 +3121,12 @@ app.get('/', (c) => {
                 <div id="findIdForm" class="hidden">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6" data-i18n="find_id.title">아이디 찾기</h2>
                     <form onsubmit="handleFindId(event)">
-                        <div class="mb-3 sm:mb-4">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="find_id.name">이름</label>
-                            <input type="text" id="findIdName" required
-                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
-                        </div>
                         <div class="mb-4 sm:mb-6">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="find_id.phone">전화번호</label>
-                            <div class="flex gap-1 sm:gap-2 w-full">
-                                <input type="text" value="010" disabled
-                                    class="w-1/3 px-2 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg bg-gray-100 text-center font-bold text-sm sm:text-base">
-                                <input type="tel" id="findIdPhone1" required
-                                    placeholder="1234"
-                                    maxlength="4"
-                                    pattern="[0-9]{4}"
-                                    inputmode="numeric"
-                                    oninput="this.value = this.value.replace(/[^0-9]/g, '').slice(0, 4); if(this.value.length === 4) document.getElementById('findIdPhone2').focus();"
-                                    class="w-1/3 px-2 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-center text-sm sm:text-base">
-                                <input type="tel" id="findIdPhone2" required
-                                    placeholder="5678"
-                                    maxlength="4"
-                                    pattern="[0-9]{4}"
-                                    inputmode="numeric"
-                                    oninput="this.value = this.value.replace(/[^0-9]/g, '').slice(0, 4);"
-                                    class="w-1/3 px-2 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-center text-sm sm:text-base">
-                            </div>
+                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="find_id.wallet">QKEY 지갑주소</label>
+                            <input type="text" id="findIdWallet" required
+                                placeholder="0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e"
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base break-all">
+                            <p class="text-xs text-gray-500 mt-1" data-i18n="find_id.wallet_hint">회원가입 시 등록한 QKEY 지갑주소를 입력하세요</p>
                         </div>
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-2 sm:py-3 rounded-lg font-bold hover:bg-purple-700 transition text-sm sm:text-base" data-i18n="login.find_id">
@@ -3157,40 +3142,12 @@ app.get('/', (c) => {
                 <div id="findPasswordForm" class="hidden">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6" data-i18n="find_pw.title">비밀번호 찾기</h2>
                     <form onsubmit="handleFindPassword(event)">
-                        <div class="mb-3 sm:mb-4">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="find_pw.email">이메일</label>
-                            <div class="flex gap-1 items-center w-full">
-                                <input type="text" id="findPasswordEmailId" required
-                                    placeholder="example"
-                                    class="flex-1 min-w-0 px-2 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                <span class="text-gray-600 text-sm">@</span>
-                                <select id="findPasswordEmailDomain" required
-                                    class="flex-1 min-w-0 px-1 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                    <option value="gmail.com" selected>gmail.com</option>
-                                    <option value="naver.com">naver.com</option>
-                                </select>
-                            </div>
-                        </div>
                         <div class="mb-4 sm:mb-6">
-                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="find_pw.phone">전화번호</label>
-                            <div class="flex gap-1 sm:gap-2 w-full">
-                                <input type="text" value="010" disabled
-                                    class="w-1/3 px-2 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg bg-gray-100 text-center font-bold text-sm sm:text-base">
-                                <input type="tel" id="findPasswordPhone1" required
-                                    placeholder="1234"
-                                    maxlength="4"
-                                    pattern="[0-9]{4}"
-                                    inputmode="numeric"
-                                    oninput="this.value = this.value.replace(/[^0-9]/g, '').slice(0, 4); if(this.value.length === 4) document.getElementById('findPasswordPhone2').focus();"
-                                    class="w-1/3 px-2 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-center text-sm sm:text-base">
-                                <input type="tel" id="findPasswordPhone2" required
-                                    placeholder="5678"
-                                    maxlength="4"
-                                    pattern="[0-9]{4}"
-                                    inputmode="numeric"
-                                    oninput="this.value = this.value.replace(/[^0-9]/g, '').slice(0, 4);"
-                                    class="w-1/3 px-2 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-center text-sm sm:text-base">
-                            </div>
+                            <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="find_pw.wallet">QKEY 지갑주소</label>
+                            <input type="text" id="findPasswordWallet" required
+                                placeholder="0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e"
+                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base break-all">
+                            <p class="text-xs text-gray-500 mt-1" data-i18n="find_pw.wallet_hint">회원가입 시 등록한 QKEY 지갑주소를 입력하세요</p>
                         </div>
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-2 sm:py-3 rounded-lg font-bold hover:bg-purple-700 transition text-sm sm:text-base" data-i18n="login.find_password">
@@ -3212,7 +3169,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416d"></script>
+        <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             function showRegister() {
                 document.getElementById('loginForm').classList.add('hidden');
@@ -3256,9 +3213,7 @@ app.get('/', (c) => {
 
             async function handleLogin(e) {
                 e.preventDefault();
-                const emailId = document.getElementById('loginEmailId').value;
-                const emailDomain = document.getElementById('loginEmailDomain').value;
-                const email = emailId + '@' + emailDomain;
+                const email = document.getElementById('loginId').value.toLowerCase().trim();
                 const password = document.getElementById('loginPassword').value;
 
                 try {
@@ -3277,9 +3232,7 @@ app.get('/', (c) => {
                 console.log('회원가입 버튼 클릭됨');
                 
                 const name = document.getElementById('registerName').value;
-                const emailId = document.getElementById('registerEmailId').value;
-                const emailDomain = document.getElementById('registerEmailDomain').value;
-                const email = emailId + '@' + emailDomain;
+                const email = document.getElementById('registerId').value.toLowerCase().trim();
                 const phone1 = document.getElementById('registerPhone1').value;
                 const phone2 = document.getElementById('registerPhone2').value;
                 const phone = '010-' + phone1 + '-' + phone2;
@@ -3347,8 +3300,7 @@ app.get('/', (c) => {
                         showLogin();
                         // 폼 초기화
                         document.getElementById('registerName').value = '';
-                        document.getElementById('registerEmailId').value = '';
-                        document.getElementById('registerEmailDomain').value = '';
+                        document.getElementById('registerId').value = '';
                         document.getElementById('registerPhone1').value = '';
                         document.getElementById('registerPhone2').value = '';
                         document.getElementById('registerWallet').value = '';
@@ -3364,13 +3316,15 @@ app.get('/', (c) => {
 
             async function handleFindId(e) {
                 e.preventDefault();
-                const name = document.getElementById('findIdName').value;
-                const phone1 = document.getElementById('findIdPhone1').value;
-                const phone2 = document.getElementById('findIdPhone2').value;
-                const phone = '010-' + phone1 + '-' + phone2;
+                const walletAddress = document.getElementById('findIdWallet').value.trim();
+
+                if (!walletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+                    alert(I18N.t('register.qkey_wallet_hint'));
+                    return;
+                }
 
                 try {
-                    const response = await axios.post('/api/auth/find-id', { name, phone });
+                    const response = await axios.post('/api/auth/find-id', { walletAddress });
                     if (response.data.success) {
                         alert(I18N.t('find_id.result') + response.data.email);
                         showLogin();
@@ -3402,15 +3356,15 @@ app.get('/', (c) => {
 
             async function handleFindPassword(e) {
                 e.preventDefault();
-                const emailId = document.getElementById('findPasswordEmailId').value;
-                const emailDomain = document.getElementById('findPasswordEmailDomain').value;
-                const email = emailId + '@' + emailDomain;
-                const phone1 = document.getElementById('findPasswordPhone1').value;
-                const phone2 = document.getElementById('findPasswordPhone2').value;
-                const phone = '010-' + phone1 + '-' + phone2;
+                const walletAddress = document.getElementById('findPasswordWallet').value.trim();
+
+                if (!walletAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+                    alert(I18N.t('register.qkey_wallet_hint'));
+                    return;
+                }
 
                 try {
-                    const response = await axios.post('/api/auth/find-password', { email, phone });
+                    const response = await axios.post('/api/auth/find-password', { walletAddress });
                     if (response.data.success) {
                         alert(I18N.t('find_pw.result') + response.data.tempPassword + I18N.t('find_pw.result_hint'));
                         showLogin();
@@ -3935,7 +3889,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416d"></script>
+        <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -4996,7 +4950,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416d"></script>
+        <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -5479,7 +5433,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416d"></script>
+        <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             // Initialize i18n
             I18N.init();
