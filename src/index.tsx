@@ -120,7 +120,7 @@ app.post('/api/auth/admin-login', async (c) => {
 // 회원가입
 app.post('/api/auth/register', async (c) => {
   try {
-    const { email, password, name, phone, walletAddress, usdtWalletAddress, referralCode } = await c.req.json()
+    const { email, password, name, phone, walletAddress, usdtWalletAddress, referralCode, country, language } = await c.req.json()
 
     if (!email || !password || !name || !phone || !walletAddress || !usdtWalletAddress) {
       return c.json({ error: '모든 필드를 입력해주세요' }, 400)
@@ -205,9 +205,9 @@ app.post('/api/auth/register', async (c) => {
 
     // 사용자 생성
     const result = await db.prepare(`
-      INSERT INTO users (email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, referrer_id)
-      VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)
-    `).bind(normalizedEmail, hashedPassword, name, cleanPhone, walletAddress, usdtWalletAddress, newReferralCode, referrerId).run()
+      INSERT INTO users (email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, referrer_id, country, language)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?, ?)
+    `).bind(normalizedEmail, hashedPassword, name, cleanPhone, walletAddress, usdtWalletAddress, newReferralCode, referrerId, country || '', language || 'ko').run()
 
     return c.json({ 
       success: true, 
@@ -896,12 +896,14 @@ app.get('/api/admin/users', async (c) => {
         u.qx_balance, 
         u.qkey_balance,
         u.usdt_balance, 
+        u.country,
+        u.language,
         u.created_at,
         COALESCE(SUM(CASE WHEN s.status = 'active' THEN s.amount ELSE 0 END), 0) as staking_amount
       FROM users u
       LEFT JOIN staking s ON u.id = s.user_id
       GROUP BY u.id, u.name, u.email, u.phone, u.wallet_address, u.usdt_wallet_address,
-               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance, u.created_at
+               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance, u.country, u.language, u.created_at
       ORDER BY u.created_at DESC
     `).all()
 
@@ -1393,6 +1395,343 @@ app.get('/api/admin/signups', async (c) => {
     })
   } catch (error) {
     return c.json({ error: '가입 현황 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// ============================================
+// API Routes - Admin Sales & Export
+// ============================================
+
+// 전체 매출 현황 (아이디/이름/판매금액/판매일)
+app.get('/api/admin/sales', async (c) => {
+  try {
+    const db = c.env.DB
+    const sales = await db.prepare(`
+      SELECT 
+        s.id as staking_id,
+        u.id as user_id,
+        u.email,
+        u.name,
+        u.country,
+        u.language,
+        s.amount,
+        s.status,
+        s.created_at as sale_date,
+        s.start_date,
+        s.end_date,
+        s.period_days,
+        s.daily_rate
+      FROM staking s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.status IN ('active', 'completed')
+      ORDER BY s.created_at DESC
+    `).all()
+
+    // 총 매출 집계
+    const totalSales = await db.prepare(`
+      SELECT 
+        COALESCE(SUM(amount), 0) as total_amount,
+        COUNT(*) as total_count
+      FROM staking WHERE status IN ('active', 'completed')
+    `).first()
+
+    const todaySales = await db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as amount, COUNT(*) as count
+      FROM staking WHERE status IN ('active', 'completed') AND DATE(start_date) = DATE('now')
+    `).first()
+
+    const weekSales = await db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as amount, COUNT(*) as count
+      FROM staking WHERE status IN ('active', 'completed') AND start_date >= DATE('now', '-7 days')
+    `).first()
+
+    const monthSales = await db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as amount, COUNT(*) as count
+      FROM staking WHERE status IN ('active', 'completed') AND start_date >= DATE('now', '-30 days')
+    `).first()
+
+    return c.json({
+      success: true,
+      stats: {
+        totalAmount: totalSales?.total_amount || 0,
+        totalCount: totalSales?.total_count || 0,
+        todayAmount: todaySales?.amount || 0,
+        todayCount: todaySales?.count || 0,
+        weekAmount: weekSales?.amount || 0,
+        weekCount: weekSales?.count || 0,
+        monthAmount: monthSales?.amount || 0,
+        monthCount: monthSales?.count || 0
+      },
+      sales: sales.results
+    })
+  } catch (error) {
+    return c.json({ error: '매출 현황 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 회원 산하 매출 조회 (1대/2대/전체)
+app.get('/api/admin/downline-sales/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId')
+    const db = c.env.DB
+
+    // 해당 회원 정보
+    const user = await db.prepare('SELECT id, name, email, referral_code FROM users WHERE id = ?').bind(userId).first()
+    if (!user) return c.json({ error: '회원을 찾을 수 없습니다' }, 404)
+
+    // 1대 (직접 추천) 산하
+    const level1Users = await db.prepare(`
+      SELECT u.id, u.name, u.email, u.country, u.language, u.created_at,
+        COALESCE(SUM(CASE WHEN s.status IN ('active','completed') THEN s.amount ELSE 0 END), 0) as staking_amount
+      FROM users u
+      LEFT JOIN staking s ON u.id = s.user_id
+      WHERE u.referrer_id = ?
+      GROUP BY u.id, u.name, u.email, u.country, u.language, u.created_at
+      ORDER BY staking_amount DESC
+    `).bind(userId).all()
+
+    // 1대 산하 ID 목록
+    const level1Ids = (level1Users.results || []).map((u: any) => u.id)
+
+    // 2대 (간접 추천) 산하
+    let level2Users = { results: [] as any[] }
+    if (level1Ids.length > 0) {
+      const placeholders = level1Ids.map(() => '?').join(',')
+      level2Users = await db.prepare(`
+        SELECT u.id, u.name, u.email, u.country, u.language, u.created_at,
+          COALESCE(SUM(CASE WHEN s.status IN ('active','completed') THEN s.amount ELSE 0 END), 0) as staking_amount,
+          r.name as referrer_name
+        FROM users u
+        LEFT JOIN staking s ON u.id = s.user_id
+        LEFT JOIN users r ON u.referrer_id = r.id
+        WHERE u.referrer_id IN (${placeholders})
+        GROUP BY u.id, u.name, u.email, u.country, u.language, u.created_at, r.name
+        ORDER BY staking_amount DESC
+      `).bind(...level1Ids).all()
+    }
+
+    // 집계
+    const level1Total = (level1Users.results || []).reduce((sum: number, u: any) => sum + (u.staking_amount || 0), 0)
+    const level2Total = (level2Users.results || []).reduce((sum: number, u: any) => sum + (u.staking_amount || 0), 0)
+
+    return c.json({
+      success: true,
+      user: { id: user.id, name: user.name, email: user.email, referral_code: user.referral_code },
+      level1: {
+        count: level1Users.results?.length || 0,
+        totalAmount: level1Total,
+        users: level1Users.results
+      },
+      level2: {
+        count: level2Users.results?.length || 0,
+        totalAmount: level2Total,
+        users: level2Users.results
+      },
+      grandTotal: level1Total + level2Total
+    })
+  } catch (error) {
+    return c.json({ error: '산하 매출 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 회원 검색 API (이메일/이름으로 검색)
+app.get('/api/admin/search-user', async (c) => {
+  try {
+    const query = c.req.query('q') || ''
+    if (!query || query.length < 1) {
+      return c.json({ error: '검색어를 입력해주세요' }, 400)
+    }
+    const db = c.env.DB
+    const searchTerm = '%' + query + '%'
+    const users = await db.prepare(`
+      SELECT u.id, u.name, u.email, u.country, u.language, u.referral_code, u.created_at,
+        COALESCE(SUM(CASE WHEN s.status IN ('active','completed') THEN s.amount ELSE 0 END), 0) as staking_amount
+      FROM users u
+      LEFT JOIN staking s ON u.id = s.user_id
+      WHERE u.email LIKE ? OR u.name LIKE ? OR u.referral_code LIKE ?
+      GROUP BY u.id, u.name, u.email, u.country, u.language, u.referral_code, u.created_at
+      ORDER BY staking_amount DESC
+      LIMIT 20
+    `).bind(searchTerm, searchTerm, searchTerm).all()
+
+    return c.json({ success: true, users: users.results })
+  } catch (error) {
+    return c.json({ error: '회원 검색 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 회원 전체 수당 체크 (모든 회원의 보상 현황)
+app.get('/api/admin/member-rewards', async (c) => {
+  try {
+    const db = c.env.DB
+
+    // 회원별 전체 수당 집계
+    const memberRewards = await db.prepare(`
+      SELECT 
+        u.id, u.name, u.email, u.country, u.language,
+        u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance,
+        COALESCE(SUM(CASE WHEN s.status IN ('active','completed') THEN s.amount ELSE 0 END), 0) as staking_amount,
+        COALESCE(dr.daily_total, 0) as daily_reward_total,
+        COALESCE(rr.referral_total, 0) as referral_reward_total,
+        COALESCE(dr.daily_total, 0) + COALESCE(rr.referral_total, 0) as total_reward
+      FROM users u
+      LEFT JOIN staking s ON u.id = s.user_id
+      LEFT JOIN (
+        SELECT user_id, SUM(usdt_amount) as daily_total FROM daily_rewards GROUP BY user_id
+      ) dr ON u.id = dr.user_id
+      LEFT JOIN (
+        SELECT to_user_id, SUM(qkey_amount) as referral_total FROM referral_rewards GROUP BY to_user_id
+      ) rr ON u.id = rr.to_user_id
+      GROUP BY u.id, u.name, u.email, u.country, u.language,
+               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance,
+               dr.daily_total, rr.referral_total
+      ORDER BY total_reward DESC
+    `).all()
+
+    // 전체 합계
+    const totals = await db.prepare(`
+      SELECT 
+        COALESCE(SUM(usdt_amount), 0) as total_daily_qkey
+      FROM daily_rewards
+    `).first()
+
+    const referralTotals = await db.prepare(`
+      SELECT COALESCE(SUM(qkey_amount), 0) as total_referral_qkey
+      FROM referral_rewards
+    `).first()
+
+    return c.json({
+      success: true,
+      members: memberRewards.results,
+      totals: {
+        totalDailyQkey: totals?.total_daily_qkey || 0,
+        totalReferralQkey: referralTotals?.total_referral_qkey || 0,
+        totalCombined: (totals?.total_daily_qkey || 0) + (referralTotals?.total_referral_qkey || 0)
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '수당 현황 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 엑셀 다운로드 API - CSV 형식 (출금내역)
+app.get('/api/admin/export/withdrawals', async (c) => {
+  try {
+    const db = c.env.DB
+    const withdrawals = await db.prepare(`
+      SELECT w.id, u.email, u.name, w.coin_type, w.amount, w.wallet_address, w.status, w.created_at, w.processed_at
+      FROM withdrawals w
+      JOIN users u ON w.user_id = u.id
+      ORDER BY w.created_at DESC
+    `).all()
+
+    let csv = '\\uFEFFID,이메일,이름,코인종류,수량,지갑주소,상태,신청일,처리일\\n'
+    for (const w of (withdrawals.results || []) as any[]) {
+      const status = w.status === 'pending' ? '대기' : w.status === 'approved' ? '승인' : '거절'
+      csv += `${w.id},"${w.email}","${w.name}",${w.coin_type},${w.amount},"${w.wallet_address}",${status},"${w.created_at}","${w.processed_at || ''}"\n`
+    }
+
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="withdrawals_export.csv"'
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '출금내역 내보내기 실패' }, 500)
+  }
+})
+
+// 엑셀 다운로드 API - CSV 형식 (전체 매출)
+app.get('/api/admin/export/sales', async (c) => {
+  try {
+    const db = c.env.DB
+    const sales = await db.prepare(`
+      SELECT s.id, u.email, u.name, u.country, u.language, s.amount, s.status, s.period_days, s.daily_rate, s.start_date, s.end_date, s.created_at
+      FROM staking s
+      JOIN users u ON s.user_id = u.id
+      ORDER BY s.created_at DESC
+    `).all()
+
+    let csv = '\\uFEFFID,이메일,이름,국가,언어,판매금액($),상태,거치기간(일),일일배당률,시작일,종료일,신청일\\n'
+    for (const s of (sales.results || []) as any[]) {
+      const status = s.status === 'active' ? '진행중' : s.status === 'pending' ? '대기' : s.status === 'rejected' ? '거절' : '완료'
+      csv += `${s.id},"${s.email}","${s.name}","${s.country || ''}","${s.language || ''}",${s.amount},${status},${s.period_days || ''},${s.daily_rate ? (s.daily_rate * 100).toFixed(1) + '%' : ''},"${s.start_date || ''}","${s.end_date || ''}","${s.created_at}"\n`
+    }
+
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="sales_export.csv"'
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '매출내역 내보내기 실패' }, 500)
+  }
+})
+
+// 엑셀 다운로드 API - CSV 형식 (전체 회원)
+app.get('/api/admin/export/users', async (c) => {
+  try {
+    const db = c.env.DB
+    const users = await db.prepare(`
+      SELECT u.id, u.email, u.name, u.phone, u.country, u.language, u.wallet_address, u.usdt_wallet_address,
+        u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance, u.referral_code, u.created_at,
+        COALESCE(SUM(CASE WHEN s.status IN ('active','completed') THEN s.amount ELSE 0 END), 0) as staking_amount
+      FROM users u
+      LEFT JOIN staking s ON u.id = s.user_id
+      GROUP BY u.id
+      ORDER BY u.created_at DESC
+    `).all()
+
+    let csv = '\\uFEFFID,이메일,이름,전화번호,국가,언어,QKEY지갑,USDT지갑,QTA잔액,QX잔액,QKEY잔액,USDT잔액,추천코드,투자금액($),가입일\\n'
+    for (const u of (users.results || []) as any[]) {
+      csv += `${u.id},"${u.email}","${u.name}","${u.phone || ''}","${u.country || ''}","${u.language || ''}","${u.wallet_address}","${u.usdt_wallet_address || ''}",${u.qta_balance},${u.qx_balance},${u.qkey_balance},${u.usdt_balance},"${u.referral_code || ''}",${u.staking_amount},"${u.created_at}"\n`
+    }
+
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="users_export.csv"'
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '회원목록 내보내기 실패' }, 500)
+  }
+})
+
+// 엑셀 다운로드 API - CSV 형식 (회원 수당)
+app.get('/api/admin/export/rewards', async (c) => {
+  try {
+    const db = c.env.DB
+    const rewards = await db.prepare(`
+      SELECT 
+        u.id, u.email, u.name, u.country,
+        u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance,
+        COALESCE(SUM(CASE WHEN s.status IN ('active','completed') THEN s.amount ELSE 0 END), 0) as staking_amount,
+        COALESCE(dr.daily_total, 0) as daily_reward_total,
+        COALESCE(rr.referral_total, 0) as referral_reward_total
+      FROM users u
+      LEFT JOIN staking s ON u.id = s.user_id
+      LEFT JOIN (SELECT user_id, SUM(usdt_amount) as daily_total FROM daily_rewards GROUP BY user_id) dr ON u.id = dr.user_id
+      LEFT JOIN (SELECT to_user_id, SUM(qkey_amount) as referral_total FROM referral_rewards GROUP BY to_user_id) rr ON u.id = rr.to_user_id
+      GROUP BY u.id
+      ORDER BY daily_reward_total DESC
+    `).all()
+
+    let csv = '\\uFEFFID,이메일,이름,국가,투자금액($),일일배당합계(QKEY),추천보상합계(QKEY),총수당(QKEY),QTA잔액,QX잔액,QKEY잔액,USDT잔액\\n'
+    for (const r of (rewards.results || []) as any[]) {
+      csv += `${r.id},"${r.email}","${r.name}","${r.country || ''}",${r.staking_amount},${Math.round(r.daily_reward_total)},${Math.round(r.referral_reward_total)},${Math.round(r.daily_reward_total + r.referral_reward_total)},${r.qta_balance},${r.qx_balance},${r.qkey_balance},${r.usdt_balance}\n`
+    }
+
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="member_rewards_export.csv"'
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '수당내역 내보내기 실패' }, 500)
   }
 })
 
@@ -1903,6 +2242,46 @@ app.get('/', (c) => {
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base break-all">
                             <p class="text-xs text-red-600 mt-1 font-medium">바이낸스(BINANCE) 지갑주소를 입력하십시요</p>
                         </div>
+                        <div class="grid grid-cols-2 gap-2 sm:gap-3 mb-3 sm:mb-4">
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">국가</label>
+                                <select id="registerCountry" required
+                                    class="w-full px-2 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
+                                    <option value="KR" selected>한국 (Korea)</option>
+                                    <option value="US">미국 (USA)</option>
+                                    <option value="JP">일본 (Japan)</option>
+                                    <option value="CN">중국 (China)</option>
+                                    <option value="VN">베트남 (Vietnam)</option>
+                                    <option value="TH">태국 (Thailand)</option>
+                                    <option value="PH">필리핀 (Philippines)</option>
+                                    <option value="ID">인도네시아 (Indonesia)</option>
+                                    <option value="MY">말레이시아 (Malaysia)</option>
+                                    <option value="SG">싱가포르 (Singapore)</option>
+                                    <option value="IN">인도 (India)</option>
+                                    <option value="GB">영국 (UK)</option>
+                                    <option value="DE">독일 (Germany)</option>
+                                    <option value="FR">프랑스 (France)</option>
+                                    <option value="AU">호주 (Australia)</option>
+                                    <option value="CA">캐나다 (Canada)</option>
+                                    <option value="RU">러시아 (Russia)</option>
+                                    <option value="BR">브라질 (Brazil)</option>
+                                    <option value="OTHER">기타 (Other)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 text-sm font-bold mb-2">언어</label>
+                                <select id="registerLanguage" required
+                                    class="w-full px-2 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
+                                    <option value="ko" selected>한국어</option>
+                                    <option value="en">English</option>
+                                    <option value="ja">日本語</option>
+                                    <option value="zh">中文</option>
+                                    <option value="vi">Tiếng Việt</option>
+                                    <option value="th">ไทย</option>
+                                    <option value="other">기타</option>
+                                </select>
+                            </div>
+                        </div>
                         <div class="mb-4 sm:mb-6">
                             <label class="block text-gray-700 text-sm font-bold mb-2">추천인 코드 (선택사항)</label>
                             <input type="text" id="registerReferralCode"
@@ -2090,8 +2469,10 @@ app.get('/', (c) => {
                 const password = document.getElementById('registerPassword').value;
                 const passwordConfirm = document.getElementById('registerPasswordConfirm').value;
                 const referralCode = document.getElementById('registerReferralCode').value.trim().toUpperCase();
+                const country = document.getElementById('registerCountry').value;
+                const language = document.getElementById('registerLanguage').value;
 
-                console.log('입력값:', { name, email, phone, walletAddress, usdtWalletAddress, password, passwordConfirm, referralCode });
+                console.log('입력값:', { name, email, phone, walletAddress, usdtWalletAddress, password, passwordConfirm, referralCode, country, language });
 
                 // 비밀번호 확인 검증
                 if (password !== passwordConfirm) {
@@ -2120,7 +2501,9 @@ app.get('/', (c) => {
                         password, 
                         walletAddress,
                         usdtWalletAddress,
-                        referralCode: referralCode || null
+                        referralCode: referralCode || null,
+                        country,
+                        language
                     });
                     console.log('API 응답:', response.data);
                     
@@ -3888,6 +4271,14 @@ app.get('/admin/dashboard', (c) => {
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
                             <i class="fas fa-user-plus mr-1 sm:mr-2"></i>가입현황
                         </button>
+                        <button onclick="showTab('sales')" id="tab-sales" 
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-chart-bar mr-1 sm:mr-2"></i>매출현황
+                        </button>
+                        <button onclick="showTab('memberRewards')" id="tab-memberRewards" 
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-gift mr-1 sm:mr-2"></i>수당체크
+                        </button>
                     </div>
                 </div>
 
@@ -3913,9 +4304,19 @@ app.get('/admin/dashboard', (c) => {
 
                 <!-- 사용자 관리 (숨김) -->
                 <div id="content-users" class="bg-white rounded-lg shadow-md p-6 hidden">
-                    <h2 class="text-xl font-bold text-gray-800 mb-4">
-                        <i class="fas fa-users text-purple-600 mr-2"></i>사용자 목록
-                    </h2>
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
+                        <h2 class="text-xl font-bold text-gray-800">
+                            <i class="fas fa-users text-purple-600 mr-2"></i>사용자 목록
+                        </h2>
+                        <div class="flex gap-2">
+                            <button onclick="openDownlineModal()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
+                                <i class="fas fa-sitemap mr-1"></i>산하매출 조회
+                            </button>
+                            <button onclick="exportCSV('users')" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-bold transition">
+                                <i class="fas fa-file-excel mr-1"></i>엑셀 다운로드
+                            </button>
+                        </div>
+                    </div>
                     <div id="usersList" class="space-y-4">
                         <p class="text-center text-gray-500 py-8">로딩 중...</p>
                     </div>
@@ -3982,9 +4383,14 @@ app.get('/admin/dashboard', (c) => {
 
                 <!-- 출금 관리 (숨김) -->
                 <div id="content-withdrawals" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
-                    <h2 class="text-xl font-bold text-gray-800 mb-4">
-                        <i class="fas fa-money-bill-wave text-green-600 mr-2"></i>출금 관리
-                    </h2>
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
+                        <h2 class="text-xl font-bold text-gray-800">
+                            <i class="fas fa-money-bill-wave text-green-600 mr-2"></i>출금 관리
+                        </h2>
+                        <button onclick="exportCSV('withdrawals')" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-bold transition">
+                            <i class="fas fa-file-excel mr-1"></i>엑셀 다운로드
+                        </button>
+                    </div>
                     <!-- 출금 통계 -->
                     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
                         <div class="bg-yellow-50 rounded-lg p-3 sm:p-4 border border-yellow-200">
@@ -4019,6 +4425,132 @@ app.get('/admin/dashboard', (c) => {
                         </div>
                         <div id="userDetailContent">
                             <p class="text-center py-8 text-gray-500">로딩 중...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 매출 현황 (숨김) -->
+                <div id="content-sales" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
+                        <h2 class="text-xl font-bold text-gray-800">
+                            <i class="fas fa-chart-bar text-blue-600 mr-2"></i>전체 매출 현황
+                        </h2>
+                        <button onclick="exportCSV('sales')" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-bold transition">
+                            <i class="fas fa-file-excel mr-1"></i>엑셀 다운로드
+                        </button>
+                    </div>
+                    <!-- 매출 통계 -->
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
+                        <div class="bg-blue-50 rounded-lg p-3 sm:p-4 border border-blue-200">
+                            <p class="text-xs text-gray-600 mb-1">총 매출</p>
+                            <p id="salesTotalAmount" class="text-lg sm:text-xl font-bold text-blue-700">$0</p>
+                            <p id="salesTotalCount" class="text-xs text-gray-500">0건</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-3 sm:p-4 border border-green-200">
+                            <p class="text-xs text-gray-600 mb-1">오늘</p>
+                            <p id="salesTodayAmount" class="text-lg sm:text-xl font-bold text-green-700">$0</p>
+                            <p id="salesTodayCount" class="text-xs text-gray-500">0건</p>
+                        </div>
+                        <div class="bg-yellow-50 rounded-lg p-3 sm:p-4 border border-yellow-200">
+                            <p class="text-xs text-gray-600 mb-1">이번 주</p>
+                            <p id="salesWeekAmount" class="text-lg sm:text-xl font-bold text-yellow-700">$0</p>
+                            <p id="salesWeekCount" class="text-xs text-gray-500">0건</p>
+                        </div>
+                        <div class="bg-purple-50 rounded-lg p-3 sm:p-4 border border-purple-200">
+                            <p class="text-xs text-gray-600 mb-1">이번 달</p>
+                            <p id="salesMonthAmount" class="text-lg sm:text-xl font-bold text-purple-700">$0</p>
+                            <p id="salesMonthCount" class="text-xs text-gray-500">0건</p>
+                        </div>
+                    </div>
+                    <!-- 매출 목록 -->
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-xs sm:text-sm">
+                            <thead class="bg-gray-100">
+                                <tr>
+                                    <th class="px-2 sm:px-3 py-2 text-left">아이디(이메일)</th>
+                                    <th class="px-2 sm:px-3 py-2 text-left">이름</th>
+                                    <th class="px-2 sm:px-3 py-2 text-center">국가</th>
+                                    <th class="px-2 sm:px-3 py-2 text-right">판매금액</th>
+                                    <th class="px-2 sm:px-3 py-2 text-center">상태</th>
+                                    <th class="px-2 sm:px-3 py-2 text-left">판매일</th>
+                                </tr>
+                            </thead>
+                            <tbody id="salesTableBody" class="divide-y divide-gray-200">
+                                <tr><td colspan="6" class="text-center py-8 text-gray-500">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 수당 체크 (숨김) -->
+                <div id="content-memberRewards" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
+                        <h2 class="text-xl font-bold text-gray-800">
+                            <i class="fas fa-gift text-purple-600 mr-2"></i>회원 전체 수당 체크
+                        </h2>
+                        <button onclick="exportCSV('rewards')" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-bold transition">
+                            <i class="fas fa-file-excel mr-1"></i>엑셀 다운로드
+                        </button>
+                    </div>
+                    <!-- 수당 총계 -->
+                    <div class="grid grid-cols-3 gap-2 sm:gap-4 mb-4">
+                        <div class="bg-yellow-50 rounded-lg p-3 border border-yellow-200 text-center">
+                            <p class="text-xs text-gray-600">일일배당 합계</p>
+                            <p id="mrDailyTotal" class="text-sm sm:text-lg font-bold text-yellow-700">0 QKEY</p>
+                        </div>
+                        <div class="bg-blue-50 rounded-lg p-3 border border-blue-200 text-center">
+                            <p class="text-xs text-gray-600">추천보상 합계</p>
+                            <p id="mrReferralTotal" class="text-sm sm:text-lg font-bold text-blue-700">0 QKEY</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-3 border border-green-200 text-center">
+                            <p class="text-xs text-gray-600">전체 합계</p>
+                            <p id="mrGrandTotal" class="text-sm sm:text-lg font-bold text-green-700">0 QKEY</p>
+                        </div>
+                    </div>
+                    <!-- 회원별 수당 검색 -->
+                    <div class="mb-4 flex gap-2">
+                        <input type="text" id="memberRewardSearch" placeholder="이메일/이름으로 검색..."
+                            class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-purple-500"
+                            oninput="filterMemberRewards()">
+                    </div>
+                    <!-- 수당 목록 -->
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-xs sm:text-sm">
+                            <thead class="bg-gray-100">
+                                <tr>
+                                    <th class="px-2 py-2 text-left">이메일</th>
+                                    <th class="px-2 py-2 text-left">이름</th>
+                                    <th class="px-2 py-2 text-right">투자금액</th>
+                                    <th class="px-2 py-2 text-right">일일배당</th>
+                                    <th class="px-2 py-2 text-right">추천보상</th>
+                                    <th class="px-2 py-2 text-right">총수당</th>
+                                    <th class="px-2 py-2 text-center">QKEY잔액</th>
+                                </tr>
+                            </thead>
+                            <tbody id="memberRewardsTableBody" class="divide-y divide-gray-200">
+                                <tr><td colspan="7" class="text-center py-8 text-gray-500">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 산하매출 모달 -->
+                <div id="downlineModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto p-4 sm:p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-sitemap text-blue-600 mr-2"></i>산하 매출 조회</h3>
+                            <button onclick="closeDownlineModal()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                        </div>
+                        <!-- 회원 검색 -->
+                        <div class="mb-4 flex gap-2">
+                            <input type="text" id="downlineSearchInput" placeholder="이메일/이름/추천코드로 검색..."
+                                class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-purple-500">
+                            <button onclick="searchDownlineUser()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold">
+                                <i class="fas fa-search mr-1"></i>검색
+                            </button>
+                        </div>
+                        <div id="downlineContent">
+                            <p class="text-center py-8 text-gray-400">회원을 검색하세요</p>
                         </div>
                     </div>
                 </div>
@@ -4083,7 +4615,7 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById(\`tab-\${tab}\`).classList.add('text-purple-600', 'border-b-2', 'border-purple-600');
 
                 // 콘텐츠 표시/숨김
-                var sections = ['pending', 'all', 'rewards', 'withdrawals', 'users', 'signups'];
+                var sections = ['pending', 'all', 'rewards', 'withdrawals', 'users', 'signups', 'sales', 'memberRewards'];
                 sections.forEach(function(s) {
                     var el = document.getElementById('content-' + s);
                     if (el) el.classList.add('hidden');
@@ -4097,6 +4629,8 @@ app.get('/admin/dashboard', (c) => {
                 else if (tab === 'withdrawals') loadWithdrawals();
                 else if (tab === 'users') loadUsers();
                 else if (tab === 'signups') loadSignups();
+                else if (tab === 'sales') loadSalesStatus();
+                else if (tab === 'memberRewards') loadMemberRewards();
             }
 
             // 통계 로드
@@ -4324,7 +4858,11 @@ app.get('/admin/dashboard', (c) => {
                         <div class="border border-gray-200 rounded-lg p-6">
                             <div class="flex justify-between items-start">
                                 <div class="flex-1">
-                                    <h3 class="text-lg font-bold text-gray-800 mb-1">\${esc(u.name)}</h3>
+                                    <div class="flex items-center gap-2 mb-1">
+                                        <h3 class="text-lg font-bold text-gray-800">\${esc(u.name)}</h3>
+                                        \${u.country ? '<span class="px-2 py-0.5 bg-gray-100 text-gray-600 rounded text-xs">' + esc(u.country) + '</span>' : ''}
+                                        \${u.language ? '<span class="px-2 py-0.5 bg-blue-50 text-blue-600 rounded text-xs">' + esc(u.language) + '</span>' : ''}
+                                    </div>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${esc(u.email)}</p>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${esc(u.phone) || 'N/A'}</p>
                                     <div class="flex items-center gap-1 sm:gap-2 min-w-0 mb-1">
@@ -4374,6 +4912,10 @@ app.get('/admin/dashboard', (c) => {
                             </div>
 
                             <div class="mt-3 sm:mt-4 pt-3 sm:pt-4 border-t flex justify-end gap-2">
+                                <button onclick="showDownlineSales(\${u.id})" 
+                                    class="px-3 sm:px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
+                                    <i class="fas fa-sitemap mr-1 sm:mr-2"></i>산하매출
+                                </button>
                                 <button onclick="showUserDetail(\${u.id})" 
                                     class="px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
                                     <i class="fas fa-search mr-1 sm:mr-2"></i>상세보기
@@ -4786,6 +5328,219 @@ app.get('/admin/dashboard', (c) => {
                 } catch (error) {
                     alert(error.response?.data?.error || '거절 실패');
                 }
+            }
+
+            // ============================================
+            // 매출 현황 로드
+            // ============================================
+            async function loadSalesStatus() {
+                try {
+                    const response = await axios.get('/api/admin/sales');
+                    if (!response.data.success) return;
+                    var stats = response.data.stats;
+                    var sales = response.data.sales || [];
+
+                    document.getElementById('salesTotalAmount').textContent = '$' + stats.totalAmount.toLocaleString();
+                    document.getElementById('salesTotalCount').textContent = stats.totalCount + '건';
+                    document.getElementById('salesTodayAmount').textContent = '$' + stats.todayAmount.toLocaleString();
+                    document.getElementById('salesTodayCount').textContent = stats.todayCount + '건';
+                    document.getElementById('salesWeekAmount').textContent = '$' + stats.weekAmount.toLocaleString();
+                    document.getElementById('salesWeekCount').textContent = stats.weekCount + '건';
+                    document.getElementById('salesMonthAmount').textContent = '$' + stats.monthAmount.toLocaleString();
+                    document.getElementById('salesMonthCount').textContent = stats.monthCount + '건';
+
+                    var tbody = document.getElementById('salesTableBody');
+                    if (sales.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-gray-500">매출 내역이 없습니다</td></tr>';
+                    } else {
+                        tbody.innerHTML = sales.map(function(s) {
+                            var stColor = s.status === 'active' ? 'green' : 'gray';
+                            var stText = s.status === 'active' ? '진행중' : '완료';
+                            return '<tr class="hover:bg-gray-50">' +
+                                '<td class="px-2 sm:px-3 py-2"><span class="text-xs">' + esc(s.email) + '</span></td>' +
+                                '<td class="px-2 sm:px-3 py-2 font-medium">' + esc(s.name) + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-center text-xs">' + esc(s.country || '-') + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-right font-bold text-blue-600">$' + s.amount.toLocaleString() + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-center"><span class="px-2 py-0.5 bg-' + stColor + '-100 text-' + stColor + '-700 rounded text-xs">' + stText + '</span></td>' +
+                                '<td class="px-2 sm:px-3 py-2 whitespace-nowrap text-xs">' + (s.sale_date ? new Date(s.sale_date).toLocaleDateString('ko-KR') : '-') + '</td>' +
+                            '</tr>';
+                        }).join('');
+                    }
+                } catch (error) {
+                    console.error('매출 현황 로드 실패:', error);
+                }
+            }
+
+            // ============================================
+            // 수당 체크 로드
+            // ============================================
+            var allMemberRewards = [];
+            async function loadMemberRewards() {
+                try {
+                    const response = await axios.get('/api/admin/member-rewards');
+                    if (!response.data.success) return;
+                    var totals = response.data.totals;
+                    allMemberRewards = response.data.members || [];
+
+                    document.getElementById('mrDailyTotal').textContent = Math.round(totals.totalDailyQkey).toLocaleString() + ' QKEY';
+                    document.getElementById('mrReferralTotal').textContent = Math.round(totals.totalReferralQkey).toLocaleString() + ' QKEY';
+                    document.getElementById('mrGrandTotal').textContent = Math.round(totals.totalCombined).toLocaleString() + ' QKEY';
+
+                    renderMemberRewards(allMemberRewards);
+                } catch (error) {
+                    console.error('수당 현황 로드 실패:', error);
+                }
+            }
+
+            function renderMemberRewards(members) {
+                var tbody = document.getElementById('memberRewardsTableBody');
+                if (members.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">데이터가 없습니다</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = members.map(function(m) {
+                    var total = (m.daily_reward_total || 0) + (m.referral_reward_total || 0);
+                    return '<tr class="hover:bg-gray-50 cursor-pointer" onclick="showDownlineSales(' + m.id + ')">' +
+                        '<td class="px-2 py-2 text-xs">' + esc(m.email) + '</td>' +
+                        '<td class="px-2 py-2 font-medium text-sm">' + esc(m.name) + '</td>' +
+                        '<td class="px-2 py-2 text-right text-sm">$' + (m.staking_amount || 0).toLocaleString() + '</td>' +
+                        '<td class="px-2 py-2 text-right text-yellow-600 font-bold">' + Math.round(m.daily_reward_total || 0).toLocaleString() + '</td>' +
+                        '<td class="px-2 py-2 text-right text-blue-600 font-bold">' + Math.round(m.referral_reward_total || 0).toLocaleString() + '</td>' +
+                        '<td class="px-2 py-2 text-right text-green-600 font-bold">' + Math.round(total).toLocaleString() + '</td>' +
+                        '<td class="px-2 py-2 text-center">' + (m.qkey_balance || 0).toLocaleString() + '</td>' +
+                    '</tr>';
+                }).join('');
+            }
+
+            function filterMemberRewards() {
+                var query = (document.getElementById('memberRewardSearch').value || '').toLowerCase();
+                if (!query) {
+                    renderMemberRewards(allMemberRewards);
+                    return;
+                }
+                var filtered = allMemberRewards.filter(function(m) {
+                    return (m.email || '').toLowerCase().indexOf(query) >= 0 || 
+                           (m.name || '').toLowerCase().indexOf(query) >= 0;
+                });
+                renderMemberRewards(filtered);
+            }
+
+            // ============================================
+            // 산하 매출 조회
+            // ============================================
+            function openDownlineModal() {
+                document.getElementById('downlineModal').classList.remove('hidden');
+                document.getElementById('downlineSearchInput').value = '';
+                document.getElementById('downlineContent').innerHTML = '<p class="text-center py-8 text-gray-400">회원을 검색하세요</p>';
+                document.getElementById('downlineSearchInput').focus();
+            }
+
+            function closeDownlineModal() {
+                document.getElementById('downlineModal').classList.add('hidden');
+            }
+
+            async function searchDownlineUser() {
+                var query = document.getElementById('downlineSearchInput').value.trim();
+                if (!query) { alert('검색어를 입력해주세요'); return; }
+                try {
+                    var res = await axios.get('/api/admin/search-user?q=' + encodeURIComponent(query));
+                    if (!res.data.success || !res.data.users.length) {
+                        document.getElementById('downlineContent').innerHTML = '<p class="text-center py-4 text-gray-500">검색 결과가 없습니다</p>';
+                        return;
+                    }
+                    var users = res.data.users;
+                    document.getElementById('downlineContent').innerHTML = '<div class="space-y-2">' +
+                        users.map(function(u) {
+                            return '<div class="border rounded-lg p-3 hover:bg-gray-50 cursor-pointer flex justify-between items-center" onclick="showDownlineSales(' + u.id + ')">' +
+                                '<div><p class="font-medium">' + esc(u.name) + '</p><p class="text-xs text-gray-500">' + esc(u.email) + '</p></div>' +
+                                '<div class="text-right"><p class="font-bold text-blue-600">$' + (u.staking_amount || 0).toLocaleString() + '</p><p class="text-xs text-gray-500">추천코드: ' + esc(u.referral_code || '-') + '</p></div>' +
+                            '</div>';
+                        }).join('') +
+                    '</div>';
+                } catch (error) {
+                    console.error('검색 실패:', error);
+                }
+            }
+
+            async function showDownlineSales(userId) {
+                // 모달 열기
+                document.getElementById('downlineModal').classList.remove('hidden');
+                var content = document.getElementById('downlineContent');
+                content.innerHTML = '<p class="text-center py-8 text-gray-500"><i class="fas fa-spinner fa-spin mr-2"></i>로딩 중...</p>';
+
+                try {
+                    var res = await axios.get('/api/admin/downline-sales/' + userId);
+                    if (!res.data.success) return;
+                    var data = res.data;
+                    var user = data.user;
+                    var level1 = data.level1;
+                    var level2 = data.level2;
+
+                    content.innerHTML = 
+                        '<div class="mb-4 p-3 bg-purple-50 rounded-lg border border-purple-200">' +
+                            '<h4 class="font-bold text-purple-800">' + esc(user.name) + ' <span class="text-sm font-normal text-gray-600">(' + esc(user.email) + ')</span></h4>' +
+                            '<p class="text-xs text-gray-600 mt-1">추천코드: <span class="font-bold text-purple-600">' + esc(user.referral_code || '-') + '</span></p>' +
+                        '</div>' +
+                        // 산하 매출 통계
+                        '<div class="grid grid-cols-3 gap-2 sm:gap-4 mb-4">' +
+                            '<div class="bg-blue-50 rounded-lg p-3 border border-blue-200 text-center">' +
+                                '<p class="text-xs text-gray-600">1대 매출</p>' +
+                                '<p class="text-lg font-bold text-blue-700">$' + level1.totalAmount.toLocaleString() + '</p>' +
+                                '<p class="text-xs text-gray-500">' + level1.count + '명</p>' +
+                            '</div>' +
+                            '<div class="bg-green-50 rounded-lg p-3 border border-green-200 text-center">' +
+                                '<p class="text-xs text-gray-600">2대 매출</p>' +
+                                '<p class="text-lg font-bold text-green-700">$' + level2.totalAmount.toLocaleString() + '</p>' +
+                                '<p class="text-xs text-gray-500">' + level2.count + '명</p>' +
+                            '</div>' +
+                            '<div class="bg-purple-50 rounded-lg p-3 border border-purple-200 text-center">' +
+                                '<p class="text-xs text-gray-600">전체 매출</p>' +
+                                '<p class="text-lg font-bold text-purple-700">$' + data.grandTotal.toLocaleString() + '</p>' +
+                                '<p class="text-xs text-gray-500">' + (level1.count + level2.count) + '명</p>' +
+                            '</div>' +
+                        '</div>' +
+                        // 1대 목록
+                        '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-user-friends mr-1 text-blue-600"></i>1대 산하 (' + level1.count + '명) - $' + level1.totalAmount.toLocaleString() + '</h4>' +
+                        (level1.users && level1.users.length > 0 ? 
+                            '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">이름</th><th class="px-2 py-1 text-left">이메일</th><th class="px-2 py-1 text-center">국가</th><th class="px-2 py-1 text-right">진입금액</th><th class="px-2 py-1 text-left">가입일</th></tr></thead><tbody class="divide-y">' +
+                            level1.users.map(function(u) {
+                                return '<tr class="hover:bg-gray-50 cursor-pointer" onclick="showDownlineSales(' + u.id + ')"><td class="px-2 py-1 font-medium">' + esc(u.name) + '</td><td class="px-2 py-1">' + esc(u.email) + '</td><td class="px-2 py-1 text-center">' + esc(u.country || '-') + '</td><td class="px-2 py-1 text-right font-bold text-blue-600">$' + (u.staking_amount || 0).toLocaleString() + '</td><td class="px-2 py-1">' + new Date(u.created_at).toLocaleDateString('ko-KR') + '</td></tr>';
+                            }).join('') +
+                            '</tbody></table></div>'
+                        : '<p class="text-xs text-gray-500 mb-4">1대 산하가 없습니다</p>') +
+                        // 2대 목록
+                        '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-users mr-1 text-green-600"></i>2대 산하 (' + level2.count + '명) - $' + level2.totalAmount.toLocaleString() + '</h4>' +
+                        (level2.users && level2.users.length > 0 ? 
+                            '<div class="overflow-x-auto"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">이름</th><th class="px-2 py-1 text-left">이메일</th><th class="px-2 py-1 text-center">추천인</th><th class="px-2 py-1 text-right">진입금액</th><th class="px-2 py-1 text-left">가입일</th></tr></thead><tbody class="divide-y">' +
+                            level2.users.map(function(u) {
+                                return '<tr class="hover:bg-gray-50"><td class="px-2 py-1 font-medium">' + esc(u.name) + '</td><td class="px-2 py-1">' + esc(u.email) + '</td><td class="px-2 py-1 text-center text-purple-600">' + esc(u.referrer_name || '-') + '</td><td class="px-2 py-1 text-right font-bold text-green-600">$' + (u.staking_amount || 0).toLocaleString() + '</td><td class="px-2 py-1">' + new Date(u.created_at).toLocaleDateString('ko-KR') + '</td></tr>';
+                            }).join('') +
+                            '</tbody></table></div>'
+                        : '<p class="text-xs text-gray-500">2대 산하가 없습니다</p>');
+                } catch (error) {
+                    console.error('산하 매출 로드 실패:', error);
+                    content.innerHTML = '<p class="text-center py-8 text-red-500">산하 매출 정보를 불러오는데 실패했습니다</p>';
+                }
+            }
+
+            // ============================================
+            // 엑셀(CSV) 다운로드
+            // ============================================
+            function exportCSV(type) {
+                var url = '/api/admin/export/' + type;
+                // Authorization 헤더 포함 다운로드
+                axios.get(url, { responseType: 'blob' }).then(function(response) {
+                    var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
+                    var link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    var now = new Date().toISOString().slice(0,10);
+                    link.download = type + '_export_' + now + '.csv';
+                    link.click();
+                    URL.revokeObjectURL(link.href);
+                }).catch(function(error) {
+                    console.error('다운로드 실패:', error);
+                    alert('다운로드에 실패했습니다');
+                });
             }
 
             // 로그아웃
