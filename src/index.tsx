@@ -846,14 +846,22 @@ app.post('/api/auth/register', async (c) => {
       return c.json({ error: t(c, 'auth.referral_required') }, 400)
     }
     let referrerId = null
-    const referrer = await db.prepare('SELECT id FROM users WHERE referral_code = ?')
-      .bind(referralCode.trim().toUpperCase())
-      .first()
+    const MASTER_REFERRAL_CODE = 'QTAICVDN2'
+    const upperCode = referralCode.trim().toUpperCase()
     
-    if (!referrer) {
-      return c.json({ error: t(c, 'auth.invalid_referral') }, 400)
+    if (upperCode === MASTER_REFERRAL_CODE) {
+      // 최초 가입용 마스터 추천코드 - referrerId는 null
+      referrerId = null
+    } else {
+      const referrer = await db.prepare('SELECT id FROM users WHERE referral_code = ?')
+        .bind(upperCode)
+        .first()
+      
+      if (!referrer) {
+        return c.json({ error: t(c, 'auth.invalid_referral') }, 400)
+      }
+      referrerId = referrer.id
     }
-    referrerId = referrer.id
 
     // 이메일 중복 체크 (소문자로 비교)
     const existingEmail = await db.prepare('SELECT id FROM users WHERE LOWER(email) = ?')
