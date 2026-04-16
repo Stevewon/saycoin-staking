@@ -2786,6 +2786,145 @@ app.get('/api/referral-rewards/:userId', async (c) => {
 // Frontend Routes
 // ============================================
 
+// 이용약관 페이지
+app.get('/terms', (c) => {
+  const userCountry = c.req.header('CF-IPCountry') || '';
+  return c.html(`
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="user-country" content="${userCountry}">
+        <title>이용약관 - QTA플랫폼</title>
+        <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+        <style>
+          body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+          .terms-content h2 { font-size: 1.1rem; font-weight: 700; margin-top: 1.5rem; margin-bottom: 0.5rem; color: #4a3780; }
+          .terms-content p, .terms-content li { font-size: 0.9rem; line-height: 1.7; color: #374151; }
+          .terms-content ul { list-style: disc; padding-left: 1.5rem; margin: 0.3rem 0; }
+          .terms-content ol { list-style: decimal; padding-left: 1.5rem; }
+          .terms-content ol > li { margin-bottom: 0.5rem; }
+        </style>
+    </head>
+    <body>
+        <div class="min-h-screen flex items-start justify-center py-6 px-3">
+            <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl p-5 sm:p-8">
+                <div class="flex items-center justify-between mb-6">
+                    <div class="flex items-center gap-3">
+                        <img src="/static/quantarium-logo.png" alt="Logo" class="w-10 h-10" onerror="this.style.display='none'">
+                        <h1 class="text-xl sm:text-2xl font-bold text-purple-700">QTA플랫폼</h1>
+                    </div>
+                    <a href="/" class="text-purple-600 hover:text-purple-800 text-sm font-medium">
+                        <i class="fas fa-arrow-left mr-1"></i>돌아가기
+                    </a>
+                </div>
+
+                <h1 class="text-lg sm:text-xl font-bold text-gray-800 mb-4 text-center border-b pb-3">QTA플랫폼 서비스 이용약관</h1>
+
+                <div class="terms-content">
+                    <h2>제1조 (목적)</h2>
+                    <p>본 약관은 QTA플랫폼(이하 "회사")이 운영하는 온라인 플랫폼을 통해 제공하는 <strong>기술관련 정보 제공 및 참여 지원 서비스</strong>(이하 "서비스")의 이용과 관련하여 회사와 이용자 간의 권리·의무 및 책임사항을 규정함을 목적으로 합니다.</p>
+
+                    <h2>제2조 (정의)</h2>
+                    <ol>
+                        <li>"서비스"란 회사가 운영하는 플랫폼을 통해 제공하는 프로젝트 관련 정보 열람, 참여 신청, 활동 내역 확인 등 <strong>비금융적 플랫폼 서비스</strong>를 의미합니다.</li>
+                        <li>"이용자"란 본 약관에 동의하고 회사가 제공하는 서비스에 접속하여 이를 이용하는 자를 말합니다.</li>
+                        <li>"참여"란 이용자가 회사가 안내하는 프로젝트에 자발적으로 참여 의사를 표시하는 행위를 의미하며, 이는 <strong>플랫폼 이용에 대한 수익 보장 또는 원금 보전을 의미하지 않습니다.</strong></li>
+                        <li>플랫폼 관련 정보란 회사가 안내·콘텐츠·현황를 통하여 제공하는 서비스를 의미합니다.</li>
+                    </ol>
+
+                    <h2>제3조 (약관의 효력 및 변경)</h2>
+                    <ol>
+                        <li>본 약관은 회사의 웹사이트 또는 모바일 애플리케이션에 게시함으로써 효력이 발생합니다.</li>
+                        <li>회사는 관계 법령을 위반하지 않는 범위 내에서 약관을 변경할 수 있으며, 변경된 약관은 공지한 날로부터 효력이 발생합니다.</li>
+                    </ol>
+
+                    <h2>제4조 (서비스 이용 신청 및 제한)</h2>
+                    <ol>
+                        <li>이용자는 회사가 정한 절차에 따라 본인 의사 결정으로 회원가입 및 본인 확인을 완료한 후 서비스를 이용할 수 있습니다.</li>
+                        <li>회사는 다음 각 호에 해당하는 경우 서비스 이용을 제한하거나 거부할 수 있습니다.
+                            <ul>
+                                <li>타인의 명의 또는 정보 도용</li>
+                                <li>허위 정보 기재</li>
+                                <li>법령 또는 회사 운영정책 위반 이력 존재</li>
+                            </ul>
+                        </li>
+                    </ol>
+
+                    <h2>제5조 (서비스의 내용)</h2>
+                    <ol>
+                        <li>회사는 이용자에게 다음 각 호의 서비스를 제공합니다.
+                            <ul>
+                                <li>플랫폼내 정보 열람 및 참여 신청</li>
+                                <li>참여 내역 및 활동 기록 조회</li>
+                                <li>만기 참여 종료 신청</li>
+                                <li>프로젝트 관련 일반적 정보 콘텐츠 제공</li>
+                            </ul>
+                        </li>
+                        <li>회사는 <strong>"금융상품의 중개, 판매, 자문, 운용 행위를 수행하지 않습니다."</strong></li>
+                        <li>서비스 제공 시간은 회사의 정책에 따라 변경될 수 있습니다.</li>
+                    </ol>
+
+                    <h2>제6조 (이용자의 책임 및 유의사항)</h2>
+                    <ol>
+                        <li>이용자는 서비스 이용과 관련된 모든 판단과 결정에 대해 전적인 책임을 부담합니다.</li>
+                        <li>이용자는 회사의 이용 정책을 준수하여야 하며, 서비스의 안정적 운영을 방해하는 행위를 해서는 안 됩니다.</li>
+                        <li>회사는 다음 사항을 <strong>"보장하거나 약속하지 않습니다."</strong>
+                            <ul>
+                                <li>수익 발생 여부</li>
+                                <li>원금 보전</li>
+                                <li>참여 결과에 따른 경제적 이익</li>
+                            </ul>
+                        </li>
+                        <li>서비스는 정보 제공 및 참여 기회 제공을 목적으로 하며, 이용자는 이를 충분히 인지하고 신중히 이용해야 합니다.</li>
+                    </ol>
+
+                    <h2>제7조 (비용 및 부담)</h2>
+                    <ol>
+                        <li>서비스 이용 과정에서 발생하는 제반 비용은 이용자 본인의 책임과 부담으로 할 수 있습니다.</li>
+                        <li>회사가 별도의 비용을 부과하는 경우, 그 내용과 조건을 사전에 명확히 고지합니다.</li>
+                    </ol>
+
+                    <h2>제8조 (개인정보 보호)</h2>
+                    <p>회사는 「개인정보 보호법」 등 관계 법령을 준수하여 이용자의 개인정보를 보호하며, 개인정보 처리에 관한 사항은 별도의 「개인정보 처리방침」에 따릅니다.</p>
+                    <p>회사는 서비스 제공 및 플랫폼 운영을 위하여 필요한 최소한의 개인정보만을 수집·이용합니다.</p>
+                    <p>이 과정에서 회사는 이용자의 전화번호 및 디지털 자산 지갑주소만을 수집·관리하며, 성명, 주민등록번호 등 개인을 직접 식별할 수 있는 정보는 수집하지 않습니다.</p>
+
+                    <h2>제9조 (책임의 제한)</h2>
+                    <ol>
+                        <li>회사는 천재지변, 시스템 장애, 통신 장애 등 불가항력적 사유로 인한 서비스 중단에 대해 책임을 지지 않습니다.</li>
+                        <li>회사는 이용자의 참여 결과로 발생하는 직·간접적 손실에 대하여 책임을 부담하지 않습니다.</li>
+                        <li>회사는 <strong>"금융업자, 투자자문업자 또는 자산운용사가 아니며"</strong>, 본 서비스는 금융행위에 해당하지 않습니다.</li>
+                        <li>플랫폼 이용 손실에 대해서는 회사의 고의 또는 중과실이 없는 한 책임을 지지 않습니다.</li>
+                    </ol>
+
+                    <h2>제10조 (준거법 및 관할)</h2>
+                    <p>본 약관은 대한민국 법령을 준거법으로 하며, 서비스 이용과 관련하여 발생하는 분쟁에 대해서는 회사 본점 소재지를 관할하는 법원을 전속 관할 법원으로 합니다.</p>
+
+                    <div class="mt-6 pt-4 border-t border-gray-200">
+                        <h2 class="text-base font-bold text-gray-800 mt-2">부칙</h2>
+                        <ul class="list-none pl-0">
+                            <li>공고일자: <strong>2026년 4월 01일</strong></li>
+                            <li>시행일자: <strong>2026년 4월 01일</strong></li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="mt-6 text-center">
+                    <a href="/" class="inline-block bg-purple-600 text-white px-8 py-3 rounded-lg font-bold hover:bg-purple-700 transition text-sm">
+                        <i class="fas fa-arrow-left mr-2"></i>메인으로 돌아가기
+                    </a>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+  `);
+});
+
 // 메인 페이지 (로그인 전)
 app.get('/', (c) => {
   const userCountry = c.req.header('CF-IPCountry') || '';
@@ -2951,6 +3090,18 @@ app.get('/', (c) => {
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
                             <p class="text-xs text-red-500 mt-1" data-i18n="register.referral_required">추천인 코드는 필수입니다</p>
                         </div>
+                        <div class="mb-4 sm:mb-6">
+                            <label class="flex items-start gap-2 cursor-pointer">
+                                <input type="checkbox" id="agreeTerms" 
+                                    class="mt-1 w-4 h-4 text-purple-600 border-gray-300 rounded focus:ring-purple-500">
+                                <span class="text-xs sm:text-sm text-gray-700">
+                                    <a href="/terms" target="_blank" class="text-purple-600 underline font-bold" data-i18n="register.terms_link">이용약관</a>
+                                    <span data-i18n="register.terms_agree">에 동의합니다.</span>
+                                    <span class="text-red-500">*</span>
+                                </span>
+                            </label>
+                            <p id="termsError" class="text-xs text-red-500 mt-1 hidden" data-i18n="register.terms_required">이용약관에 동의해주세요.</p>
+                        </div>
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-2 sm:py-3 rounded-lg font-bold hover:bg-purple-700 transition text-sm sm:text-base" data-i18n="common.register">
                             회원가입
@@ -3053,8 +3204,15 @@ app.get('/', (c) => {
             </div>
         </div>
 
+        <!-- Footer with Terms Link -->
+        <div class="text-center mt-4 mb-6">
+            <a href="/terms" target="_blank" class="text-white/70 hover:text-white text-xs sm:text-sm underline" data-i18n="common.terms">이용약관</a>
+            <span class="text-white/40 mx-2">|</span>
+            <span class="text-white/50 text-xs">&copy; 2026 QTA Platform</span>
+        </div>
+
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416c"></script>
+        <script src="/static/i18n.js?v=20260416d"></script>
         <script>
             function showRegister() {
                 document.getElementById('loginForm').classList.add('hidden');
@@ -3134,6 +3292,15 @@ app.get('/', (c) => {
                 const language = I18N.currentLang || navigator.language.split('-')[0] || '';
 
                 console.log('입력값:', { name, email, phone, walletAddress, usdtWalletAddress, password, passwordConfirm, referralCode, country, language });
+
+                // 이용약관 동의 검증
+                const agreeTerms = document.getElementById('agreeTerms').checked;
+                if (!agreeTerms) {
+                    document.getElementById('termsError').classList.remove('hidden');
+                    alert(I18N.t('register.terms_required'));
+                    return;
+                }
+                document.getElementById('termsError').classList.add('hidden');
 
                 // 추천인 코드 필수 검증
                 if (!referralCode) {
@@ -3768,7 +3935,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416c"></script>
+        <script src="/static/i18n.js?v=20260416d"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -4829,7 +4996,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416c"></script>
+        <script src="/static/i18n.js?v=20260416d"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -5312,7 +5479,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416c"></script>
+        <script src="/static/i18n.js?v=20260416d"></script>
         <script>
             // Initialize i18n
             I18N.init();
