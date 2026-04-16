@@ -2820,8 +2820,8 @@ app.get('/terms', (c) => {
         <meta name="user-country" content="${userCountry}">
         <title>이용약관 - QTA플랫폼</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="/static/tailwind.css">
+        <link href="/static/fa/all.min.css" rel="stylesheet">
         <style>
           body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
           .terms-content h2 { font-size: 1.1rem; font-weight: 700; margin-top: 1.5rem; margin-bottom: 0.5rem; color: #4a3780; }
@@ -2959,8 +2959,8 @@ app.get('/', (c) => {
         <meta name="user-country" content="${userCountry}">
         <title>QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="/static/tailwind.css">
+        <link href="/static/fa/all.min.css" rel="stylesheet">
         <style>
           body { 
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -3176,7 +3176,7 @@ app.get('/', (c) => {
             <span class="text-white/50 text-xs">&copy; 2026 QTA Platform</span>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+        <script src="/static/axios.min.js"></script>
         <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             function showRegister() {
@@ -3399,9 +3399,9 @@ app.get('/dashboard', (c) => {
         <meta name="user-country" content="${userCountry}">
         <title data-i18n="dash.title">대시보드 - QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
-        <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+        <link rel="stylesheet" href="/static/tailwind.css">
+        <link href="/static/fa/all.min.css" rel="stylesheet">
+        <script src="/static/qrcode.min.js"></script>
         <style>
           body { background-color: #f3f4f6; }
           html, body { overflow-x: hidden; max-width: 100vw; }
@@ -3896,7 +3896,7 @@ app.get('/dashboard', (c) => {
             </main>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+        <script src="/static/axios.min.js"></script>
         <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             let currentUser = null;
@@ -4905,8 +4905,8 @@ app.get('/admin', (c) => {
         <meta name="user-country" content="${userCountry}">
         <title>Admin Login - QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="/static/tailwind.css">
+        <link href="/static/fa/all.min.css" rel="stylesheet">
         <style>
             body {
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -4957,7 +4957,7 @@ app.get('/admin', (c) => {
             </div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+        <script src="/static/axios.min.js"></script>
         <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             I18N.init();
@@ -4998,8 +4998,8 @@ app.get('/admin/dashboard', (c) => {
         <meta name="user-country" content="${userCountry}">
         <title data-i18n="admin.dashboard">관리자 대시보드 - QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="/static/tailwind.css">
+        <link href="/static/fa/all.min.css" rel="stylesheet">
         <style>
             body { background-color: #f3f4f6; }
             html, body { overflow-x: hidden; max-width: 100vw; }
@@ -5440,7 +5440,7 @@ app.get('/admin/dashboard', (c) => {
             </main>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+        <script src="/static/axios.min.js"></script>
         <script src="/static/i18n.js?v=20260416e"></script>
         <script>
             // Initialize i18n
