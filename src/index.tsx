@@ -15,6 +15,105 @@ app.use('/api/*', cors())
 app.use('/static/*', serveStatic({ root: './public' }))
 
 // ============================================
+// Admin Auth Helpers
+// ============================================
+const ADMIN_ID = 'admin'
+const ADMIN_PW = 'admin1234'
+
+// 관리자 토큰 생성 (간이 HMAC - 실서비스에서는 JWT 사용 권장)
+function generateAdminToken(): string {
+  const payload = ADMIN_ID + ':' + Date.now()
+  // 간단한 base64 토큰 (Cloudflare Workers에서 crypto 사용 가능)
+  return btoa(payload + ':' + ADMIN_PW)
+}
+
+// 관리자 토큰 검증
+function verifyAdminToken(token: string): boolean {
+  try {
+    const decoded = atob(token)
+    return decoded.endsWith(':' + ADMIN_PW)
+  } catch {
+    return false
+  }
+}
+
+// HTML 이스케이프 (XSS 방지)
+function escapeHtml(str: string): string {
+  if (!str) return ''
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+// 비밀번호 해싱 (SHA-256)
+async function hashPassword(password: string): Promise<string> {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(password + '_QUANTARIUM_SALT')
+  const hash = await crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+// 비밀번호 검증 (평문 호환 + 해시 점진적 전환)
+async function verifyPassword(inputPassword: string, storedPassword: string): Promise<boolean> {
+  // 해시된 비밀번호인지 체크 (64자 hex = SHA-256)
+  if (storedPassword.length === 64 && /^[a-f0-9]{64}$/.test(storedPassword)) {
+    const hashed = await hashPassword(inputPassword)
+    return hashed === storedPassword
+  }
+  // 기존 평문 비밀번호 (마이그레이션 전)
+  return inputPassword === storedPassword
+}
+
+// ============================================
+// Admin API Auth Middleware
+// ============================================
+app.use('/api/admin/*', async (c, next) => {
+  const authHeader = c.req.header('Authorization')
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  }
+  const token = authHeader.substring(7)
+  if (!verifyAdminToken(token)) {
+    return c.json({ error: '유효하지 않은 관리자 토큰입니다' }, 401)
+  }
+  await next()
+})
+
+// 배당금 API도 관리자 인증 필요
+app.use('/api/rewards/daily', async (c, next) => {
+  if (c.req.method === 'POST') {
+    const authHeader = c.req.header('Authorization')
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+    }
+    const token = authHeader.substring(7)
+    if (!verifyAdminToken(token)) {
+      return c.json({ error: '유효하지 않은 관리자 토큰입니다' }, 401)
+    }
+  }
+  await next()
+})
+
+// ============================================
+// API Routes - Admin Login
+// ============================================
+app.post('/api/auth/admin-login', async (c) => {
+  try {
+    const { adminId, password } = await c.req.json()
+    if (adminId === ADMIN_ID && password === ADMIN_PW) {
+      const token = generateAdminToken()
+      return c.json({ success: true, token })
+    }
+    return c.json({ error: '관리자 ID 또는 비밀번호가 일치하지 않습니다' }, 401)
+  } catch {
+    return c.json({ error: '로그인 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// ============================================
 // API Routes - Auth
 // ============================================
 
@@ -101,11 +200,14 @@ app.post('/api/auth/register', async (c) => {
       }
     }
 
+    // 비밀번호 해싱
+    const hashedPassword = await hashPassword(password)
+
     // 사용자 생성
     const result = await db.prepare(`
       INSERT INTO users (email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, referrer_id)
       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)
-    `).bind(normalizedEmail, password, name, cleanPhone, walletAddress, usdtWalletAddress, newReferralCode, referrerId).run()
+    `).bind(normalizedEmail, hashedPassword, name, cleanPhone, walletAddress, usdtWalletAddress, newReferralCode, referrerId).run()
 
     return c.json({ 
       success: true, 
@@ -132,13 +234,27 @@ app.post('/api/auth/login', async (c) => {
 
     const db = c.env.DB
 
+    // 이메일로 사용자 조회 (비밀번호는 별도 검증)
     const user = await db.prepare(`
-      SELECT id, email, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, created_at
-      FROM users WHERE LOWER(email) = ? AND password = ?
-    `).bind(normalizedEmail, password).first()
+      SELECT id, email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, created_at
+      FROM users WHERE LOWER(email) = ?
+    `).bind(normalizedEmail).first()
 
     if (!user) {
       return c.json({ error: '이메일 또는 비밀번호가 일치하지 않습니다' }, 401)
+    }
+
+    // 비밀번호 검증 (해시/평문 호환)
+    const passwordMatch = await verifyPassword(password, user.password as string)
+    if (!passwordMatch) {
+      return c.json({ error: '이메일 또는 비밀번호가 일치하지 않습니다' }, 401)
+    }
+
+    // 평문 비밀번호인 경우 해시로 마이그레이션
+    const storedPw = user.password as string
+    if (!(storedPw.length === 64 && /^[a-f0-9]{64}$/.test(storedPw))) {
+      const hashedPw = await hashPassword(password)
+      await db.prepare('UPDATE users SET password = ? WHERE id = ?').bind(hashedPw, user.id).run()
     }
 
     // referral_code가 없으면 생성
@@ -220,17 +336,18 @@ app.post('/api/auth/find-password', async (c) => {
       return c.json({ error: '일치하는 계정을 찾을 수 없습니다' }, 404)
     }
 
-    // 임시 비밀번호 생성 (실제 서비스에서는 이메일/SMS로 전송)
+    // 임시 비밀번호 생성 (해시하여 저장)
     const tempPassword = Math.random().toString(36).slice(-8)
+    const hashedTemp = await hashPassword(tempPassword)
 
     await db.prepare(`
       UPDATE users SET password = ? WHERE id = ?
-    `).bind(tempPassword, user.id).run()
+    `).bind(hashedTemp, user.id).run()
 
     return c.json({ 
       success: true, 
       tempPassword: tempPassword,
-      message: '임시 비밀번호가 발급되었습니다'
+      message: '임시 비밀번호가 발급되었습니다. 로그인 후 반드시 비밀번호를 변경해주세요.'
     })
   } catch (error) {
     return c.json({ error: '비밀번호 찾기 중 오류가 발생했습니다' }, 500)
@@ -248,13 +365,14 @@ app.post('/api/user/update-profile', async (c) => {
 
     const db = c.env.DB
 
-    // 비밀번호 변경이 있는 경우
+    // 비밀번호 변경이 있는 경우 (해시하여 저장)
     if (password) {
+      const hashedPw = await hashPassword(password)
       await db.prepare(`
         UPDATE users 
         SET name = ?, phone = ?, password = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).bind(name, phone || null, password, userId).run()
+      `).bind(name, phone || null, hashedPw, userId).run()
     } else {
       // 비밀번호 변경 없이 이름, 전화번호만 업데이트
       await db.prepare(`
@@ -311,9 +429,21 @@ app.post('/api/withdrawal/request', async (c) => {
                          coinType === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
     const currentBalance = user[balanceField]
 
-    if (currentBalance < amount) {
-      return c.json({ error: '잔액이 부족합니다' }, 400)
+    // 이미 pending 상태인 출금 합산 확인 (Race Condition 방지)
+    const pendingWithdrawals = await db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as pending_total FROM withdrawals
+      WHERE user_id = ? AND coin_type = ? AND status = 'pending'
+    `).bind(userId, coinType).first()
+    const pendingTotal = (pendingWithdrawals?.pending_total || 0) as number
+
+    if (currentBalance - pendingTotal < amount) {
+      return c.json({ error: '잔액이 부족합니다 (출금 대기 중인 금액 포함)' }, 400)
     }
+
+    // 잔액 즉시 차감 (출금 신청 시점)
+    await db.prepare(`
+      UPDATE users SET ${balanceField} = ${balanceField} - ? WHERE id = ? AND ${balanceField} >= ?
+    `).bind(amount, userId, amount).run()
 
     // 출금 신청 생성
     const withdrawalResult = await db.prepare(`
@@ -971,6 +1101,252 @@ app.post('/api/admin/users/bulk-delete', async (c) => {
   } catch (error) {
     console.error('일괄 삭제 오류:', error)
     return c.json({ error: '일괄 삭제 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 관리자: 배당 현황 조회 (전체 배당금 지급 내역)
+app.get('/api/admin/rewards', async (c) => {
+  try {
+    const db = c.env.DB
+
+    // 배당 통계
+    const stats = await db.prepare(`
+      SELECT 
+        COUNT(*) as total_count,
+        COALESCE(SUM(usdt_amount), 0) as total_qkey,
+        COUNT(DISTINCT user_id) as unique_users,
+        MAX(reward_date) as last_reward_date
+      FROM daily_rewards
+    `).first()
+
+    // 오늘 배당 내역
+    const todayRewards = await db.prepare(`
+      SELECT 
+        COUNT(*) as count,
+        COALESCE(SUM(usdt_amount), 0) as total_qkey
+      FROM daily_rewards
+      WHERE reward_date = date('now')
+    `).first()
+
+    // 최근 배당 내역 (최근 100건, 사용자 정보 포함)
+    const recentRewards = await db.prepare(`
+      SELECT 
+        d.id, d.user_id, d.staking_id, d.usdt_amount as qkey_amount, d.reward_date, d.created_at,
+        u.name, u.email,
+        s.amount as staking_amount, s.daily_rate
+      FROM daily_rewards d
+      JOIN users u ON d.user_id = u.id
+      LEFT JOIN staking s ON d.staking_id = s.id
+      ORDER BY d.created_at DESC
+      LIMIT 100
+    `).all()
+
+    // 추천 보상 통계
+    const referralStats = await db.prepare(`
+      SELECT 
+        COUNT(*) as total_count,
+        COALESCE(SUM(reward_amount), 0) as total_qkey,
+        COALESCE(SUM(CASE WHEN level = 0 THEN reward_amount ELSE 0 END), 0) as direct_total,
+        COALESCE(SUM(CASE WHEN level = 1 THEN reward_amount ELSE 0 END), 0) as level1_total,
+        COALESCE(SUM(CASE WHEN level = 2 THEN reward_amount ELSE 0 END), 0) as level2_total
+      FROM referral_rewards
+    `).first()
+
+    return c.json({
+      success: true,
+      stats: {
+        totalCount: stats?.total_count || 0,
+        totalQkey: stats?.total_qkey || 0,
+        uniqueUsers: stats?.unique_users || 0,
+        lastRewardDate: stats?.last_reward_date || '-'
+      },
+      today: {
+        count: todayRewards?.count || 0,
+        totalQkey: todayRewards?.total_qkey || 0
+      },
+      referralStats: {
+        totalCount: referralStats?.total_count || 0,
+        totalQkey: referralStats?.total_qkey || 0,
+        directTotal: referralStats?.direct_total || 0,
+        level1Total: referralStats?.level1_total || 0,
+        level2Total: referralStats?.level2_total || 0
+      },
+      rewards: recentRewards.results
+    })
+  } catch (error) {
+    console.error('배당 현황 조회 오류:', error)
+    return c.json({ error: '배당 현황 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 관리자: 출금 관리 (전체 출금 신청 목록)
+app.get('/api/admin/withdrawals', async (c) => {
+  try {
+    const db = c.env.DB
+
+    // 출금 통계
+    const stats = await db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending_count,
+        COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) as approved_count,
+        COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) as rejected_count,
+        COUNT(*) as total_count
+      FROM withdrawals
+    `).first()
+
+    // 전체 출금 목록 (사용자 정보 포함)
+    const withdrawals = await db.prepare(`
+      SELECT 
+        w.id, w.user_id, w.coin_type, w.amount, w.wallet_address, w.status, w.created_at,
+        u.name, u.email
+      FROM withdrawals w
+      JOIN users u ON w.user_id = u.id
+      ORDER BY w.created_at DESC
+      LIMIT 200
+    `).all()
+
+    return c.json({
+      success: true,
+      stats: {
+        pendingCount: stats?.pending_count || 0,
+        approvedCount: stats?.approved_count || 0,
+        rejectedCount: stats?.rejected_count || 0,
+        totalCount: stats?.total_count || 0
+      },
+      withdrawals: withdrawals.results
+    })
+  } catch (error) {
+    console.error('출금 관리 조회 오류:', error)
+    return c.json({ error: '출금 관리 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 관리자: 출금 승인
+app.post('/api/admin/withdrawal/approve/:withdrawalId', async (c) => {
+  try {
+    const db = c.env.DB
+    const withdrawalId = c.req.param('withdrawalId')
+
+    const withdrawal = await db.prepare(`
+      SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'
+    `).bind(withdrawalId).first()
+
+    if (!withdrawal) {
+      return c.json({ error: '승인 대기 중인 출금 신청을 찾을 수 없습니다' }, 404)
+    }
+
+    await db.prepare(`
+      UPDATE withdrawals SET status = 'approved' WHERE id = ?
+    `).bind(withdrawalId).run()
+
+    return c.json({ success: true, message: '출금이 승인되었습니다' })
+  } catch (error) {
+    return c.json({ error: '출금 승인 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 관리자: 출금 거절 (잔액 환불)
+app.post('/api/admin/withdrawal/reject/:withdrawalId', async (c) => {
+  try {
+    const db = c.env.DB
+    const withdrawalId = c.req.param('withdrawalId')
+
+    const withdrawal = await db.prepare(`
+      SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'
+    `).bind(withdrawalId).first()
+
+    if (!withdrawal) {
+      return c.json({ error: '승인 대기 중인 출금 신청을 찾을 수 없습니다' }, 404)
+    }
+
+    // 잔액 환불
+    const balanceField = withdrawal.coin_type === 'QTA' ? 'qta_balance' :
+                         withdrawal.coin_type === 'QX' ? 'qx_balance' :
+                         withdrawal.coin_type === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
+
+    await db.prepare(`
+      UPDATE users SET ${balanceField} = ${balanceField} + ? WHERE id = ?
+    `).bind(withdrawal.amount, withdrawal.user_id).run()
+
+    await db.prepare(`
+      UPDATE withdrawals SET status = 'rejected' WHERE id = ?
+    `).bind(withdrawalId).run()
+
+    return c.json({ success: true, message: '출금이 거절되었습니다. 잔액이 환불되었습니다.' })
+  } catch (error) {
+    return c.json({ error: '출금 거절 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 관리자: 회원 상세 조회
+app.get('/api/admin/user/:userId', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = c.req.param('userId')
+
+    // 사용자 기본 정보
+    const user = await db.prepare(`
+      SELECT id, email, name, phone, wallet_address, usdt_wallet_address, 
+             qta_balance, qx_balance, qkey_balance, usdt_balance, 
+             referral_code, referrer_id, created_at
+      FROM users WHERE id = ?
+    `).bind(userId).first()
+
+    if (!user) {
+      return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
+    }
+
+    // 스테이킹 내역
+    const stakings = await db.prepare(`
+      SELECT * FROM staking WHERE user_id = ? ORDER BY created_at DESC
+    `).bind(userId).all()
+
+    // 배당 내역
+    const rewards = await db.prepare(`
+      SELECT d.*, s.amount as staking_amount
+      FROM daily_rewards d
+      LEFT JOIN staking s ON d.staking_id = s.id
+      WHERE d.user_id = ?
+      ORDER BY d.created_at DESC
+      LIMIT 50
+    `).bind(userId).all()
+
+    // 출금 내역
+    const withdrawals = await db.prepare(`
+      SELECT * FROM withdrawals WHERE user_id = ? ORDER BY created_at DESC
+    `).bind(userId).all()
+
+    // 거래 내역
+    const transactions = await db.prepare(`
+      SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50
+    `).bind(userId).all()
+
+    // 추천인 정보
+    let referrer = null
+    if (user.referrer_id) {
+      referrer = await db.prepare(`
+        SELECT id, name, email FROM users WHERE id = ?
+      `).bind(user.referrer_id).first()
+    }
+
+    // 피추천인 수
+    const referrals = await db.prepare(`
+      SELECT COUNT(*) as count FROM users WHERE referrer_id = ?
+    `).bind(userId).first()
+
+    return c.json({
+      success: true,
+      user,
+      stakings: stakings.results,
+      rewards: rewards.results,
+      withdrawals: withdrawals.results,
+      transactions: transactions.results,
+      referrer,
+      referralCount: referrals?.count || 0
+    })
+  } catch (error) {
+    console.error('회원 상세 조회 오류:', error)
+    return c.json({ error: '회원 상세 조회 중 오류가 발생했습니다' }, 500)
   }
 })
 
@@ -1881,11 +2257,11 @@ app.get('/dashboard', (c) => {
                         <p class="text-xs opacity-75 mt-1" id="stakingCount">진행중: 0건</p>
                     </div>
                     
-                    <!-- QKEY Balance (두 번째) -->
+                    <!-- USDT Balance (두 번째) -->
                     <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90">QKEY Balance</span>
-                            <i class="fas fa-key text-xl sm:text-2xl"></i>
+                            <span class="text-xs sm:text-sm opacity-90">USDT Balance</span>
+                            <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
                     </div>
@@ -3357,12 +3733,14 @@ app.get('/admin', (c) => {
                 const adminId = document.getElementById('adminId').value;
                 const password = document.getElementById('adminPassword').value;
 
-                // 간단한 관리자 인증 (실제로는 서버에서 검증해야 함)
-                if (adminId === 'admin' && password === 'admin1234') {
-                    localStorage.setItem('admin', JSON.stringify({ id: 'admin', role: 'admin' }));
-                    window.location.href = '/admin/dashboard';
-                } else {
-                    alert('관리자 ID 또는 비밀번호가 일치하지 않습니다.');
+                try {
+                    const response = await axios.post('/api/auth/admin-login', { adminId, password });
+                    if (response.data.success) {
+                        localStorage.setItem('admin', JSON.stringify({ id: 'admin', role: 'admin', token: response.data.token }));
+                        window.location.href = '/admin/dashboard';
+                    }
+                } catch (error) {
+                    alert(error.response?.data?.error || '관리자 ID 또는 비밀번호가 일치하지 않습니다.');
                 }
             }
         </script>
@@ -3467,24 +3845,48 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 일일 배당 지급 버튼 -->
+                <div class="bg-white rounded-lg shadow-md p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                        <div>
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-coins text-yellow-600 mr-2"></i>일일 배당금 지급</h3>
+                            <p class="text-sm text-gray-600 mt-1">활성 투자 건에 대한 일일 QKEY 배당금을 지급합니다</p>
+                        </div>
+                        <button onclick="executeDailyReward()" id="dailyRewardBtn"
+                            class="px-6 py-3 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg font-bold transition text-sm sm:text-base whitespace-nowrap">
+                            <i class="fas fa-play mr-2"></i>배당금 지급 실행
+                        </button>
+                    </div>
+                    <div id="dailyRewardResult" class="mt-3 hidden">
+                    </div>
+                </div>
+
                 <!-- 탭 메뉴 -->
                 <div class="bg-white rounded-lg shadow-md mb-4 sm:mb-6">
                     <div class="flex border-b overflow-x-auto -webkit-overflow-scrolling-touch">
                         <button onclick="showTab('pending')" id="tab-pending" 
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-purple-600 border-b-2 border-purple-600 whitespace-nowrap text-xs sm:text-base">
-                            <i class="fas fa-clock mr-1 sm:mr-2"></i>승인 대기
+                            <i class="fas fa-clock mr-1 sm:mr-2"></i>승인대기
                         </button>
                         <button onclick="showTab('all')" id="tab-all" 
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
-                            <i class="fas fa-list mr-1 sm:mr-2"></i>전체 목록
+                            <i class="fas fa-list mr-1 sm:mr-2"></i>전체목록
+                        </button>
+                        <button onclick="showTab('rewards')" id="tab-rewards" 
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-coins mr-1 sm:mr-2"></i>배당현황
+                        </button>
+                        <button onclick="showTab('withdrawals')" id="tab-withdrawals" 
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-money-bill-wave mr-1 sm:mr-2"></i>출금관리
                         </button>
                         <button onclick="showTab('users')" id="tab-users" 
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
-                            <i class="fas fa-users mr-1 sm:mr-2"></i>사용자
+                            <i class="fas fa-users mr-1 sm:mr-2"></i>회원관리
                         </button>
                         <button onclick="showTab('signups')" id="tab-signups" 
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
-                            <i class="fas fa-user-plus mr-1 sm:mr-2"></i>가입
+                            <i class="fas fa-user-plus mr-1 sm:mr-2"></i>가입현황
                         </button>
                     </div>
                 </div>
@@ -3519,6 +3921,108 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 배당 현황 (숨김) -->
+                <div id="content-rewards" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4">
+                        <i class="fas fa-coins text-yellow-600 mr-2"></i>배당 현황
+                    </h2>
+                    <!-- 배당 통계 -->
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
+                        <div class="bg-yellow-50 rounded-lg p-3 sm:p-4 border border-yellow-200">
+                            <p class="text-xs text-gray-600 mb-1">총 지급 QKEY</p>
+                            <p id="rewardsTotalQkey" class="text-lg sm:text-xl font-bold text-yellow-700">0</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-3 sm:p-4 border border-green-200">
+                            <p class="text-xs text-gray-600 mb-1">오늘 지급</p>
+                            <p id="rewardsTodayQkey" class="text-lg sm:text-xl font-bold text-green-700">0</p>
+                        </div>
+                        <div class="bg-blue-50 rounded-lg p-3 sm:p-4 border border-blue-200">
+                            <p class="text-xs text-gray-600 mb-1">총 지급 건수</p>
+                            <p id="rewardsTotalCount" class="text-lg sm:text-xl font-bold text-blue-700">0</p>
+                        </div>
+                        <div class="bg-purple-50 rounded-lg p-3 sm:p-4 border border-purple-200">
+                            <p class="text-xs text-gray-600 mb-1">추천 보상 합계</p>
+                            <p id="rewardsReferralTotal" class="text-lg sm:text-xl font-bold text-purple-700">0</p>
+                        </div>
+                    </div>
+                    <!-- 추천 보상 상세 -->
+                    <div class="grid grid-cols-3 gap-2 mb-4">
+                        <div class="bg-orange-50 rounded-lg p-2 sm:p-3 border border-orange-200 text-center">
+                            <p class="text-xs text-gray-600">직접판매</p>
+                            <p id="rewardsDirectTotal" class="text-sm sm:text-base font-bold text-orange-600">0</p>
+                        </div>
+                        <div class="bg-blue-50 rounded-lg p-2 sm:p-3 border border-blue-200 text-center">
+                            <p class="text-xs text-gray-600">1대 매칭</p>
+                            <p id="rewardsLevel1Total" class="text-sm sm:text-base font-bold text-blue-600">0</p>
+                        </div>
+                        <div class="bg-purple-50 rounded-lg p-2 sm:p-3 border border-purple-200 text-center">
+                            <p class="text-xs text-gray-600">2대 매칭</p>
+                            <p id="rewardsLevel2Total" class="text-sm sm:text-base font-bold text-purple-600">0</p>
+                        </div>
+                    </div>
+                    <!-- 최근 배당 내역 -->
+                    <h3 class="text-base font-bold text-gray-700 mb-2">최근 배당 내역</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-xs sm:text-sm">
+                            <thead class="bg-gray-100">
+                                <tr>
+                                    <th class="px-2 sm:px-3 py-2 text-left">날짜</th>
+                                    <th class="px-2 sm:px-3 py-2 text-left">회원</th>
+                                    <th class="px-2 sm:px-3 py-2 text-right">투자금액</th>
+                                    <th class="px-2 sm:px-3 py-2 text-right">배당률</th>
+                                    <th class="px-2 sm:px-3 py-2 text-right">지급 QKEY</th>
+                                </tr>
+                            </thead>
+                            <tbody id="rewardsTableBody" class="divide-y divide-gray-200">
+                                <tr><td colspan="5" class="text-center py-8 text-gray-500">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 출금 관리 (숨김) -->
+                <div id="content-withdrawals" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4">
+                        <i class="fas fa-money-bill-wave text-green-600 mr-2"></i>출금 관리
+                    </h2>
+                    <!-- 출금 통계 -->
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
+                        <div class="bg-yellow-50 rounded-lg p-3 sm:p-4 border border-yellow-200">
+                            <p class="text-xs text-gray-600 mb-1">대기중</p>
+                            <p id="wdPendingCount" class="text-lg sm:text-xl font-bold text-yellow-700">0</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-3 sm:p-4 border border-green-200">
+                            <p class="text-xs text-gray-600 mb-1">승인됨</p>
+                            <p id="wdApprovedCount" class="text-lg sm:text-xl font-bold text-green-700">0</p>
+                        </div>
+                        <div class="bg-red-50 rounded-lg p-3 sm:p-4 border border-red-200">
+                            <p class="text-xs text-gray-600 mb-1">거절됨</p>
+                            <p id="wdRejectedCount" class="text-lg sm:text-xl font-bold text-red-700">0</p>
+                        </div>
+                        <div class="bg-gray-50 rounded-lg p-3 sm:p-4 border border-gray-200">
+                            <p class="text-xs text-gray-600 mb-1">전체</p>
+                            <p id="wdTotalCount" class="text-lg sm:text-xl font-bold text-gray-700">0</p>
+                        </div>
+                    </div>
+                    <!-- 출금 목록 -->
+                    <div id="withdrawalsList" class="space-y-3">
+                        <p class="text-center text-gray-500 py-8">로딩 중...</p>
+                    </div>
+                </div>
+
+                <!-- 회원 상세 모달 (숨김) -->
+                <div id="userDetailModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-4 sm:p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-user-circle text-purple-600 mr-2"></i>회원 상세 정보</h3>
+                            <button onclick="closeUserDetail()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                        </div>
+                        <div id="userDetailContent">
+                            <p class="text-center py-8 text-gray-500">로딩 중...</p>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 가입 현황 (숨김) -->
                 <div id="content-signups" class="bg-white rounded-lg shadow-md p-6 hidden">
                     <h2 class="text-xl font-bold text-gray-800 mb-4">
@@ -3549,8 +4053,19 @@ app.get('/admin/dashboard', (c) => {
         <script>
             // 관리자 인증 확인
             const admin = JSON.parse(localStorage.getItem('admin') || 'null');
-            if (!admin) {
+            if (!admin || !admin.token) {
                 window.location.href = '/admin';
+            }
+
+            // axios 기본 헤더에 관리자 토큰 설정
+            if (admin && admin.token) {
+                axios.defaults.headers.common['Authorization'] = 'Bearer ' + admin.token;
+            }
+
+            // HTML 이스케이프 (XSS 방지)
+            function esc(str) {
+                if (!str) return '';
+                return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
             }
 
             let currentTab = 'pending';
@@ -3568,22 +4083,20 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById(\`tab-\${tab}\`).classList.add('text-purple-600', 'border-b-2', 'border-purple-600');
 
                 // 콘텐츠 표시/숨김
-                document.getElementById('content-pending').classList.add('hidden');
-                document.getElementById('content-all').classList.add('hidden');
-                document.getElementById('content-users').classList.add('hidden');
-                document.getElementById('content-signups').classList.add('hidden');
+                var sections = ['pending', 'all', 'rewards', 'withdrawals', 'users', 'signups'];
+                sections.forEach(function(s) {
+                    var el = document.getElementById('content-' + s);
+                    if (el) el.classList.add('hidden');
+                });
                 document.getElementById(\`content-\${tab}\`).classList.remove('hidden');
 
                 // 데이터 로드
-                if (tab === 'pending') {
-                    loadPendingStakings();
-                } else if (tab === 'all') {
-                    loadAllStakings();
-                } else if (tab === 'users') {
-                    loadUsers();
-                } else if (tab === 'signups') {
-                    loadSignups();
-                }
+                if (tab === 'pending') loadPendingStakings();
+                else if (tab === 'all') loadAllStakings();
+                else if (tab === 'rewards') loadRewardsStatus();
+                else if (tab === 'withdrawals') loadWithdrawals();
+                else if (tab === 'users') loadUsers();
+                else if (tab === 'signups') loadSignups();
             }
 
             // 통계 로드
@@ -3636,9 +4149,9 @@ app.get('/admin/dashboard', (c) => {
                                         </span>
                                         <span class="text-xs text-gray-500">\${new Date(s.created_at).toLocaleString('ko-KR')}</span>
                                     </div>
-                                    <h3 class="text-xl font-bold text-gray-800 mb-1">\${s.name}</h3>
-                                    <p class="text-sm text-gray-600"><i class="fas fa-envelope mr-1"></i>\${s.email}</p>
-                                    <p class="text-xs sm:text-sm text-gray-600 font-mono truncate"><i class="fas fa-wallet mr-1"></i>\${s.wallet_address}</p>
+                                    <h3 class="text-xl font-bold text-gray-800 mb-1">\${esc(s.name)}</h3>
+                                    <p class="text-sm text-gray-600"><i class="fas fa-envelope mr-1"></i>\${esc(s.email)}</p>
+                                    <p class="text-xs sm:text-sm text-gray-600 font-mono truncate"><i class="fas fa-wallet mr-1"></i>\${esc(s.wallet_address)}</p>
                                 </div>
                             </div>
 
@@ -3750,8 +4263,8 @@ app.get('/admin/dashboard', (c) => {
                                             </span>
                                             <span class="text-xs text-gray-500">\${new Date(s.created_at).toLocaleString('ko-KR')}</span>
                                         </div>
-                                        <h3 class="text-lg font-bold text-gray-800">\${s.name}</h3>
-                                        <p class="text-sm text-gray-600">\${s.email}</p>
+                                        <h3 class="text-lg font-bold text-gray-800">\${esc(s.name)}</h3>
+                                        <p class="text-sm text-gray-600">\${esc(s.email)}</p>
                                     </div>
                                 </div>
 
@@ -3778,7 +4291,7 @@ app.get('/admin/dashboard', (c) => {
                                     </div>
                                     <div>
                                         <p class="text-gray-600">종료일</p>
-                                        <p class="font-bold">\${new Date(s.end_date).toLocaleDateString('ko-KR')}</p>
+                                        <p class="font-bold">\${s.end_date ? new Date(s.end_date).toLocaleDateString('ko-KR') : '-'}</p>
                                     </div>
                                 </div>
                                 <div class="mt-2 pt-2 border-t border-gray-200">
@@ -3811,11 +4324,11 @@ app.get('/admin/dashboard', (c) => {
                         <div class="border border-gray-200 rounded-lg p-6">
                             <div class="flex justify-between items-start">
                                 <div class="flex-1">
-                                    <h3 class="text-lg font-bold text-gray-800 mb-1">\${u.name}</h3>
-                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${u.email}</p>
-                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${u.phone || 'N/A'}</p>
+                                    <h3 class="text-lg font-bold text-gray-800 mb-1">\${esc(u.name)}</h3>
+                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${esc(u.email)}</p>
+                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${esc(u.phone) || 'N/A'}</p>
                                     <div class="flex items-center gap-1 sm:gap-2 min-w-0 mb-1">
-                                        <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${u.wallet_address}</p>
+                                        <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${esc(u.wallet_address)}</p>
                                         <button onclick="copyWalletAddress('\${u.wallet_address}')" 
                                             class="flex-shrink-0 px-2 py-1 bg-purple-100 hover:bg-purple-200 text-purple-700 rounded text-xs transition duration-200"
                                             title="QKEY 지갑주소 복사">
@@ -3860,8 +4373,12 @@ app.get('/admin/dashboard', (c) => {
                                 </div>
                             </div>
 
-                            <div class="mt-3 sm:mt-4 pt-3 sm:pt-4 border-t flex justify-end">
-                                <button onclick="deleteUser(\${u.id}, '\${u.name}', '\${u.email}', \${u.staking_amount})" 
+                            <div class="mt-3 sm:mt-4 pt-3 sm:pt-4 border-t flex justify-end gap-2">
+                                <button onclick="showUserDetail(\${u.id})" 
+                                    class="px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
+                                    <i class="fas fa-search mr-1 sm:mr-2"></i>상세보기
+                                </button>
+                                <button onclick="deleteUser(\${u.id}, '\${esc(u.name)}', '\${esc(u.email)}', \${u.staking_amount})" 
                                     class="px-3 sm:px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
                                     <i class="fas fa-user-times mr-1 sm:mr-2"></i>강제 탈퇴
                                 </button>
@@ -3896,11 +4413,11 @@ app.get('/admin/dashboard', (c) => {
                         <div class="border border-gray-200 rounded-lg p-6">
                             <div class="flex justify-between items-start">
                                 <div class="flex-1">
-                                    <h3 class="text-lg font-bold text-gray-800 mb-1">\${u.name}</h3>
-                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${u.email}</p>
-                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${u.phone || 'N/A'}</p>
-                                    <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${u.wallet_address}</p>
-                                    <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-green-600 font-semibold">USDT</span> \${u.usdt_wallet_address || 'N/A'}</p>
+                                    <h3 class="text-lg font-bold text-gray-800 mb-1">\${esc(u.name)}</h3>
+                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${esc(u.email)}</p>
+                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${esc(u.phone) || 'N/A'}</p>
+                                    <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${esc(u.wallet_address)}</p>
+                                    <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-green-600 font-semibold">USDT</span> \${esc(u.usdt_wallet_address) || 'N/A'}</p>
                                 </div>
                                 <div class="text-right">
                                     <p class="text-xs text-gray-600 mb-1">가입일</p>
@@ -3955,7 +4472,242 @@ app.get('/admin/dashboard', (c) => {
                 document.body.removeChild(textarea);
             }
 
-            // 일일 보상 지급 실행
+            // ============================================
+            // 배당 현황 로드
+            // ============================================
+            async function loadRewardsStatus() {
+                try {
+                    const response = await axios.get('/api/admin/rewards');
+                    if (!response.data.success) return;
+                    const { stats, today, referralStats, rewards } = response.data;
+
+                    document.getElementById('rewardsTotalQkey').textContent = Math.round(stats.totalQkey).toLocaleString() + ' QKEY';
+                    document.getElementById('rewardsTodayQkey').textContent = Math.round(today.totalQkey).toLocaleString() + ' QKEY';
+                    document.getElementById('rewardsTotalCount').textContent = stats.totalCount.toLocaleString() + '건';
+                    document.getElementById('rewardsReferralTotal').textContent = Math.round(referralStats.totalQkey).toLocaleString() + ' QKEY';
+                    document.getElementById('rewardsDirectTotal').textContent = Math.round(referralStats.directTotal).toLocaleString();
+                    document.getElementById('rewardsLevel1Total').textContent = Math.round(referralStats.level1Total).toLocaleString();
+                    document.getElementById('rewardsLevel2Total').textContent = Math.round(referralStats.level2Total).toLocaleString();
+
+                    var tbody = document.getElementById('rewardsTableBody');
+                    if (rewards.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-8 text-gray-500">배당 내역이 없습니다</td></tr>';
+                    } else {
+                        tbody.innerHTML = rewards.map(function(r) {
+                            return '<tr class="hover:bg-gray-50">' +
+                                '<td class="px-2 sm:px-3 py-2 whitespace-nowrap">' + r.reward_date + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2"><span class="font-medium">' + esc(r.name) + '</span><br><span class="text-xs text-gray-500">' + esc(r.email) + '</span></td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-right">$' + (r.staking_amount || 0).toLocaleString() + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-right">' + (r.daily_rate ? (r.daily_rate * 100).toFixed(1) + '%' : '-') + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-right font-bold text-yellow-600">' + Math.round(r.qkey_amount).toLocaleString() + '</td>' +
+                            '</tr>';
+                        }).join('');
+                    }
+                } catch (error) {
+                    console.error('배당 현황 로드 실패:', error);
+                }
+            }
+
+            // ============================================
+            // 출금 관리 로드
+            // ============================================
+            async function loadWithdrawals() {
+                try {
+                    const response = await axios.get('/api/admin/withdrawals');
+                    if (!response.data.success) return;
+                    const { stats, withdrawals } = response.data;
+
+                    document.getElementById('wdPendingCount').textContent = stats.pendingCount;
+                    document.getElementById('wdApprovedCount').textContent = stats.approvedCount;
+                    document.getElementById('wdRejectedCount').textContent = stats.rejectedCount;
+                    document.getElementById('wdTotalCount').textContent = stats.totalCount;
+
+                    var listEl = document.getElementById('withdrawalsList');
+                    if (withdrawals.length === 0) {
+                        listEl.innerHTML = '<p class="text-center text-gray-500 py-8">출금 신청 내역이 없습니다</p>';
+                        return;
+                    }
+
+                    listEl.innerHTML = withdrawals.map(function(w) {
+                        var statusColor = w.status === 'pending' ? 'yellow' : w.status === 'approved' ? 'green' : 'red';
+                        var statusText = w.status === 'pending' ? '대기중' : w.status === 'approved' ? '승인됨' : '거절됨';
+                        var coinColor = w.coin_type === 'QTA' ? 'blue' : w.coin_type === 'QX' ? 'purple' : w.coin_type === 'QKEY' ? 'yellow' : 'green';
+                        
+                        return '<div class="border rounded-lg p-3 sm:p-4 border-' + statusColor + '-200 bg-' + statusColor + '-50">' +
+                            '<div class="flex flex-col sm:flex-row justify-between items-start gap-2 mb-2">' +
+                                '<div class="flex-1">' +
+                                    '<div class="flex items-center gap-2 mb-1">' +
+                                        '<span class="px-2 py-0.5 bg-' + statusColor + '-100 text-' + statusColor + '-700 rounded text-xs font-bold">' + statusText + '</span>' +
+                                        '<span class="px-2 py-0.5 bg-' + coinColor + '-100 text-' + coinColor + '-700 rounded text-xs font-bold">' + w.coin_type + '</span>' +
+                                        '<span class="text-xs text-gray-500">' + new Date(w.created_at).toLocaleString('ko-KR') + '</span>' +
+                                    '</div>' +
+                                    '<p class="text-sm font-medium text-gray-800">' + esc(w.name) + ' <span class="text-gray-500 font-normal">(' + esc(w.email) + ')</span></p>' +
+                                '</div>' +
+                                '<p class="text-xl sm:text-2xl font-bold text-' + coinColor + '-600">' + parseFloat(w.amount).toLocaleString() + ' ' + w.coin_type + '</p>' +
+                            '</div>' +
+                            '<div class="flex items-center gap-2 text-xs text-gray-600 mb-2">' +
+                                '<i class="fas fa-wallet"></i>' +
+                                '<span class="font-mono truncate">' + esc(w.wallet_address) + '</span>' +
+                                '<button onclick="copyWalletAddress(\\'' + w.wallet_address + '\\')" class="px-2 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs"><i class="fas fa-copy"></i></button>' +
+                            '</div>' +
+                            (w.status === 'pending' ? 
+                                '<div class="flex gap-2">' +
+                                    '<button onclick="approveWithdrawal(' + w.id + ')" class="flex-1 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-bold transition"><i class="fas fa-check mr-1"></i>승인</button>' +
+                                    '<button onclick="rejectWithdrawal(' + w.id + ')" class="flex-1 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-bold transition"><i class="fas fa-times mr-1"></i>거절(환불)</button>' +
+                                '</div>' 
+                            : '') +
+                        '</div>';
+                    }).join('');
+                } catch (error) {
+                    console.error('출금 관리 로드 실패:', error);
+                }
+            }
+
+            // 출금 승인
+            async function approveWithdrawal(withdrawalId) {
+                if (!confirm('이 출금을 승인하시겠습니까?')) return;
+                try {
+                    const response = await axios.post('/api/admin/withdrawal/approve/' + withdrawalId);
+                    if (response.data.success) {
+                        alert(response.data.message);
+                        loadWithdrawals();
+                    }
+                } catch (error) {
+                    alert(error.response?.data?.error || '출금 승인 실패');
+                }
+            }
+
+            // 출금 거절 (환불)
+            async function rejectWithdrawal(withdrawalId) {
+                if (!confirm('이 출금을 거절하시겠습니까?\\n잔액이 사용자에게 환불됩니다.')) return;
+                try {
+                    const response = await axios.post('/api/admin/withdrawal/reject/' + withdrawalId);
+                    if (response.data.success) {
+                        alert(response.data.message);
+                        loadWithdrawals();
+                    }
+                } catch (error) {
+                    alert(error.response?.data?.error || '출금 거절 실패');
+                }
+            }
+
+            // ============================================
+            // 일일 배당금 지급 실행
+            // ============================================
+            async function executeDailyReward() {
+                if (!confirm('일일 배당금을 지급하시겠습니까?\\n\\n활성 투자 건에 대해 QKEY 배당금이 지급됩니다.')) return;
+                
+                var btn = document.getElementById('dailyRewardBtn');
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>처리 중...';
+
+                try {
+                    const response = await axios.post('/api/rewards/daily');
+                    if (response.data.success) {
+                        var resultEl = document.getElementById('dailyRewardResult');
+                        resultEl.classList.remove('hidden');
+                        resultEl.innerHTML = '<div class="bg-green-50 border border-green-300 rounded-lg p-3">' +
+                            '<p class="text-sm font-bold text-green-800"><i class="fas fa-check-circle mr-1"></i>' + response.data.message + '</p>' +
+                            '<div class="grid grid-cols-3 gap-2 mt-2 text-center">' +
+                                '<div><p class="text-xs text-gray-600">지급 인원</p><p class="font-bold text-green-600">' + (response.data.rewarded || 0) + '명</p></div>' +
+                                '<div><p class="text-xs text-gray-600">총 QKEY</p><p class="font-bold text-yellow-600">' + (response.data.totalQkey || 0).toLocaleString() + '</p></div>' +
+                                '<div><p class="text-xs text-gray-600">스킵</p><p class="font-bold text-gray-600">' + (response.data.skipped || 0) + '건</p></div>' +
+                            '</div>' +
+                        '</div>';
+                        await loadStatistics();
+                    }
+                } catch (error) {
+                    alert(error.response?.data?.error || '배당금 지급 중 오류가 발생했습니다');
+                }
+
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-play mr-2"></i>배당금 지급 실행';
+            }
+
+            // ============================================
+            // 회원 상세 보기
+            // ============================================
+            async function showUserDetail(userId) {
+                document.getElementById('userDetailModal').classList.remove('hidden');
+                var content = document.getElementById('userDetailContent');
+                content.innerHTML = '<p class="text-center py-8 text-gray-500"><i class="fas fa-spinner fa-spin mr-2"></i>로딩 중...</p>';
+
+                try {
+                    const response = await axios.get('/api/admin/user/' + userId);
+                    if (!response.data.success) return;
+                    var u = response.data.user;
+                    var stakings = response.data.stakings || [];
+                    var rewards = response.data.rewards || [];
+                    var withdrawals = response.data.withdrawals || [];
+                    var transactions = response.data.transactions || [];
+                    var referrer = response.data.referrer;
+                    var referralCount = response.data.referralCount || 0;
+
+                    content.innerHTML = 
+                        // 기본 정보
+                        '<div class="mb-4">' +
+                            '<h4 class="font-bold text-gray-800 text-lg mb-2">' + esc(u.name) + '</h4>' +
+                            '<div class="grid grid-cols-2 gap-2 text-sm">' +
+                                '<div><span class="text-gray-500">이메일:</span> ' + esc(u.email) + '</div>' +
+                                '<div><span class="text-gray-500">전화:</span> ' + esc(u.phone || 'N/A') + '</div>' +
+                                '<div class="col-span-2"><span class="text-gray-500">QKEY 지갑:</span> <span class="font-mono text-xs">' + esc(u.wallet_address) + '</span></div>' +
+                                '<div class="col-span-2"><span class="text-gray-500">USDT 지갑:</span> <span class="font-mono text-xs">' + esc(u.usdt_wallet_address || 'N/A') + '</span></div>' +
+                                '<div><span class="text-gray-500">추천인 코드:</span> <span class="font-bold text-purple-600">' + esc(u.referral_code || '-') + '</span></div>' +
+                                '<div><span class="text-gray-500">추천인:</span> ' + (referrer ? esc(referrer.name) + ' (' + esc(referrer.email) + ')' : '없음') + '</div>' +
+                                '<div><span class="text-gray-500">피추천인:</span> ' + referralCount + '명</div>' +
+                                '<div><span class="text-gray-500">가입일:</span> ' + new Date(u.created_at).toLocaleString('ko-KR') + '</div>' +
+                            '</div>' +
+                        '</div>' +
+                        // 잔액
+                        '<div class="grid grid-cols-4 gap-2 mb-4">' +
+                            '<div class="bg-blue-50 rounded-lg p-2 text-center border border-blue-200"><p class="text-xs text-gray-500">QTA</p><p class="font-bold text-blue-600 text-sm">' + (u.qta_balance || 0).toLocaleString() + '</p></div>' +
+                            '<div class="bg-purple-50 rounded-lg p-2 text-center border border-purple-200"><p class="text-xs text-gray-500">QX</p><p class="font-bold text-purple-600 text-sm">' + (u.qx_balance || 0).toLocaleString() + '</p></div>' +
+                            '<div class="bg-yellow-50 rounded-lg p-2 text-center border border-yellow-200"><p class="text-xs text-gray-500">QKEY</p><p class="font-bold text-yellow-600 text-sm">' + (u.qkey_balance || 0).toLocaleString() + '</p></div>' +
+                            '<div class="bg-green-50 rounded-lg p-2 text-center border border-green-200"><p class="text-xs text-gray-500">USDT</p><p class="font-bold text-green-600 text-sm">' + (u.usdt_balance || 0).toFixed(2) + '</p></div>' +
+                        '</div>' +
+                        // 스테이킹
+                        '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-chart-line mr-1 text-purple-600"></i>스테이킹 (' + stakings.length + '건)</h4>' +
+                        (stakings.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">금액</th><th class="px-2 py-1">상태</th><th class="px-2 py-1">기간</th><th class="px-2 py-1">배당률</th><th class="px-2 py-1">시작일</th><th class="px-2 py-1">종료일</th></tr></thead><tbody class="divide-y">' +
+                            stakings.map(function(s) {
+                                var stColor = s.status === 'active' ? 'green' : s.status === 'pending' ? 'yellow' : s.status === 'rejected' ? 'red' : 'gray';
+                                var stText = s.status === 'active' ? '진행' : s.status === 'pending' ? '대기' : s.status === 'rejected' ? '거절' : '완료';
+                                return '<tr><td class="px-2 py-1 font-bold">$' + s.amount.toLocaleString() + '</td><td class="px-2 py-1 text-center"><span class="px-1 py-0.5 bg-' + stColor + '-100 text-' + stColor + '-700 rounded text-xs">' + stText + '</span></td><td class="px-2 py-1 text-center">' + (s.period_days || 0) + '일</td><td class="px-2 py-1 text-center">' + (s.daily_rate ? (s.daily_rate * 100).toFixed(1) + '%' : '-') + '</td><td class="px-2 py-1">' + (s.start_date ? new Date(s.start_date).toLocaleDateString('ko-KR') : '-') + '</td><td class="px-2 py-1">' + (s.end_date ? new Date(s.end_date).toLocaleDateString('ko-KR') : '-') + '</td></tr>';
+                            }).join('') +
+                        '</tbody></table></div>' : '<p class="text-xs text-gray-500 mb-4">스테이킹 없음</p>') +
+                        // 배당 내역
+                        '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-coins mr-1 text-yellow-600"></i>배당 내역 (' + rewards.length + '건)</h4>' +
+                        (rewards.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">날짜</th><th class="px-2 py-1 text-right">QKEY</th><th class="px-2 py-1 text-right">투자금</th></tr></thead><tbody class="divide-y">' +
+                            rewards.slice(0, 20).map(function(r) {
+                                return '<tr><td class="px-2 py-1">' + r.reward_date + '</td><td class="px-2 py-1 text-right font-bold text-yellow-600">' + Math.round(r.usdt_amount).toLocaleString() + '</td><td class="px-2 py-1 text-right">$' + (r.staking_amount || 0).toLocaleString() + '</td></tr>';
+                            }).join('') +
+                        '</tbody></table></div>' : '<p class="text-xs text-gray-500 mb-4">배당 내역 없음</p>') +
+                        // 출금 내역
+                        '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-money-bill-wave mr-1 text-green-600"></i>출금 내역 (' + withdrawals.length + '건)</h4>' +
+                        (withdrawals.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">날짜</th><th class="px-2 py-1">코인</th><th class="px-2 py-1 text-right">수량</th><th class="px-2 py-1">상태</th></tr></thead><tbody class="divide-y">' +
+                            withdrawals.map(function(w) {
+                                var wColor = w.status === 'pending' ? 'yellow' : w.status === 'approved' ? 'green' : 'red';
+                                var wText = w.status === 'pending' ? '대기' : w.status === 'approved' ? '승인' : '거절';
+                                return '<tr><td class="px-2 py-1">' + new Date(w.created_at).toLocaleDateString('ko-KR') + '</td><td class="px-2 py-1 text-center font-bold">' + w.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(w.amount).toLocaleString() + '</td><td class="px-2 py-1 text-center"><span class="px-1 py-0.5 bg-' + wColor + '-100 text-' + wColor + '-700 rounded text-xs">' + wText + '</span></td></tr>';
+                            }).join('') +
+                        '</tbody></table></div>' : '<p class="text-xs text-gray-500 mb-4">출금 내역 없음</p>') +
+                        // 최근 거래
+                        '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-exchange-alt mr-1 text-blue-600"></i>최근 거래 (' + transactions.length + '건)</h4>' +
+                        (transactions.length > 0 ? '<div class="overflow-x-auto"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">날짜</th><th class="px-2 py-1">유형</th><th class="px-2 py-1">코인</th><th class="px-2 py-1 text-right">수량</th><th class="px-2 py-1 text-left">설명</th></tr></thead><tbody class="divide-y">' +
+                            transactions.slice(0, 20).map(function(t) {
+                                return '<tr><td class="px-2 py-1 whitespace-nowrap">' + new Date(t.created_at).toLocaleDateString('ko-KR') + '</td><td class="px-2 py-1 text-center">' + t.type + '</td><td class="px-2 py-1 text-center font-bold">' + t.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(t.amount).toLocaleString() + '</td><td class="px-2 py-1 truncate max-w-[150px]" title="' + esc(t.description || '') + '">' + esc(t.description || '-') + '</td></tr>';
+                            }).join('') +
+                        '</tbody></table></div>' : '<p class="text-xs text-gray-500">거래 내역 없음</p>');
+
+                } catch (error) {
+                    console.error('회원 상세 로드 실패:', error);
+                    content.innerHTML = '<p class="text-center py-8 text-red-500">회원 정보를 불러오는데 실패했습니다</p>';
+                }
+            }
+
+            function closeUserDetail() {
+                document.getElementById('userDetailModal').classList.add('hidden');
+            }
+
             // 사용자 강제 탈퇴
             async function deleteUser(userId, userName, userEmail, stakingAmount) {
                 // 진행 중인 스테이킹이 있는지 확인
