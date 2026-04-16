@@ -2788,12 +2788,14 @@ app.get('/api/referral-rewards/:userId', async (c) => {
 
 // 메인 페이지 (로그인 전)
 app.get('/', (c) => {
+  const userCountry = c.req.header('CF-IPCountry') || '';
   return c.html(`
     <!DOCTYPE html>
     <html lang="ko">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="user-country" content="${userCountry}">
         <title>QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
@@ -3258,12 +3260,14 @@ app.get('/', (c) => {
 
 // 대시보드
 app.get('/dashboard', (c) => {
+  const userCountry = c.req.header('CF-IPCountry') || '';
   return c.html(`
     <!DOCTYPE html>
     <html lang="ko">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="user-country" content="${userCountry}">
         <title data-i18n="dash.title">대시보드 - QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
@@ -4762,12 +4766,14 @@ app.get('/dashboard', (c) => {
 
 // 관리자 로그인 페이지
 app.get('/admin', (c) => {
+  const userCountry = c.req.header('CF-IPCountry') || '';
   return c.html(`
     <!DOCTYPE html>
     <html lang="ko">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="user-country" content="${userCountry}">
         <title>Admin Login - QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
@@ -4853,12 +4859,14 @@ app.get('/admin', (c) => {
 
 // 관리자 대시보드
 app.get('/admin/dashboard', (c) => {
+  const userCountry = c.req.header('CF-IPCountry') || '';
   return c.html(`
     <!DOCTYPE html>
     <html lang="ko">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="user-country" content="${userCountry}">
         <title data-i18n="admin.dashboard">관리자 대시보드 - QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <script src="https://cdn.tailwindcss.com"></script>
