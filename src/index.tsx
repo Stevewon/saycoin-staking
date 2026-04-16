@@ -2938,46 +2938,8 @@ app.get('/', (c) => {
                                 class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base break-all">
                             <p class="text-xs text-red-600 mt-1 font-medium" data-i18n="register.usdt_wallet_hint">바이낸스(BINANCE) 지갑주소를 입력하십시요</p>
                         </div>
-                        <div class="grid grid-cols-2 gap-2 sm:gap-3 mb-3 sm:mb-4">
-                            <div>
-                                <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.country">국가</label>
-                                <select id="registerCountry" required
-                                    class="w-full px-2 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                    <option value="KR" selected>Korea</option>
-                                    <option value="US">USA</option>
-                                    <option value="JP">Japan</option>
-                                    <option value="CN">China</option>
-                                    <option value="VN">Vietnam</option>
-                                    <option value="TH">Thailand</option>
-                                    <option value="PH">Philippines</option>
-                                    <option value="ID">Indonesia</option>
-                                    <option value="MY">Malaysia</option>
-                                    <option value="SG">Singapore</option>
-                                    <option value="IN">India</option>
-                                    <option value="GB">UK</option>
-                                    <option value="DE">Germany</option>
-                                    <option value="FR">France</option>
-                                    <option value="AU">Australia</option>
-                                    <option value="CA">Canada</option>
-                                    <option value="RU">Russia</option>
-                                    <option value="BR">Brazil</option>
-                                    <option value="OTHER">Other</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.language">언어</label>
-                                <select id="registerLanguage" required
-                                    class="w-full px-2 py-2 sm:px-3 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-xs sm:text-base">
-                                    <option value="ko" selected>한국어 (Korean)</option>
-                                    <option value="en">English</option>
-                                    <option value="ja">日本語</option>
-                                    <option value="zh">中文</option>
-                                    <option value="vi">Tiếng Việt</option>
-                                    <option value="th">ไทย</option>
-                                    <option value="other">Other</option>
-                                </select>
-                            </div>
-                        </div>
+                        <input type="hidden" id="registerCountry" value="">
+                        <input type="hidden" id="registerLanguage" value="">
                         <div class="mb-4 sm:mb-6">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.referral_code">추천인 코드</label>
                             <input type="text" id="registerReferralCode" required
@@ -3166,8 +3128,8 @@ app.get('/', (c) => {
                 const password = document.getElementById('registerPassword').value;
                 const passwordConfirm = document.getElementById('registerPasswordConfirm').value;
                 const referralCode = document.getElementById('registerReferralCode').value.trim().toUpperCase();
-                const country = document.getElementById('registerCountry').value;
-                const language = document.getElementById('registerLanguage').value;
+                const country = navigator.language.split('-')[1] || '';
+                const language = I18N.currentLang || navigator.language.split('-')[0] || '';
 
                 console.log('입력값:', { name, email, phone, walletAddress, usdtWalletAddress, password, passwordConfirm, referralCode, country, language });
 
