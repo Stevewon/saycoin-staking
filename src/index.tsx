@@ -3052,7 +3052,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js"></script>
+        <script src="/static/i18n.js?v=20260416"></script>
         <script>
             function showRegister() {
                 document.getElementById('loginForm').classList.add('hidden');
@@ -3764,7 +3764,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js"></script>
+        <script src="/static/i18n.js?v=20260416"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -4823,7 +4823,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js"></script>
+        <script src="/static/i18n.js?v=20260416"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -5304,7 +5304,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/i18n.js"></script>
+        <script src="/static/i18n.js?v=20260416"></script>
         <script>
             // Initialize i18n
             I18N.init();
