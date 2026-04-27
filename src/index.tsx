@@ -4990,6 +4990,13 @@ app.get('/dashboard', (c) => {
                         const swapEl = document.getElementById('swapQkeyBalance');
                         if (swapEl) swapEl.textContent = (user.qkey_balance || 0).toLocaleString();
                         
+                        // 쇼핑몰 QKEY 잔액 업데이트
+                        const shopBalEl = document.getElementById('shopQkeyBalance');
+                        if (shopBalEl) shopBalEl.textContent = (user.qkey_balance || 0).toLocaleString() + ' QKEY';
+                        
+                        // currentUser 객체도 갱신
+                        currentUser = user;
+                        
                         // 로컬 스토리지 업데이트
                         localStorage.setItem('user', JSON.stringify(user));
                     }
@@ -5284,6 +5291,7 @@ app.get('/dashboard', (c) => {
                         '<p class="text-xs text-gray-500 truncate mb-1">' + escapeHtml(p.description || '') + '</p>' +
                         '<p class="text-xs text-gray-600 mb-1">' + Number(p.price_krw).toLocaleString() + '원</p>' +
                         '<p class="text-sm font-bold text-pink-600 mb-1">' + priceQkey.toLocaleString() + ' QKEY</p>' +
+                        (function(){ var bal = currentUser ? (currentUser.qkey_balance || 0) : 0; return bal < priceQkey ? '<p class="text-xs text-red-500 font-bold mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>QKEY 부족 (' + (priceQkey - bal).toLocaleString() + ' 부족)</p>' : ''; })() +
                         stockText +
                         (function(){ var opts=[]; try { if(p.options) opts=JSON.parse(p.options); } catch(e){} return opts.map(function(o,idx){ return '<div class="mt-1"><label class="text-xs text-gray-500">' + escapeHtml(o.name) + '</label><select id="opt_' + p.id + '_' + idx + '" class="w-full px-2 py-1 border rounded text-xs bg-white"><option value="">선택</option>' + (o.values||[]).map(function(v){ return '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; }).join('') + '</select></div>'; }).join(''); })() +
                         detailBtn +
@@ -5316,6 +5324,22 @@ app.get('/dashboard', (c) => {
             }
 
             async function buyProduct(productId, productName, priceQkey) {
+                // 잔액 확인 (API에서 최신 잔액 가져오기)
+                var myQkey = 0;
+                try {
+                    var balRes = await axios.get('/api/user/' + currentUser.id);
+                    if (balRes.data.success) myQkey = balRes.data.user.qkey_balance || 0;
+                } catch(e) { myQkey = currentUser.qkey_balance || 0; }
+                
+                if (myQkey < priceQkey) {
+                    var shortage = priceQkey - myQkey;
+                    alert('❌ QKEY 잔액이 부족합니다!\n\n' +
+                        '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\n' +
+                        '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\n' +
+                        '부족 금액: ' + shortage.toLocaleString() + ' QKEY\n\n' +
+                        'QKEY를 충전하거나 스테이킹 배당으로 적립 후 다시 시도해주세요.');
+                    return;
+                }
                 // 옵션 확인
                 var products = window._shopProducts || [];
                 var prod = products.find(function(x) { return x.id === productId; });
@@ -5329,8 +5353,12 @@ app.get('/dashboard', (c) => {
                         selectedOptions.push(opts[oi].name + ': ' + val);
                     }
                 }
-                var optionText = selectedOptions.length > 0 ? '\\n선택옵션: ' + selectedOptions.join(', ') : '';
-                if (!confirm(productName + optionText + '\\n\\n' + priceQkey.toLocaleString() + ' QKEY가 차감됩니다.\\n\\n구매하시겠습니까?')) return;
+                var optionText = selectedOptions.length > 0 ? '\n선택옵션: ' + selectedOptions.join(', ') : '';
+                if (!confirm(productName + optionText + '\n\n' +
+                    '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\n' +
+                    '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\n' +
+                    '결제 후 잔액: ' + (myQkey - priceQkey).toLocaleString() + ' QKEY\n\n' +
+                    '구매하시겠습니까?')) return;
 
                 var shippingName = prompt('수령인 이름:');
                 if (!shippingName) return;
