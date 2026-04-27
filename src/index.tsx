@@ -3480,13 +3480,22 @@ app.post('/api/admin/shop/product', async (c) => {
   try {
     const { name, description, price_krw, image_url, detail_image_url, category, stock } = await c.req.json()
     if (!name || !price_krw) return c.json({ error: '상품명과 가격은 필수입니다' }, 400)
+    // 이미지 크기 검증 (D1 row limit ~1MB, Base64 overhead 고려하여 500KB 제한)
+    const imgSize = (image_url || '').length + (detail_image_url || '').length
+    if (imgSize > 500 * 1024) {
+      return c.json({ error: '이미지 용량이 너무 큽니다. 더 작은 이미지를 사용해주세요. (최대 500KB)' }, 400)
+    }
     const db = c.env.DB
     await db.prepare(`INSERT INTO products (name, description, price_krw, image_url, detail_image_url, category, stock) VALUES (?,?,?,?,?,?,?)`).bind(
       name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1
     ).run()
     return c.json({ success: true, message: '상품이 등록되었습니다' })
-  } catch(e) {
-    return c.json({ error: '상품 등록 중 오류가 발생했습니다' }, 500)
+  } catch(e: any) {
+    const errMsg = e?.message || ''
+    if (errMsg.includes('too large') || errMsg.includes('SQLITE_TOOBIG')) {
+      return c.json({ error: '데이터가 너무 큽니다. 이미지 크기를 줄여주세요.' }, 400)
+    }
+    return c.json({ error: '상품 등록 중 오류가 발생했습니다: ' + errMsg }, 500)
   }
 })
 
@@ -3495,13 +3504,22 @@ app.put('/api/admin/shop/product/:id', async (c) => {
   try {
     const id = c.req.param('id')
     const { name, description, price_krw, image_url, detail_image_url, category, stock, is_active } = await c.req.json()
+    // 이미지 크기 검증
+    const imgSize = (image_url || '').length + (detail_image_url || '').length
+    if (imgSize > 500 * 1024) {
+      return c.json({ error: '이미지 용량이 너무 큽니다. 더 작은 이미지를 사용해주세요. (최대 500KB)' }, 400)
+    }
     const db = c.env.DB
     await db.prepare(`UPDATE products SET name=?, description=?, price_krw=?, image_url=?, detail_image_url=?, category=?, stock=?, is_active=? WHERE id=?`).bind(
       name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1, is_active ?? 1, id
     ).run()
     return c.json({ success: true, message: '상품이 수정되었습니다' })
-  } catch(e) {
-    return c.json({ error: '상품 수정 중 오류가 발생했습니다' }, 500)
+  } catch(e: any) {
+    const errMsg = e?.message || ''
+    if (errMsg.includes('too large') || errMsg.includes('SQLITE_TOOBIG')) {
+      return c.json({ error: '데이터가 너무 큽니다. 이미지 크기를 줄여주세요.' }, 400)
+    }
+    return c.json({ error: '상품 수정 중 오류가 발생했습니다: ' + errMsg }, 500)
   }
 })
 
@@ -5427,7 +5445,7 @@ app.get('/dashboard', (c) => {
                             await updateWithdrawalBalances();
                         }
                     } catch (error) {
-                        alert(error.response?.data?.error || I18N.t('swap.error'));
+                        alert(error.response?.data?.error || I18N.t('withdrawal.request_error'));
                     }
                 }
             }
@@ -7917,23 +7935,46 @@ app.get('/admin/dashboard', (c) => {
             }
 
             function processImageFile(file, type) {
-                var maxSize = type === 'thumb' ? 2*1024*1024 : 5*1024*1024;
+                var maxSize = 10*1024*1024; // 원본은 10MB까지 허용 (리사이즈 후 압축)
                 if (!file.type.startsWith('image/')) { alert('이미지 파일만 업로드 가능합니다'); return; }
-                if (file.size > maxSize) { alert('파일 크기가 너무 큽니다 (최대 ' + (maxSize/1024/1024) + 'MB)'); return; }
+                if (file.size > maxSize) { alert('파일 크기가 너무 큽니다 (최대 10MB)'); return; }
+                // Canvas로 리사이즈 + JPEG 압축 (DB 저장 크기 제한 대응)
                 var reader = new FileReader();
                 reader.onload = function(e) {
-                    var dataUrl = e.target.result;
-                    if (type === 'thumb') {
-                        document.getElementById('shopProdImage').value = dataUrl;
-                        document.getElementById('thumbPreviewImg').src = dataUrl;
-                        document.getElementById('thumbPreview').classList.remove('hidden');
-                        document.getElementById('thumbPlaceholder').classList.add('hidden');
-                    } else {
-                        document.getElementById('shopProdDetailImage').value = dataUrl;
-                        document.getElementById('detailPreviewImg').src = dataUrl;
-                        document.getElementById('detailPreview').classList.remove('hidden');
-                        document.getElementById('detailPlaceholder').classList.add('hidden');
-                    }
+                    var img = new Image();
+                    img.onload = function() {
+                        var maxW = type === 'thumb' ? 600 : 1200;
+                        var maxH = type === 'thumb' ? 600 : 1600;
+                        var w = img.width, h = img.height;
+                        if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
+                        if (h > maxH) { w = Math.round(w * maxH / h); h = maxH; }
+                        var canvas = document.createElement('canvas');
+                        canvas.width = w; canvas.height = h;
+                        var ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, w, h);
+                        // JPEG 품질 조정으로 300KB 이하 목표
+                        var quality = 0.8;
+                        var dataUrl = canvas.toDataURL('image/jpeg', quality);
+                        // 300KB 초과 시 품질 낮추기
+                        while (dataUrl.length > 300*1024 && quality > 0.3) {
+                            quality -= 0.1;
+                            dataUrl = canvas.toDataURL('image/jpeg', quality);
+                        }
+                        var sizeKB = Math.round(dataUrl.length / 1024);
+                        console.log('Image compressed: ' + img.width + 'x' + img.height + ' -> ' + w + 'x' + h + ', ' + sizeKB + 'KB (q=' + quality.toFixed(1) + ')');
+                        if (type === 'thumb') {
+                            document.getElementById('shopProdImage').value = dataUrl;
+                            document.getElementById('thumbPreviewImg').src = dataUrl;
+                            document.getElementById('thumbPreview').classList.remove('hidden');
+                            document.getElementById('thumbPlaceholder').classList.add('hidden');
+                        } else {
+                            document.getElementById('shopProdDetailImage').value = dataUrl;
+                            document.getElementById('detailPreviewImg').src = dataUrl;
+                            document.getElementById('detailPreview').classList.remove('hidden');
+                            document.getElementById('detailPlaceholder').classList.add('hidden');
+                        }
+                    };
+                    img.src = e.target.result;
                 };
                 reader.readAsDataURL(file);
             }
@@ -7964,6 +8005,12 @@ app.get('/admin/dashboard', (c) => {
 
                 if (!name || price <= 0) {
                     alert('상품명과 가격(원)은 필수입니다.');
+                    return;
+                }
+                // 프론트 크기 검증 (썸네일+상세 이미지 합산 500KB 제한)
+                var totalImgSize = image.length + detailImage.length;
+                if (totalImgSize > 500 * 1024) {
+                    alert('이미지 용량이 너무 큽니다 (' + Math.round(totalImgSize/1024) + 'KB). 더 작은 이미지를 사용해주세요. (최대 500KB)');
                     return;
                 }
                 try {
