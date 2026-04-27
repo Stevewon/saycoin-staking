@@ -3460,10 +3460,12 @@ app.get('/api/shop/init', async (c) => {
     category TEXT DEFAULT '일반',
     stock INTEGER DEFAULT -1,
     is_active INTEGER DEFAULT 1,
+    options TEXT DEFAULT '',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`).run()
   // 기존 테이블에 컬럼 추가 (이미 있으면 무시)
   try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e) {}
+  try { await db.prepare(`ALTER TABLE products ADD COLUMN options TEXT DEFAULT ''`).run() } catch(e) {}
   await db.prepare(`CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -3490,7 +3492,8 @@ app.get('/api/shop/products', async (c) => {
     return c.json({ success: true, products: products.results })
   } catch(e) {
     // 테이블이 없으면 자동 생성
-    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, options TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN options TEXT DEFAULT ''`).run() } catch(eo) {}
     try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
     await db.prepare(`CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, price_krw INTEGER NOT NULL, qkey_used REAL NOT NULL, status TEXT DEFAULT 'paid', shipping_name TEXT DEFAULT '', shipping_phone TEXT DEFAULT '', shipping_address TEXT DEFAULT '', shipping_memo TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
     return c.json({ success: true, products: [] })
@@ -3500,7 +3503,7 @@ app.get('/api/shop/products', async (c) => {
 // 상품 구매
 app.post('/api/shop/order', async (c) => {
   try {
-    const { userId, productId, quantity, shippingName, shippingPhone, shippingAddress, shippingMemo } = await c.req.json()
+    const { userId, productId, quantity, shippingName, shippingPhone, shippingAddress, shippingMemo, selectedOptions } = await c.req.json()
     const db = c.env.DB
     const qty = quantity || 1
 
@@ -3538,7 +3541,7 @@ app.post('/api/shop/order', async (c) => {
     // 주문 생성
     await db.prepare(`INSERT INTO orders (user_id, product_id, product_name, quantity, price_krw, qkey_used, shipping_name, shipping_phone, shipping_address, shipping_memo) VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(
       userId, productId, product.name, qty, totalKrw, qkeyNeeded,
-      shippingName || '', shippingPhone || '', shippingAddress || '', shippingMemo || ''
+      shippingName || '', shippingPhone || '', shippingAddress || '', (selectedOptions ? '[옵션: ' + selectedOptions + '] ' : '') + (shippingMemo || '')
     ).run()
 
     // 거래 기록
@@ -3567,7 +3570,7 @@ app.get('/api/shop/orders/:userId', async (c) => {
 // 어드민: 상품 등록
 app.post('/api/admin/shop/product', async (c) => {
   try {
-    const { name, description, price_krw, image_url, detail_image_url, category, stock } = await c.req.json()
+    const { name, description, price_krw, image_url, detail_image_url, category, stock, options } = await c.req.json()
     if (!name || !price_krw) return c.json({ error: '상품명과 가격은 필수입니다' }, 400)
     // 이미지 크기 검증 (D1 row limit ~1MB, Base64 overhead 고려하여 500KB 제한)
     const imgSize = (image_url || '').length + (detail_image_url || '').length
@@ -3575,11 +3578,13 @@ app.post('/api/admin/shop/product', async (c) => {
       return c.json({ error: '이미지 용량이 너무 큽니다. 더 작은 이미지를 사용해주세요. (최대 500KB)' }, 400)
     }
     const db = c.env.DB
-    // 테이블 자동 생성 + detail_image_url 컬럼 마이그레이션
-    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    // 테이블 자동 생성 + 컬럼 마이그레이션
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, options TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN options TEXT DEFAULT ''`).run() } catch(eo) {}
     try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
-    await db.prepare(`INSERT INTO products (name, description, price_krw, image_url, detail_image_url, category, stock) VALUES (?,?,?,?,?,?,?)`).bind(
-      name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1
+    const optionsStr = options ? (typeof options === 'string' ? options : JSON.stringify(options)) : ''
+    await db.prepare(`INSERT INTO products (name, description, price_krw, image_url, detail_image_url, category, stock, options) VALUES (?,?,?,?,?,?,?,?)`).bind(
+      name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1, optionsStr
     ).run()
     return c.json({ success: true, message: '상품이 등록되었습니다' })
   } catch(e: any) {
@@ -3595,7 +3600,7 @@ app.post('/api/admin/shop/product', async (c) => {
 app.put('/api/admin/shop/product/:id', async (c) => {
   try {
     const id = c.req.param('id')
-    const { name, description, price_krw, image_url, detail_image_url, category, stock, is_active } = await c.req.json()
+    const { name, description, price_krw, image_url, detail_image_url, category, stock, is_active, options } = await c.req.json()
     // 이미지 크기 검증
     const imgSize = (image_url || '').length + (detail_image_url || '').length
     if (imgSize > 500 * 1024) {
@@ -3603,8 +3608,10 @@ app.put('/api/admin/shop/product/:id', async (c) => {
     }
     const db = c.env.DB
     try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
-    await db.prepare(`UPDATE products SET name=?, description=?, price_krw=?, image_url=?, detail_image_url=?, category=?, stock=?, is_active=? WHERE id=?`).bind(
-      name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1, is_active ?? 1, id
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN options TEXT DEFAULT ''`).run() } catch(eo) {}
+    const optionsStr = options ? (typeof options === 'string' ? options : JSON.stringify(options)) : ''
+    await db.prepare(`UPDATE products SET name=?, description=?, price_krw=?, image_url=?, detail_image_url=?, category=?, stock=?, is_active=?, options=? WHERE id=?`).bind(
+      name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1, is_active ?? 1, optionsStr, id
     ).run()
     return c.json({ success: true, message: '상품이 수정되었습니다' })
   } catch(e: any) {
@@ -3634,7 +3641,8 @@ app.get('/api/admin/shop/products', async (c) => {
     const products = await db.prepare(`SELECT * FROM products ORDER BY created_at DESC`).all()
     return c.json({ success: true, products: products.results })
   } catch(e) {
-    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, options TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN options TEXT DEFAULT ''`).run() } catch(eo) {}
     try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
     return c.json({ success: true, products: [] })
   }
@@ -5277,6 +5285,7 @@ app.get('/dashboard', (c) => {
                         '<p class="text-xs text-gray-600 mb-1">' + Number(p.price_krw).toLocaleString() + '원</p>' +
                         '<p class="text-sm font-bold text-pink-600 mb-1">' + priceQkey.toLocaleString() + ' QKEY</p>' +
                         stockText +
+                        (function(){ var opts=[]; try { if(p.options) opts=JSON.parse(p.options); } catch(e){} return opts.map(function(o,idx){ return '<div class="mt-1"><label class="text-xs text-gray-500">' + escapeHtml(o.name) + '</label><select id="opt_' + p.id + '_' + idx + '" class="w-full px-2 py-1 border rounded text-xs bg-white"><option value="">선택</option>' + (o.values||[]).map(function(v){ return '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; }).join('') + '</select></div>'; }).join(''); })() +
                         detailBtn +
                         '<button onclick="buyProduct(' + p.id + ',\\'' + escapeHtml(p.name).replace(/'/g,"\\\\'") + '\\',' + priceQkey + ')" class="w-full mt-1 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg text-xs font-bold transition"><i class="fas fa-shopping-bag mr-1"></i>구매</button>' +
                     '</div>';
@@ -5307,7 +5316,21 @@ app.get('/dashboard', (c) => {
             }
 
             async function buyProduct(productId, productName, priceQkey) {
-                if (!confirm(productName + ' 구매\\n\\n' + priceQkey.toLocaleString() + ' QKEY가 차감됩니다.\\n\\n구매하시겠습니까?')) return;
+                // 옵션 확인
+                var products = window._shopProducts || [];
+                var prod = products.find(function(x) { return x.id === productId; });
+                var opts = []; try { if(prod && prod.options) opts = JSON.parse(prod.options); } catch(e){}
+                var selectedOptions = [];
+                for (var oi = 0; oi < opts.length; oi++) {
+                    var selEl = document.getElementById('opt_' + productId + '_' + oi);
+                    if (selEl) {
+                        var val = selEl.value;
+                        if (!val) { alert(opts[oi].name + '을(를) 선택해주세요.'); return; }
+                        selectedOptions.push(opts[oi].name + ': ' + val);
+                    }
+                }
+                var optionText = selectedOptions.length > 0 ? '\\n선택옵션: ' + selectedOptions.join(', ') : '';
+                if (!confirm(productName + optionText + '\\n\\n' + priceQkey.toLocaleString() + ' QKEY가 차감됩니다.\\n\\n구매하시겠습니까?')) return;
 
                 var shippingName = prompt('수령인 이름:');
                 if (!shippingName) return;
@@ -5321,7 +5344,8 @@ app.get('/dashboard', (c) => {
                     var res = await axios.post('/api/shop/order', {
                         userId: currentUser.id, productId: productId, quantity: 1,
                         shippingName: shippingName, shippingPhone: shippingPhone,
-                        shippingAddress: shippingAddress, shippingMemo: shippingMemo
+                        shippingAddress: shippingAddress, shippingMemo: shippingMemo,
+                        selectedOptions: selectedOptions.join(' / ')
                     });
                     if (res.data.success) {
                         alert(res.data.message);
@@ -6866,6 +6890,19 @@ app.get('/admin/dashboard', (c) => {
                             </select>
                             <input type="number" id="shopProdStock" placeholder="재고 (-1=무제한)" class="px-3 py-2 border rounded-lg text-sm" value="-1">
                         </div>
+                        <!-- 옵션 설정 -->
+                        <div class="mb-3">
+                            <label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-list-ul mr-1 text-orange-500"></i>옵션 설정 (선택)</label>
+                            <p class="text-xs text-gray-400 mb-2">옵션명과 항목을 쉼표로 구분. 예: 사이즈:S,M,L,XL | 컬러:블랙,화이트,네이비</p>
+                            <div id="shopProdOptions" class="space-y-2">
+                                <div class="flex gap-2 items-center">
+                                    <input type="text" placeholder="옵션명 (예: 사이즈)" class="shopOptName px-2 py-1.5 border rounded text-sm w-28">
+                                    <input type="text" placeholder="항목 (쉼표 구분: S,M,L,XL)" class="shopOptValues px-2 py-1.5 border rounded text-sm flex-1">
+                                    <button onclick="removeOptionRow(this)" class="text-red-400 hover:text-red-600 text-sm"><i class="fas fa-times-circle"></i></button>
+                                </div>
+                            </div>
+                            <button onclick="addOptionRow()" class="mt-2 px-3 py-1 bg-orange-100 hover:bg-orange-200 text-orange-700 rounded text-xs font-bold"><i class="fas fa-plus mr-1"></i>옵션 추가</button>
+                        </div>
                         <!-- 이미지 업로드 영역 -->
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                             <!-- 썸네일 -->
@@ -8097,6 +8134,96 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // 옵션 행 추가/제거
+            function addOptionRow() {
+                var container = document.getElementById('shopProdOptions');
+                var row = document.createElement('div');
+                row.className = 'flex gap-2 items-center';
+                row.innerHTML = '<input type="text" placeholder="옵션명 (예: 사이즈)" class="shopOptName px-2 py-1.5 border rounded text-sm w-28"><input type="text" placeholder="항목 (쉼표 구분: S,M,L,XL)" class="shopOptValues px-2 py-1.5 border rounded text-sm flex-1"><button onclick="removeOptionRow(this)" class="text-red-400 hover:text-red-600 text-sm"><i class="fas fa-times-circle"></i></button>';
+                container.appendChild(row);
+            }
+            function removeOptionRow(btn) {
+                var container = document.getElementById('shopProdOptions');
+                if (container.children.length > 1) { btn.parentElement.remove(); }
+                else { btn.parentElement.querySelectorAll('input').forEach(function(i){i.value='';}); }
+            }
+            function collectOptions() {
+                var opts = [];
+                document.querySelectorAll('#shopProdOptions > div').forEach(function(row) {
+                    var name = row.querySelector('.shopOptName').value.trim();
+                    var vals = row.querySelector('.shopOptValues').value.trim();
+                    if (name && vals) {
+                        opts.push({ name: name, values: vals.split(',').map(function(v){return v.trim();}).filter(function(v){return v;}) });
+                    }
+                });
+                return opts.length > 0 ? JSON.stringify(opts) : '';
+            }
+
+            // 상품 수정 모달
+            function adminEditProduct(productId) {
+                var products = [];
+                axios.get('/api/admin/shop/products').then(function(res) {
+                    products = res.data.products || [];
+                    var p = products.find(function(x) { return x.id === productId; });
+                    if (!p) { alert('상품을 찾을 수 없습니다'); return; }
+                    var opts = [];
+                    try { if(p.options) opts = JSON.parse(p.options); } catch(e) {}
+                    var optsHtml = (opts.length > 0 ? opts : [{ name: '', values: [] }]).map(function(o) {
+                        return '<div class="flex gap-2 items-center"><input type="text" value="' + esc(o.name||'') + '" placeholder="옵션명" class="editOptName px-2 py-1.5 border rounded text-sm w-28"><input type="text" value="' + esc((o.values||[]).join(',')) + '" placeholder="항목 (쉼표 구분)" class="editOptValues px-2 py-1.5 border rounded text-sm flex-1"><button onclick="this.parentElement.remove()" class="text-red-400 hover:text-red-600 text-sm"><i class="fas fa-times-circle"></i></button></div>';
+                    }).join('');
+                    var modal = document.createElement('div');
+                    modal.id = 'editProductModal';
+                    modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4';
+                    modal.innerHTML = '<div class="bg-white rounded-xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-5">' +
+                        '<div class="flex justify-between items-center mb-4"><h3 class="font-bold text-lg"><i class="fas fa-edit mr-2 text-blue-600"></i>상품 수정</h3><button onclick="document.getElementById(\\'editProductModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-xl">&times;</button></div>' +
+                        '<div class="space-y-3">' +
+                        '<input type="text" id="editProdName" value="' + esc(p.name) + '" placeholder="상품명 *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<input type="number" id="editProdPrice" value="' + p.price_krw + '" placeholder="가격 (원) *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<input type="text" id="editProdDesc" value="' + esc(p.description||'') + '" placeholder="상품 설명" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<select id="editProdCategory" class="w-full px-3 py-2 border rounded-lg text-sm bg-white"><option value="일반">일반</option><option value="식품">식품</option><option value="건강">건강</option><option value="생활">생활</option><option value="패션">패션</option><option value="뷰티">뷰티</option><option value="전자기기">전자기기</option><option value="기타">기타</option></select>' +
+                        '<input type="number" id="editProdStock" value="' + (p.stock||-1) + '" placeholder="재고 (-1=무제한)" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<div><label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-list-ul mr-1 text-orange-500"></i>옵션 설정</label><div id="editProdOptions" class="space-y-2">' + optsHtml + '</div>' +
+                        '<button onclick="var c=document.getElementById(\\'editProdOptions\\');var r=document.createElement(\\'div\\');r.className=\\'flex gap-2 items-center\\';r.innerHTML=\\'<input type=text placeholder=옵션명 class=editOptName px-2 py-1.5 border rounded text-sm w-28><input type=text placeholder=항목(쉼표구분) class=editOptValues px-2 py-1.5 border rounded text-sm flex-1><button onclick=this.parentElement.remove() class=text-red-400 hover:text-red-600 text-sm><i class=fas fa-times-circle></i></button>\\';c.appendChild(r)" class="mt-2 px-3 py-1 bg-orange-100 hover:bg-orange-200 text-orange-700 rounded text-xs font-bold"><i class="fas fa-plus mr-1"></i>옵션 추가</button></div>' +
+                        '<div class="flex gap-2 pt-3"><button onclick="saveEditProduct(' + p.id + ')" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-sm"><i class="fas fa-save mr-1"></i>저장</button><button onclick="document.getElementById(\\'editProductModal\\').remove()" class="flex-1 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-bold text-sm">취소</button></div>' +
+                        '</div></div>';
+                    document.body.appendChild(modal);
+                    document.getElementById('editProdCategory').value = p.category || '일반';
+                });
+            }
+
+            async function saveEditProduct(productId) {
+                var name = document.getElementById('editProdName').value.trim();
+                var price = parseInt(document.getElementById('editProdPrice').value) || 0;
+                if (!name || price <= 0) { alert('상품명과 가격은 필수입니다.'); return; }
+                var opts = [];
+                document.querySelectorAll('#editProdOptions > div').forEach(function(row) {
+                    var n = row.querySelector('.editOptName').value.trim();
+                    var v = row.querySelector('.editOptValues').value.trim();
+                    if (n && v) { opts.push({ name: n, values: v.split(',').map(function(x){return x.trim();}).filter(function(x){return x;}) }); }
+                });
+                try {
+                    // 기존 상품 정보 가져오기 (이미지 보존)
+                    var prodRes = await axios.get('/api/admin/shop/products');
+                    var existing = (prodRes.data.products || []).find(function(p) { return p.id === productId; });
+                    await axios.put('/api/admin/shop/product/' + productId, {
+                        name: name,
+                        description: document.getElementById('editProdDesc').value.trim(),
+                        price_krw: price,
+                        image_url: existing ? existing.image_url : '',
+                        detail_image_url: existing ? existing.detail_image_url : '',
+                        category: document.getElementById('editProdCategory').value,
+                        stock: parseInt(document.getElementById('editProdStock').value) || -1,
+                        is_active: existing ? existing.is_active : 1,
+                        options: opts.length > 0 ? JSON.stringify(opts) : ''
+                    });
+                    alert('상품이 수정되었습니다!');
+                    document.getElementById('editProductModal').remove();
+                    loadAdminShopProducts();
+                } catch(e) {
+                    alert('수정 실패: ' + (e.response?.data?.error || e.message));
+                }
+            }
+
             async function adminAddProduct() {
                 var name = document.getElementById('shopProdName').value.trim();
                 var price = parseInt(document.getElementById('shopProdPrice').value) || 0;
@@ -8106,6 +8233,7 @@ app.get('/admin/dashboard', (c) => {
                 var category = document.getElementById('shopProdCategory').value.trim() || '일반';
                 var stock = parseInt(document.getElementById('shopProdStock').value);
                 if (isNaN(stock)) stock = -1;
+                var options = collectOptions();
 
                 if (!name || price <= 0) {
                     alert('상품명과 가격(원)은 필수입니다.');
@@ -8120,7 +8248,7 @@ app.get('/admin/dashboard', (c) => {
                 try {
                     var res = await axios.post('/api/admin/shop/product', {
                         name: name, description: desc, price_krw: price,
-                        image_url: image, detail_image_url: detailImage, category: category, stock: stock
+                        image_url: image, detail_image_url: detailImage, category: category, stock: stock, options: options
                     });
                     if (res.data.success) {
                         alert('상품이 등록되었습니다!');
@@ -8132,6 +8260,7 @@ app.get('/admin/dashboard', (c) => {
                         document.getElementById('shopProdCategory').value = '';
                         document.getElementById('shopProdStock').value = '-1';
                         clearImage('thumb'); clearImage('detail');
+                        document.getElementById('shopProdOptions').innerHTML = '<div class="flex gap-2 items-center"><input type="text" placeholder="옵션명 (예: 사이즈)" class="shopOptName px-2 py-1.5 border rounded text-sm w-28"><input type="text" placeholder="항목 (쉼표 구분: S,M,L,XL)" class="shopOptValues px-2 py-1.5 border rounded text-sm flex-1"><button onclick="removeOptionRow(this)" class="text-red-400 hover:text-red-600 text-sm"><i class="fas fa-times-circle"></i></button></div>';
                         loadAdminShopProducts();
                     }
                 } catch(e) {
@@ -8166,8 +8295,10 @@ app.get('/admin/dashboard', (c) => {
                                     (p.image_url ? '<span class="text-blue-500"><i class="fas fa-image mr-1"></i>썸네일✓</span> ' : '<span class="text-gray-300">썸네일✗</span> ') +
                                     (p.detail_image_url ? '<span class="text-purple-500"><i class="fas fa-file-image mr-1"></i>상세이미지✓</span>' : '<span class="text-gray-300">상세이미지✗</span>') +
                                 '</p>' +
+                                (p.options ? '<p class="text-xs mt-1 text-orange-600"><i class="fas fa-list-ul mr-1"></i>' + (function(){ try { var opts=JSON.parse(p.options); return opts.map(function(o){return o.name+':'+o.values.join(',')}).join(' | '); } catch(e){ return p.options; } })() + '</p>' : '') +
                             '</div>' +
-                            '<div class="flex gap-2 ml-3">' +
+                            '<div class="flex flex-col gap-1 ml-3">' +
+                                '<button onclick="adminEditProduct(' + p.id + ')" class="px-2 py-1 text-xs bg-blue-100 text-blue-600 hover:bg-blue-200 rounded"><i class="fas fa-edit mr-1"></i>수정</button>' +
                                 '<button onclick="adminToggleProduct(' + p.id + ',' + (p.is_active ? 0 : 1) + ',this)" class="px-2 py-1 text-xs rounded ' + (p.is_active ? 'bg-red-100 text-red-600 hover:bg-red-200' : 'bg-green-100 text-green-600 hover:bg-green-200') + '">' +
                                     (p.is_active ? '<i class="fas fa-ban mr-1"></i>비활성' : '<i class="fas fa-check mr-1"></i>활성화') +
                                 '</button>' +
