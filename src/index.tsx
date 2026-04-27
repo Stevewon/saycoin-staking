@@ -29,7 +29,7 @@ app.use('/static/*', serveStatic({ root: './public' }))
 // Admin Auth Helpers
 // ============================================
 const ADMIN_ID = 'admin'
-const ADMIN_PW = 'admin1234'
+const ADMIN_PW = 'Qta@2026!Sec#Admin'
 
 // ============================================
 // Server-side i18n Helper
@@ -117,6 +117,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.sales_error': '매출 현황 조회 중 오류가 발생했습니다',
     'admin.member_not_found': '회원을 찾을 수 없습니다',
     'admin.downline_error': '산하 매출 조회 중 오류가 발생했습니다',
+    'admin.downline_search_placeholder': '아이디/이름/추천코드로 검색...',
+    'admin.downline_search_prompt': '회원을 검색하세요',
+    'admin.downline_enter_query': '검색어를 입력해주세요',
+    'admin.downline_no_result': '검색 결과가 없습니다',
     'admin.search_required': '검색어를 입력해주세요',
     'admin.search_error': '회원 검색 중 오류가 발생했습니다',
     'admin.member_rewards_error': '수당 현황 조회 중 오류가 발생했습니다',
@@ -124,6 +128,178 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.export_sales_error': '매출내역 내보내기 실패',
     'admin.export_users_error': '회원목록 내보내기 실패',
     'admin.export_rewards_error': '수당내역 내보내기 실패',
+    'admin.join_date': '가입일',
+    'admin.investment_amount': '투자금액',
+    'admin.downline_sales': '산하 매출 조회',
+    'admin.downline_sales_btn': '산하 매출',
+    'admin.view_detail': '상세 조회',
+    'admin.force_delete': '강제 탈퇴',
+    'admin.title': '관리자',
+    'admin.subtitle': '관리 패널',
+    'admin.dashboard': '대시보드',
+    'admin.login': '로그인',
+    'admin.login_fail': '로그인 실패',
+    'admin.logout': '로그아웃',
+    'admin.id': '아이디',
+    'admin.password': '비밀번호',
+    'admin.loading': '로딩 중...',
+    'admin.no_data': '데이터 없음',
+    'admin.approve': '승인',
+    'admin.reject': '거절',
+    'admin.rejected': '거절됨',
+    'admin.pending': '대기중',
+    'admin.approve_confirm': '승인하시겠습니까?',
+    'admin.reject_confirm': '거절하시겠습니까?',
+    'admin.approve_fail': '승인 실패',
+    'admin.reject_fail': '거절 실패',
+    'admin.reject_refund': '거절 및 환불',
+    'admin.tab_pending': '승인 대기',
+    'admin.tab_all': '전체 목록',
+    'admin.tab_users': '회원 관리',
+    'admin.tab_rewards': '배당 관리',
+    'admin.tab_sales': '매출 현황',
+    'admin.tab_signups': '가입 현황',
+    'admin.tab_withdrawals': '출금 관리',
+    'admin.tab_member_rewards': '수당 현황',
+    'admin.pending_title': '승인 대기 목록',
+    'admin.all_title': '전체 스테이킹 목록',
+    'admin.user_list': '회원 목록',
+    'admin.user_detail': '회원 상세',
+    'admin.user_detail_fail': '회원 상세 조회 실패',
+    'admin.rewards_title': '배당 현황',
+    'admin.withdrawals_title': '출금 관리',
+    'admin.sales_title': '매출 현황',
+    'admin.signups_title': '가입 현황',
+    'admin.member_rewards_title': '수당 현황',
+    'admin.downline_title': '산하 매출 조회',
+    'admin.downline_search': '산하 검색',
+    'admin.downline_fail': '산하 매출 조회 실패',
+    'admin.export_csv': 'CSV 내보내기',
+    'admin.total_users': '총 회원수',
+    'admin.total_sales': '총 매출',
+    'admin.total_sales_all': '총 매출 (전체)',
+    'admin.new_signups': '신규 가입',
+    'admin.today': '오늘',
+    'admin.this_week': '이번 주',
+    'admin.this_month': '이번 달',
+    'admin.col_name': '이름',
+    'admin.col_name_short': '이름',
+    'admin.col_email': '아이디(이메일)',
+    'admin.col_email_short': '아이디',
+    'admin.col_country': '국가',
+    'admin.col_status': '상태',
+    'admin.col_date': '날짜',
+    'admin.col_member': '회원',
+    'admin.col_investment': '투자금',
+    'admin.col_entry_amount': '진입금액',
+    'admin.col_sale_amount': '판매금액',
+    'admin.col_sale_date': '판매일',
+    'admin.col_referrer': '추천인',
+    'admin.col_daily_reward': '일일배당',
+    'admin.col_referral_reward': '추천보상',
+    'admin.col_total_reward': '총 보상',
+    'admin.col_paid_qkey': '지급 QKEY',
+    'admin.col_qkey_balance': 'QKEY 잔액',
+    'admin.col_rate': '배율',
+    'admin.status_active': '활성',
+    'admin.status_completed': '완료',
+    'admin.status_pending': '대기',
+    'admin.status_rejected': '거절',
+    'admin.no_pending': '대기 중인 항목 없음',
+    'admin.no_stakings': '스테이킹 없음',
+    'admin.no_staking': '스테이킹 없음',
+    'admin.no_users': '회원 없음',
+    'admin.no_rewards': '배당 없음',
+    'admin.no_withdrawals': '출금 내역 없음',
+    'admin.no_sales': '매출 없음',
+    'admin.no_signups': '가입 없음',
+    'admin.no_tx': '거래 내역 없음',
+    'admin.no_reward_history': '보상 내역 없음',
+    'admin.no_withdrawal_history': '출금 내역 없음',
+    'admin.no_level1': '1대 추천인 없음',
+    'admin.no_level2': '2대 추천인 없음',
+    'admin.people_unit': '명',
+    'admin.cases_unit': '건',
+    'admin.days_unit': '일',
+    'admin.amount_label': '금액',
+    'admin.coin_label': '코인',
+    'admin.qty_label': '수량',
+    'admin.rate_label': '배율',
+    'admin.type_label': '유형',
+    'admin.desc_label': '설명',
+    'admin.date_label': '날짜',
+    'admin.status_label': '상태',
+    'admin.period_label': '기간',
+    'admin.email_label': '이메일',
+    'admin.phone_label': '전화번호',
+    'admin.start_date': '시작일',
+    'admin.end_date': '종료일',
+    'admin.staking_period': '스테이킹 기간',
+    'admin.staking_section': '스테이킹 정보',
+    'admin.reward_section': '보상 정보',
+    'admin.tx_section': '거래 내역',
+    'admin.withdrawal_section': '출금 내역',
+    'admin.referral_code_label': '추천코드',
+    'admin.referral_code_short': '추천코드: ',
+    'admin.referrer_label': '추천인',
+    'admin.referrer_none': '없음',
+    'admin.referees_label': '피추천인',
+    'admin.referral_total': '추천 총계',
+    'admin.referral_reward_total': '추천 보상 총계',
+    'admin.daily_rate': '일일 배당률',
+    'admin.daily_total': '일일 배당 합계',
+    'admin.daily_reward_title': '일일 배당금 지급',
+    'admin.daily_reward_btn': '일일 배당금 지급',
+    'admin.daily_reward_desc': '활성 스테이킹에 대해 일일 배당금을 지급합니다',
+    'admin.daily_reward_confirm': '일일 배당금을 지급하시겠습니까?',
+    'admin.daily_reward_fail': '배당금 지급 실패',
+    'admin.daily_reward_processing': '배당금 지급 처리 중...',
+    'admin.daily_reward_people': '명에게 지급',
+    'admin.daily_reward_skipped': '건 스킵',
+    'admin.daily_reward_total_qkey': '총 지급 QKEY',
+    'admin.today_paid': '오늘 지급',
+    'admin.total_paid_count': '총 지급 횟수',
+    'admin.total_qkey_paid': '총 지급 QKEY',
+    'admin.recent_rewards': '최근 배당',
+    'admin.active_staking': '활성 스테이킹',
+    'admin.grand_total': '총합계',
+    'admin.direct_sale': '직접 판매',
+    'admin.level1_sales': '1대 매출',
+    'admin.level2_sales': '2대 매출',
+    'admin.level1_downline': '1대 산하',
+    'admin.level2_downline': '2대 산하',
+    'admin.level1_matching': '1대 매칭',
+    'admin.level2_matching': '2대 매칭',
+    'admin.back_to_user': '회원 목록으로',
+    'admin.load_fail': '로드 실패',
+    'admin.download_fail': '다운로드 실패',
+    'admin.copy_fail': '복사 실패',
+    'admin.wallet_copied': '지갑 주소가 복사되었습니다',
+    'admin.copy_wallet_title_qkey': 'QKEY 지갑 복사',
+    'admin.copy_wallet_title_usdt': 'USDT 지갑 복사',
+    'admin.qkey_wallet_label': 'QKEY 지갑',
+    'admin.usdt_wallet_label': 'USDT 지갑',
+    'admin.txid_not_registered': 'TXID 미등록',
+    'admin.txid_unregistered': '미등록',
+    'admin.delete_confirm1': '정말 탈퇴시키시겠습니까?',
+    'admin.delete_confirm2': '이 작업은 되돌릴 수 없습니다.',
+    'admin.delete_irreversible': '복구 불가',
+    'admin.delete_fail': '탈퇴 처리 실패',
+    'admin.delete_user_label': '사용자',
+    'admin.delete_name_label': '이름',
+    'admin.delete_email_label': '이메일',
+    'admin.delete_staking_label': '스테이킹',
+    'admin.delete_active_staking': '활성 스테이킹 있음',
+    'admin.delete_has_staking': '스테이킹 보유',
+    'admin.wd_pending': '출금 대기',
+    'admin.wd_approved': '출금 승인됨',
+    'admin.wd_rejected': '출금 거절됨',
+    'admin.wd_total': '총 출금',
+    'admin.wd_approve_confirm': '출금을 승인하시겠습니까?',
+    'admin.wd_approve_fail': '출금 승인 실패',
+    'admin.wd_reject_confirm': '출금을 거절하시겠습니까?',
+    'admin.wd_reject_fail': '출금 거절 실패',
+    'admin.no_search_result': '검색 결과 없음',
     'rewards.no_active': '활성 투자가 없거나 아직 첫 지급일이 아닙니다',
     'rewards.daily_error': '일일 배당금 지급 중 오류가 발생했습니다',
     'rewards.history_error': '보상 내역 조회 중 오류가 발생했습니다',
@@ -229,6 +405,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.sales_error': 'An error occurred while fetching sales status',
     'admin.member_not_found': 'Member not found',
     'admin.downline_error': 'An error occurred while fetching downline sales',
+    'admin.downline_search_placeholder': 'Search by ID/name/referral code...',
+    'admin.downline_search_prompt': 'Search for a member',
+    'admin.downline_enter_query': 'Please enter a search term',
+    'admin.downline_no_result': 'No results found',
     'admin.search_required': 'Please enter a search term',
     'admin.search_error': 'An error occurred while searching members',
     'admin.member_rewards_error': 'An error occurred while fetching member rewards',
@@ -341,6 +521,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.sales_error': '売上状況の取得中にエラーが発生しました',
     'admin.member_not_found': '会員が見つかりません',
     'admin.downline_error': '傘下売上の取得中にエラーが発生しました',
+    'admin.downline_search_placeholder': 'ID/名前/紹介コードで検索...',
+    'admin.downline_search_prompt': '会員を検索してください',
+    'admin.downline_enter_query': '検索語を入力してください',
+    'admin.downline_no_result': '検索結果がありません',
     'admin.search_required': '検索語を入力してください',
     'admin.search_error': '会員検索中にエラーが発生しました',
     'admin.member_rewards_error': '手当状況の取得中にエラーが発生しました',
@@ -453,6 +637,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.sales_error': '获取销售状况时发生错误',
     'admin.member_not_found': '未找到会员',
     'admin.downline_error': '获取下线销售数据时发生错误',
+    'admin.downline_search_placeholder': '按ID/姓名/推荐码搜索...',
+    'admin.downline_search_prompt': '请搜索会员',
+    'admin.downline_enter_query': '请输入搜索关键词',
+    'admin.downline_no_result': '没有搜索结果',
     'admin.search_required': '请输入搜索关键词',
     'admin.search_error': '搜索会员时发生错误',
     'admin.member_rewards_error': '获取奖金状况时发生错误',
@@ -565,6 +753,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.sales_error': 'Đã xảy ra lỗi khi lấy tình trạng doanh số',
     'admin.member_not_found': 'Không tìm thấy thành viên',
     'admin.downline_error': 'Đã xảy ra lỗi khi lấy doanh số tuyến dưới',
+    'admin.downline_search_placeholder': 'Tìm theo ID/tên/mã giới thiệu...',
+    'admin.downline_search_prompt': 'Tìm kiếm thành viên',
+    'admin.downline_enter_query': 'Vui lòng nhập từ khóa tìm kiếm',
+    'admin.downline_no_result': 'Không tìm thấy kết quả',
     'admin.search_required': 'Vui lòng nhập từ khóa tìm kiếm',
     'admin.search_error': 'Đã xảy ra lỗi khi tìm kiếm thành viên',
     'admin.member_rewards_error': 'Đã xảy ra lỗi khi lấy tình trạng hoa hồng',
@@ -677,6 +869,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.sales_error': 'เกิดข้อผิดพลาดในการดึงสถานะยอดขาย',
     'admin.member_not_found': 'ไม่พบสมาชิก',
     'admin.downline_error': 'เกิดข้อผิดพลาดในการดึงยอดขายลูกทีม',
+    'admin.downline_search_placeholder': 'ค้นหาด้วย ID/ชื่อ/รหัสแนะนำ...',
+    'admin.downline_search_prompt': 'ค้นหาสมาชิก',
+    'admin.downline_enter_query': 'กรุณากรอกคำค้นหา',
+    'admin.downline_no_result': 'ไม่พบผลลัพธ์',
     'admin.search_required': 'กรุณากรอกคำค้นหา',
     'admin.search_error': 'เกิดข้อผิดพลาดในการค้นหาสมาชิก',
     'admin.member_rewards_error': 'เกิดข้อผิดพลาดในการดึงสถานะค่าตอบแทน',
@@ -971,10 +1167,15 @@ app.post('/api/auth/login', async (c) => {
       await db.prepare('UPDATE users SET password = ? WHERE id = ?').bind(hashedPw, user.id).run()
     }
 
-    // referral_code가 없으면 생성
+    // referral_code가 없으면 생성 (6자리 랜덤, 중복 체크)
     let referralCode = user.referral_code
     if (!referralCode) {
-      referralCode = 'QTA' + Math.random().toString(36).substring(2, 7).toUpperCase()
+      let isUnique = false
+      while (!isUnique) {
+        referralCode = 'QTA' + Math.random().toString(36).substring(2, 8).toUpperCase()
+        const existing = await db.prepare('SELECT id FROM users WHERE referral_code = ?').bind(referralCode).first()
+        if (!existing) isUnique = true
+      }
       await db.prepare(`
         UPDATE users SET referral_code = ? WHERE id = ?
       `).bind(referralCode, user.id).run()
@@ -1003,7 +1204,7 @@ app.post('/api/auth/login', async (c) => {
   }
 })
 
-// 아이디 찾기 (이름 + 전화번호)
+// 아이디 찾기 (QKEY 지갑주소)
 app.post('/api/auth/find-id', async (c) => {
   try {
     const { walletAddress } = await c.req.json()
@@ -1117,9 +1318,22 @@ app.post('/api/user/update-profile', async (c) => {
 // API Routes - Withdrawal
 // ============================================
 
-// 출금 신청
+// 출금 신청 (금요일 오전 10시 ~ 오후 2시 KST만 가능)
 app.post('/api/withdrawal/request', async (c) => {
   try {
+    // 금요일 10:00~14:00 KST 체크
+    const now = new Date()
+    const kst = new Date(now.getTime() + (9 * 60 * 60 * 1000))
+    const kstDay = kst.getUTCDay()   // 0=일, 5=금
+    const kstHour = kst.getUTCHours()
+
+    if (kstDay !== 5 || kstHour < 10 || kstHour >= 14) {
+      return c.json({ 
+        error: '출금 신청은 매주 금요일 오전 10시 ~ 오후 2시(KST)에만 가능합니다. / Withdrawals are only available on Fridays 10:00 AM - 2:00 PM (KST).',
+        withdrawal_closed: true
+      }, 400)
+    }
+
     const { userId, coinType, amount, walletAddress } = await c.req.json()
 
     if (!userId || !coinType || !amount || !walletAddress) {
@@ -1145,27 +1359,24 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
     }
 
-    // 잔액 확인
+    // 잔액 확인 (잔액은 출금 신청 시 즉시 차감되므로 현재 잔액만 체크)
     const balanceField = coinType === 'QTA' ? 'qta_balance' : 
                          coinType === 'QX' ? 'qx_balance' : 
                          coinType === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
-    const currentBalance = user[balanceField]
+    const currentBalance = (user[balanceField] || 0) as number
 
-    // 이미 pending 상태인 출금 합산 확인 (Race Condition 방지)
-    const pendingWithdrawals = await db.prepare(`
-      SELECT COALESCE(SUM(amount), 0) as pending_total FROM withdrawals
-      WHERE user_id = ? AND coin_type = ? AND status = 'pending'
-    `).bind(userId, coinType).first()
-    const pendingTotal = (pendingWithdrawals?.pending_total || 0) as number
-
-    if (currentBalance - pendingTotal < amount) {
+    if (currentBalance < amount) {
       return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
     }
 
-    // 잔액 즉시 차감 (출금 신청 시점)
-    await db.prepare(`
+    // 잔액 즉시 차감 (출금 신청 시점) - 경쟁조건 방지: UPDATE 결과 확인
+    const deductResult = await db.prepare(`
       UPDATE users SET ${balanceField} = ${balanceField} - ? WHERE id = ? AND ${balanceField} >= ?
     `).bind(amount, userId, amount).run()
+
+    if (!deductResult.meta.changes || deductResult.meta.changes === 0) {
+      return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
+    }
 
     // 출금 신청 생성
     const withdrawalResult = await db.prepare(`
@@ -1253,13 +1464,17 @@ app.post('/api/swap/qkey-to-usdt', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (${qkeyBalance.toLocaleString()} QKEY / ${requiredQkey.toLocaleString()} QKEY)` }, 400)
     }
 
-    // QKEY 차감 & USDT 증가 (150 QKEY = 1 USDT)
-    await db.prepare(`
+    // QKEY 차감 & USDT 증가 (150 QKEY = 1 USDT) - 경쟁조건 방지
+    const swapResult = await db.prepare(`
       UPDATE users 
       SET qkey_balance = qkey_balance - ?,
           usdt_balance = usdt_balance + ?
-      WHERE id = ?
-    `).bind(requiredQkey, amount, userId).run()
+      WHERE id = ? AND qkey_balance >= ?
+    `).bind(requiredQkey, amount, userId, requiredQkey).run()
+
+    if (!swapResult.meta.changes || swapResult.meta.changes === 0) {
+      return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
+    }
 
     // 거래 내역 기록 (QKEY 차감)
     await db.prepare(`
@@ -1285,6 +1500,169 @@ app.post('/api/swap/qkey-to-usdt', async (c) => {
     })
   } catch (error) {
     console.error('Swap error:', error)
+    return c.json({ error: t(c, 'swap.error') }, 500)
+  }
+})
+
+// QKEY → QTA 스왑 (1:1, QKEY 1개 = QTA 1개)
+app.post('/api/swap/qkey-to-qta', async (c) => {
+  try {
+    const { userId, amount } = await c.req.json() // amount = 받고 싶은 QTA 수량
+    if (!userId || !amount || amount <= 0) {
+      return c.json({ error: t(c, 'profile.required_fields') }, 400)
+    }
+    const requiredQkey = amount // 1:1 비율
+
+    const db = c.env.DB
+    const user = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first()
+    if (!user) return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
+
+    if ((user.qkey_balance || 0) < requiredQkey) {
+      return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (${(user.qkey_balance || 0).toLocaleString()} QKEY / ${requiredQkey.toLocaleString()} QKEY)` }, 400)
+    }
+
+    // QKEY 차감 & QTA 증가 - 경쟁조건 방지
+    const swapQtaResult = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ?, qta_balance = qta_balance + ? WHERE id = ? AND qkey_balance >= ?`).bind(requiredQkey, amount, userId, requiredQkey).run()
+    if (!swapQtaResult.meta.changes || swapQtaResult.meta.changes === 0) {
+      return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
+    }
+
+    // 거래 내역 (QKEY 차감)
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, requiredQkey, `QKEY → QTA swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`).run()
+
+    // 거래 내역 (QTA 증가 - swap_in으로 기록 → 출금 가능 수량에 반영)
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QTA', ?, ?)`).bind(userId, amount, `QKEY → QTA swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`).run()
+
+    return c.json({ success: true, message: `${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA`, swap: { from: 'QKEY', to: 'QTA', qkeyUsed: requiredQkey, received: amount } })
+  } catch (error) {
+    return c.json({ error: t(c, 'swap.error') }, 500)
+  }
+})
+
+// QKEY → QX 스왑 (5:1, QKEY 5개 = QX 1개)
+app.post('/api/swap/qkey-to-qx', async (c) => {
+  try {
+    const { userId, amount } = await c.req.json() // amount = 받고 싶은 QX 수량
+    if (!userId || !amount || amount <= 0) {
+      return c.json({ error: t(c, 'profile.required_fields') }, 400)
+    }
+    const requiredQkey = amount * 5 // 5:1 비율
+
+    const db = c.env.DB
+    const user = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first()
+    if (!user) return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
+
+    if ((user.qkey_balance || 0) < requiredQkey) {
+      return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (${(user.qkey_balance || 0).toLocaleString()} QKEY / ${requiredQkey.toLocaleString()} QKEY)` }, 400)
+    }
+
+    const swapQxResult = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ?, qx_balance = qx_balance + ? WHERE id = ? AND qkey_balance >= ?`).bind(requiredQkey, amount, userId, requiredQkey).run()
+    if (!swapQxResult.meta.changes || swapQxResult.meta.changes === 0) {
+      return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
+    }
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, requiredQkey, `QKEY → QX swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`).run()
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QX', ?, ?)`).bind(userId, amount, `QKEY → QX swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`).run()
+
+    return c.json({ success: true, message: `${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX`, swap: { from: 'QKEY', to: 'QX', qkeyUsed: requiredQkey, received: amount } })
+  } catch (error) {
+    return c.json({ error: t(c, 'swap.error') }, 500)
+  }
+})
+
+// USDT → QKEY 스왑 (1 USDT = 150 QKEY, 역방향)
+app.post('/api/swap/usdt-to-qkey', async (c) => {
+  try {
+    const { userId, amount } = await c.req.json() // amount = 사용할 USDT 수량
+    if (!userId || !amount || amount <= 0) {
+      return c.json({ error: t(c, 'profile.required_fields') }, 400)
+    }
+    const qkeyToReceive = amount * 150 // 1 USDT = 150 QKEY
+
+    const db = c.env.DB
+    const user = await db.prepare(`SELECT usdt_balance FROM users WHERE id = ?`).bind(userId).first()
+    if (!user) return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
+
+    if ((user.usdt_balance || 0) < amount) {
+      return c.json({ error: `USDT 잔액이 부족합니다 (${(user.usdt_balance || 0).toFixed(2)} USDT / ${amount.toFixed(2)} USDT)` }, 400)
+    }
+
+    const swapUkResult = await db.prepare(`UPDATE users SET usdt_balance = usdt_balance - ?, qkey_balance = qkey_balance + ? WHERE id = ? AND usdt_balance >= ?`).bind(amount, qkeyToReceive, userId, amount).run()
+    if (!swapUkResult.meta.changes || swapUkResult.meta.changes === 0) {
+      return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
+    }
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, amount, `USDT → QKEY swap (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`).run()
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QKEY', ?, ?)`).bind(userId, qkeyToReceive, `USDT → QKEY swap (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`).run()
+
+    return c.json({ success: true, message: `${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY`, swap: { from: 'USDT', to: 'QKEY', usdtUsed: amount, received: qkeyToReceive } })
+  } catch (error) {
+    return c.json({ error: t(c, 'swap.error') }, 500)
+  }
+})
+
+// USDT → QTA 스왑 (1 USDT = 150 QTA, QKEY 1:1 기준)
+app.post('/api/swap/usdt-to-qta', async (c) => {
+  try {
+    const { userId, amount } = await c.req.json() // amount = 사용할 USDT 수량
+    if (!userId || !amount || amount <= 0) {
+      return c.json({ error: t(c, 'profile.required_fields') }, 400)
+    }
+    const qtaToReceive = amount * 150
+
+    const db = c.env.DB
+    const user = await db.prepare(`SELECT usdt_balance FROM users WHERE id = ?`).bind(userId).first()
+    if (!user) return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
+
+    if ((user.usdt_balance || 0) < amount) {
+      return c.json({ error: `USDT 잔액이 부족합니다 (${(user.usdt_balance || 0).toFixed(2)} USDT)` }, 400)
+    }
+
+    const swapUqtaResult = await db.prepare(`UPDATE users SET usdt_balance = usdt_balance - ?, qta_balance = qta_balance + ? WHERE id = ? AND usdt_balance >= ?`).bind(amount, qtaToReceive, userId, amount).run()
+    if (!swapUqtaResult.meta.changes || swapUqtaResult.meta.changes === 0) {
+      return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
+    }
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, amount, `USDT → QTA swap (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`).run()
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QTA', ?, ?)`).bind(userId, qtaToReceive, `USDT → QTA swap (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`).run()
+
+    return c.json({ success: true, message: `${amount} USDT → ${qtaToReceive.toLocaleString()} QTA`, swap: { from: 'USDT', to: 'QTA', usdtUsed: amount, received: qtaToReceive } })
+  } catch (error) {
+    return c.json({ error: t(c, 'swap.error') }, 500)
+  }
+})
+
+// USDT → QX 스왑 (1 USDT = 30 QX, QKEY 150/5=30 기준)
+app.post('/api/swap/usdt-to-qx', async (c) => {
+  try {
+    const { userId, amount } = await c.req.json()
+    if (!userId || !amount || amount <= 0) {
+      return c.json({ error: t(c, 'profile.required_fields') }, 400)
+    }
+    const qxToReceive = amount * 30
+
+    const db = c.env.DB
+    const user = await db.prepare(`SELECT usdt_balance FROM users WHERE id = ?`).bind(userId).first()
+    if (!user) return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
+
+    if ((user.usdt_balance || 0) < amount) {
+      return c.json({ error: `USDT 잔액이 부족합니다 (${(user.usdt_balance || 0).toFixed(2)} USDT)` }, 400)
+    }
+
+    const swapUqxResult = await db.prepare(`UPDATE users SET usdt_balance = usdt_balance - ?, qx_balance = qx_balance + ? WHERE id = ? AND usdt_balance >= ?`).bind(amount, qxToReceive, userId, amount).run()
+    if (!swapUqxResult.meta.changes || swapUqxResult.meta.changes === 0) {
+      return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
+    }
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, amount, `USDT → QX swap (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`).run()
+
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QX', ?, ?)`).bind(userId, qxToReceive, `USDT → QX swap (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`).run()
+
+    return c.json({ success: true, message: `${amount} USDT → ${qxToReceive.toLocaleString()} QX`, swap: { from: 'USDT', to: 'QX', usdtUsed: amount, received: qxToReceive } })
+  } catch (error) {
     return c.json({ error: t(c, 'swap.error') }, 500)
   }
 })
@@ -1337,10 +1715,16 @@ app.post('/api/staking/create', async (c) => {
 
     const db = c.env.DB
 
-    // 코인 지급 수량 계산: $1,000 기준 QTA 15만개, QX 2만개, QKEY 5천개
-    const qtaReward = (amount / 1000) * 150000
-    const qxReward = (amount / 1000) * 20000
-    const qkeyReward = (amount / 1000) * 5000
+    // 코인 지급 수량 계산 (날짜 기반 정책)
+    // ~5/3: QTA 75,000 / QX 10,000 / QKEY 5,000 per $1,000
+    // 5/4~: QTA 75,000 only (QX·QKEY 즉시지급 없음, 일일배당 QKEY만 유지)
+    const PHASE2_DATE = new Date('2026-05-04T00:00:00+09:00') // KST 기준 5월 4일
+    const now = new Date()
+    const isPhase2 = now >= PHASE2_DATE
+
+    const qtaReward = (amount / 1000) * 75000
+    const qxReward = isPhase2 ? 0 : (amount / 1000) * 10000
+    const qkeyReward = isPhase2 ? 0 : (amount / 1000) * 5000
 
     // 일일 배당률 계산
     const dailyRate = getDailyRate(amount)
@@ -1450,30 +1834,38 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
       WHERE id = ?
     `).bind(startDate.toISOString(), endDate.toISOString(), stakingId).run()
 
-    // 사용자 잔액 업데이트 (QTA, QX, QKEY 지급)
+    // 사용자 잔액 업데이트 (QTA 항상 지급, QX·QKEY는 DB 저장값 기반)
     const qkeyReward = staking.qkey_reward || 0
-    await db.prepare(`
-      UPDATE users 
-      SET qta_balance = qta_balance + ?, 
-          qx_balance = qx_balance + ?,
-          qkey_balance = qkey_balance + ?
-      WHERE id = ?
-    `).bind(staking.qta_reward, staking.qx_reward, qkeyReward, staking.user_id).run()
+    const qxReward = staking.qx_reward || 0
 
-    // 거래 내역 기록 (QTA)
+    // QTA는 항상 지급
+    await db.prepare(`
+      UPDATE users SET qta_balance = qta_balance + ? WHERE id = ?
+    `).bind(staking.qta_reward, staking.user_id).run()
+
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'staking_reward', 'QTA', ?, ?)
     `).bind(staking.user_id, staking.qta_reward, `Staking reward (${periodDays}d)`).run()
 
-    // Transaction record (QX)
-    await db.prepare(`
-      INSERT INTO transactions (user_id, type, coin_type, amount, description)
-      VALUES (?, 'staking_reward', 'QX', ?, ?)
-    `).bind(staking.user_id, staking.qx_reward, `Staking reward (${periodDays}d)`).run()
+    // QX 지급 (0보다 클 때만)
+    if (qxReward > 0) {
+      await db.prepare(`
+        UPDATE users SET qx_balance = qx_balance + ? WHERE id = ?
+      `).bind(qxReward, staking.user_id).run()
 
-    // Transaction record (QKEY)
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'staking_reward', 'QX', ?, ?)
+      `).bind(staking.user_id, qxReward, `Staking reward (${periodDays}d)`).run()
+    }
+
+    // QKEY 즉시지급 (0보다 클 때만)
     if (qkeyReward > 0) {
+      await db.prepare(`
+        UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+      `).bind(qkeyReward, staking.user_id).run()
+
       await db.prepare(`
         INSERT INTO transactions (user_id, type, coin_type, amount, description)
         VALUES (?, 'staking_reward', 'QKEY', ?, ?)
@@ -2074,6 +2466,52 @@ app.get('/api/admin/user/:userId', async (c) => {
   }
 })
 
+// 관리자: 회원 코인 잔액 리셋 (각 코인별 0으로)
+app.post('/api/admin/user/:userId/reset-balance', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = c.req.param('userId')
+    const { coinType } = await c.req.json()
+
+    const validCoins = ['QTA', 'QX', 'QKEY']
+    if (!validCoins.includes(coinType)) {
+      return c.json({ error: 'Invalid coin type' }, 400)
+    }
+
+    // 현재 잔액 조회
+    const columnMap: Record<string, string> = { QTA: 'qta_balance', QX: 'qx_balance', QKEY: 'qkey_balance' }
+    const column = columnMap[coinType]
+
+    const user = await db.prepare(`SELECT id, email, ${column} FROM users WHERE id = ?`).bind(userId).first()
+    if (!user) {
+      return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
+    }
+
+    const prevBalance = (user as any)[column] || 0
+
+    // 잔액을 0으로 리셋
+    await db.prepare(`UPDATE users SET ${column} = 0 WHERE id = ?`).bind(userId).run()
+
+    // 거래 내역 기록
+    if (prevBalance > 0) {
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'admin_reset', ?, ?, ?)
+      `).bind(userId, coinType, -prevBalance, `Admin reset ${coinType} balance (${prevBalance.toLocaleString()} → 0)`).run()
+    }
+
+    return c.json({
+      success: true,
+      message: `${coinType} balance reset to 0`,
+      coinType,
+      previousBalance: prevBalance
+    })
+  } catch (error) {
+    console.error('잔액 리셋 오류:', error)
+    return c.json({ error: 'Balance reset failed' }, 500)
+  }
+})
+
 // 관리자: 회원가입 현황 조회
 app.get('/api/admin/signups', async (c) => {
   try {
@@ -2302,8 +2740,8 @@ app.get('/api/admin/member-rewards', async (c) => {
         SELECT user_id, SUM(usdt_amount) as daily_total FROM daily_rewards GROUP BY user_id
       ) dr ON u.id = dr.user_id
       LEFT JOIN (
-        SELECT to_user_id, SUM(qkey_amount) as referral_total FROM referral_rewards GROUP BY to_user_id
-      ) rr ON u.id = rr.to_user_id
+        SELECT referrer_id, SUM(reward_amount) as referral_total FROM referral_rewards GROUP BY referrer_id
+      ) rr ON u.id = rr.referrer_id
       GROUP BY u.id, u.name, u.email, u.country, u.language,
                u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance,
                dr.daily_total, rr.referral_total
@@ -2318,7 +2756,7 @@ app.get('/api/admin/member-rewards', async (c) => {
     `).first()
 
     const referralTotals = await db.prepare(`
-      SELECT COALESCE(SUM(qkey_amount), 0) as total_referral_qkey
+      SELECT COALESCE(SUM(reward_amount), 0) as total_referral_qkey
       FROM referral_rewards
     `).first()
 
@@ -2347,7 +2785,7 @@ app.get('/api/admin/export/withdrawals', async (c) => {
       ORDER BY w.created_at DESC
     `).all()
 
-    let csv = '\\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.coin_type'),t(c,'csv.amount'),t(c,'csv.wallet_address'),t(c,'csv.status'),t(c,'csv.request_date'),t(c,'csv.process_date')].join(',') + '\\n'
+    let csv = '\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.coin_type'),t(c,'csv.amount'),t(c,'csv.wallet_address'),t(c,'csv.status'),t(c,'csv.request_date'),t(c,'csv.process_date')].join(',') + '\n'
     for (const w of (withdrawals.results || []) as any[]) {
       const status = w.status === 'pending' ? t(c,'csv.pending') : w.status === 'approved' ? t(c,'csv.approved') : t(c,'csv.rejected')
       csv += `${w.id},"${w.email}","${w.name}",${w.coin_type},${w.amount},"${w.wallet_address}",${status},"${w.created_at}","${w.processed_at || ''}"\n`
@@ -2364,6 +2802,40 @@ app.get('/api/admin/export/withdrawals', async (c) => {
   }
 })
 
+// 관리자 - 스왑 내역 조회
+app.get('/api/admin/swaps', async (c) => {
+  try {
+    const db = c.env.DB
+    const swaps = await db.prepare(`
+      SELECT t.id, t.user_id, u.email, u.name, t.type, t.coin_type, t.amount, t.description, t.created_at
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      WHERE t.type IN ('swap_in', 'swap_out')
+      ORDER BY t.created_at DESC
+      LIMIT 500
+    `).all()
+
+    // 스왑 통계
+    const stats = await db.prepare(`
+      SELECT 
+        COUNT(*) as total_count,
+        COUNT(DISTINCT user_id) as unique_users,
+        SUM(CASE WHEN type = 'swap_out' AND coin_type = 'QKEY' THEN amount ELSE 0 END) as total_qkey_used,
+        SUM(CASE WHEN type = 'swap_out' AND coin_type = 'USDT' THEN amount ELSE 0 END) as total_usdt_used,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'QTA' THEN amount ELSE 0 END) as total_qta_received,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'QX' THEN amount ELSE 0 END) as total_qx_received,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'USDT' THEN amount ELSE 0 END) as total_usdt_received,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'QKEY' THEN amount ELSE 0 END) as total_qkey_received
+      FROM transactions
+      WHERE type IN ('swap_in', 'swap_out')
+    `).first()
+
+    return c.json({ success: true, swaps: swaps.results, stats })
+  } catch (error) {
+    return c.json({ error: 'Failed to load swap history' }, 500)
+  }
+})
+
 // 엑셀 다운로드 API - CSV 형식 (전체 매출)
 app.get('/api/admin/export/sales', async (c) => {
   try {
@@ -2375,7 +2847,7 @@ app.get('/api/admin/export/sales', async (c) => {
       ORDER BY s.created_at DESC
     `).all()
 
-    let csv = '\\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.country'),t(c,'csv.language'),t(c,'csv.sale_amount'),t(c,'csv.status'),t(c,'csv.period_days'),t(c,'csv.daily_rate'),t(c,'csv.start_date'),t(c,'csv.end_date'),t(c,'csv.request_date')].join(',') + '\\n'
+    let csv = '\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.country'),t(c,'csv.language'),t(c,'csv.sale_amount'),t(c,'csv.status'),t(c,'csv.period_days'),t(c,'csv.daily_rate'),t(c,'csv.start_date'),t(c,'csv.end_date'),t(c,'csv.request_date')].join(',') + '\n'
     for (const s of (sales.results || []) as any[]) {
       const status = s.status === 'active' ? t(c,'csv.active') : s.status === 'pending' ? t(c,'csv.pending') : s.status === 'rejected' ? t(c,'csv.rejected') : t(c,'csv.completed')
       csv += `${s.id},"${s.email}","${s.name}","${s.country || ''}","${s.language || ''}",${s.amount},${status},${s.period_days || ''},${s.daily_rate ? (s.daily_rate * 100).toFixed(1) + '%' : ''},"${s.start_date || ''}","${s.end_date || ''}","${s.created_at}"\n`
@@ -2406,7 +2878,7 @@ app.get('/api/admin/export/users', async (c) => {
       ORDER BY u.created_at DESC
     `).all()
 
-    let csv = '\\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.phone'),t(c,'csv.country'),t(c,'csv.language'),t(c,'csv.qkey_wallet'),t(c,'csv.usdt_wallet'),t(c,'csv.qta_balance'),t(c,'csv.qx_balance'),t(c,'csv.qkey_balance'),t(c,'csv.usdt_balance'),t(c,'csv.referral_code'),t(c,'csv.staking_amount'),t(c,'csv.join_date')].join(',') + '\\n'
+    let csv = '\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.phone'),t(c,'csv.country'),t(c,'csv.language'),t(c,'csv.qkey_wallet'),t(c,'csv.usdt_wallet'),t(c,'csv.qta_balance'),t(c,'csv.qx_balance'),t(c,'csv.qkey_balance'),t(c,'csv.usdt_balance'),t(c,'csv.referral_code'),t(c,'csv.staking_amount'),t(c,'csv.join_date')].join(',') + '\n'
     for (const u of (users.results || []) as any[]) {
       csv += `${u.id},"${u.email}","${u.name}","${u.phone || ''}","${u.country || ''}","${u.language || ''}","${u.wallet_address}","${u.usdt_wallet_address || ''}",${u.qta_balance},${u.qx_balance},${u.qkey_balance},${u.usdt_balance},"${u.referral_code || ''}",${u.staking_amount},"${u.created_at}"\n`
     }
@@ -2436,12 +2908,12 @@ app.get('/api/admin/export/rewards', async (c) => {
       FROM users u
       LEFT JOIN staking s ON u.id = s.user_id
       LEFT JOIN (SELECT user_id, SUM(usdt_amount) as daily_total FROM daily_rewards GROUP BY user_id) dr ON u.id = dr.user_id
-      LEFT JOIN (SELECT to_user_id, SUM(qkey_amount) as referral_total FROM referral_rewards GROUP BY to_user_id) rr ON u.id = rr.to_user_id
+      LEFT JOIN (SELECT referrer_id, SUM(reward_amount) as referral_total FROM referral_rewards GROUP BY referrer_id) rr ON u.id = rr.referrer_id
       GROUP BY u.id
       ORDER BY daily_reward_total DESC
     `).all()
 
-    let csv = '\\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.country'),t(c,'csv.staking_amount'),t(c,'csv.daily_total'),t(c,'csv.referral_total'),t(c,'csv.total_reward'),t(c,'csv.qta_balance'),t(c,'csv.qx_balance'),t(c,'csv.qkey_balance'),t(c,'csv.usdt_balance')].join(',') + '\\n'
+    let csv = '\uFEFF' + [t(c,'csv.id'),t(c,'csv.email'),t(c,'csv.name'),t(c,'csv.country'),t(c,'csv.staking_amount'),t(c,'csv.daily_total'),t(c,'csv.referral_total'),t(c,'csv.total_reward'),t(c,'csv.qta_balance'),t(c,'csv.qx_balance'),t(c,'csv.qkey_balance'),t(c,'csv.usdt_balance')].join(',') + '\n'
     for (const r of (rewards.results || []) as any[]) {
       csv += `${r.id},"${r.email}","${r.name}","${r.country || ''}",${r.staking_amount},${Math.round(r.daily_reward_total)},${Math.round(r.referral_reward_total)},${Math.round(r.daily_reward_total + r.referral_reward_total)},${r.qta_balance},${r.qx_balance},${r.qkey_balance},${r.usdt_balance}\n`
     }
@@ -2461,13 +2933,81 @@ app.get('/api/admin/export/rewards', async (c) => {
 // API Routes - Daily Rewards
 // ============================================
 
+// 한국 공휴일/국경일 목록 (2026년)
+// 매년 업데이트 필요
+function getKoreanHolidays(year: number): string[] {
+  const holidays: Record<number, string[]> = {
+    2025: [
+      '2025-01-01','2025-01-28','2025-01-29','2025-01-30',
+      '2025-03-01','2025-05-05','2025-05-06','2025-06-06',
+      '2025-08-15','2025-10-03','2025-10-05','2025-10-06','2025-10-07',
+      '2025-10-09','2025-12-25'
+    ],
+    2026: [
+      '2026-01-01',                        // 신정
+      '2026-02-16','2026-02-17','2026-02-18', // 설날
+      '2026-03-01',                        // 삼일절
+      '2026-05-05',                        // 어린이날
+      '2026-05-24',                        // 부처님오신날
+      '2026-06-06',                        // 현충일
+      '2026-08-15',                        // 광복절
+      '2026-09-24','2026-09-25','2026-09-26', // 추석
+      '2026-10-03',                        // 개천절
+      '2026-10-09',                        // 한글날
+      '2026-12-25'                         // 성탄절
+    ],
+    2027: [
+      '2027-01-01',
+      '2027-02-05','2027-02-06','2027-02-07',
+      '2027-03-01','2027-05-05','2027-05-13','2027-06-06',
+      '2027-08-15','2027-10-03','2027-10-09',
+      '2027-10-14','2027-10-15','2027-10-16',
+      '2027-12-25'
+    ]
+  }
+  return holidays[year] || holidays[2026]
+}
+
+function isKoreanBusinessDay(date: Date): { isBusinessDay: boolean, reason: string } {
+  // KST 기준으로 변환
+  const kst = new Date(date.getTime() + (9 * 60 * 60 * 1000))
+  const day = kst.getUTCDay() // 0=일, 6=토
+  const dateStr = kst.toISOString().split('T')[0]
+  const year = kst.getUTCFullYear()
+
+  // 토/일 체크
+  if (day === 0) return { isBusinessDay: false, reason: 'sunday' }
+  if (day === 6) return { isBusinessDay: false, reason: 'saturday' }
+
+  // 공휴일 체크
+  const holidays = getKoreanHolidays(year)
+  if (holidays.includes(dateStr)) return { isBusinessDay: false, reason: 'holiday' }
+
+  return { isBusinessDay: true, reason: 'business_day' }
+}
+
 // 일일 배당금 지급 (하루 1회 자동 지급)
 // 정책: 승인일 익일부터, 거치기간 내 매일 지급, 금액별 차등 배당률
+// 월~금만 지급 (토/일/공휴일/국경일 제외)
 app.post('/api/rewards/daily', async (c) => {
   try {
     const db = c.env.DB
     const now = new Date()
     const today = now.toISOString().split('T')[0]
+
+    // 영업일 체크: 토/일/공휴일이면 지급 불가
+    const { isBusinessDay, reason } = isKoreanBusinessDay(now)
+    if (!isBusinessDay) {
+      const reasonText = reason === 'saturday' ? '토요일' : reason === 'sunday' ? '일요일' : '공휴일/국경일'
+      return c.json({
+        success: true,
+        message: `오늘은 ${reasonText}이므로 배당금 지급이 불가합니다.`,
+        rewarded: 0,
+        totalQkey: 0,
+        skipped: 0,
+        reason: reason
+      })
+    }
 
     // 활성 투자 조회 (승인일 익일부터 거치기간 종료일까지)
     const activeStakings = await db.prepare(`
@@ -2812,6 +3352,237 @@ app.get('/api/referral-rewards/:userId', async (c) => {
   } catch (error) {
     console.error('보상 내역 조회 오류:', error)
     return c.json({ error: t(c, 'rewards.history_error') }, 500)
+  }
+})
+
+// ============================================
+// Shop (QKEY 쇼핑몰) API
+// ============================================
+
+// DB 테이블 자동 생성
+app.get('/api/shop/init', async (c) => {
+  const db = c.env.DB
+  await db.prepare(`CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    price_krw INTEGER NOT NULL,
+    image_url TEXT DEFAULT '',
+    detail_image_url TEXT DEFAULT '',
+    category TEXT DEFAULT '일반',
+    stock INTEGER DEFAULT -1,
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`).run()
+  // 기존 테이블에 컬럼 추가 (이미 있으면 무시)
+  try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e) {}
+  await db.prepare(`CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    product_name TEXT NOT NULL,
+    quantity INTEGER DEFAULT 1,
+    price_krw INTEGER NOT NULL,
+    qkey_used REAL NOT NULL,
+    status TEXT DEFAULT 'paid',
+    shipping_name TEXT DEFAULT '',
+    shipping_phone TEXT DEFAULT '',
+    shipping_address TEXT DEFAULT '',
+    shipping_memo TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`).run()
+  return c.json({ success: true, message: 'Shop tables created' })
+})
+
+// 상품 목록 (사용자용 - 활성 상품만)
+app.get('/api/shop/products', async (c) => {
+  const db = c.env.DB
+  try {
+    const products = await db.prepare(`SELECT * FROM products WHERE is_active = 1 ORDER BY created_at DESC`).all()
+    return c.json({ success: true, products: products.results })
+  } catch(e) {
+    // 테이블이 없으면 자동 생성
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    await db.prepare(`CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, price_krw INTEGER NOT NULL, qkey_used REAL NOT NULL, status TEXT DEFAULT 'paid', shipping_name TEXT DEFAULT '', shipping_phone TEXT DEFAULT '', shipping_address TEXT DEFAULT '', shipping_memo TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    return c.json({ success: true, products: [] })
+  }
+})
+
+// 상품 구매
+app.post('/api/shop/order', async (c) => {
+  try {
+    const { userId, productId, quantity, shippingName, shippingPhone, shippingAddress, shippingMemo } = await c.req.json()
+    const db = c.env.DB
+    const qty = quantity || 1
+
+    const product = await db.prepare(`SELECT * FROM products WHERE id = ? AND is_active = 1`).bind(productId).first()
+    if (!product) return c.json({ error: '상품을 찾을 수 없습니다' }, 404)
+
+    if (product.stock !== -1 && product.stock < qty) return c.json({ error: '재고가 부족합니다' }, 400)
+
+    const totalKrw = (product.price_krw as number) * qty
+    const qkeyNeeded = totalKrw / 10  // 1 QKEY = 10원
+
+    const user = await db.prepare(`SELECT id, qkey_balance, name FROM users WHERE id = ?`).bind(userId).first()
+    if (!user) return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
+
+    if ((user.qkey_balance as number) < qkeyNeeded) {
+      return c.json({ error: `QKEY 잔액이 부족합니다. 필요: ${qkeyNeeded.toLocaleString()} QKEY / 보유: ${(user.qkey_balance as number).toLocaleString()} QKEY` }, 400)
+    }
+
+    // QKEY 차감 - 경쟁조건 방지
+    const purchaseResult = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ? AND qkey_balance >= ?`).bind(qkeyNeeded, userId, qkeyNeeded).run()
+    if (!purchaseResult.meta.changes || purchaseResult.meta.changes === 0) {
+      return c.json({ error: `QKEY 잔액이 부족합니다 (concurrent request)` }, 400)
+    }
+
+    // 재고 차감 - 경쟁조건 방지
+    if (product.stock !== -1) {
+      const stockResult = await db.prepare(`UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?`).bind(qty, productId, qty).run()
+      if (!stockResult.meta.changes || stockResult.meta.changes === 0) {
+        // 재고 부족 시 QKEY 환불
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(qkeyNeeded, userId).run()
+        return c.json({ error: '재고가 부족합니다 (동시 구매로 인한 재고 소진)' }, 400)
+      }
+    }
+
+    // 주문 생성
+    await db.prepare(`INSERT INTO orders (user_id, product_id, product_name, quantity, price_krw, qkey_used, shipping_name, shipping_phone, shipping_address, shipping_memo) VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(
+      userId, productId, product.name, qty, totalKrw, qkeyNeeded,
+      shippingName || '', shippingPhone || '', shippingAddress || '', shippingMemo || ''
+    ).run()
+
+    // 거래 기록
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'shop_purchase', 'QKEY', ?, ?)`).bind(
+      userId, qkeyNeeded, `쇼핑몰 구매: ${product.name} x${qty} (${totalKrw.toLocaleString()}원)`
+    ).run()
+
+    return c.json({ success: true, message: `${product.name} 구매 완료! (${qkeyNeeded.toLocaleString()} QKEY 사용)`, qkeyUsed: qkeyNeeded })
+  } catch (error) {
+    return c.json({ error: '구매 처리 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 내 주문 내역
+app.get('/api/shop/orders/:userId', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = c.req.param('userId')
+    const orders = await db.prepare(`SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC`).bind(userId).all()
+    return c.json({ success: true, orders: orders.results })
+  } catch(e) {
+    return c.json({ success: true, orders: [] })
+  }
+})
+
+// 어드민: 상품 등록
+app.post('/api/admin/shop/product', async (c) => {
+  try {
+    const { name, description, price_krw, image_url, detail_image_url, category, stock } = await c.req.json()
+    if (!name || !price_krw) return c.json({ error: '상품명과 가격은 필수입니다' }, 400)
+    const db = c.env.DB
+    await db.prepare(`INSERT INTO products (name, description, price_krw, image_url, detail_image_url, category, stock) VALUES (?,?,?,?,?,?,?)`).bind(
+      name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1
+    ).run()
+    return c.json({ success: true, message: '상품이 등록되었습니다' })
+  } catch(e) {
+    return c.json({ error: '상품 등록 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 어드민: 상품 수정
+app.put('/api/admin/shop/product/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    const { name, description, price_krw, image_url, detail_image_url, category, stock, is_active } = await c.req.json()
+    const db = c.env.DB
+    await db.prepare(`UPDATE products SET name=?, description=?, price_krw=?, image_url=?, detail_image_url=?, category=?, stock=?, is_active=? WHERE id=?`).bind(
+      name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1, is_active ?? 1, id
+    ).run()
+    return c.json({ success: true, message: '상품이 수정되었습니다' })
+  } catch(e) {
+    return c.json({ error: '상품 수정 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 어드민: 상품 삭제
+app.delete('/api/admin/shop/product/:id', async (c) => {
+  try {
+    const db = c.env.DB
+    await db.prepare(`DELETE FROM products WHERE id = ?`).bind(c.req.param('id')).run()
+    return c.json({ success: true })
+  } catch(e) {
+    return c.json({ error: '상품 삭제 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 어드민: 전체 상품 목록 (비활성 포함)
+app.get('/api/admin/shop/products', async (c) => {
+  const db = c.env.DB
+  try {
+    const products = await db.prepare(`SELECT * FROM products ORDER BY created_at DESC`).all()
+    return c.json({ success: true, products: products.results })
+  } catch(e) {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    return c.json({ success: true, products: [] })
+  }
+})
+
+// 어드민: 전체 주문 현황 (실시간)
+app.get('/api/admin/shop/orders', async (c) => {
+  const db = c.env.DB
+  try {
+    const orders = await db.prepare(`
+      SELECT o.*, u.name as user_name, u.email as user_email, u.phone as user_phone
+      FROM orders o JOIN users u ON o.user_id = u.id
+      ORDER BY o.created_at DESC LIMIT 200
+    `).all()
+
+    const stats = await db.prepare(`
+      SELECT COUNT(*) as total_orders, SUM(qkey_used) as total_qkey, SUM(price_krw) as total_krw,
+      COUNT(DISTINCT user_id) as unique_buyers FROM orders
+    `).first()
+
+    return c.json({ success: true, orders: orders.results, stats })
+  } catch(e) {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, price_krw INTEGER NOT NULL, qkey_used REAL NOT NULL, status TEXT DEFAULT 'paid', shipping_name TEXT DEFAULT '', shipping_phone TEXT DEFAULT '', shipping_address TEXT DEFAULT '', shipping_memo TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    return c.json({ success: true, orders: [], stats: { total_orders: 0, total_qkey: 0, total_krw: 0, unique_buyers: 0 } })
+  }
+})
+
+// 어드민: 주문 상태 변경
+app.put('/api/admin/shop/order/:id/status', async (c) => {
+  try {
+    const { status } = await c.req.json()
+    const db = c.env.DB
+    await db.prepare(`UPDATE orders SET status = ? WHERE id = ?`).bind(status, c.req.param('id')).run()
+    return c.json({ success: true })
+  } catch(e) {
+    return c.json({ error: '상태 변경 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 어드민: 주문현황 CSV 다운로드
+app.get('/api/admin/shop/export/orders', async (c) => {
+  const db = c.env.DB
+  try {
+    const orders = await db.prepare(`
+      SELECT o.id, u.name as user_name, u.email as user_email, u.phone as user_phone,
+        o.product_name, o.quantity, o.price_krw, o.qkey_used, o.status,
+        o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_memo, o.created_at
+      FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC
+    `).all()
+    const statusLabels: Record<string,string> = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'}
+    const header = '주문번호,주문자,이메일,전화번호,상품명,수량,금액(원),QKEY사용,상태,수령인,수령연락처,배송주소,배송메모,주문일시'
+    const rows = (orders.results || []).map((o: any) =>
+      [o.id, o.user_name, o.user_email, o.user_phone, o.product_name, o.quantity, o.price_krw, o.qkey_used,
+       statusLabels[o.status]||o.status, o.shipping_name, o.shipping_phone,
+       '"'+(o.shipping_address||'').replace(/"/g,'""')+'"', o.shipping_memo, o.created_at].join(',')
+    )
+    const csv = '\uFEFF' + header + '\n' + rows.join('\n')
+    return new Response(csv, { headers: { 'Content-Type': 'text/csv;charset=utf-8', 'Content-Disposition': 'attachment;filename=shop_orders_export.csv' } })
+  } catch(e) {
+    return new Response('주문 데이터가 없습니다', { status: 404 })
   }
 })
 
@@ -3188,7 +3959,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416e"></script>
+        <script src="/static/i18n.js?v=20260427c"></script>
         <script>
             function showRegister() {
                 document.getElementById('loginForm').classList.add('hidden');
@@ -3457,14 +4228,28 @@ app.get('/dashboard', (c) => {
                 </div>
             </header>
 
-            <!-- Main Content -->
-            <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8">
+            <!-- 상단 카테고리 네비게이션 -->
+            <nav class="bg-white border-b shadow-sm sticky top-0 z-40">
+                <div class="max-w-7xl mx-auto px-3 sm:px-4 flex">
+                    <button onclick="switchDashPage('main')" id="dashNav-main"
+                        class="flex items-center gap-1 px-4 py-3 text-sm font-bold text-purple-600 border-b-2 border-purple-600 transition">
+                        <i class="fas fa-chart-line"></i><span>대시보드</span>
+                    </button>
+                    <button onclick="switchDashPage('shop')" id="dashNav-shop"
+                        class="flex items-center gap-1 px-4 py-3 text-sm font-bold text-gray-400 hover:text-pink-600 transition">
+                        <i class="fas fa-shopping-cart"></i><span>쇼핑몰</span>
+                    </button>
+                </div>
+            </nav>
+
+            <!-- Main Content (대시보드) -->
+            <main id="dashPage-main" class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8">
                 <!-- Balance Cards -->
                 <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-4 mb-6 sm:mb-8">
                     <!-- 퀀타리움 스테이킹 현황 (첫 번째 - full width) -->
                     <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.purchase_transfer">퀀타리움구매 → 지갑 전송수량</span>
+                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.purchase_transfer">퀀타리움구매(USDT)</span>
                             <i class="fas fa-chart-line text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-2xl sm:text-3xl font-bold" id="stakingStatus">0</p>
@@ -3483,7 +4268,7 @@ app.get('/dashboard', (c) => {
                     <!-- QTA (세 번째) -->
                     <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qta_coin">QTA 코인</span>
+                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qta_coin">QTA코인(지갑전송수량)</span>
                             <i class="fas fa-coins text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qtaBalance">0</p>
@@ -3505,41 +4290,6 @@ app.get('/dashboard', (c) => {
                             <i class="fas fa-key text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qkeyBalance">0</p>
-                    </div>
-                </div>
-
-                <!-- Swap Section (QKEY → USDT) -->
-                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
-                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
-                        <i class="fas fa-exchange-alt mr-2 text-green-600"></i><span data-i18n="dash.swap_title">QKEY → USDT 스왑</span>
-                    </h2>
-                    <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
-                        <div class="flex items-start gap-2">
-                            <i class="fas fa-info-circle text-green-600 text-lg mt-0.5"></i>
-                            <div>
-                                <p class="text-sm text-green-800 font-medium" data-i18n="dash.swap_info">보유한 QKEY를 USDT로 스왑할 수 있습니다</p>
-                                <p class="text-xs text-green-700 mt-1" data-i18n="dash.swap_rate">교환 비율: 150 QKEY = 1 USDT | 최소 100 USDT | 100 단위</p>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
-                        <div>
-                            <label class="block text-gray-700 font-bold mb-2 text-sm" data-i18n="dash.swap_available">스왑 가능 QKEY 잔액</label>
-                            <p class="text-2xl font-bold text-yellow-600" id="swapQkeyBalance">0</p>
-                        </div>
-                        <div>
-                            <label class="block text-gray-700 font-bold mb-2 text-sm" data-i18n="dash.swap_amount">스왑 수량 (USDT)</label>
-                            <div class="flex gap-2">
-                                <input type="number" id="swapAmount" 
-                                    min="100" step="100" placeholder="Min 100, units of 100" data-i18n-placeholder="dash.swap_placeholder"
-                                    class="flex-1 px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-green-500 text-sm sm:text-base">
-                                <button type="button" onclick="handleSwap()"
-                                    class="px-4 py-2 sm:px-6 sm:py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold transition text-sm sm:text-base whitespace-nowrap">
-                                    <i class="fas fa-exchange-alt mr-1"></i><span data-i18n="dash.swap_btn">Swap</span>
-                                </button>
-                            </div>
-                            <p class="text-xs text-gray-500 mt-1"><span data-i18n="dash.swap_hint">Min 100, in units of 100</span></p>
-                        </div>
                     </div>
                 </div>
 
@@ -3624,11 +4374,11 @@ app.get('/dashboard', (c) => {
                                     <span class="text-gray-600" data-i18n="dash.qta_preview">QTA Reward :</span>
                                     <span id="qtaRewardPreview" class="font-bold text-blue-600">0</span>
                                 </div>
-                                <div class="flex justify-between text-sm">
+                                <div id="qxPreviewRow" class="flex justify-between text-sm">
                                     <span class="text-gray-600" data-i18n="dash.qx_preview">QX Reward :</span>
                                     <span id="qxRewardPreview" class="font-bold text-purple-600">0</span>
                                 </div>
-                                <div class="flex justify-between text-sm">
+                                <div id="qkeyPreviewRow" class="flex justify-between text-sm">
                                     <span class="text-gray-600" data-i18n="dash.qkey_preview">QKEY Reward :</span>
                                     <span id="qkeyRewardPreview" class="font-bold text-yellow-600">0</span>
                                 </div>
@@ -3656,10 +4406,10 @@ app.get('/dashboard', (c) => {
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <!-- 지갑주소 입력 -->
                                 <div class="bg-white rounded-lg p-3 border border-blue-200 shadow-sm">
-                                    <label class="block text-xs text-gray-600 mb-1 font-medium" data-i18n="dash.company_wallet">회사 지갑주소 (QUANTARIUM)</label>
+                                    <label class="block text-xs text-gray-600 mb-1 font-medium" data-i18n="dash.company_wallet">회사 지갑주소 BEP-20 (BSC)</label>
                                     <div class="flex items-center gap-2 mb-2">
                                         <input type="text" id="companyWallet" 
-                                            value="0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e" 
+                                            value="0x8b6E72e378A99aEBc291C2C6861766d519239100" 
                                             readonly
                                             class="flex-1 min-w-0 px-2 py-2 bg-gray-50 border border-gray-300 rounded font-mono text-xs sm:text-sm truncate">
                                         <button type="button" onclick="copyCompanyWallet()" 
@@ -3677,7 +4427,7 @@ app.get('/dashboard', (c) => {
                                 <div class="bg-white rounded-lg p-3 border border-blue-200 shadow-sm flex flex-col items-center justify-center">
                                     <label class="block text-xs text-gray-600 mb-2 font-medium" data-i18n="dash.qr_label">Easy deposit via QR code</label>
                                     <div id="qrcode" class="bg-white p-2 rounded"></div>
-                                    <p class="text-xs text-gray-500 mt-2 text-center" data-i18n="dash.qr_scan">Scan QR with wallet app</p>
+                                    <p class="text-xs text-gray-500 mt-2 text-center" data-i18n="dash.qr_scan">BEP-20 (BSC)</p>
                                 </div>
                             </div>
                         </div>
@@ -3689,19 +4439,124 @@ app.get('/dashboard', (c) => {
                     </form>
                 </div>
 
-                <!-- Withdrawal Section (스테이킹 기간 종료 시 표시) -->
-                <div id="withdrawalSection" class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8" style="display: none;">
+                <!-- Swap Section (코인 교환) - 2탭 UI -->
+                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
+                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4">
+                        <i class="fas fa-exchange-alt mr-2 text-indigo-600"></i><span data-i18n="dash.swap_title">코인 교환 (Swap)</span>
+                    </h2>
+
+                    <!-- 탭 버튼 -->
+                    <div class="flex rounded-lg overflow-hidden border-2 border-indigo-200 mb-4">
+                        <button id="swapTabQkey" onclick="switchSwapTab('qkey')"
+                            class="flex-1 py-3 text-sm sm:text-base font-bold transition bg-indigo-600 text-white">
+                            <i class="fas fa-key mr-1"></i>QKEY <span data-i18n="dash.swap_from">로 교환</span>
+                        </button>
+                        <button id="swapTabUsdt" onclick="switchSwapTab('usdt')"
+                            class="flex-1 py-3 text-sm sm:text-base font-bold transition bg-white text-gray-600 hover:bg-gray-50">
+                            <i class="fas fa-dollar-sign mr-1"></i>USDT <span data-i18n="dash.swap_from">로 교환</span>
+                        </button>
+                    </div>
+
+                    <!-- QKEY 탭 -->
+                    <div id="swapPanelQkey">
+                        <!-- 잔액 -->
+                        <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-4 flex items-center justify-between">
+                            <span class="text-sm font-medium text-yellow-800"><i class="fas fa-key mr-1"></i>QKEY <span data-i18n="dash.balance">보유량</span></span>
+                            <span id="swapQkeyBalance" class="text-lg font-bold text-yellow-700">0</span>
+                        </div>
+                        <!-- 교환 대상 선택 -->
+                        <div class="mb-4">
+                            <label class="block text-sm font-bold text-gray-700 mb-2" data-i18n="dash.swap_target">교환 대상</label>
+                            <select id="swapQkeyTarget" onchange="updateSwapPreview('qkey')"
+                                class="w-full px-4 py-3 border-2 border-indigo-200 rounded-lg text-sm sm:text-base font-medium focus:outline-none focus:border-indigo-500 bg-white">
+                                <option value="qta">QTA (1 QKEY = 1 QTA)</option>
+                                <option value="qx">QX (5 QKEY = 1 QX)</option>
+                                <option value="usdt">USDT (150 QKEY = 1 USDT)</option>
+                            </select>
+                        </div>
+                        <!-- 수량 입력 -->
+                        <div class="mb-3">
+                            <label class="block text-sm font-bold text-gray-700 mb-2" id="swapQkeyInputLabel">수량 입력</label>
+                            <input type="number" id="swapQkeyAmount" min="1" placeholder="수량 입력" oninput="updateSwapPreview('qkey')"
+                                class="w-full px-4 py-3 border-2 border-gray-200 rounded-lg text-sm sm:text-base focus:outline-none focus:border-indigo-500">
+                        </div>
+                        <!-- 미리보기 -->
+                        <div id="swapQkeyPreview" class="bg-indigo-50 border border-indigo-200 rounded-lg p-3 mb-4">
+                            <div class="flex items-center justify-between">
+                                <span class="text-sm text-gray-600" data-i18n="dash.swap_need">필요</span>
+                                <span class="text-sm font-bold text-indigo-700" id="swapQkeyNeedText">0 QKEY</span>
+                            </div>
+                            <div class="flex items-center justify-center my-2">
+                                <i class="fas fa-arrow-down text-indigo-400"></i>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-sm text-gray-600" data-i18n="dash.swap_receive">받는 수량</span>
+                                <span class="text-sm font-bold text-green-600" id="swapQkeyGetText">0</span>
+                            </div>
+                        </div>
+                        <!-- 교환 버튼 -->
+                        <button onclick="executeSwapNew('qkey')" 
+                            class="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-sm sm:text-base transition">
+                            <i class="fas fa-exchange-alt mr-2"></i><span data-i18n="dash.swap_btn">교환</span>
+                        </button>
+                    </div>
+
+                    <!-- USDT 탭 -->
+                    <div id="swapPanelUsdt" style="display:none;">
+                        <!-- 잔액 -->
+                        <div class="bg-green-50 border border-green-200 rounded-lg p-3 mb-4 flex items-center justify-between">
+                            <span class="text-sm font-medium text-green-800"><i class="fas fa-dollar-sign mr-1"></i>USDT <span data-i18n="dash.balance">보유량</span></span>
+                            <span id="swapUsdtBalance" class="text-lg font-bold text-green-700">0</span>
+                        </div>
+                        <!-- 교환 대상 선택 -->
+                        <div class="mb-4">
+                            <label class="block text-sm font-bold text-gray-700 mb-2" data-i18n="dash.swap_target">교환 대상</label>
+                            <select id="swapUsdtTarget" onchange="updateSwapPreview('usdt')"
+                                class="w-full px-4 py-3 border-2 border-green-200 rounded-lg text-sm sm:text-base font-medium focus:outline-none focus:border-green-500 bg-white">
+                                <option value="qkey">QKEY (1 USDT = 150 QKEY)</option>
+                                <option value="qta">QTA (1 USDT = 150 QTA)</option>
+                                <option value="qx">QX (1 USDT = 30 QX)</option>
+                            </select>
+                        </div>
+                        <!-- 수량 입력 -->
+                        <div class="mb-3">
+                            <label class="block text-sm font-bold text-gray-700 mb-2" id="swapUsdtInputLabel">USDT 수량 입력</label>
+                            <input type="number" id="swapUsdtAmount" min="1" placeholder="USDT 수량 입력" oninput="updateSwapPreview('usdt')"
+                                class="w-full px-4 py-3 border-2 border-gray-200 rounded-lg text-sm sm:text-base focus:outline-none focus:border-green-500">
+                        </div>
+                        <!-- 미리보기 -->
+                        <div id="swapUsdtPreview" class="bg-green-50 border border-green-200 rounded-lg p-3 mb-4">
+                            <div class="flex items-center justify-between">
+                                <span class="text-sm text-gray-600" data-i18n="dash.swap_need">필요</span>
+                                <span class="text-sm font-bold text-green-700" id="swapUsdtNeedText">0 USDT</span>
+                            </div>
+                            <div class="flex items-center justify-center my-2">
+                                <i class="fas fa-arrow-down text-green-400"></i>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-sm text-gray-600" data-i18n="dash.swap_receive">받는 수량</span>
+                                <span class="text-sm font-bold text-indigo-600" id="swapUsdtGetText">0</span>
+                            </div>
+                        </div>
+                        <!-- 교환 버튼 -->
+                        <button onclick="executeSwapNew('usdt')"
+                            class="w-full py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-sm sm:text-base transition">
+                            <i class="fas fa-exchange-alt mr-2"></i><span data-i18n="dash.swap_btn">교환</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Withdrawal Section (항상 표시, 금요일 10~14시 KST만 버튼 활성화) -->
+                <div id="withdrawalSection" class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4">
                         <i class="fas fa-money-bill-wave mr-2 text-green-600"></i><span data-i18n="dash.withdrawal_title">코인 출금 신청</span>
                     </h2>
-                    <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
-                        <p class="text-sm text-green-800">
-                            <i class="fas fa-check-circle mr-2"></i>
-                            <span data-i18n="dash.withdrawal_available">거치기간이 종료되었습니다. 보유하신 코인을 출금 신청하실 수 있습니다.</span>
-                        </p>
-                    </div>
                     
                     <div class="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+                        <!-- 출금 시간 안내 -->
+                        <div id="withdrawalTimeNotice" class="col-span-2 lg:col-span-4 mb-2">
+                        </div>
+
                         <!-- QTA 출금 -->
                         <div class="border-2 border-blue-200 rounded-lg p-3 sm:p-4 hover:border-blue-400 transition">
                             <div class="flex items-center justify-between mb-2 sm:mb-3">
@@ -3710,8 +4565,8 @@ app.get('/dashboard', (c) => {
                             </div>
                             <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
                             <p class="text-lg sm:text-2xl font-bold text-blue-600 mb-3 sm:mb-4" id="withdrawQtaBalance">0</p>
-                            <button onclick="requestWithdrawal('QTA')" 
-                                class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                            <button onclick="requestWithdrawal('QTA')" id="withdrawBtn_QTA"
+                                class="withdraw-btn w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
                                 <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
                             </button>
                         </div>
@@ -3724,8 +4579,8 @@ app.get('/dashboard', (c) => {
                             </div>
                             <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
                             <p class="text-lg sm:text-2xl font-bold text-purple-600 mb-3 sm:mb-4" id="withdrawQxBalance">0</p>
-                            <button onclick="requestWithdrawal('QX')" 
-                                class="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                            <button onclick="requestWithdrawal('QX')" id="withdrawBtn_QX"
+                                class="withdraw-btn w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
                                 <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
                             </button>
                         </div>
@@ -3738,8 +4593,8 @@ app.get('/dashboard', (c) => {
                             </div>
                             <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
                             <p class="text-lg sm:text-2xl font-bold text-yellow-600 mb-3 sm:mb-4" id="withdrawQkeyBalance">0</p>
-                            <button onclick="requestWithdrawal('QKEY')" 
-                                class="w-full bg-yellow-600 hover:bg-yellow-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                            <button onclick="requestWithdrawal('QKEY')" id="withdrawBtn_QKEY"
+                                class="withdraw-btn w-full bg-yellow-600 hover:bg-yellow-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
                                 <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
                             </button>
                         </div>
@@ -3752,8 +4607,8 @@ app.get('/dashboard', (c) => {
                             </div>
                             <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
                             <p class="text-lg sm:text-2xl font-bold text-green-600 mb-3 sm:mb-4" id="withdrawUsdtBalance">0</p>
-                            <button onclick="requestWithdrawal('USDT')" 
-                                class="w-full bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
+                            <button onclick="requestWithdrawal('USDT')" id="withdrawBtn_USDT"
+                                class="withdraw-btn w-full bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
                                 <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
                             </button>
                         </div>
@@ -3821,7 +4676,7 @@ app.get('/dashboard', (c) => {
                             <div class="relative">
                                 <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm"></i>
                                 <input type="text" id="referralSearchInput" 
-                                    placeholder="Search by name or email..." data-i18n-placeholder="dash.search_referral" 
+                                    placeholder="아이디 또는 이메일로 검색..." data-i18n-placeholder="dash.search_referral" 
                                     oninput="filterReferralList()"
                                     class="w-full pl-9 pr-8 py-2 border border-gray-300 rounded-lg text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500">
                                 <button onclick="document.getElementById('referralSearchInput').value=''; filterReferralList();" 
@@ -3905,13 +4760,61 @@ app.get('/dashboard', (c) => {
                     </div>
                 </div>
             </main>
+
+            <!-- 쇼핑몰 페이지 (별도) -->
+            <div id="dashPage-shop" class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8 hidden">
+                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-xl sm:text-2xl font-bold text-gray-800">
+                            <i class="fas fa-shopping-cart mr-2 text-pink-600"></i>QKEY 쇼핑몰
+                        </h2>
+                        <div class="flex items-center gap-2">
+                            <span class="text-xs text-gray-500">(1 QKEY = 10원)</span>
+                            <span id="shopQkeyBalance" class="text-sm font-bold text-pink-700 bg-pink-50 px-2 py-1 rounded">0 QKEY</span>
+                        </div>
+                    </div>
+                    <!-- 탭 버튼 -->
+                    <div class="flex border-b mb-4">
+                        <button onclick="switchShopTab('products')" id="shopTab-products"
+                            class="flex-1 py-2 text-sm font-bold text-pink-600 border-b-2 border-pink-600 transition">
+                            <i class="fas fa-store mr-1"></i>상품목록
+                        </button>
+                        <button onclick="switchShopTab('orders')" id="shopTab-orders"
+                            class="flex-1 py-2 text-sm font-bold text-gray-400 hover:text-gray-600 transition">
+                            <i class="fas fa-receipt mr-1"></i>내 구매내역
+                        </button>
+                    </div>
+                    <!-- 상품 패널 -->
+                    <div id="shopPanel-products">
+                        <!-- 카테고리 필터 -->
+                        <div id="shopCategoryFilter" class="flex flex-wrap gap-2 mb-4">
+                            <button onclick="filterShopCategory('전체')" class="shopCatBtn px-3 py-1 rounded-full text-xs font-bold bg-pink-600 text-white">전체</button>
+                        </div>
+                        <div id="shopProductList" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4">
+                            <p class="col-span-2 sm:col-span-3 lg:col-span-4 text-center text-gray-400 py-8 text-sm">상품을 불러오는 중...</p>
+                        </div>
+                    </div>
+                    <!-- 구매내역 패널 -->
+                    <div id="shopPanel-orders" class="hidden">
+                        <div id="shopMyOrders" class="space-y-2 max-h-[70vh] overflow-y-auto">
+                            <p class="text-center text-gray-400 text-sm py-8">구매 내역이 없습니다</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416e"></script>
+        <script src="/static/i18n.js?v=20260427c"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
+
+            // HTML 이스케이프 (XSS 방지)
+            function escapeHtml(str) {
+                if (!str) return '';
+                return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+            }
 
             // 로그인 체크
             function checkAuth() {
@@ -4008,15 +4911,9 @@ app.get('/dashboard', (c) => {
                             return endDate <= now;
                         });
                         
-                        // 출금 섹션 표시 여부
-                        const withdrawalSection = document.getElementById('withdrawalSection');
-                        if (hasCompletedStaking) {
-                            withdrawalSection.style.display = 'block';
-                            // 출금 가능 잔액 업데이트
-                            updateWithdrawalBalances();
-                        } else {
-                            withdrawalSection.style.display = 'none';
-                        }
+                        // 출금 섹션 항상 표시 + 잔액 업데이트
+                        updateWithdrawalBalances();
+                        updateWithdrawalButtons();
                         
                         if (stakings.length === 0) {
                             listEl.innerHTML = '<p class="text-gray-500 text-center py-8">' + I18N.t('dash.no_staking') + '</p>';
@@ -4097,6 +4994,320 @@ app.get('/dashboard', (c) => {
                 }
             }
             
+            // ============================================
+            // 스왑 (코인 교환) 기능 - 2탭 UI
+            // ============================================
+
+            function switchSwapTab(tab) {
+                var qkeyTab = document.getElementById('swapTabQkey');
+                var usdtTab = document.getElementById('swapTabUsdt');
+                var qkeyPanel = document.getElementById('swapPanelQkey');
+                var usdtPanel = document.getElementById('swapPanelUsdt');
+                if (tab === 'qkey') {
+                    qkeyTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-indigo-600 text-white';
+                    usdtTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-white text-gray-600 hover:bg-gray-50';
+                    qkeyPanel.style.display = '';
+                    usdtPanel.style.display = 'none';
+                } else {
+                    usdtTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-green-600 text-white';
+                    qkeyTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-white text-gray-600 hover:bg-gray-50';
+                    usdtPanel.style.display = '';
+                    qkeyPanel.style.display = 'none';
+                }
+            }
+
+            var swapRates = {
+                qkey: { qta: {need: 1, get: 1}, qx: {need: 5, get: 1}, usdt: {need: 150, get: 1} },
+                usdt: { qkey: {need: 1, get: 150}, qta: {need: 1, get: 150}, qx: {need: 1, get: 30} }
+            };
+
+            function updateSwapPreview(from) {
+                if (from === 'qkey') {
+                    var target = document.getElementById('swapQkeyTarget').value;
+                    var v = parseInt(document.getElementById('swapQkeyAmount').value) || 0;
+                    var rate = swapRates.qkey[target];
+                    var needAmount = v * rate.need;
+                    var getAmount = v * rate.get;
+                    document.getElementById('swapQkeyNeedText').textContent = needAmount.toLocaleString() + ' QKEY';
+                    document.getElementById('swapQkeyGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
+                    // USDT일 때 label 힌트
+                    var label = document.getElementById('swapQkeyInputLabel');
+                    if (target === 'usdt') {
+                        label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' (Min 100, 100 unit)';
+                    } else {
+                        label.textContent = target.toUpperCase() + ' ' + I18N.t('dash.swap_amount_label');
+                    }
+                } else {
+                    var target = document.getElementById('swapUsdtTarget').value;
+                    var v = parseFloat(document.getElementById('swapUsdtAmount').value) || 0;
+                    var rate = swapRates.usdt[target];
+                    var needAmount = v * rate.need;
+                    var getAmount = v * rate.get;
+                    document.getElementById('swapUsdtNeedText').textContent = needAmount.toLocaleString() + ' USDT';
+                    document.getElementById('swapUsdtGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
+                }
+            }
+
+            async function updateSwapBalances() {
+                try {
+                    const response = await axios.get('/api/user/' + currentUser.id);
+                    if (response.data.success) {
+                        var u = response.data.user;
+                        var qkeyEl = document.getElementById('swapQkeyBalance');
+                        var usdtEl = document.getElementById('swapUsdtBalance');
+                        if (qkeyEl) qkeyEl.textContent = (u.qkey_balance || 0).toLocaleString();
+                        if (usdtEl) usdtEl.textContent = (u.usdt_balance || 0).toFixed(2);
+                    }
+                } catch(e) {}
+            }
+            updateSwapBalances();
+
+            // ============================================
+            // QKEY 쇼핑몰
+            // ============================================
+            // 대시보드/쇼핑몰 페이지 전환
+            function switchDashPage(page) {
+                ['main','shop'].forEach(function(p) {
+                    var el = document.getElementById('dashPage-' + p);
+                    var nav = document.getElementById('dashNav-' + p);
+                    if (p === page) {
+                        if (el) el.classList.remove('hidden');
+                        if (nav) { nav.classList.remove('text-gray-400'); nav.classList.add('text-purple-600','border-b-2','border-purple-600'); }
+                    } else {
+                        if (el) el.classList.add('hidden');
+                        if (nav) { nav.classList.add('text-gray-400'); nav.classList.remove('text-purple-600','border-b-2','border-purple-600'); }
+                    }
+                });
+                if (page === 'shop') { loadShopProducts(); loadMyOrders(); }
+            }
+
+            function switchShopTab(tab) {
+                ['products','orders'].forEach(function(t) {
+                    var panel = document.getElementById('shopPanel-' + t);
+                    var btn = document.getElementById('shopTab-' + t);
+                    if (t === tab) {
+                        panel.classList.remove('hidden');
+                        btn.classList.remove('text-gray-400');
+                        btn.classList.add('text-pink-600', 'border-b-2', 'border-pink-600');
+                    } else {
+                        panel.classList.add('hidden');
+                        btn.classList.add('text-gray-400');
+                        btn.classList.remove('text-pink-600', 'border-b-2', 'border-pink-600');
+                    }
+                });
+                if (tab === 'orders') loadMyOrders();
+            }
+
+            var _currentShopCategory = '전체';
+
+            async function loadShopProducts() {
+                try {
+                    const res = await axios.get('/api/shop/products');
+                    if (!res.data.success) return;
+                    var products = res.data.products || [];
+                    // QKEY 잔액 표시
+                    var balEl = document.getElementById('shopQkeyBalance');
+                    if (balEl && currentUser) {
+                        try {
+                            var uRes = await axios.get('/api/user/' + currentUser.id);
+                            if (uRes.data.success) balEl.textContent = (uRes.data.user.qkey_balance || 0).toLocaleString() + ' QKEY';
+                        } catch(e){}
+                    }
+                    // 상품 데이터를 전역에 저장
+                    window._shopProducts = products;
+                    // 카테고리 필터 버튼 생성
+                    var cats = ['전체'];
+                    products.forEach(function(p) { if (p.category && cats.indexOf(p.category) < 0) cats.push(p.category); });
+                    var filterEl = document.getElementById('shopCategoryFilter');
+                    if (filterEl) {
+                        filterEl.innerHTML = cats.map(function(c) {
+                            var active = c === _currentShopCategory;
+                            return '<button onclick="filterShopCategory(\\'' + c + '\\')" class="shopCatBtn px-3 py-1 rounded-full text-xs font-bold transition ' +
+                                (active ? 'bg-pink-600 text-white' : 'bg-gray-200 text-gray-600 hover:bg-pink-100') + '">' + c + '</button>';
+                        }).join('');
+                    }
+                    renderShopProducts(products);
+                } catch(e) {
+                    console.error('Shop load error:', e);
+                }
+            }
+
+            function filterShopCategory(cat) {
+                _currentShopCategory = cat;
+                var products = window._shopProducts || [];
+                // 필터 버튼 스타일 업데이트
+                document.querySelectorAll('.shopCatBtn').forEach(function(btn) {
+                    if (btn.textContent === cat) {
+                        btn.className = 'shopCatBtn px-3 py-1 rounded-full text-xs font-bold transition bg-pink-600 text-white';
+                    } else {
+                        btn.className = 'shopCatBtn px-3 py-1 rounded-full text-xs font-bold transition bg-gray-200 text-gray-600 hover:bg-pink-100';
+                    }
+                });
+                var filtered = cat === '전체' ? products : products.filter(function(p) { return p.category === cat; });
+                renderShopProducts(filtered);
+            }
+
+            function renderShopProducts(products) {
+                var el = document.getElementById('shopProductList');
+                if (products.length === 0) {
+                    el.innerHTML = '<p class="col-span-2 sm:col-span-3 lg:col-span-4 text-center text-gray-400 py-8 text-sm">등록된 상품이 없습니다</p>';
+                    return;
+                }
+                el.innerHTML = products.map(function(p) {
+                    var priceQkey = Math.ceil(p.price_krw / 10);
+                    var stockText = p.stock === -1 ? '' : (p.stock <= 0 ? '<span class="text-red-500 text-xs font-bold">품절</span>' : '<span class="text-xs text-gray-500">재고 ' + p.stock + '</span>');
+                    var disabled = p.stock === 0 ? 'opacity-50 pointer-events-none' : '';
+                    var detailBtn = p.detail_image_url ? '<button onclick="showProductDetail(' + p.id + ')" class="w-full mb-1 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs transition"><i class="fas fa-search-plus mr-1"></i>상세보기</button>' : '';
+                    return '<div class="border-2 border-pink-200 rounded-xl p-3 hover:border-pink-400 transition ' + disabled + '">' +
+                        (p.image_url ? '<img src="' + escapeHtml(p.image_url) + '" class="w-full h-28 object-cover rounded-lg mb-2 cursor-pointer" onclick="showProductDetail(' + p.id + ')" onerror="this.style.display=\\'none\\'">' : '<div class="w-full h-28 bg-gradient-to-br from-pink-100 to-purple-100 rounded-lg mb-2 flex items-center justify-center"><i class="fas fa-box text-4xl text-pink-300"></i></div>') +
+                        '<h4 class="font-bold text-sm text-gray-800 truncate">' + escapeHtml(p.name) + '</h4>' +
+                        '<p class="text-xs text-gray-500 truncate mb-1">' + escapeHtml(p.description || '') + '</p>' +
+                        '<p class="text-xs text-gray-600 mb-1">' + Number(p.price_krw).toLocaleString() + '원</p>' +
+                        '<p class="text-sm font-bold text-pink-600 mb-1">' + priceQkey.toLocaleString() + ' QKEY</p>' +
+                        stockText +
+                        detailBtn +
+                        '<button onclick="buyProduct(' + p.id + ',\\'' + escapeHtml(p.name).replace(/'/g,"\\\\'") + '\\',' + priceQkey + ')" class="w-full mt-1 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg text-xs font-bold transition"><i class="fas fa-shopping-bag mr-1"></i>구매</button>' +
+                    '</div>';
+                }).join('');
+            }
+
+            async function loadMyOrders() {
+                try {
+                    var res = await axios.get('/api/shop/orders/' + currentUser.id);
+                    if (!res.data.success) return;
+                    var orders = res.data.orders || [];
+                    var el = document.getElementById('shopMyOrders');
+                    if (orders.length === 0) {
+                        el.innerHTML = '<p class="text-center text-gray-400 text-sm py-4">구매 내역이 없습니다</p>';
+                        return;
+                    }
+                    el.innerHTML = orders.map(function(o) {
+                        var date = new Date(o.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
+                        var statusMap = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'};
+                        var statusColor = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
+                        return '<div class="flex items-center justify-between bg-gray-50 rounded-lg p-2">' +
+                            '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-gray-800 truncate">' + escapeHtml(o.product_name) + ' x' + o.quantity + '</p>' +
+                            '<p class="text-xs text-gray-500">' + date + '</p></div>' +
+                            '<div class="text-right ml-2"><p class="text-sm font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + ' QKEY</p>' +
+                            '<span class="text-xs px-2 py-0.5 bg-' + (statusColor[o.status]||'gray') + '-100 text-' + (statusColor[o.status]||'gray') + '-700 rounded-full">' + (statusMap[o.status]||o.status) + '</span></div></div>';
+                    }).join('');
+                } catch(e) {}
+            }
+
+            async function buyProduct(productId, productName, priceQkey) {
+                if (!confirm(productName + ' 구매\\n\\n' + priceQkey.toLocaleString() + ' QKEY가 차감됩니다.\\n\\n구매하시겠습니까?')) return;
+
+                var shippingName = prompt('수령인 이름:');
+                if (!shippingName) return;
+                var shippingPhone = prompt('연락처:');
+                if (!shippingPhone) return;
+                var shippingAddress = prompt('배송주소:');
+                if (!shippingAddress) return;
+                var shippingMemo = prompt('배송메모 (선택):') || '';
+
+                try {
+                    var res = await axios.post('/api/shop/order', {
+                        userId: currentUser.id, productId: productId, quantity: 1,
+                        shippingName: shippingName, shippingPhone: shippingPhone,
+                        shippingAddress: shippingAddress, shippingMemo: shippingMemo
+                    });
+                    if (res.data.success) {
+                        alert(res.data.message);
+                        await loadUserInfo();
+                        await loadShopProducts();
+                        await loadMyOrders();
+                        await updateSwapBalances();
+                    }
+                } catch(e) {
+                    alert(e.response?.data?.error || '구매 처리 중 오류');
+                }
+            }
+
+            // 상품 상세 모달
+            function showProductDetail(productId) {
+                var products = window._shopProducts || [];
+                var p = products.find(function(x) { return x.id === productId; });
+                if (!p) return;
+                var priceQkey = Math.ceil(p.price_krw / 10);
+                var imgHtml = p.detail_image_url 
+                    ? '<img src="' + escapeHtml(p.detail_image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">'
+                    : (p.image_url ? '<img src="' + escapeHtml(p.image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">' : '');
+                var modal = document.createElement('div');
+                modal.id = 'productDetailModal';
+                modal.className = 'fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4';
+                modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
+                modal.innerHTML = '<div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">' +
+                    '<div class="sticky top-0 bg-white p-4 border-b flex items-center justify-between rounded-t-2xl">' +
+                        '<h3 class="font-bold text-lg text-gray-800">' + escapeHtml(p.name) + '</h3>' +
+                        '<button onclick="document.getElementById(\\'productDetailModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>' +
+                    '</div>' +
+                    '<div class="p-4">' +
+                        imgHtml +
+                        '<p class="text-sm text-gray-600 mb-3">' + escapeHtml(p.description || '') + '</p>' +
+                        '<div class="flex items-center justify-between bg-pink-50 rounded-lg p-3 mb-3">' +
+                            '<span class="text-sm text-gray-700">가격</span>' +
+                            '<div class="text-right"><p class="text-lg font-bold text-pink-600">' + priceQkey.toLocaleString() + ' QKEY</p><p class="text-xs text-gray-500">' + Number(p.price_krw).toLocaleString() + '원</p></div>' +
+                        '</div>' +
+                        (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-3">재고: ' + (p.stock <= 0 ? '<span class="text-red-500 font-bold">품절</span>' : p.stock + '개') + '</p>' : '') +
+                        (p.stock === 0 ? '' : '<button onclick="document.getElementById(\\'productDetailModal\\').remove(); buyProduct(' + p.id + ',\\'' + escapeHtml(p.name).replace(/'/g,"\\\\\\\\'") + '\\',' + priceQkey + ')" class="w-full py-3 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold transition"><i class="fas fa-shopping-bag mr-1"></i>구매하기</button>') +
+                    '</div>' +
+                '</div>';
+                var old = document.getElementById('productDetailModal');
+                if (old) old.remove();
+                document.body.appendChild(modal);
+            }
+
+            // 쇼핑몰 초기 로딩
+            loadShopProducts();
+            loadMyOrders();
+
+            // 어드민에서 쇼핑몰 바로가기로 왔으면 자동 전환
+            if (localStorage.getItem('openShop') === '1') {
+                localStorage.removeItem('openShop');
+                setTimeout(function() { switchDashPage('shop'); }, 300);
+            }
+
+            async function executeSwapNew(from) {
+                var target, amt, endpoint, confirmMsg;
+
+                if (from === 'qkey') {
+                    target = document.getElementById('swapQkeyTarget').value;
+                    amt = parseInt(document.getElementById('swapQkeyAmount').value) || 0;
+                    if (amt <= 0) { alert(I18N.t('alert.enter_valid_amount')); return; }
+                    // USDT 스왑은 최소 100, 100 단위
+                    if (target === 'usdt') {
+                        if (amt < 100) { alert(I18N.t('swap.min_amount')); return; }
+                        if (amt % 100 !== 0) { alert(I18N.t('swap.unit_error')); return; }
+                    }
+                    endpoint = '/api/swap/qkey-to-' + target;
+                    var rate = swapRates.qkey[target];
+                    confirmMsg = (amt * rate.need).toLocaleString() + ' QKEY → ' + (amt * rate.get).toLocaleString() + ' ' + target.toUpperCase();
+                } else {
+                    target = document.getElementById('swapUsdtTarget').value;
+                    amt = parseFloat(document.getElementById('swapUsdtAmount').value) || 0;
+                    if (amt <= 0) { alert(I18N.t('alert.enter_valid_amount')); return; }
+                    endpoint = '/api/swap/usdt-to-' + target;
+                    var rate = swapRates.usdt[target];
+                    confirmMsg = (amt * rate.need).toLocaleString() + ' USDT → ' + (amt * rate.get).toLocaleString() + ' ' + target.toUpperCase();
+                }
+
+                if (!confirm(confirmMsg + '\\n\\n' + I18N.t('dash.swap_confirm'))) return;
+
+                try {
+                    const response = await axios.post(endpoint, { userId: currentUser.id, amount: amt });
+                    if (response.data.success) {
+                        alert(response.data.message);
+                        document.getElementById(from === 'qkey' ? 'swapQkeyAmount' : 'swapUsdtAmount').value = '';
+                        updateSwapPreview(from);
+                        await loadUserInfo();
+                        await updateSwapBalances();
+                        await updateWithdrawalBalances();
+                    }
+                } catch (error) {
+                    alert(error.response?.data?.error || I18N.t('swap.error'));
+                }
+            }
+
             // 출금 가능 잔액 업데이트
             async function updateWithdrawalBalances() {
                 try {
@@ -4108,13 +5319,66 @@ app.get('/dashboard', (c) => {
                         document.getElementById('withdrawQkeyBalance').textContent = (user.qkey_balance || 0).toLocaleString();
                         document.getElementById('withdrawUsdtBalance').textContent = user.usdt_balance.toFixed(2);
                     }
+
                 } catch (error) {
                     console.error('Failed to load withdrawal balances:', error);
                 }
             }
             
+            // 출금 가능 시간 체크 (금요일 10:00~14:00 KST)
+            function isWithdrawalTime() {
+                const now = new Date();
+                // KST = UTC+9
+                const kst = new Date(now.getTime() + (9 * 60 * 60 * 1000));
+                const day = kst.getUTCDay(); // 0=일, 5=금
+                const hour = kst.getUTCHours();
+                return (day === 5 && hour >= 10 && hour < 14);
+            }
+
+            // 버튼 원래 색상 저장용
+            var _withdrawBtnOriginalClasses = {};
+
+            function updateWithdrawalButtons() {
+                const canWithdraw = isWithdrawalTime();
+                var btns = document.querySelectorAll('.withdraw-btn');
+                var notice = document.getElementById('withdrawalTimeNotice');
+                
+                if (canWithdraw) {
+                    btns.forEach(function(btn) {
+                        btn.disabled = false;
+                        btn.classList.remove('cursor-not-allowed');
+                        // 원래 색상 복원
+                        if (_withdrawBtnOriginalClasses[btn.id]) {
+                            btn.className = _withdrawBtnOriginalClasses[btn.id];
+                        }
+                    });
+                    if (notice) notice.innerHTML = '<div class="bg-green-50 border border-green-300 rounded-lg p-2 text-center"><p class="text-xs sm:text-sm text-green-700 font-medium"><i class="fas fa-check-circle mr-1"></i>' + I18N.t('dash.withdrawal_open') + '</p></div>';
+                } else {
+                    btns.forEach(function(btn) {
+                        // 원래 클래스 저장 (최초 1회만)
+                        if (!_withdrawBtnOriginalClasses[btn.id]) {
+                            _withdrawBtnOriginalClasses[btn.id] = btn.className;
+                        }
+                        btn.disabled = true;
+                        // 완전 회색 버튼으로 변경
+                        btn.className = 'withdraw-btn w-full bg-gray-400 text-white py-2 rounded-lg font-medium text-xs sm:text-sm cursor-not-allowed';
+                    });
+                    if (notice) notice.innerHTML = '<div class="bg-red-50 border border-red-300 rounded-lg p-2 text-center"><p class="text-xs sm:text-sm text-red-700 font-medium"><i class="fas fa-lock mr-1"></i>' + I18N.t('dash.withdrawal_closed') + '</p><p class="text-[10px] sm:text-xs text-red-500 mt-1">' + I18N.t('dash.withdrawal_schedule') + '</p></div>';
+                }
+            }
+
+            // 페이지 로드 시 + 1분마다 체크
+            updateWithdrawalButtons();
+            setInterval(updateWithdrawalButtons, 60000);
+
             // 출금 신청
             async function requestWithdrawal(coinType) {
+                // 클라이언트 시간 이중 체크
+                if (!isWithdrawalTime()) {
+                    alert(I18N.t('dash.withdrawal_closed'));
+                    updateWithdrawalButtons();
+                    return;
+                }
                 const balances = {
                     'QTA': parseFloat(document.getElementById('withdrawQtaBalance').textContent.replace(/,/g, '')),
                     'QX': parseFloat(document.getElementById('withdrawQxBalance').textContent.replace(/,/g, '')),
@@ -4163,7 +5427,7 @@ app.get('/dashboard', (c) => {
                             await updateWithdrawalBalances();
                         }
                     } catch (error) {
-                        alert(error.response?.data?.error || I18N.t('alert.withdrawal_applied'));
+                        alert(error.response?.data?.error || I18N.t('swap.error'));
                     }
                 }
             }
@@ -4190,7 +5454,7 @@ app.get('/dashboard', (c) => {
 
             // QR 코드 생성
             function generateQRCode() {
-                const companyWallet = '0xE0c166B147a742E4FbCf5e5BCf73aCA631f14f0e';
+                const companyWallet = '0x8b6E72e378A99aEBc291C2C6861766d519239100';
                 const qrcodeContainer = document.getElementById('qrcode');
                 
                 // 기존 QR 코드 제거
@@ -4357,13 +5621,21 @@ app.get('/dashboard', (c) => {
                     document.getElementById('policyRow1').className = 'bg-purple-100 font-bold';
                 }
 
-                // 보상 미리보기
-                const qtaReward = (accumulatedAmount / 1000) * 150000;
-                const qxReward = (accumulatedAmount / 1000) * 20000;
-                const qkeyReward = (accumulatedAmount / 1000) * 5000;
+                // 보상 미리보기 (날짜별 정책: ~5/3 QTA 75k + QX 10k + QKEY 5k, 5/4~ QTA 75k only)
+                var PHASE2 = new Date('2026-05-04T00:00:00+09:00');
+                var isPhase2 = new Date() >= PHASE2;
+                var qtaReward = (accumulatedAmount / 1000) * 75000;
+                var qxReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 10000;
+                var qkeyReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 5000;
                 document.getElementById('qtaRewardPreview').textContent = qtaReward.toLocaleString();
                 document.getElementById('qxRewardPreview').textContent = qxReward.toLocaleString();
                 document.getElementById('qkeyRewardPreview').textContent = qkeyReward.toLocaleString();
+
+                // QX/QKEY 행 숨김 처리 (Phase2)
+                var qxRow = document.getElementById('qxPreviewRow');
+                var qkeyRow = document.getElementById('qkeyPreviewRow');
+                if (qxRow) qxRow.style.display = isPhase2 ? 'none' : '';
+                if (qkeyRow) qkeyRow.style.display = isPhase2 ? 'none' : '';
                 document.getElementById('dailyRatePreview').textContent = policy.rate;
                 document.getElementById('periodPreview').textContent = policy.periodText;
                 document.getElementById('rewardPreview').classList.remove('hidden');
@@ -4387,11 +5659,17 @@ app.get('/dashboard', (c) => {
                 }
                 
                 const policy = getPolicy(amount);
-                const qtaReward = (amount / 1000) * 150000;
-                const qxReward = (amount / 1000) * 20000;
-                const qkeyReward = (amount / 1000) * 5000;
+                var _P2 = new Date('2026-05-04T00:00:00+09:00');
+                var _isP2 = new Date() >= _P2;
+                const qtaReward = (amount / 1000) * 75000;
+                const qxReward = _isP2 ? 0 : (amount / 1000) * 10000;
+                const qkeyReward = _isP2 ? 0 : (amount / 1000) * 5000;
                 
-                if (confirm('$' + amount.toLocaleString() + ' / ' + policy.periodText + '\\n\\n' + I18N.t('dash.daily_rate') + ': ' + policy.rate + '\\n' + I18N.t('dash.period') + ': ' + policy.periodText + '\\n\\n• QTA ' + qtaReward.toLocaleString() + '\\n• QX ' + qxReward.toLocaleString() + '\\n• QKEY ' + qkeyReward.toLocaleString())) {
+                var _msg = '$' + amount.toLocaleString() + ' / ' + policy.periodText + '\\n\\n' + I18N.t('dash.daily_rate') + ': ' + policy.rate + '
+' + I18N.t('dash.period') + ': ' + policy.periodText + '\\n\\n• QTA ' + qtaReward.toLocaleString();
+                if (!_isP2) _msg += '\\n• QX ' + qxReward.toLocaleString() + '\\n• QKEY ' + qkeyReward.toLocaleString();
+                _msg += '\\n\\n• ' + I18N.t('dash.daily_rate') + ' QKEY (' + policy.rate + ')';
+                if (confirm(_msg)) {
                     try {
                         const response = await axios.post('/api/staking/create', {
                             userId: currentUser.id,
@@ -4641,7 +5919,7 @@ app.get('/dashboard', (c) => {
                 return '<div class="bg-' + color + '-50 border border-' + color + '-200 rounded-lg p-3 sm:p-4">' +
                     '<div class="flex justify-between items-start mb-2">' +
                         '<div>' +
-                            '<p class="font-bold text-gray-800 text-sm sm:text-base">' + user.name + '</p>' +
+                            '<p class="font-bold text-gray-800 text-sm sm:text-base">' + user.email + '</p>' +
                             '<p class="text-xs text-gray-500">' + I18N.t('dash.joined') + ': ' + new Date(user.created_at).toLocaleDateString('ko-KR') + '</p>' +
                         '</div>' +
                         '<div class="text-right">' +
@@ -4830,52 +6108,7 @@ app.get('/dashboard', (c) => {
                 }
             }
 
-            // QKEY → USDT 스왑
-            async function handleSwap() {
-                const amountInput = document.getElementById('swapAmount');
-                const amount = parseInt(amountInput.value);
 
-                if (!amount || isNaN(amount)) {
-                    alert(I18N.t('alert.enter_valid_amount'));
-                    return;
-                }
-
-                if (amount < 100) {
-                    alert(I18N.t('dash.swap_rate'));
-                    return;
-                }
-
-                if (amount % 100 !== 0) {
-                    alert(I18N.t('dash.swap_unit_hint'));
-                    return;
-                }
-
-                const qkeyBalance = parseInt((document.getElementById('swapQkeyBalance').textContent || '0').replace(/,/g, ''));
-                var requiredQkey = amount * 150;
-                if (requiredQkey > qkeyBalance) {
-                    alert(I18N.t('alert.insufficient_balance'));
-                    return;
-                }
-
-                if (!confirm(requiredQkey.toLocaleString() + ' QKEY → ' + amount.toLocaleString() + ' USDT\\n\\n' + I18N.t('dash.swap_rate'))) {
-                    return;
-                }
-
-                try {
-                    const response = await axios.post('/api/swap/qkey-to-usdt', {
-                        userId: currentUser.id,
-                        amount: amount
-                    });
-
-                    if (response.data.success) {
-                        alert(I18N.t('alert.swap_complete') + '\\n\\n' + requiredQkey.toLocaleString() + ' QKEY → ' + amount.toLocaleString() + ' USDT');
-                        amountInput.value = '';
-                        await loadUserInfo();
-                    }
-                } catch (error) {
-                    alert(error.response?.data?.error || 'Swap error');
-                }
-            }
 
             // 로그아웃
             function handleLogout() {
@@ -4969,7 +6202,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416e"></script>
+        <script src="/static/i18n.js?v=20260427c"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -5032,8 +6265,11 @@ app.get('/admin/dashboard', (c) => {
                                 <p class="text-xs sm:text-sm text-gray-600" data-i18n="admin.dashboard">관리자 대시보드</p>
                             </div>
                         </div>
-                        <div class="flex items-center gap-2">
+                        <div class="flex items-center gap-2 sm:gap-3">
                             <div id="langSelector"></div>
+                            <a href="/dashboard" onclick="localStorage.setItem('openShop','1')" class="text-pink-600 hover:text-pink-700 flex-shrink-0 text-sm sm:text-base font-bold">
+                                <i class="fas fa-shopping-cart mr-1"></i><span class="hidden sm:inline">쇼핑몰</span>
+                            </a>
                             <button onclick="handleLogout()" class="text-red-600 hover:text-red-700 flex-shrink-0 text-sm sm:text-base">
                                 <i class="fas fa-sign-out-alt mr-1"></i><span class="hidden sm:inline" data-i18n="admin.logout">로그아웃</span>
                             </button>
@@ -5145,9 +6381,17 @@ app.get('/admin/dashboard', (c) => {
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
                             <i class="fas fa-chart-bar mr-1 sm:mr-2"></i><span data-i18n="admin.tab_sales">매출현황</span>
                         </button>
+                        <button onclick="showTab('swaps')" id="tab-swaps" 
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-exchange-alt mr-1 sm:mr-2"></i><span data-i18n="admin.tab_swaps">스왑관리</span>
+                        </button>
                         <button onclick="showTab('memberRewards')" id="tab-memberRewards" 
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
                             <i class="fas fa-gift mr-1 sm:mr-2"></i><span data-i18n="admin.tab_member_rewards">수당체크</span>
+                        </button>
+                        <button onclick="showTab('shop')" id="tab-shop" 
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-shopping-cart mr-1 sm:mr-2"></i>쇼핑몰
                         </button>
                     </div>
                 </div>
@@ -5404,6 +6648,181 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 스왑 관리 -->
+                <div id="content-swaps" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4">
+                        <i class="fas fa-exchange-alt text-indigo-600 mr-2"></i><span data-i18n="admin.swaps_title">스왑 내역 관리</span>
+                    </h2>
+                    <!-- 스왑 통계 -->
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                        <div class="bg-indigo-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">총 스왑 건수</p>
+                            <p class="text-xl font-bold text-indigo-600" id="swapStatCount">0</p>
+                        </div>
+                        <div class="bg-yellow-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">사용 QKEY</p>
+                            <p class="text-xl font-bold text-yellow-600" id="swapStatQkeyUsed">0</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">사용 USDT</p>
+                            <p class="text-xl font-bold text-green-600" id="swapStatUsdtUsed">0</p>
+                        </div>
+                        <div class="bg-blue-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">참여 회원수</p>
+                            <p class="text-xl font-bold text-blue-600" id="swapStatUsers">0</p>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+                        <div class="bg-blue-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">발행 QTA</p>
+                            <p class="text-lg font-bold text-blue-600" id="swapStatQtaOut">0</p>
+                        </div>
+                        <div class="bg-purple-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">발행 QX</p>
+                            <p class="text-lg font-bold text-purple-600" id="swapStatQxOut">0</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">발행 USDT</p>
+                            <p class="text-lg font-bold text-green-600" id="swapStatUsdtOut">0</p>
+                        </div>
+                        <div class="bg-yellow-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">발행 QKEY</p>
+                            <p class="text-lg font-bold text-yellow-600" id="swapStatQkeyOut">0</p>
+                        </div>
+                    </div>
+                    <!-- 스왑 테이블 -->
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-100">
+                                <tr>
+                                    <th class="px-3 py-2 text-left">회원</th>
+                                    <th class="px-3 py-2 text-left">유형</th>
+                                    <th class="px-3 py-2 text-right">수량</th>
+                                    <th class="px-3 py-2 text-left">코인</th>
+                                    <th class="px-3 py-2 text-left">설명</th>
+                                    <th class="px-3 py-2 text-left">일시</th>
+                                </tr>
+                            </thead>
+                            <tbody id="swapTableBody" class="divide-y divide-gray-200">
+                                <tr><td colspan="6" class="text-center py-8 text-gray-500">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 쇼핑몰 관리 -->
+                <div id="content-shop" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4">
+                        <i class="fas fa-shopping-cart text-pink-600 mr-2"></i>쇼핑몰 관리
+                    </h2>
+                    
+                    <!-- 주문 통계 -->
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                        <div class="bg-pink-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">총 주문</p>
+                            <p class="text-xl font-bold text-pink-600" id="shopStatOrders">0</p>
+                        </div>
+                        <div class="bg-yellow-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">사용 QKEY</p>
+                            <p class="text-xl font-bold text-yellow-600" id="shopStatQkey">0</p>
+                        </div>
+                        <div class="bg-green-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">총 매출(원)</p>
+                            <p class="text-xl font-bold text-green-600" id="shopStatKrw">0</p>
+                        </div>
+                        <div class="bg-blue-50 rounded-lg p-3 text-center">
+                            <p class="text-xs text-gray-500">구매 회원수</p>
+                            <p class="text-xl font-bold text-blue-600" id="shopStatBuyers">0</p>
+                        </div>
+                    </div>
+
+                    <!-- 상품 등록 -->
+                    <div class="bg-gray-50 rounded-lg p-4 mb-4 border">
+                        <h3 class="font-bold text-gray-700 mb-3"><i class="fas fa-plus-circle mr-1"></i>상품 등록</h3>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                            <input type="text" id="shopProdName" placeholder="상품명 *" class="px-3 py-2 border rounded-lg text-sm">
+                            <input type="number" id="shopProdPrice" placeholder="가격 (원) *" class="px-3 py-2 border rounded-lg text-sm">
+                            <input type="text" id="shopProdDesc" placeholder="상품 설명" class="px-3 py-2 border rounded-lg text-sm sm:col-span-2">
+                            <select id="shopProdCategory" class="px-3 py-2 border rounded-lg text-sm bg-white">
+                                <option value="일반">일반</option>
+                                <option value="식품">식품</option>
+                                <option value="건강">건강</option>
+                                <option value="생활">생활</option>
+                                <option value="패션">패션</option>
+                                <option value="뷰티">뷰티</option>
+                                <option value="전자기기">전자기기</option>
+                                <option value="기타">기타</option>
+                            </select>
+                            <input type="number" id="shopProdStock" placeholder="재고 (-1=무제한)" class="px-3 py-2 border rounded-lg text-sm" value="-1">
+                        </div>
+                        <!-- 이미지 업로드 영역 -->
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                            <!-- 썸네일 -->
+                            <div>
+                                <label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-image mr-1 text-blue-500"></i>썸네일 이미지 (목록용)</label>
+                                <div id="thumbDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center cursor-pointer hover:border-pink-400 hover:bg-pink-50 transition relative"
+                                    onclick="document.getElementById('thumbFileInput').click()">
+                                    <input type="file" id="thumbFileInput" accept="image/*" class="hidden" onchange="handleImageUpload(this,'thumb')">
+                                    <div id="thumbPreview" class="hidden"><img id="thumbPreviewImg" class="max-h-24 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearImage('thumb')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div>
+                                    <div id="thumbPlaceholder"><i class="fas fa-cloud-upload-alt text-2xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그앤드롭</p><p class="text-xs text-gray-400">JPG, PNG (최대 2MB)</p></div>
+                                </div>
+                                <input type="hidden" id="shopProdImage">
+                            </div>
+                            <!-- 상세 이미지 -->
+                            <div>
+                                <label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-file-image mr-1 text-purple-500"></i>상세페이지 이미지</label>
+                                <div id="detailDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center cursor-pointer hover:border-purple-400 hover:bg-purple-50 transition relative"
+                                    onclick="document.getElementById('detailFileInput').click()">
+                                    <input type="file" id="detailFileInput" accept="image/*" class="hidden" onchange="handleImageUpload(this,'detail')">
+                                    <div id="detailPreview" class="hidden"><img id="detailPreviewImg" class="max-h-24 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearImage('detail')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div>
+                                    <div id="detailPlaceholder"><i class="fas fa-cloud-upload-alt text-2xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그앤드롭</p><p class="text-xs text-gray-400">JPG, PNG (최대 5MB)</p></div>
+                                </div>
+                                <input type="hidden" id="shopProdDetailImage">
+                            </div>
+                        </div>
+                        <button onclick="adminAddProduct()" class="px-6 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold text-sm transition">
+                            <i class="fas fa-plus mr-1"></i>상품 등록
+                        </button>
+                    </div>
+
+                    <!-- 등록된 상품 목록 -->
+                    <div class="mb-6">
+                        <h3 class="font-bold text-gray-700 mb-3"><i class="fas fa-box mr-1"></i>등록 상품</h3>
+                        <div id="adminProductList" class="space-y-2">
+                            <p class="text-gray-400 text-center py-4">로딩 중...</p>
+                        </div>
+                    </div>
+
+                    <!-- 실시간 주문 현황 -->
+                    <div>
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-gray-700"><i class="fas fa-receipt mr-1"></i>실시간 주문 현황</h3>
+                            <div class="flex gap-2">
+                                <button onclick="exportShopOrders()" class="px-3 py-1 bg-green-500 hover:bg-green-600 text-white rounded text-xs font-medium"><i class="fas fa-file-csv mr-1"></i>CSV 다운로드</button>
+                                <button onclick="loadAdminShopOrders()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                            </div>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead class="bg-gray-100">
+                                    <tr>
+                                        <th class="px-3 py-2 text-left">주문자</th>
+                                        <th class="px-3 py-2 text-left">상품</th>
+                                        <th class="px-3 py-2 text-right">금액</th>
+                                        <th class="px-3 py-2 text-right">QKEY</th>
+                                        <th class="px-3 py-2 text-left">배송정보</th>
+                                        <th class="px-3 py-2 text-center">상태</th>
+                                        <th class="px-3 py-2 text-left">일시</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="adminOrderTableBody" class="divide-y divide-gray-200">
+                                    <tr><td colspan="7" class="text-center py-8 text-gray-400">로딩 중...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 산하매출 모달 -->
                 <div id="downlineModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
                     <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto p-4 sm:p-6">
@@ -5413,7 +6832,7 @@ app.get('/admin/dashboard', (c) => {
                         </div>
                         <!-- 회원 검색 -->
                         <div class="mb-4 flex gap-2">
-                            <input type="text" id="downlineSearchInput" data-i18n-placeholder="admin.downline_search_placeholder" placeholder="이메일/이름/추천코드로 검색..."
+                            <input type="text" id="downlineSearchInput" data-i18n-placeholder="admin.downline_search_placeholder" placeholder="아이디/이름/추천코드로 검색..."
                                 class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-purple-500">
                             <button onclick="searchDownlineUser()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold">
                                 <i class="fas fa-search mr-1"></i><span data-i18n="admin.downline_search">검색</span>
@@ -5452,7 +6871,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260416e"></script>
+        <script src="/static/i18n.js?v=20260427c"></script>
         <script>
             // Initialize i18n
             I18N.init();
@@ -5474,6 +6893,7 @@ app.get('/admin/dashboard', (c) => {
                 if (!str) return '';
                 return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
             }
+            var escapeHtml = esc; // alias for consistency
 
             let currentTab = 'pending';
 
@@ -5490,7 +6910,7 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById(\`tab-\${tab}\`).classList.add('text-purple-600', 'border-b-2', 'border-purple-600');
 
                 // 콘텐츠 표시/숨김
-                var sections = ['pending', 'all', 'rewards', 'withdrawals', 'users', 'signups', 'sales', 'memberRewards'];
+                var sections = ['pending', 'all', 'rewards', 'withdrawals', 'users', 'signups', 'sales', 'swaps', 'memberRewards', 'shop'];
                 sections.forEach(function(s) {
                     var el = document.getElementById('content-' + s);
                     if (el) el.classList.add('hidden');
@@ -5505,7 +6925,9 @@ app.get('/admin/dashboard', (c) => {
                 else if (tab === 'users') loadUsers();
                 else if (tab === 'signups') loadSignups();
                 else if (tab === 'sales') loadSalesStatus();
+                else if (tab === 'swaps') loadSwaps();
                 else if (tab === 'memberRewards') loadMemberRewards();
+                else if (tab === 'shop') { loadAdminShopProducts(); loadAdminShopOrders(); }
             }
 
             // 통계 로드
@@ -5558,8 +6980,8 @@ app.get('/admin/dashboard', (c) => {
                                         </span>
                                         <span class="text-xs text-gray-500">\${new Date(s.created_at).toLocaleString(I18N.getLang())}</span>
                                     </div>
-                                    <h3 class="text-xl font-bold text-gray-800 mb-1">\${esc(s.name)}</h3>
-                                    <p class="text-sm text-gray-600"><i class="fas fa-envelope mr-1"></i>\${esc(s.email)}</p>
+                                    <h3 class="text-xl font-bold text-gray-800 mb-1">\${esc(s.email)}</h3>
+                                    <p class="text-sm text-gray-600"><i class="fas fa-user mr-1"></i>\${esc(s.name)}</p>
                                     <p class="text-xs sm:text-sm text-gray-600 font-mono truncate"><i class="fas fa-wallet mr-1"></i>\${esc(s.wallet_address)}</p>
                                 </div>
                             </div>
@@ -5672,8 +7094,8 @@ app.get('/admin/dashboard', (c) => {
                                             </span>
                                             <span class="text-xs text-gray-500">\${new Date(s.created_at).toLocaleString(I18N.getLang())}</span>
                                         </div>
-                                        <h3 class="text-lg font-bold text-gray-800">\${esc(s.name)}</h3>
-                                        <p class="text-sm text-gray-600">\${esc(s.email)}</p>
+                                        <h3 class="text-lg font-bold text-gray-800">\${esc(s.email)}</h3>
+                                        <p class="text-sm text-gray-600"><i class="fas fa-user mr-1"></i>\${esc(s.name)}</p>
                                     </div>
                                 </div>
 
@@ -5734,11 +7156,11 @@ app.get('/admin/dashboard', (c) => {
                             <div class="flex justify-between items-start">
                                 <div class="flex-1">
                                     <div class="flex items-center gap-2 mb-1">
-                                        <h3 class="text-lg font-bold text-gray-800">\${esc(u.name)}</h3>
+                                        <h3 class="text-lg font-bold text-gray-800">\${esc(u.email)}</h3>
                                         \${u.country ? '<span class="px-2 py-0.5 bg-gray-100 text-gray-600 rounded text-xs">' + esc(u.country) + '</span>' : ''}
                                         \${u.language ? '<span class="px-2 py-0.5 bg-blue-50 text-blue-600 rounded text-xs">' + esc(u.language) + '</span>' : ''}
                                     </div>
-                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${esc(u.email)}</p>
+                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-user mr-1"></i>\${esc(u.name)}</p>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${esc(u.phone) || 'N/A'}</p>
                                     <div class="flex items-center gap-1 sm:gap-2 min-w-0 mb-1">
                                         <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${esc(u.wallet_address)}</p>
@@ -5830,8 +7252,8 @@ app.get('/admin/dashboard', (c) => {
                         <div class="border border-gray-200 rounded-lg p-6">
                             <div class="flex justify-between items-start">
                                 <div class="flex-1">
-                                    <h3 class="text-lg font-bold text-gray-800 mb-1">\${esc(u.name)}</h3>
-                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-envelope mr-1"></i>\${esc(u.email)}</p>
+                                    <h3 class="text-lg font-bold text-gray-800 mb-1">\${esc(u.email)}</h3>
+                                    <p class="text-sm text-gray-600 mb-1"><i class="fas fa-user mr-1"></i>\${esc(u.name)}</p>
                                     <p class="text-sm text-gray-600 mb-1"><i class="fas fa-phone mr-1"></i>\${esc(u.phone) || 'N/A'}</p>
                                     <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-purple-600 font-semibold">QKEY</span> \${esc(u.wallet_address)}</p>
                                     <p class="text-xs text-gray-500 font-mono truncate"><i class="fas fa-wallet mr-1"></i><span class="text-green-600 font-semibold">USDT</span> \${esc(u.usdt_wallet_address) || 'N/A'}</p>
@@ -6023,14 +7445,22 @@ app.get('/admin/dashboard', (c) => {
                     if (response.data.success) {
                         var resultEl = document.getElementById('dailyRewardResult');
                         resultEl.classList.remove('hidden');
-                        resultEl.innerHTML = '<div class="bg-green-50 border border-green-300 rounded-lg p-3">' +
-                            '<p class="text-sm font-bold text-green-800"><i class="fas fa-check-circle mr-1"></i>' + response.data.message + '</p>' +
-                            '<div class="grid grid-cols-3 gap-2 mt-2 text-center">' +
-                                '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_people') + '</p><p class="font-bold text-green-600">' + (response.data.rewarded || 0) + I18N.t('admin.people_unit') + '</p></div>' +
-                                '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_total_qkey') + '</p><p class="font-bold text-yellow-600">' + (response.data.totalQkey || 0).toLocaleString() + '</p></div>' +
-                                '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_skipped') + '</p><p class="font-bold text-gray-600">' + (response.data.skipped || 0) + I18N.t('admin.cases_unit') + '</p></div>' +
-                            '</div>' +
-                        '</div>';
+                        
+                        // 비영업일 (토/일/공휴일)이면 노란색 경고
+                        if (response.data.reason && response.data.reason !== 'business_day') {
+                            resultEl.innerHTML = '<div class="bg-yellow-50 border border-yellow-300 rounded-lg p-3">' +
+                                '<p class="text-sm font-bold text-yellow-800"><i class="fas fa-exclamation-triangle mr-1"></i>' + response.data.message + '</p>' +
+                            '</div>';
+                        } else {
+                            resultEl.innerHTML = '<div class="bg-green-50 border border-green-300 rounded-lg p-3">' +
+                                '<p class="text-sm font-bold text-green-800"><i class="fas fa-check-circle mr-1"></i>' + response.data.message + '</p>' +
+                                '<div class="grid grid-cols-3 gap-2 mt-2 text-center">' +
+                                    '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_people') + '</p><p class="font-bold text-green-600">' + (response.data.rewarded || 0) + I18N.t('admin.people_unit') + '</p></div>' +
+                                    '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_total_qkey') + '</p><p class="font-bold text-yellow-600">' + (response.data.totalQkey || 0).toLocaleString() + '</p></div>' +
+                                    '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_skipped') + '</p><p class="font-bold text-gray-600">' + (response.data.skipped || 0) + I18N.t('admin.cases_unit') + '</p></div>' +
+                                '</div>' +
+                            '</div>';
+                        }
                         await loadStatistics();
                     }
                 } catch (error) {
@@ -6063,9 +7493,9 @@ app.get('/admin/dashboard', (c) => {
                     content.innerHTML = 
                         // 기본 정보
                         '<div class="mb-4">' +
-                            '<h4 class="font-bold text-gray-800 text-lg mb-2">' + esc(u.name) + '</h4>' +
+                            '<h4 class="font-bold text-gray-800 text-lg mb-2">' + esc(u.email) + '</h4>' +
                             '<div class="grid grid-cols-2 gap-2 text-sm">' +
-                                '<div><span class="text-gray-500">' + I18N.t('admin.email_label') + '</span> ' + esc(u.email) + '</div>' +
+                                '<div><span class="text-gray-500">' + I18N.t('admin.col_name') + ':</span> ' + esc(u.name) + '</div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.phone_label') + '</span> ' + esc(u.phone || 'N/A') + '</div>' +
                                 '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.qkey_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.wallet_address) + '</span></div>' +
                                 '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.usdt_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.usdt_wallet_address || 'N/A') + '</span></div>' +
@@ -6075,11 +7505,11 @@ app.get('/admin/dashboard', (c) => {
                                 '<div><span class="text-gray-500">' + I18N.t('admin.join_date') + ':</span> ' + new Date(u.created_at).toLocaleString(I18N.getLang()) + '</div>' +
                             '</div>' +
                         '</div>' +
-                        // 잔액
+                        // 잔액 + 리셋 버튼
                         '<div class="grid grid-cols-4 gap-2 mb-4">' +
-                            '<div class="bg-blue-50 rounded-lg p-2 text-center border border-blue-200"><p class="text-xs text-gray-500">QTA</p><p class="font-bold text-blue-600 text-sm">' + (u.qta_balance || 0).toLocaleString() + '</p></div>' +
-                            '<div class="bg-purple-50 rounded-lg p-2 text-center border border-purple-200"><p class="text-xs text-gray-500">QX</p><p class="font-bold text-purple-600 text-sm">' + (u.qx_balance || 0).toLocaleString() + '</p></div>' +
-                            '<div class="bg-yellow-50 rounded-lg p-2 text-center border border-yellow-200"><p class="text-xs text-gray-500">QKEY</p><p class="font-bold text-yellow-600 text-sm">' + (u.qkey_balance || 0).toLocaleString() + '</p></div>' +
+                            '<div class="bg-blue-50 rounded-lg p-2 text-center border border-blue-200"><p class="text-xs text-gray-500">QTA</p><p class="font-bold text-blue-600 text-sm">' + (u.qta_balance || 0).toLocaleString() + '</p>' + ((u.qta_balance || 0) > 0 ? '<button onclick="resetCoinBalance(' + u.id + ',&quot;QTA&quot;)" class="mt-1 px-2 py-0.5 bg-red-500 text-white text-[10px] rounded hover:bg-red-600">0 리셋</button>' : '') + '</div>' +
+                            '<div class="bg-purple-50 rounded-lg p-2 text-center border border-purple-200"><p class="text-xs text-gray-500">QX</p><p class="font-bold text-purple-600 text-sm">' + (u.qx_balance || 0).toLocaleString() + '</p>' + ((u.qx_balance || 0) > 0 ? '<button onclick="resetCoinBalance(' + u.id + ',&quot;QX&quot;)" class="mt-1 px-2 py-0.5 bg-red-500 text-white text-[10px] rounded hover:bg-red-600">0 리셋</button>' : '') + '</div>' +
+                            '<div class="bg-yellow-50 rounded-lg p-2 text-center border border-yellow-200"><p class="text-xs text-gray-500">QKEY</p><p class="font-bold text-yellow-600 text-sm">' + (u.qkey_balance || 0).toLocaleString() + '</p>' + ((u.qkey_balance || 0) > 0 ? '<button onclick="resetCoinBalance(' + u.id + ',&quot;QKEY&quot;)" class="mt-1 px-2 py-0.5 bg-red-500 text-white text-[10px] rounded hover:bg-red-600">0 리셋</button>' : '') + '</div>' +
                             '<div class="bg-green-50 rounded-lg p-2 text-center border border-green-200"><p class="text-xs text-gray-500">USDT</p><p class="font-bold text-green-600 text-sm">' + (u.usdt_balance || 0).toFixed(2) + '</p></div>' +
                         '</div>' +
                         // 스테이킹
@@ -6125,19 +7555,37 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById('userDetailModal').classList.add('hidden');
             }
 
+            // 코인 잔액 0 리셋
+            async function resetCoinBalance(userId, coinType) {
+                if (!confirm(coinType + ' 잔액을 0으로 리셋하시겠습니까?\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
+                try {
+                    var res = await axios.post('/api/admin/user/' + userId + '/reset-balance', { coinType: coinType });
+                    if (res.data.success) {
+                        alert(coinType + ' 잔액 리셋 완료\\n(' + (res.data.previousBalance || 0).toLocaleString() + ' → 0)');
+                        showUserDetail(userId); // 새로고침
+                        loadUsers(); // 목록도 새로고침
+                    }
+                } catch (err) {
+                    alert(coinType + ' 잔액 리셋 실패: ' + (err.response?.data?.error || err.message));
+                }
+            }
+
             // 사용자 강제 탈퇴
             async function deleteUser(userId, userName, userEmail, stakingAmount) {
                 // 진행 중인 스테이킹이 있는지 확인
                 if (stakingAmount > 0) {
                     alert(I18N.t('admin.delete_has_staking') + '\\n\\n' + 
-                          I18N.t('admin.delete_user_label') + userName + '\\n' +
-                          I18N.t('admin.delete_email_label') + userEmail + '\\n' +
+                          I18N.t('admin.delete_user_label') + userName + '
+' +
+                          I18N.t('admin.delete_email_label') + userEmail + '
+' +
                           I18N.t('admin.delete_staking_label') + stakingAmount.toLocaleString());
                     return;
                 }
 
                 if (!confirm(I18N.t('admin.delete_confirm1') + '\\n\\n' + 
-                             I18N.t('admin.delete_user_label') + userName + '\\n' +
+                             I18N.t('admin.delete_user_label') + userName + '
+' +
                              I18N.t('admin.delete_email_label') + userEmail + '\\n\\n' +
                              I18N.t('admin.delete_irreversible'))) {
                     return;
@@ -6152,7 +7600,8 @@ app.get('/admin/dashboard', (c) => {
                     const response = await axios.delete('/api/admin/user/' + userId);
                     if (response.data.success) {
                         alert(I18N.t('admin.delete_success') + '\\n\\n' +
-                              I18N.t('admin.delete_name_label') + response.data.deletedUser.name + '\\n' +
+                              I18N.t('admin.delete_name_label') + response.data.deletedUser.name + '
+' +
                               I18N.t('admin.delete_email_label') + response.data.deletedUser.email);
                         await loadUsers();
                         await loadSignups();
@@ -6247,6 +7696,52 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // ============================================
+            // 스왑 내역 로드
+            // ============================================
+            async function loadSwaps() {
+                try {
+                    const response = await axios.get('/api/admin/swaps');
+                    if (response.data.success) {
+                        var swaps = response.data.swaps || [];
+                        var stats = response.data.stats || {};
+                        
+                        // 통계 업데이트
+                        document.getElementById('swapStatCount').textContent = Math.floor((stats.total_count || 0) / 2);
+                        document.getElementById('swapStatQkeyUsed').textContent = (stats.total_qkey_used || 0).toLocaleString();
+                        document.getElementById('swapStatUsdtUsed').textContent = (stats.total_usdt_used || 0).toLocaleString();
+                        document.getElementById('swapStatUsers').textContent = (stats.unique_users || 0).toLocaleString();
+                        document.getElementById('swapStatQtaOut').textContent = (stats.total_qta_received || 0).toLocaleString();
+                        document.getElementById('swapStatQxOut').textContent = (stats.total_qx_received || 0).toLocaleString();
+                        document.getElementById('swapStatUsdtOut').textContent = (stats.total_usdt_received || 0).toLocaleString();
+                        document.getElementById('swapStatQkeyOut').textContent = (stats.total_qkey_received || 0).toLocaleString();
+                        
+                        // 테이블 렌더링 (swap_in만 표시 - swap_out과 쌍이므로)
+                        var tbody = document.getElementById('swapTableBody');
+                        if (swaps.length === 0) {
+                            tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-gray-500">스왑 내역이 없습니다</td></tr>';
+                            return;
+                        }
+                        
+                        tbody.innerHTML = swaps.map(function(s) {
+                            var typeLabel = s.type === 'swap_in' ? '<span class="text-green-600 font-medium">IN</span>' : '<span class="text-red-600 font-medium">OUT</span>';
+                            var coinColor = s.coin_type === 'QTA' ? 'blue' : s.coin_type === 'QX' ? 'purple' : s.coin_type === 'QKEY' ? 'yellow' : 'green';
+                            var date = new Date(s.created_at).toLocaleString('ko-KR', {timeZone:'Asia/Seoul'});
+                            return '<tr class="hover:bg-gray-50">' +
+                                '<td class="px-3 py-2">' + escapeHtml(s.name) + '<br><span class="text-xs text-gray-400">' + escapeHtml(s.email) + '</span></td>' +
+                                '<td class="px-3 py-2">' + typeLabel + '</td>' +
+                                '<td class="px-3 py-2 text-right font-bold">' + s.amount.toLocaleString() + '</td>' +
+                                '<td class="px-3 py-2"><span class="px-2 py-1 bg-' + coinColor + '-100 text-' + coinColor + '-700 rounded text-xs font-bold">' + s.coin_type + '</span></td>' +
+                                '<td class="px-3 py-2 text-xs text-gray-500 max-w-[200px] truncate">' + escapeHtml(s.description || '') + '</td>' +
+                                '<td class="px-3 py-2 text-xs text-gray-500 whitespace-nowrap">' + date + '</td>' +
+                            '</tr>';
+                        }).join('');
+                    }
+                } catch (error) {
+                    console.error('Failed to load swaps:', error);
+                    document.getElementById('swapTableBody').innerHTML = '<tr><td colspan="6" class="text-center py-8 text-red-500">로드 실패</td></tr>';
+                }
+            }
+
             // 수당 체크 로드
             // ============================================
             var allMemberRewards = [];
@@ -6327,7 +7822,7 @@ app.get('/admin/dashboard', (c) => {
                     document.getElementById('downlineContent').innerHTML = '<div class="space-y-2">' +
                         users.map(function(u) {
                             return '<div class="border rounded-lg p-3 hover:bg-gray-50 cursor-pointer flex justify-between items-center" onclick="showDownlineSales(' + u.id + ')">' +
-                                '<div><p class="font-medium">' + esc(u.name) + '</p><p class="text-xs text-gray-500">' + esc(u.email) + '</p></div>' +
+                                '<div><p class="font-medium">' + esc(u.name) + '</p><p class="text-xs text-gray-500">' + I18N.t('login.id') + ': ' + esc(u.email) + '</p></div>' +
                                 '<div class="text-right"><p class="font-bold text-blue-600">$' + (u.staking_amount || 0).toLocaleString() + '</p><p class="text-xs text-gray-500">' + I18N.t('admin.referral_code_short') + esc(u.referral_code || '-') + '</p></div>' +
                             '</div>';
                         }).join('') +
@@ -6353,7 +7848,7 @@ app.get('/admin/dashboard', (c) => {
 
                     content.innerHTML = 
                         '<div class="mb-4 p-3 bg-purple-50 rounded-lg border border-purple-200">' +
-                            '<h4 class="font-bold text-purple-800">' + esc(user.name) + ' <span class="text-sm font-normal text-gray-600">(' + esc(user.email) + ')</span></h4>' +
+                            '<h4 class="font-bold text-purple-800">' + esc(user.email) + ' <span class="text-sm font-normal text-gray-600">(' + esc(user.name) + ')</span></h4>' +
                             '<p class="text-xs text-gray-600 mt-1">' + I18N.t('admin.referral_code_short') + '<span class="font-bold text-purple-600">' + esc(user.referral_code || '-') + '</span></p>' +
                         '</div>' +
                         // 산하 매출 통계
@@ -6396,6 +7891,245 @@ app.get('/admin/dashboard', (c) => {
                     console.error('Downline sales load failed:', error);
                     content.innerHTML = '<p class="text-center py-8 text-red-500">' + I18N.t('admin.downline_fail') + '</p>';
                 }
+            }
+
+            // ============================================
+            // 쇼핑몰 관리 (Admin Shop)
+            // ============================================
+
+            // 이미지 업로드 (드래그앤드롭 + 파일선택)
+            function setupDropZone(zoneId, type) {
+                var zone = document.getElementById(zoneId);
+                if (!zone) return;
+                zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.classList.add('border-pink-500','bg-pink-50'); });
+                zone.addEventListener('dragleave', function(e) { e.preventDefault(); zone.classList.remove('border-pink-500','bg-pink-50'); });
+                zone.addEventListener('drop', function(e) {
+                    e.preventDefault(); zone.classList.remove('border-pink-500','bg-pink-50');
+                    var files = e.dataTransfer.files;
+                    if (files.length > 0) processImageFile(files[0], type);
+                });
+            }
+            setupDropZone('thumbDropZone', 'thumb');
+            setupDropZone('detailDropZone', 'detail');
+
+            function handleImageUpload(input, type) {
+                if (input.files && input.files[0]) processImageFile(input.files[0], type);
+            }
+
+            function processImageFile(file, type) {
+                var maxSize = type === 'thumb' ? 2*1024*1024 : 5*1024*1024;
+                if (!file.type.startsWith('image/')) { alert('이미지 파일만 업로드 가능합니다'); return; }
+                if (file.size > maxSize) { alert('파일 크기가 너무 큽니다 (최대 ' + (maxSize/1024/1024) + 'MB)'); return; }
+                var reader = new FileReader();
+                reader.onload = function(e) {
+                    var dataUrl = e.target.result;
+                    if (type === 'thumb') {
+                        document.getElementById('shopProdImage').value = dataUrl;
+                        document.getElementById('thumbPreviewImg').src = dataUrl;
+                        document.getElementById('thumbPreview').classList.remove('hidden');
+                        document.getElementById('thumbPlaceholder').classList.add('hidden');
+                    } else {
+                        document.getElementById('shopProdDetailImage').value = dataUrl;
+                        document.getElementById('detailPreviewImg').src = dataUrl;
+                        document.getElementById('detailPreview').classList.remove('hidden');
+                        document.getElementById('detailPlaceholder').classList.add('hidden');
+                    }
+                };
+                reader.readAsDataURL(file);
+            }
+
+            function clearImage(type) {
+                if (type === 'thumb') {
+                    document.getElementById('shopProdImage').value = '';
+                    document.getElementById('thumbPreview').classList.add('hidden');
+                    document.getElementById('thumbPlaceholder').classList.remove('hidden');
+                    document.getElementById('thumbFileInput').value = '';
+                } else {
+                    document.getElementById('shopProdDetailImage').value = '';
+                    document.getElementById('detailPreview').classList.add('hidden');
+                    document.getElementById('detailPlaceholder').classList.remove('hidden');
+                    document.getElementById('detailFileInput').value = '';
+                }
+            }
+
+            async function adminAddProduct() {
+                var name = document.getElementById('shopProdName').value.trim();
+                var price = parseInt(document.getElementById('shopProdPrice').value) || 0;
+                var desc = document.getElementById('shopProdDesc').value.trim();
+                var image = document.getElementById('shopProdImage').value.trim();
+                var detailImage = document.getElementById('shopProdDetailImage').value.trim();
+                var category = document.getElementById('shopProdCategory').value.trim() || '일반';
+                var stock = parseInt(document.getElementById('shopProdStock').value);
+                if (isNaN(stock)) stock = -1;
+
+                if (!name || price <= 0) {
+                    alert('상품명과 가격(원)은 필수입니다.');
+                    return;
+                }
+                try {
+                    var res = await axios.post('/api/admin/shop/product', {
+                        name: name, description: desc, price_krw: price,
+                        image_url: image, detail_image_url: detailImage, category: category, stock: stock
+                    });
+                    if (res.data.success) {
+                        alert('상품이 등록되었습니다!');
+                        document.getElementById('shopProdName').value = '';
+                        document.getElementById('shopProdPrice').value = '';
+                        document.getElementById('shopProdDesc').value = '';
+                        document.getElementById('shopProdImage').value = '';
+                        document.getElementById('shopProdDetailImage').value = '';
+                        document.getElementById('shopProdCategory').value = '';
+                        document.getElementById('shopProdStock').value = '-1';
+                        clearImage('thumb'); clearImage('detail');
+                        loadAdminShopProducts();
+                    }
+                } catch(e) {
+                    alert(e.response?.data?.error || '상품 등록 중 오류');
+                }
+            }
+
+            async function loadAdminShopProducts() {
+                try {
+                    var res = await axios.get('/api/admin/shop/products');
+                    if (!res.data.success) return;
+                    var products = res.data.products || [];
+                    var el = document.getElementById('adminProductList');
+                    if (products.length === 0) {
+                        el.innerHTML = '<p class="text-gray-400 text-center py-4">등록된 상품이 없습니다</p>';
+                        return;
+                    }
+                    el.innerHTML = products.map(function(p) {
+                        var qkeyPrice = Math.ceil(p.price_krw / 10);
+                        var activeLabel = p.is_active ? '<span class="text-green-600 text-xs font-bold">판매중</span>' : '<span class="text-red-500 text-xs font-bold">비활성</span>';
+                        var stockLabel = p.stock === -1 ? '무제한' : p.stock;
+                        return '<div class="flex items-center justify-between border rounded-lg p-3 hover:bg-gray-50">' +
+                            '<div class="flex-1 min-w-0">' +
+                                '<div class="flex items-center gap-2 mb-1">' +
+                                    '<span class="font-bold text-sm text-gray-800">' + esc(p.name) + '</span>' +
+                                    activeLabel +
+                                    '<span class="text-xs text-gray-400">[' + esc(p.category) + ']</span>' +
+                                '</div>' +
+                                '<p class="text-xs text-gray-500">' + esc(p.description || '-') + '</p>' +
+                                '<p class="text-xs text-gray-600 mt-1">' + Number(p.price_krw).toLocaleString() + '원 / ' + qkeyPrice.toLocaleString() + ' QKEY | 재고: ' + stockLabel + '</p>' +
+                                '<p class="text-xs mt-1">' +
+                                    (p.image_url ? '<span class="text-blue-500"><i class="fas fa-image mr-1"></i>썸네일✓</span> ' : '<span class="text-gray-300">썸네일✗</span> ') +
+                                    (p.detail_image_url ? '<span class="text-purple-500"><i class="fas fa-file-image mr-1"></i>상세이미지✓</span>' : '<span class="text-gray-300">상세이미지✗</span>') +
+                                '</p>' +
+                            '</div>' +
+                            '<div class="flex gap-2 ml-3">' +
+                                '<button onclick="adminToggleProduct(' + p.id + ',' + (p.is_active ? 0 : 1) + ',this)" class="px-2 py-1 text-xs rounded ' + (p.is_active ? 'bg-red-100 text-red-600 hover:bg-red-200' : 'bg-green-100 text-green-600 hover:bg-green-200') + '">' +
+                                    (p.is_active ? '<i class="fas fa-ban mr-1"></i>비활성' : '<i class="fas fa-check mr-1"></i>활성화') +
+                                '</button>' +
+                                '<button onclick="adminDeleteProduct(' + p.id + ')" class="px-2 py-1 text-xs bg-gray-100 text-gray-600 hover:bg-gray-200 rounded"><i class="fas fa-trash mr-1"></i>삭제</button>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('');
+                } catch(e) {
+                    console.error('Admin products load error:', e);
+                }
+            }
+
+            async function adminToggleProduct(id, newActive, btnEl) {
+                try {
+                    // 기존 상품 정보를 가져와서 is_active만 변경
+                    var res = await axios.get('/api/admin/shop/products');
+                    var product = (res.data.products || []).find(function(p) { return p.id === id; });
+                    if (!product) { alert('상품을 찾을 수 없습니다'); return; }
+                    await axios.put('/api/admin/shop/product/' + id, {
+                        name: product.name, description: product.description, price_krw: product.price_krw,
+                        image_url: product.image_url, detail_image_url: product.detail_image_url || '', category: product.category, stock: product.stock, is_active: newActive
+                    });
+                    loadAdminShopProducts();
+                } catch(e) {
+                    alert('상태 변경 중 오류');
+                }
+            }
+
+            async function adminDeleteProduct(id) {
+                if (!confirm('이 상품을 삭제하시겠습니까?')) return;
+                try {
+                    await axios.delete('/api/admin/shop/product/' + id);
+                    loadAdminShopProducts();
+                } catch(e) {
+                    alert('삭제 중 오류');
+                }
+            }
+
+            var shopOrderRefreshTimer = null;
+            async function loadAdminShopOrders() {
+                try {
+                    var res = await axios.get('/api/admin/shop/orders');
+                    if (!res.data.success) return;
+                    var orders = res.data.orders || [];
+                    var stats = res.data.stats || {};
+
+                    // 통계 업데이트
+                    document.getElementById('shopStatOrders').textContent = (stats.total_orders || 0).toLocaleString();
+                    document.getElementById('shopStatQkey').textContent = Math.round(stats.total_qkey || 0).toLocaleString();
+                    document.getElementById('shopStatKrw').textContent = Number(stats.total_krw || 0).toLocaleString();
+                    document.getElementById('shopStatBuyers').textContent = (stats.unique_buyers || 0).toLocaleString();
+
+                    var tbody = document.getElementById('adminOrderTableBody');
+                    if (orders.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-400">주문 내역이 없습니다</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = orders.map(function(o) {
+                        var date = new Date(o.created_at).toLocaleString('ko-KR', {timeZone: 'Asia/Seoul'});
+                        var statusOptions = ['paid','shipping','delivered','cancelled'];
+                        var statusLabels = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'};
+                        var statusColors = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
+                        var selectHtml = '<select onchange="adminUpdateOrderStatus(' + o.id + ', this.value)" class="text-xs border rounded px-1 py-0.5 bg-' + (statusColors[o.status]||'gray') + '-50">';
+                        statusOptions.forEach(function(s) {
+                            selectHtml += '<option value="' + s + '"' + (o.status === s ? ' selected' : '') + '>' + statusLabels[s] + '</option>';
+                        });
+                        selectHtml += '</select>';
+                        var shippingInfo = [o.shipping_name, o.shipping_phone, o.shipping_address].filter(Boolean).join(' / ') || '-';
+                        return '<tr class="hover:bg-gray-50">' +
+                            '<td class="px-3 py-2 text-xs"><span class="font-medium">' + esc(o.user_name || '-') + '</span><br><span class="text-gray-400">' + esc(o.user_email || '') + '</span></td>' +
+                            '<td class="px-3 py-2 text-xs font-medium">' + esc(o.product_name) + ' x' + o.quantity + '</td>' +
+                            '<td class="px-3 py-2 text-xs text-right">' + Number(o.price_krw).toLocaleString() + '원</td>' +
+                            '<td class="px-3 py-2 text-xs text-right font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + '</td>' +
+                            '<td class="px-3 py-2 text-xs max-w-[200px] truncate" title="' + esc(shippingInfo) + '">' + esc(shippingInfo) + '</td>' +
+                            '<td class="px-3 py-2 text-center">' + selectHtml + '</td>' +
+                            '<td class="px-3 py-2 text-xs text-gray-500">' + date + '</td>' +
+                        '</tr>';
+                    }).join('');
+                } catch(e) {
+                    console.error('Admin orders load error:', e);
+                }
+                
+                // 실시간 자동 새로고침 (10초마다)
+                if (shopOrderRefreshTimer) clearInterval(shopOrderRefreshTimer);
+                if (currentTab === 'shop') {
+                    shopOrderRefreshTimer = setInterval(function() {
+                        if (currentTab === 'shop') loadAdminShopOrders();
+                        else clearInterval(shopOrderRefreshTimer);
+                    }, 10000);
+                }
+            }
+
+            async function adminUpdateOrderStatus(orderId, newStatus) {
+                try {
+                    await axios.put('/api/admin/shop/order/' + orderId + '/status', { status: newStatus });
+                    loadAdminShopOrders();
+                } catch(e) {
+                    alert('상태 변경 중 오류');
+                }
+            }
+
+            function exportShopOrders() {
+                axios.get('/api/admin/shop/export/orders', { responseType: 'blob' }).then(function(response) {
+                    var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
+                    var link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    var now = new Date().toISOString().slice(0,10);
+                    link.download = 'shop_orders_' + now + '.csv';
+                    link.click();
+                    URL.revokeObjectURL(link.href);
+                }).catch(function(error) {
+                    alert('다운로드 실패');
+                });
             }
 
             // ============================================
