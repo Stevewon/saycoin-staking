@@ -2535,7 +2535,7 @@ app.post('/api/admin/user/:userId/reset-all', async (c) => {
     const db = c.env.DB
     const userId = c.req.param('userId')
 
-    const user = await db.prepare(`SELECT id, email, qta_balance, qx_balance, qkey_balance FROM users WHERE id = ?`).bind(userId).first() as any
+    const user = await db.prepare(`SELECT id, email, qta_balance, qx_balance, qkey_balance, usdt_balance FROM users WHERE id = ?`).bind(userId).first() as any
     if (!user) {
       return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
     }
@@ -2543,23 +2543,24 @@ app.post('/api/admin/user/:userId/reset-all', async (c) => {
     const prevBalances = {
       QTA: user.qta_balance || 0,
       QX: user.qx_balance || 0,
-      QKEY: user.qkey_balance || 0
+      QKEY: user.qkey_balance || 0,
+      USDT: user.usdt_balance || 0
     }
 
-    // 3종 코인 잔액 모두 0으로 리셋
-    await db.prepare(`UPDATE users SET qta_balance = 0, qx_balance = 0, qkey_balance = 0 WHERE id = ?`).bind(userId).run()
+    // 전체 잔액 0으로 리셋 (USDT 포함)
+    await db.prepare(`UPDATE users SET qta_balance = 0, qx_balance = 0, qkey_balance = 0, usdt_balance = 0 WHERE id = ?`).bind(userId).run()
 
     const deleted: Record<string, number> = {}
 
-    // 해당 사용자의 QTA, QX, QKEY 관련 모든 거래내역 삭제
+    // 해당 사용자의 모든 거래내역 삭제 (USDT 포함)
     try {
-      const r = await db.prepare(`DELETE FROM transactions WHERE user_id = ? AND coin_type IN ('QTA', 'QX', 'QKEY')`).bind(userId).run()
+      const r = await db.prepare(`DELETE FROM transactions WHERE user_id = ?`).bind(userId).run()
       deleted.transactions = r.meta?.changes || 0
     } catch (e) { deleted.transactions = 0 }
 
-    // 해당 사용자의 QTA, QX, QKEY 관련 모든 출금내역 삭제
+    // 해당 사용자의 모든 출금내역 삭제 (USDT 포함)
     try {
-      const r = await db.prepare(`DELETE FROM withdrawals WHERE user_id = ? AND coin_type IN ('QTA', 'QX', 'QKEY')`).bind(userId).run()
+      const r = await db.prepare(`DELETE FROM withdrawals WHERE user_id = ?`).bind(userId).run()
       deleted.withdrawals = r.meta?.changes || 0
     } catch (e) { deleted.withdrawals = 0 }
 
@@ -7616,7 +7617,7 @@ app.get('/admin/dashboard', (c) => {
                             '<div class="bg-yellow-50 rounded-lg p-2 text-center border border-yellow-200"><p class="text-xs text-gray-500">QKEY</p><p class="font-bold text-yellow-600 text-sm">' + (u.qkey_balance || 0).toLocaleString() + '</p></div>' +
                             '<div class="bg-green-50 rounded-lg p-2 text-center border border-green-200"><p class="text-xs text-gray-500">USDT</p><p class="font-bold text-green-600 text-sm">' + (u.usdt_balance || 0).toFixed(2) + '</p></div>' +
                         '</div>' +
-                        (((u.qta_balance || 0) > 0 || (u.qx_balance || 0) > 0 || (u.qkey_balance || 0) > 0) ? '<div class="text-center mb-4"><button onclick="resetAllCoins(' + u.id + ')" class="px-4 py-1.5 bg-red-600 text-white text-xs font-bold rounded-lg hover:bg-red-700 shadow"><i class="fas fa-undo mr-1"></i>코인 리셋 (QTA·QX·QKEY 전체 0 + 기록 삭제)</button></div>' : '<div class="mb-4"></div>') +
+                        (((u.qta_balance || 0) > 0 || (u.qx_balance || 0) > 0 || (u.qkey_balance || 0) > 0 || (u.usdt_balance || 0) > 0) ? '<div class="text-center mb-4"><button onclick="resetAllCoins(' + u.id + ')" class="px-4 py-1.5 bg-red-600 text-white text-xs font-bold rounded-lg hover:bg-red-700 shadow"><i class="fas fa-undo mr-1"></i>전체 리셋 (잔액 0 + 모든 기록 삭제)</button></div>' : '<div class="mb-4"></div>') +
                         // 스테이킹
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-chart-line mr-1 text-purple-600"></i>' + I18N.t('admin.staking_section') + ' (' + stakings.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (stakings.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.amount_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.status_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.period_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.rate_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.start_date') + '</th><th class="px-2 py-1">' + I18N.t('admin.end_date') + '</th></tr></thead><tbody class="divide-y">' +
@@ -7662,16 +7663,17 @@ app.get('/admin/dashboard', (c) => {
 
             // 코인 3종 전체 리셋 (QTA+QX+QKEY 잔액 0 + 관련 기록 전부 삭제)
             async function resetAllCoins(userId) {
-                if (!confirm('이 사용자의 QTA, QX, QKEY 잔액을 모두 0으로 리셋하시겠습니까?\\n\\n⚠️ 잔액뿐 아니라 해당 코인의 거래내역, 출금내역, 일일배당, 추천보상, 주문내역이 모두 삭제됩니다.\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
+                if (!confirm('이 사용자의 모든 잔액(QTA/QX/QKEY/USDT)을 0으로 리셋하시겠습니까?\\n\\n⚠️ 잔액 + 모든 거래내역, 출금내역, 일일배당, 추천보상, 주문내역이 완전히 삭제됩니다.\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
                 try {
                     var res = await axios.post('/api/admin/user/' + userId + '/reset-all');
                     if (res.data.success) {
                         var del = res.data.deletedRecords || {};
                         var prev = res.data.previousBalances || {};
-                        var msg = '전체 코인 리셋 완료\\n';
+                        var msg = '전체 리셋 완료\\n';
                         msg += 'QTA: ' + (prev.QTA || 0).toLocaleString() + ' → 0\\n';
                         msg += 'QX: ' + (prev.QX || 0).toLocaleString() + ' → 0\\n';
                         msg += 'QKEY: ' + (prev.QKEY || 0).toLocaleString() + ' → 0\\n';
+                        msg += 'USDT: ' + (prev.USDT || 0).toLocaleString() + ' → 0\\n';
                         msg += '\\n삭제된 기록:\\n';
                         msg += '  - 거래내역: ' + (del.transactions || 0) + '건\\n';
                         msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건\\n';
