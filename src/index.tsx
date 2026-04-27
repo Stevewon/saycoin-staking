@@ -2582,6 +2582,12 @@ app.post('/api/admin/user/:userId/reset-all', async (c) => {
       deleted.orders = r.meta?.changes || 0
     } catch (e) { deleted.orders = 0 }
 
+    // 스테이킹 삭제
+    try {
+      const r = await db.prepare(`DELETE FROM staking WHERE user_id = ?`).bind(userId).run()
+      deleted.stakings = r.meta?.changes || 0
+    } catch (e) { deleted.stakings = 0 }
+
     return c.json({
       success: true,
       message: '전체 코인 리셋 및 관련 기록 삭제 완료',
@@ -7679,7 +7685,8 @@ app.get('/admin/dashboard', (c) => {
                         msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건\\n';
                         msg += '  - 일일배당: ' + (del.dailyRewards || 0) + '건\\n';
                         msg += '  - 추천보상: ' + (del.referralRewards || 0) + '건\\n';
-                        msg += '  - 주문내역: ' + (del.orders || 0) + '건';
+                        msg += '  - 주문내역: ' + (del.orders || 0) + '건\\n';
+                        msg += '  - 스테이킹: ' + (del.stakings || 0) + '건';
                         alert(msg);
                         showUserDetail(userId);
                         loadUsers();
