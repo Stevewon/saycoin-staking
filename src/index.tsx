@@ -3428,7 +3428,8 @@ app.get('/api/shop/products', async (c) => {
     return c.json({ success: true, products: products.results })
   } catch(e) {
     // 테이블이 없으면 자동 생성
-    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
     await db.prepare(`CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, price_krw INTEGER NOT NULL, qkey_used REAL NOT NULL, status TEXT DEFAULT 'paid', shipping_name TEXT DEFAULT '', shipping_phone TEXT DEFAULT '', shipping_address TEXT DEFAULT '', shipping_memo TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
     return c.json({ success: true, products: [] })
   }
@@ -3512,6 +3513,9 @@ app.post('/api/admin/shop/product', async (c) => {
       return c.json({ error: '이미지 용량이 너무 큽니다. 더 작은 이미지를 사용해주세요. (최대 500KB)' }, 400)
     }
     const db = c.env.DB
+    // 테이블 자동 생성 + detail_image_url 컬럼 마이그레이션
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
     await db.prepare(`INSERT INTO products (name, description, price_krw, image_url, detail_image_url, category, stock) VALUES (?,?,?,?,?,?,?)`).bind(
       name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1
     ).run()
@@ -3536,6 +3540,7 @@ app.put('/api/admin/shop/product/:id', async (c) => {
       return c.json({ error: '이미지 용량이 너무 큽니다. 더 작은 이미지를 사용해주세요. (최대 500KB)' }, 400)
     }
     const db = c.env.DB
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
     await db.prepare(`UPDATE products SET name=?, description=?, price_krw=?, image_url=?, detail_image_url=?, category=?, stock=?, is_active=? WHERE id=?`).bind(
       name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1, is_active ?? 1, id
     ).run()
@@ -3567,7 +3572,8 @@ app.get('/api/admin/shop/products', async (c) => {
     const products = await db.prepare(`SELECT * FROM products ORDER BY created_at DESC`).all()
     return c.json({ success: true, products: products.results })
   } catch(e) {
-    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    await db.prepare(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price_krw INTEGER NOT NULL, image_url TEXT DEFAULT '', detail_image_url TEXT DEFAULT '', category TEXT DEFAULT '일반', stock INTEGER DEFAULT -1, is_active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run()
+    try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
     return c.json({ success: true, products: [] })
   }
 })
