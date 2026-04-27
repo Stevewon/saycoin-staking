@@ -7634,17 +7634,14 @@ app.get('/admin/dashboard', (c) => {
                 // 진행 중인 스테이킹이 있는지 확인
                 if (stakingAmount > 0) {
                     alert(I18N.t('admin.delete_has_staking') + '\\n\\n' + 
-                          I18N.t('admin.delete_user_label') + userName + '
-' +
-                          I18N.t('admin.delete_email_label') + userEmail + '
-' +
+                          I18N.t('admin.delete_user_label') + userName + '\\n' +
+                          I18N.t('admin.delete_email_label') + userEmail + '\\n' +
                           I18N.t('admin.delete_staking_label') + stakingAmount.toLocaleString());
                     return;
                 }
 
                 if (!confirm(I18N.t('admin.delete_confirm1') + '\\n\\n' + 
-                             I18N.t('admin.delete_user_label') + userName + '
-' +
+                             I18N.t('admin.delete_user_label') + userName + '\\n' +
                              I18N.t('admin.delete_email_label') + userEmail + '\\n\\n' +
                              I18N.t('admin.delete_irreversible'))) {
                     return;
@@ -7659,8 +7656,7 @@ app.get('/admin/dashboard', (c) => {
                     const response = await axios.delete('/api/admin/user/' + userId);
                     if (response.data.success) {
                         alert(I18N.t('admin.delete_success') + '\\n\\n' +
-                              I18N.t('admin.delete_name_label') + response.data.deletedUser.name + '
-' +
+                              I18N.t('admin.delete_name_label') + response.data.deletedUser.name + '\\n' +
                               I18N.t('admin.delete_email_label') + response.data.deletedUser.email);
                         await loadUsers();
                         await loadSignups();
