@@ -3574,8 +3574,8 @@ app.post('/api/admin/shop/product', async (c) => {
     if (!name || !price_krw) return c.json({ error: '상품명과 가격은 필수입니다' }, 400)
     // 이미지 크기 검증 (D1 row limit ~1MB, Base64 overhead 고려하여 500KB 제한)
     const imgSize = (image_url || '').length + (detail_image_url || '').length
-    if (imgSize > 500 * 1024) {
-      return c.json({ error: '이미지 용량이 너무 큽니다. 더 작은 이미지를 사용해주세요. (최대 500KB)' }, 400)
+    if (imgSize > 950 * 1024) {
+      return c.json({ error: '이미지 용량이 너무 큽니다. 이미지를 줄여주세요.' }, 400)
     }
     const db = c.env.DB
     // 테이블 자동 생성 + 컬럼 마이그레이션
@@ -3603,8 +3603,8 @@ app.put('/api/admin/shop/product/:id', async (c) => {
     const { name, description, price_krw, image_url, detail_image_url, category, stock, is_active, options } = await c.req.json()
     // 이미지 크기 검증
     const imgSize = (image_url || '').length + (detail_image_url || '').length
-    if (imgSize > 500 * 1024) {
-      return c.json({ error: '이미지 용량이 너무 큽니다. 더 작은 이미지를 사용해주세요. (최대 500KB)' }, 400)
+    if (imgSize > 950 * 1024) {
+      return c.json({ error: '이미지 용량이 너무 큽니다. 이미지를 줄여주세요.' }, 400)
     }
     const db = c.env.DB
     try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
@@ -5365,9 +5365,19 @@ app.get('/dashboard', (c) => {
                 var p = products.find(function(x) { return x.id === productId; });
                 if (!p) return;
                 var priceQkey = Math.ceil(p.price_krw / 10);
-                var imgHtml = p.detail_image_url 
-                    ? '<img src="' + escapeHtml(p.detail_image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">'
-                    : (p.image_url ? '<img src="' + escapeHtml(p.image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">' : '');
+                // 상세이미지: JSON 배열이면 여러장, 아니면 단일
+                var imgHtml = '';
+                if (p.detail_image_url) {
+                    var detailImgs = [];
+                    try { var parsed = JSON.parse(p.detail_image_url); if (Array.isArray(parsed)) detailImgs = parsed; } catch(e) {}
+                    if (detailImgs.length > 0) {
+                        imgHtml = detailImgs.map(function(url) { return '<img src="' + escapeHtml(url) + '" class="w-full rounded-lg mb-2" onerror="this.style.display=\\'none\\'">'; }).join('');
+                    } else {
+                        imgHtml = '<img src="' + escapeHtml(p.detail_image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">';
+                    }
+                } else if (p.image_url) {
+                    imgHtml = '<img src="' + escapeHtml(p.image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">';
+                }
                 var modal = document.createElement('div');
                 modal.id = 'productDetailModal';
                 modal.className = 'fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4';
@@ -6916,16 +6926,15 @@ app.get('/admin/dashboard', (c) => {
                                 </div>
                                 <input type="hidden" id="shopProdImage">
                             </div>
-                            <!-- 상세 이미지 -->
-                            <div>
-                                <label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-file-image mr-1 text-purple-500"></i>상세페이지 이미지</label>
+                            <!-- 상세 이미지 (여러장) -->
+                            <div class="sm:col-span-2">
+                                <label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-file-image mr-1 text-purple-500"></i>상세페이지 이미지 (여러장 가능)</label>
                                 <div id="detailDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center cursor-pointer hover:border-purple-400 hover:bg-purple-50 transition relative"
                                     onclick="document.getElementById('detailFileInput').click()">
-                                    <input type="file" id="detailFileInput" accept="image/*" class="hidden" onchange="handleImageUpload(this,'detail')">
-                                    <div id="detailPreview" class="hidden overflow-hidden" style="max-height:120px"><img id="detailPreviewImg" class="max-h-24 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearImage('detail')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div>
-                                    <div id="detailPlaceholder"><i class="fas fa-cloud-upload-alt text-2xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그앤드롭</p><p class="text-xs text-gray-400">JPG, PNG (최대 5MB)</p></div>
+                                    <input type="file" id="detailFileInput" accept="image/*" class="hidden" onchange="handleDetailImageAdd(this)" multiple>
+                                    <div id="detailPlaceholder"><i class="fas fa-cloud-upload-alt text-2xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그앤드롭</p><p class="text-xs text-gray-400">JPG, PNG (여러장 선택 가능, 각 최대 5MB)</p></div>
                                 </div>
-                                <input type="hidden" id="shopProdDetailImage">
+                                <div id="detailImageList" class="mt-2 space-y-2"></div>
                             </div>
                         </div>
                         <button onclick="adminAddProduct()" class="w-full py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-base transition shadow-lg">
@@ -8069,56 +8078,93 @@ app.get('/admin/dashboard', (c) => {
                 });
             }
             setupDropZone('thumbDropZone', 'thumb');
-            setupDropZone('detailDropZone', 'detail');
+            // 상세이미지 드롭존은 여러장 처리
+            (function() {
+                var zone = document.getElementById('detailDropZone');
+                if (!zone) return;
+                zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.classList.add('border-purple-500','bg-purple-50'); });
+                zone.addEventListener('dragleave', function(e) { e.preventDefault(); zone.classList.remove('border-purple-500','bg-purple-50'); });
+                zone.addEventListener('drop', function(e) {
+                    e.preventDefault(); zone.classList.remove('border-purple-500','bg-purple-50');
+                    Array.from(e.dataTransfer.files).forEach(function(file) {
+                        compressImage(file, 1000, 8000, 450*1024, function(dataUrl) {
+                            detailImagesArray.push(dataUrl);
+                            renderDetailImageList();
+                        });
+                    });
+                });
+            })();
 
             function handleImageUpload(input, type) {
                 if (input.files && input.files[0]) processImageFile(input.files[0], type);
             }
 
-            function processImageFile(file, type) {
-                var maxSize = 10*1024*1024; // 원본은 10MB까지 허용 (리사이즈 후 압축)
+            // 상세 이미지 배열 (여러장)
+            var detailImagesArray = [];
+
+            function compressImage(file, maxW, maxH, maxBytes, callback) {
                 if (!file.type.startsWith('image/')) { alert('이미지 파일만 업로드 가능합니다'); return; }
-                if (file.size > maxSize) { alert('파일 크기가 너무 큽니다 (최대 10MB)'); return; }
-                // Canvas로 리사이즈 + JPEG 압축 (DB 저장 크기 제한 대응)
+                if (file.size > 10*1024*1024) { alert('파일 크기가 너무 큽니다 (최대 10MB)'); return; }
                 var reader = new FileReader();
                 reader.onload = function(e) {
                     var img = new Image();
                     img.onload = function() {
-                        var maxW = type === 'thumb' ? 600 : 1000;
-                        var maxH = type === 'thumb' ? 600 : 8000;
                         var w = img.width, h = img.height;
                         if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
                         if (h > maxH) { w = Math.round(w * maxH / h); h = maxH; }
                         var canvas = document.createElement('canvas');
                         canvas.width = w; canvas.height = h;
-                        var ctx = canvas.getContext('2d');
-                        ctx.drawImage(img, 0, 0, w, h);
-                        // JPEG 품질 조정으로 300KB 이하 목표
+                        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
                         var quality = 0.8;
                         var dataUrl = canvas.toDataURL('image/jpeg', quality);
-                        // 300KB 초과 시 품질 낮추기
-                        var maxBytes = type === 'thumb' ? 300*1024 : 450*1024;
-                        while (dataUrl.length > maxBytes && quality > 0.3) {
-                            quality -= 0.1;
-                            dataUrl = canvas.toDataURL('image/jpeg', quality);
-                        }
-                        var sizeKB = Math.round(dataUrl.length / 1024);
-                        console.log('Image compressed: ' + img.width + 'x' + img.height + ' -> ' + w + 'x' + h + ', ' + sizeKB + 'KB (q=' + quality.toFixed(1) + ')');
-                        if (type === 'thumb') {
-                            document.getElementById('shopProdImage').value = dataUrl;
-                            document.getElementById('thumbPreviewImg').src = dataUrl;
-                            document.getElementById('thumbPreview').classList.remove('hidden');
-                            document.getElementById('thumbPlaceholder').classList.add('hidden');
-                        } else {
-                            document.getElementById('shopProdDetailImage').value = dataUrl;
-                            document.getElementById('detailPreviewImg').src = dataUrl;
-                            document.getElementById('detailPreview').classList.remove('hidden');
-                            document.getElementById('detailPlaceholder').classList.add('hidden');
-                        }
+                        while (dataUrl.length > maxBytes && quality > 0.3) { quality -= 0.1; dataUrl = canvas.toDataURL('image/jpeg', quality); }
+                        console.log('Image compressed: ' + img.width + 'x' + img.height + ' -> ' + w + 'x' + h + ', ' + Math.round(dataUrl.length/1024) + 'KB');
+                        callback(dataUrl);
                     };
                     img.src = e.target.result;
                 };
                 reader.readAsDataURL(file);
+            }
+
+            function processImageFile(file, type) {
+                if (type === 'thumb') {
+                    compressImage(file, 600, 600, 300*1024, function(dataUrl) {
+                        document.getElementById('shopProdImage').value = dataUrl;
+                        document.getElementById('thumbPreviewImg').src = dataUrl;
+                        document.getElementById('thumbPreview').classList.remove('hidden');
+                        document.getElementById('thumbPlaceholder').classList.add('hidden');
+                    });
+                }
+            }
+
+            // 상세이미지 여러장 추가
+            function handleDetailImageAdd(input) {
+                if (!input.files) return;
+                Array.from(input.files).forEach(function(file) {
+                    compressImage(file, 1000, 8000, 450*1024, function(dataUrl) {
+                        detailImagesArray.push(dataUrl);
+                        renderDetailImageList();
+                    });
+                });
+                input.value = '';
+            }
+
+            function renderDetailImageList() {
+                var container = document.getElementById('detailImageList');
+                if (!container) return;
+                container.innerHTML = detailImagesArray.map(function(url, idx) {
+                    return '<div class="flex items-center gap-2 bg-gray-50 rounded p-2 border">' +
+                        '<img src="' + url.substring(0, 50) + '..." class="hidden">' +
+                        '<div class="w-16 h-16 flex-shrink-0 rounded overflow-hidden bg-gray-200"><img src="' + url + '" class="w-full h-full object-cover"></div>' +
+                        '<span class="text-xs text-gray-600 flex-1">상세이미지 ' + (idx+1) + ' (' + Math.round(url.length/1024) + 'KB)</span>' +
+                        '<button onclick="removeDetailImage(' + idx + ')" class="px-2 py-1 bg-red-100 hover:bg-red-200 text-red-600 rounded text-xs font-bold"><i class="fas fa-trash mr-1"></i>삭제</button>' +
+                        '</div>';
+                }).join('');
+            }
+
+            function removeDetailImage(idx) {
+                detailImagesArray.splice(idx, 1);
+                renderDetailImageList();
             }
 
             function clearImage(type) {
@@ -8127,11 +8173,6 @@ app.get('/admin/dashboard', (c) => {
                     document.getElementById('thumbPreview').classList.add('hidden');
                     document.getElementById('thumbPlaceholder').classList.remove('hidden');
                     document.getElementById('thumbFileInput').value = '';
-                } else {
-                    document.getElementById('shopProdDetailImage').value = '';
-                    document.getElementById('detailPreview').classList.add('hidden');
-                    document.getElementById('detailPlaceholder').classList.remove('hidden');
-                    document.getElementById('detailFileInput').value = '';
                 }
             }
 
@@ -8160,6 +8201,9 @@ app.get('/admin/dashboard', (c) => {
                 return opts.length > 0 ? JSON.stringify(opts) : '';
             }
 
+            // 수정 모달 전용 상세이미지 배열
+            var editDetailImagesArray = [];
+
             // 상품 수정 모달
             function adminEditProduct(productId) {
                 var products = [];
@@ -8172,106 +8216,121 @@ app.get('/admin/dashboard', (c) => {
                     var optsHtml = (opts.length > 0 ? opts : [{ name: '', values: [] }]).map(function(o) {
                         return '<div class="flex gap-2 items-center"><input type="text" value="' + esc(o.name||'') + '" placeholder="옵션명" class="editOptName px-2 py-1.5 border rounded text-sm w-28"><input type="text" value="' + esc((o.values||[]).join(',')) + '" placeholder="항목 (쉼표 구분)" class="editOptValues px-2 py-1.5 border rounded text-sm flex-1"><button onclick="this.parentElement.remove()" class="text-red-400 hover:text-red-600 text-sm"><i class="fas fa-times-circle"></i></button></div>';
                     }).join('');
-                    var thumbPreviewHtml = p.image_url ? '<div id="editThumbPreview" class="overflow-hidden" style="max-height:100px"><img id="editThumbPreviewImg" src="' + p.image_url + '" class="max-h-20 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearEditImage(\'thumb\')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div><div id="editThumbPlaceholder" class="hidden"><i class="fas fa-cloud-upload-alt text-xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그</p></div>' : '<div id="editThumbPreview" class="hidden overflow-hidden" style="max-height:100px"><img id="editThumbPreviewImg" class="max-h-20 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearEditImage(\'thumb\')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div><div id="editThumbPlaceholder"><i class="fas fa-cloud-upload-alt text-xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그</p></div>';
-                    var detailPreviewHtml = p.detail_image_url ? '<div id="editDetailPreview" class="overflow-hidden" style="max-height:100px"><img id="editDetailPreviewImg" src="' + p.detail_image_url + '" class="max-h-20 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearEditImage(\'detail\')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div><div id="editDetailPlaceholder" class="hidden"><i class="fas fa-cloud-upload-alt text-xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그</p></div>' : '<div id="editDetailPreview" class="hidden overflow-hidden" style="max-height:100px"><img id="editDetailPreviewImg" class="max-h-20 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearEditImage(\'detail\')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div><div id="editDetailPlaceholder"><i class="fas fa-cloud-upload-alt text-xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그</p></div>';
+                    // 기존 상세이미지 파싱 (JSON 배열 또는 단일 문자열)
+                    editDetailImagesArray = [];
+                    if (p.detail_image_url) {
+                        try {
+                            var parsed = JSON.parse(p.detail_image_url);
+                            if (Array.isArray(parsed)) editDetailImagesArray = parsed;
+                            else editDetailImagesArray = [p.detail_image_url];
+                        } catch(e) { editDetailImagesArray = [p.detail_image_url]; }
+                    }
                     var modal = document.createElement('div');
                     modal.id = 'editProductModal';
                     modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4';
                     modal.innerHTML = '<div class="bg-white rounded-xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-5">' +
                         '<div class="flex justify-between items-center mb-4"><h3 class="font-bold text-lg"><i class="fas fa-edit mr-2 text-blue-600"></i>상품 수정</h3><button onclick="document.getElementById(\\'editProductModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-xl">&times;</button></div>' +
                         '<div class="space-y-3">' +
-                        '<input type="text" id="editProdName" value="' + esc(p.name) + '" placeholder="상품명 *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
-                        '<input type="number" id="editProdPrice" value="' + p.price_krw + '" placeholder="가격 (원) *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
-                        '<input type="text" id="editProdDesc" value="' + esc(p.description||'') + '" placeholder="상품 설명" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<input type="text" id="editProdName" placeholder="상품명 *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<input type="number" id="editProdPrice" placeholder="가격 (원) *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<input type="text" id="editProdDesc" placeholder="상품 설명" class="w-full px-3 py-2 border rounded-lg text-sm">' +
                         '<select id="editProdCategory" class="w-full px-3 py-2 border rounded-lg text-sm bg-white"><option value="일반">일반</option><option value="식품">식품</option><option value="건강">건강</option><option value="생활">생활</option><option value="패션">패션</option><option value="뷰티">뷰티</option><option value="전자기기">전자기기</option><option value="기타">기타</option></select>' +
-                        '<input type="number" id="editProdStock" value="' + (p.stock||-1) + '" placeholder="재고 (-1=무제한)" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<input type="number" id="editProdStock" placeholder="재고 (-1=무제한)" class="w-full px-3 py-2 border rounded-lg text-sm">' +
                         '<div><label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-list-ul mr-1 text-orange-500"></i>옵션 설정</label><div id="editProdOptions" class="space-y-2">' + optsHtml + '</div>' +
                         '<button onclick="var c=document.getElementById(\\'editProdOptions\\');var r=document.createElement(\\'div\\');r.className=\\'flex gap-2 items-center\\';r.innerHTML=\\'<input type=text placeholder=옵션명 class=editOptName px-2 py-1.5 border rounded text-sm w-28><input type=text placeholder=항목(쉼표구분) class=editOptValues px-2 py-1.5 border rounded text-sm flex-1><button onclick=this.parentElement.remove() class=text-red-400 hover:text-red-600 text-sm><i class=fas fa-times-circle></i></button>\\';c.appendChild(r)" class="mt-2 px-3 py-1 bg-orange-100 hover:bg-orange-200 text-orange-700 rounded text-xs font-bold"><i class="fas fa-plus mr-1"></i>옵션 추가</button></div>' +
                         '<!-- 이미지 수정 영역 -->' +
-                        '<div class="grid grid-cols-2 gap-3">' +
-                        '<div><label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-image mr-1 text-blue-500"></i>썸네일</label>' +
-                        '<div id="editThumbDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-3 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition" onclick="document.getElementById(\'editThumbFileInput\').click()">' +
-                        '<input type="file" id="editThumbFileInput" accept="image/*" class="hidden" onchange="handleEditImageUpload(this,\'thumb\')">' +
-                        thumbPreviewHtml +
-                        '</div><input type="hidden" id="editProdImage" value="' + (p.image_url ? '__KEEP__' : '') + '"></div>' +
-                        '<div><label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-file-image mr-1 text-purple-500"></i>상세페이지</label>' +
-                        '<div id="editDetailDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-3 text-center cursor-pointer hover:border-purple-400 hover:bg-purple-50 transition" onclick="document.getElementById(\'editDetailFileInput\').click()">' +
-                        '<input type="file" id="editDetailFileInput" accept="image/*" class="hidden" onchange="handleEditImageUpload(this,\'detail\')">' +
-                        detailPreviewHtml +
-                        '</div><input type="hidden" id="editProdDetailImage" value="' + (p.detail_image_url ? '__KEEP__' : '') + '"></div>' +
+                        '<div class="border rounded-lg p-3 bg-gray-50">' +
+                        '<label class="block text-xs font-bold text-gray-600 mb-2"><i class="fas fa-image mr-1 text-blue-500"></i>썸네일 이미지</label>' +
+                        '<div id="editThumbDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-3 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition mb-2" onclick="document.getElementById(\\'editThumbFileInput\\').click()">' +
+                        '<input type="file" id="editThumbFileInput" accept="image/*" class="hidden" onchange="handleEditThumbUpload(this)">' +
+                        '<div id="editThumbPreview" class="hidden overflow-hidden" style="max-height:100px"><img id="editThumbPreviewImg" class="max-h-20 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearEditThumb()" class="text-xs text-red-500 hover:text-red-700 block mx-auto"><i class="fas fa-trash mr-1"></i>썸네일 삭제</button></div>' +
+                        '<div id="editThumbPlaceholder"><i class="fas fa-cloud-upload-alt text-xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭하여 썸네일 업로드</p></div>' +
+                        '</div>' +
+                        '<input type="hidden" id="editProdThumbData" value="">' +
+                        '</div>' +
+                        '<div class="border rounded-lg p-3 bg-gray-50">' +
+                        '<label class="block text-xs font-bold text-gray-600 mb-2"><i class="fas fa-file-image mr-1 text-purple-500"></i>상세페이지 이미지 (여러장 가능)</label>' +
+                        '<div id="editDetailDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-3 text-center cursor-pointer hover:border-purple-400 hover:bg-purple-50 transition mb-2" onclick="document.getElementById(\\'editDetailFileInput\\').click()">' +
+                        '<input type="file" id="editDetailFileInput" accept="image/*" class="hidden" onchange="handleEditDetailAdd(this)" multiple>' +
+                        '<div><i class="fas fa-cloud-upload-alt text-xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭하여 상세이미지 추가</p></div>' +
+                        '</div>' +
+                        '<div id="editDetailImageList" class="space-y-2"></div>' +
                         '</div>' +
                         '<div class="flex gap-2 pt-3"><button onclick="saveEditProduct(' + p.id + ')" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-sm"><i class="fas fa-save mr-1"></i>저장</button><button onclick="document.getElementById(\\'editProductModal\\').remove()" class="flex-1 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-bold text-sm">취소</button></div>' +
                         '</div></div>';
                     document.body.appendChild(modal);
+                    // JS로 값 설정 (base64를 HTML attribute에 직접 넣으면 깨짐)
+                    document.getElementById('editProdName').value = p.name || '';
+                    document.getElementById('editProdPrice').value = p.price_krw || 0;
+                    document.getElementById('editProdDesc').value = p.description || '';
                     document.getElementById('editProdCategory').value = p.category || '일반';
-                    // 수정 모달 드래그앤드롭 설정
-                    setupEditDropZone('editThumbDropZone', 'thumb');
-                    setupEditDropZone('editDetailDropZone', 'detail');
+                    document.getElementById('editProdStock').value = p.stock != null ? p.stock : -1;
+                    // 썸네일 미리보기 설정
+                    if (p.image_url) {
+                        document.getElementById('editProdThumbData').value = '__KEEP__';
+                        document.getElementById('editThumbPreviewImg').src = p.image_url;
+                        document.getElementById('editThumbPreview').classList.remove('hidden');
+                        document.getElementById('editThumbPlaceholder').classList.add('hidden');
+                    }
+                    // 상세이미지 목록 렌더
+                    renderEditDetailImageList();
+                    // 드래그앤드롭
+                    (function() {
+                        var tz = document.getElementById('editThumbDropZone');
+                        if (tz) {
+                            tz.addEventListener('dragover', function(e) { e.preventDefault(); });
+                            tz.addEventListener('drop', function(e) { e.preventDefault(); if (e.dataTransfer.files.length > 0) handleEditThumbFile(e.dataTransfer.files[0]); });
+                        }
+                        var dz = document.getElementById('editDetailDropZone');
+                        if (dz) {
+                            dz.addEventListener('dragover', function(e) { e.preventDefault(); });
+                            dz.addEventListener('drop', function(e) { e.preventDefault(); Array.from(e.dataTransfer.files).forEach(function(f) { handleEditDetailFile(f); }); });
+                        }
+                    })();
                 });
             }
 
-            // 수정 모달 전용 이미지 처리 함수들
-            function setupEditDropZone(zoneId, type) {
-                var zone = document.getElementById(zoneId);
-                if (!zone) return;
-                zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.classList.add('border-blue-500','bg-blue-50'); });
-                zone.addEventListener('dragleave', function(e) { e.preventDefault(); zone.classList.remove('border-blue-500','bg-blue-50'); });
-                zone.addEventListener('drop', function(e) {
-                    e.preventDefault(); zone.classList.remove('border-blue-500','bg-blue-50');
-                    var files = e.dataTransfer.files;
-                    if (files.length > 0) processEditImageFile(files[0], type);
+            function handleEditThumbUpload(input) { if (input.files && input.files[0]) handleEditThumbFile(input.files[0]); }
+            function handleEditThumbFile(file) {
+                compressImage(file, 600, 600, 300*1024, function(dataUrl) {
+                    document.getElementById('editProdThumbData').value = dataUrl;
+                    document.getElementById('editThumbPreviewImg').src = dataUrl;
+                    document.getElementById('editThumbPreview').classList.remove('hidden');
+                    document.getElementById('editThumbPlaceholder').classList.add('hidden');
                 });
             }
-            function handleEditImageUpload(input, type) {
-                if (input.files && input.files[0]) processEditImageFile(input.files[0], type);
+            function clearEditThumb() {
+                document.getElementById('editProdThumbData').value = '';
+                document.getElementById('editThumbPreview').classList.add('hidden');
+                document.getElementById('editThumbPlaceholder').classList.remove('hidden');
+                document.getElementById('editThumbFileInput').value = '';
             }
-            function processEditImageFile(file, type) {
-                if (!file.type.startsWith('image/')) { alert('이미지 파일만 업로드 가능합니다'); return; }
-                if (file.size > 10*1024*1024) { alert('파일 크기가 너무 큽니다 (최대 10MB)'); return; }
-                var reader = new FileReader();
-                reader.onload = function(e) {
-                    var img = new Image();
-                    img.onload = function() {
-                        var maxW = type === 'thumb' ? 600 : 1000;
-                        var maxH = type === 'thumb' ? 600 : 8000;
-                        var w = img.width, h = img.height;
-                        if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
-                        if (h > maxH) { w = Math.round(w * maxH / h); h = maxH; }
-                        var canvas = document.createElement('canvas');
-                        canvas.width = w; canvas.height = h;
-                        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-                        var quality = 0.8;
-                        var dataUrl = canvas.toDataURL('image/jpeg', quality);
-                        var maxBytes = type === 'thumb' ? 300*1024 : 450*1024;
-                        while (dataUrl.length > maxBytes && quality > 0.3) { quality -= 0.1; dataUrl = canvas.toDataURL('image/jpeg', quality); }
-                        if (type === 'thumb') {
-                            document.getElementById('editProdImage').value = dataUrl;
-                            document.getElementById('editThumbPreviewImg').src = dataUrl;
-                            document.getElementById('editThumbPreview').classList.remove('hidden');
-                            document.getElementById('editThumbPlaceholder').classList.add('hidden');
-                        } else {
-                            document.getElementById('editProdDetailImage').value = dataUrl;
-                            document.getElementById('editDetailPreviewImg').src = dataUrl;
-                            document.getElementById('editDetailPreview').classList.remove('hidden');
-                            document.getElementById('editDetailPlaceholder').classList.add('hidden');
-                        }
-                    };
-                    img.src = e.target.result;
-                };
-                reader.readAsDataURL(file);
+
+            function handleEditDetailAdd(input) {
+                if (!input.files) return;
+                Array.from(input.files).forEach(function(f) { handleEditDetailFile(f); });
+                input.value = '';
             }
-            function clearEditImage(type) {
-                if (type === 'thumb') {
-                    document.getElementById('editProdImage').value = '';
-                    document.getElementById('editThumbPreview').classList.add('hidden');
-                    document.getElementById('editThumbPlaceholder').classList.remove('hidden');
-                    document.getElementById('editThumbFileInput').value = '';
-                } else {
-                    document.getElementById('editProdDetailImage').value = '';
-                    document.getElementById('editDetailPreview').classList.add('hidden');
-                    document.getElementById('editDetailPlaceholder').classList.remove('hidden');
-                    document.getElementById('editDetailFileInput').value = '';
-                }
+            function handleEditDetailFile(file) {
+                compressImage(file, 1000, 8000, 450*1024, function(dataUrl) {
+                    editDetailImagesArray.push(dataUrl);
+                    renderEditDetailImageList();
+                });
+            }
+            function renderEditDetailImageList() {
+                var container = document.getElementById('editDetailImageList');
+                if (!container) return;
+                container.innerHTML = editDetailImagesArray.map(function(url, idx) {
+                    return '<div class="flex items-center gap-2 bg-white rounded p-2 border">' +
+                        '<div class="w-14 h-14 flex-shrink-0 rounded overflow-hidden bg-gray-200"><img src="' + url + '" class="w-full h-full object-cover"></div>' +
+                        '<span class="text-xs text-gray-600 flex-1">상세 ' + (idx+1) + ' (' + Math.round(url.length/1024) + 'KB)</span>' +
+                        '<button onclick="removeEditDetailImage(' + idx + ')" class="px-2 py-1 bg-red-100 hover:bg-red-200 text-red-600 rounded text-xs font-bold"><i class="fas fa-trash mr-1"></i>삭제</button>' +
+                        '</div>';
+                }).join('');
+            }
+            function removeEditDetailImage(idx) {
+                editDetailImagesArray.splice(idx, 1);
+                renderEditDetailImageList();
             }
 
             async function saveEditProduct(productId) {
@@ -8285,14 +8344,18 @@ app.get('/admin/dashboard', (c) => {
                     if (n && v) { opts.push({ name: n, values: v.split(',').map(function(x){return x.trim();}).filter(function(x){return x;}) }); }
                 });
                 try {
-                    // 기존 상품 정보 가져오기 (이미지 변경 여부 확인)
                     var prodRes = await axios.get('/api/admin/shop/products');
                     var existing = (prodRes.data.products || []).find(function(p) { return p.id === productId; });
-                    // 이미지 처리: __KEEP__ = 기존 유지, 빈값 = 제거, 그 외 = 새 이미지
-                    var thumbVal = document.getElementById('editProdImage').value;
-                    var detailVal = document.getElementById('editProdDetailImage').value;
+                    // 썸네일 처리
+                    var thumbVal = document.getElementById('editProdThumbData').value;
                     var finalThumb = thumbVal === '__KEEP__' ? (existing ? existing.image_url : '') : thumbVal;
-                    var finalDetail = detailVal === '__KEEP__' ? (existing ? existing.detail_image_url : '') : detailVal;
+                    // 상세이미지 처리 (여러장 → JSON, 1장 → 그대로)
+                    var finalDetail = '';
+                    if (editDetailImagesArray.length > 1) {
+                        finalDetail = JSON.stringify(editDetailImagesArray);
+                    } else if (editDetailImagesArray.length === 1) {
+                        finalDetail = editDetailImagesArray[0];
+                    }
                     await axios.put('/api/admin/shop/product/' + productId, {
                         name: name,
                         description: document.getElementById('editProdDesc').value.trim(),
@@ -8317,7 +8380,13 @@ app.get('/admin/dashboard', (c) => {
                 var price = parseInt(document.getElementById('shopProdPrice').value) || 0;
                 var desc = document.getElementById('shopProdDesc').value.trim();
                 var image = document.getElementById('shopProdImage').value.trim();
-                var detailImage = document.getElementById('shopProdDetailImage').value.trim();
+                // 상세이미지: 여러장이면 JSON 배열, 1장이면 그대로
+                var detailImage = '';
+                if (detailImagesArray.length > 1) {
+                    detailImage = JSON.stringify(detailImagesArray);
+                } else if (detailImagesArray.length === 1) {
+                    detailImage = detailImagesArray[0];
+                }
                 var category = document.getElementById('shopProdCategory').value.trim() || '일반';
                 var stock = parseInt(document.getElementById('shopProdStock').value);
                 if (isNaN(stock)) stock = -1;
@@ -8327,10 +8396,10 @@ app.get('/admin/dashboard', (c) => {
                     alert('상품명과 가격(원)은 필수입니다.');
                     return;
                 }
-                // 프론트 크기 검증 (썸네일+상세 이미지 합산 500KB 제한)
+                // 프론트 크기 검증
                 var totalImgSize = image.length + detailImage.length;
-                if (totalImgSize > 500 * 1024) {
-                    alert('이미지 용량이 너무 큽니다 (' + Math.round(totalImgSize/1024) + 'KB). 더 작은 이미지를 사용해주세요. (최대 500KB)');
+                if (totalImgSize > 900 * 1024) {
+                    alert('이미지 용량이 너무 큽니다 (' + Math.round(totalImgSize/1024) + 'KB). 이미지를 줄여주세요.');
                     return;
                 }
                 try {
@@ -8344,10 +8413,11 @@ app.get('/admin/dashboard', (c) => {
                         document.getElementById('shopProdPrice').value = '';
                         document.getElementById('shopProdDesc').value = '';
                         document.getElementById('shopProdImage').value = '';
-                        document.getElementById('shopProdDetailImage').value = '';
                         document.getElementById('shopProdCategory').value = '';
                         document.getElementById('shopProdStock').value = '-1';
-                        clearImage('thumb'); clearImage('detail');
+                        clearImage('thumb');
+                        detailImagesArray = [];
+                        renderDetailImageList();
                         document.getElementById('shopProdOptions').innerHTML = '<div class="flex gap-2 items-center"><input type="text" placeholder="옵션명 (예: 사이즈)" class="shopOptName px-2 py-1.5 border rounded text-sm w-28"><input type="text" placeholder="항목 (쉼표 구분: S,M,L,XL)" class="shopOptValues px-2 py-1.5 border rounded text-sm flex-1"><button onclick="removeOptionRow(this)" class="text-red-400 hover:text-red-600 text-sm"><i class="fas fa-times-circle"></i></button></div>';
                         loadAdminShopProducts();
                     }
