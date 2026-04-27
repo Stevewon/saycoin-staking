@@ -2466,7 +2466,7 @@ app.get('/api/admin/user/:userId', async (c) => {
   }
 })
 
-// 관리자: 회원 코인 잔액 리셋 (각 코인별 0으로)
+// 관리자: 회원 코인 잔액 리셋 (잔액 0 + 관련 거래내역/출금/보상 기록 전부 삭제)
 app.post('/api/admin/user/:userId/reset-balance', async (c) => {
   try {
     const db = c.env.DB
@@ -2492,19 +2492,45 @@ app.post('/api/admin/user/:userId/reset-balance', async (c) => {
     // 잔액을 0으로 리셋
     await db.prepare(`UPDATE users SET ${column} = 0 WHERE id = ?`).bind(userId).run()
 
-    // 거래 내역 기록
-    if (prevBalance > 0) {
-      await db.prepare(`
-        INSERT INTO transactions (user_id, type, coin_type, amount, description)
-        VALUES (?, 'admin_reset', ?, ?, ?)
-      `).bind(userId, coinType, -prevBalance, `Admin reset ${coinType} balance (${prevBalance.toLocaleString()} → 0)`).run()
+    // 해당 코인 관련 거래내역(transactions) 전부 삭제
+    let deletedTx = 0
+    try {
+      const txResult = await db.prepare(`DELETE FROM transactions WHERE user_id = ? AND coin_type = ?`).bind(userId, coinType).run()
+      deletedTx = txResult.meta?.changes || 0
+    } catch (e) { console.error('transactions 삭제 실패:', e) }
+
+    // 해당 코인 관련 출금내역(withdrawals) 전부 삭제
+    let deletedWd = 0
+    try {
+      const wdResult = await db.prepare(`DELETE FROM withdrawals WHERE user_id = ? AND coin_type = ?`).bind(userId, coinType).run()
+      deletedWd = wdResult.meta?.changes || 0
+    } catch (e) { console.error('withdrawals 삭제 실패:', e) }
+
+    // QKEY인 경우 일일배당(daily_rewards)과 추천보상(referral_rewards)도 삭제 (보상은 QKEY로 지급)
+    let deletedDailyRewards = 0
+    let deletedReferralRewards = 0
+    if (coinType === 'QKEY') {
+      try {
+        const drResult = await db.prepare(`DELETE FROM daily_rewards WHERE user_id = ?`).bind(userId).run()
+        deletedDailyRewards = drResult.meta?.changes || 0
+      } catch (e) { console.error('daily_rewards 삭제 실패:', e) }
+      try {
+        const rrResult = await db.prepare(`DELETE FROM referral_rewards WHERE referrer_id = ?`).bind(userId).run()
+        deletedReferralRewards = rrResult.meta?.changes || 0
+      } catch (e) { console.error('referral_rewards 삭제 실패:', e) }
     }
 
     return c.json({
       success: true,
-      message: `${coinType} balance reset to 0`,
+      message: `${coinType} 잔액 리셋 및 관련 기록 삭제 완료`,
       coinType,
-      previousBalance: prevBalance
+      previousBalance: prevBalance,
+      deletedRecords: {
+        transactions: deletedTx,
+        withdrawals: deletedWd,
+        dailyRewards: deletedDailyRewards,
+        referralRewards: deletedReferralRewards
+      }
     })
   } catch (error) {
     console.error('잔액 리셋 오류:', error)
@@ -7573,14 +7599,24 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById('userDetailModal').classList.add('hidden');
             }
 
-            // 코인 잔액 0 리셋
+            // 코인 잔액 0 리셋 + 관련 기록 전부 삭제
             async function resetCoinBalance(userId, coinType) {
-                if (!confirm(coinType + ' 잔액을 0으로 리셋하시겠습니까?\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
+                if (!confirm(coinType + ' 잔액을 0으로 리셋하시겠습니까?\\n\\n⚠️ 잔액뿐 아니라 해당 코인의 거래내역, 출금내역' + (coinType === 'QKEY' ? ', 일일배당, 추천보상' : '') + ' 기록이 모두 삭제됩니다.\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
                 try {
                     var res = await axios.post('/api/admin/user/' + userId + '/reset-balance', { coinType: coinType });
                     if (res.data.success) {
-                        alert(coinType + ' 잔액 리셋 완료\\n(' + (res.data.previousBalance || 0).toLocaleString() + ' → 0)');
-                        showUserDetail(userId); // 새로고침
+                        var del = res.data.deletedRecords || {};
+                        var msg = coinType + ' 리셋 완료\\n';
+                        msg += '잔액: ' + (res.data.previousBalance || 0).toLocaleString() + ' → 0\\n';
+                        msg += '삭제된 기록:\\n';
+                        msg += '  - 거래내역: ' + (del.transactions || 0) + '건\\n';
+                        msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건';
+                        if (coinType === 'QKEY') {
+                            msg += '\\n  - 일일배당: ' + (del.dailyRewards || 0) + '건';
+                            msg += '\\n  - 추천보상: ' + (del.referralRewards || 0) + '건';
+                        }
+                        alert(msg);
+                        showUserDetail(userId); // 상세 모달 새로고침
                         loadUsers(); // 목록도 새로고침
                     }
                 } catch (err) {
