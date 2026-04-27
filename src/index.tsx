@@ -6911,7 +6911,7 @@ app.get('/admin/dashboard', (c) => {
                                 <div id="thumbDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center cursor-pointer hover:border-pink-400 hover:bg-pink-50 transition relative"
                                     onclick="document.getElementById('thumbFileInput').click()">
                                     <input type="file" id="thumbFileInput" accept="image/*" class="hidden" onchange="handleImageUpload(this,'thumb')">
-                                    <div id="thumbPreview" class="hidden"><img id="thumbPreviewImg" class="max-h-24 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearImage('thumb')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div>
+                                    <div id="thumbPreview" class="hidden overflow-hidden" style="max-height:120px"><img id="thumbPreviewImg" class="max-h-24 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearImage('thumb')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div>
                                     <div id="thumbPlaceholder"><i class="fas fa-cloud-upload-alt text-2xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그앤드롭</p><p class="text-xs text-gray-400">JPG, PNG (최대 2MB)</p></div>
                                 </div>
                                 <input type="hidden" id="shopProdImage">
@@ -6922,14 +6922,14 @@ app.get('/admin/dashboard', (c) => {
                                 <div id="detailDropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center cursor-pointer hover:border-purple-400 hover:bg-purple-50 transition relative"
                                     onclick="document.getElementById('detailFileInput').click()">
                                     <input type="file" id="detailFileInput" accept="image/*" class="hidden" onchange="handleImageUpload(this,'detail')">
-                                    <div id="detailPreview" class="hidden"><img id="detailPreviewImg" class="max-h-24 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearImage('detail')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div>
+                                    <div id="detailPreview" class="hidden overflow-hidden" style="max-height:120px"><img id="detailPreviewImg" class="max-h-24 mx-auto rounded mb-1"><button onclick="event.stopPropagation();clearImage('detail')" class="text-xs text-red-500 hover:text-red-700"><i class="fas fa-times mr-1"></i>제거</button></div>
                                     <div id="detailPlaceholder"><i class="fas fa-cloud-upload-alt text-2xl text-gray-400 mb-1"></i><p class="text-xs text-gray-500">클릭 또는 드래그앤드롭</p><p class="text-xs text-gray-400">JPG, PNG (최대 5MB)</p></div>
                                 </div>
                                 <input type="hidden" id="shopProdDetailImage">
                             </div>
                         </div>
-                        <button onclick="adminAddProduct()" class="px-6 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold text-sm transition">
-                            <i class="fas fa-plus mr-1"></i>상품 등록
+                        <button onclick="adminAddProduct()" class="w-full py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-base transition shadow-lg">
+                            <i class="fas fa-save mr-2"></i>상품 저장
                         </button>
                     </div>
 
@@ -8298,7 +8298,7 @@ app.get('/admin/dashboard', (c) => {
                                 (p.options ? '<p class="text-xs mt-1 text-orange-600"><i class="fas fa-list-ul mr-1"></i>' + (function(){ try { var opts=JSON.parse(p.options); return opts.map(function(o){return o.name+':'+o.values.join(',')}).join(' | '); } catch(e){ return p.options; } })() + '</p>' : '') +
                             '</div>' +
                             '<div class="flex flex-col gap-1 ml-3">' +
-                                '<button onclick="adminEditProduct(' + p.id + ')" class="px-2 py-1 text-xs bg-blue-100 text-blue-600 hover:bg-blue-200 rounded"><i class="fas fa-edit mr-1"></i>수정</button>' +
+                                '<button onclick="adminEditProduct(' + p.id + ')" class="px-3 py-2 text-xs bg-blue-600 text-white hover:bg-blue-700 rounded font-bold shadow"><i class="fas fa-edit mr-1"></i>수정/저장</button>' +
                                 '<button onclick="adminToggleProduct(' + p.id + ',' + (p.is_active ? 0 : 1) + ',this)" class="px-2 py-1 text-xs rounded ' + (p.is_active ? 'bg-red-100 text-red-600 hover:bg-red-200' : 'bg-green-100 text-green-600 hover:bg-green-200') + '">' +
                                     (p.is_active ? '<i class="fas fa-ban mr-1"></i>비활성' : '<i class="fas fa-check mr-1"></i>활성화') +
                                 '</button>' +
