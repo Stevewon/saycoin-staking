@@ -2492,49 +2492,104 @@ app.post('/api/admin/user/:userId/reset-balance', async (c) => {
     // 잔액을 0으로 리셋
     await db.prepare(`UPDATE users SET ${column} = 0 WHERE id = ?`).bind(userId).run()
 
-    // 해당 코인 관련 거래내역(transactions) 전부 삭제
-    let deletedTx = 0
-    try {
-      const txResult = await db.prepare(`DELETE FROM transactions WHERE user_id = ? AND coin_type = ?`).bind(userId, coinType).run()
-      deletedTx = txResult.meta?.changes || 0
-    } catch (e) { console.error('transactions 삭제 실패:', e) }
+    // === 해당 사용자의 해당 코인 관련 모든 기록 완전 삭제 ===
+    const deleted: Record<string, number> = {}
 
-    // 해당 코인 관련 출금내역(withdrawals) 전부 삭제
-    let deletedWd = 0
+    // 1. 해당 코인 거래내역 삭제 (swap_in, swap_out, daily_qkey, referral_reward, shop_purchase, staking_reward, admin_reset 등)
     try {
-      const wdResult = await db.prepare(`DELETE FROM withdrawals WHERE user_id = ? AND coin_type = ?`).bind(userId, coinType).run()
-      deletedWd = wdResult.meta?.changes || 0
-    } catch (e) { console.error('withdrawals 삭제 실패:', e) }
+      const r = await db.prepare(`DELETE FROM transactions WHERE user_id = ? AND coin_type = ?`).bind(userId, coinType).run()
+      deleted.transactions = r.meta?.changes || 0
+    } catch (e) { deleted.transactions = 0 }
 
-    // QKEY인 경우 일일배당(daily_rewards)과 추천보상(referral_rewards)도 삭제 (보상은 QKEY로 지급)
-    let deletedDailyRewards = 0
-    let deletedReferralRewards = 0
+    // 2. 해당 코인 출금내역 삭제
+    try {
+      const r = await db.prepare(`DELETE FROM withdrawals WHERE user_id = ? AND coin_type = ?`).bind(userId, coinType).run()
+      deleted.withdrawals = r.meta?.changes || 0
+    } catch (e) { deleted.withdrawals = 0 }
+
+    // 3. QKEY 리셋 → 일일배당, 추천보상, 쇼핑몰 주문도 삭제 (보상/구매 모두 QKEY)
     if (coinType === 'QKEY') {
-      try {
-        const drResult = await db.prepare(`DELETE FROM daily_rewards WHERE user_id = ?`).bind(userId).run()
-        deletedDailyRewards = drResult.meta?.changes || 0
-      } catch (e) { console.error('daily_rewards 삭제 실패:', e) }
-      try {
-        const rrResult = await db.prepare(`DELETE FROM referral_rewards WHERE referrer_id = ?`).bind(userId).run()
-        deletedReferralRewards = rrResult.meta?.changes || 0
-      } catch (e) { console.error('referral_rewards 삭제 실패:', e) }
+      try { const r = await db.prepare(`DELETE FROM daily_rewards WHERE user_id = ?`).bind(userId).run(); deleted.dailyRewards = r.meta?.changes || 0 } catch (e) { deleted.dailyRewards = 0 }
+      try { const r = await db.prepare(`DELETE FROM referral_rewards WHERE referrer_id = ?`).bind(userId).run(); deleted.referralRewards = r.meta?.changes || 0 } catch (e) { deleted.referralRewards = 0 }
+      try { const r = await db.prepare(`DELETE FROM orders WHERE user_id = ?`).bind(userId).run(); deleted.orders = r.meta?.changes || 0 } catch (e) { deleted.orders = 0 }
     }
+
+    // 4. QTA 리셋 → 스테이킹 보상으로 받은 QTA이므로, 관련 스왑 거래(swap_in QTA)는 이미 위에서 삭제됨
 
     return c.json({
       success: true,
       message: `${coinType} 잔액 리셋 및 관련 기록 삭제 완료`,
       coinType,
       previousBalance: prevBalance,
-      deletedRecords: {
-        transactions: deletedTx,
-        withdrawals: deletedWd,
-        dailyRewards: deletedDailyRewards,
-        referralRewards: deletedReferralRewards
-      }
+      deletedRecords: deleted
     })
   } catch (error) {
     console.error('잔액 리셋 오류:', error)
     return c.json({ error: 'Balance reset failed' }, 500)
+  }
+})
+
+// 관리자: 전체 코인 리셋 (QTA + QX + QKEY 잔액 0 + 모든 관련 기록 삭제)
+app.post('/api/admin/user/:userId/reset-all', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = c.req.param('userId')
+
+    const user = await db.prepare(`SELECT id, email, qta_balance, qx_balance, qkey_balance FROM users WHERE id = ?`).bind(userId).first() as any
+    if (!user) {
+      return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
+    }
+
+    const prevBalances = {
+      QTA: user.qta_balance || 0,
+      QX: user.qx_balance || 0,
+      QKEY: user.qkey_balance || 0
+    }
+
+    // 3종 코인 잔액 모두 0으로 리셋
+    await db.prepare(`UPDATE users SET qta_balance = 0, qx_balance = 0, qkey_balance = 0 WHERE id = ?`).bind(userId).run()
+
+    const deleted: Record<string, number> = {}
+
+    // 해당 사용자의 QTA, QX, QKEY 관련 모든 거래내역 삭제
+    try {
+      const r = await db.prepare(`DELETE FROM transactions WHERE user_id = ? AND coin_type IN ('QTA', 'QX', 'QKEY')`).bind(userId).run()
+      deleted.transactions = r.meta?.changes || 0
+    } catch (e) { deleted.transactions = 0 }
+
+    // 해당 사용자의 QTA, QX, QKEY 관련 모든 출금내역 삭제
+    try {
+      const r = await db.prepare(`DELETE FROM withdrawals WHERE user_id = ? AND coin_type IN ('QTA', 'QX', 'QKEY')`).bind(userId).run()
+      deleted.withdrawals = r.meta?.changes || 0
+    } catch (e) { deleted.withdrawals = 0 }
+
+    // 일일배당 삭제
+    try {
+      const r = await db.prepare(`DELETE FROM daily_rewards WHERE user_id = ?`).bind(userId).run()
+      deleted.dailyRewards = r.meta?.changes || 0
+    } catch (e) { deleted.dailyRewards = 0 }
+
+    // 추천보상 삭제
+    try {
+      const r = await db.prepare(`DELETE FROM referral_rewards WHERE referrer_id = ?`).bind(userId).run()
+      deleted.referralRewards = r.meta?.changes || 0
+    } catch (e) { deleted.referralRewards = 0 }
+
+    // 주문내역 삭제
+    try {
+      const r = await db.prepare(`DELETE FROM orders WHERE user_id = ?`).bind(userId).run()
+      deleted.orders = r.meta?.changes || 0
+    } catch (e) { deleted.orders = 0 }
+
+    return c.json({
+      success: true,
+      message: '전체 코인 리셋 및 관련 기록 삭제 완료',
+      previousBalances: prevBalances,
+      deletedRecords: deleted
+    })
+  } catch (error: any) {
+    console.error('전체 리셋 오류:', error)
+    return c.json({ error: 'Full reset failed' }, 500)
   }
 })
 
@@ -7555,12 +7610,13 @@ app.get('/admin/dashboard', (c) => {
                             '</div>' +
                         '</div>' +
                         // 잔액 + 리셋 버튼
-                        '<div class="grid grid-cols-4 gap-2 mb-4">' +
-                            '<div class="bg-blue-50 rounded-lg p-2 text-center border border-blue-200"><p class="text-xs text-gray-500">QTA</p><p class="font-bold text-blue-600 text-sm">' + (u.qta_balance || 0).toLocaleString() + '</p>' + ((u.qta_balance || 0) > 0 ? '<button onclick="resetCoinBalance(' + u.id + ',&quot;QTA&quot;)" class="mt-1 px-2 py-0.5 bg-red-500 text-white text-[10px] rounded hover:bg-red-600">0 리셋</button>' : '') + '</div>' +
-                            '<div class="bg-purple-50 rounded-lg p-2 text-center border border-purple-200"><p class="text-xs text-gray-500">QX</p><p class="font-bold text-purple-600 text-sm">' + (u.qx_balance || 0).toLocaleString() + '</p>' + ((u.qx_balance || 0) > 0 ? '<button onclick="resetCoinBalance(' + u.id + ',&quot;QX&quot;)" class="mt-1 px-2 py-0.5 bg-red-500 text-white text-[10px] rounded hover:bg-red-600">0 리셋</button>' : '') + '</div>' +
-                            '<div class="bg-yellow-50 rounded-lg p-2 text-center border border-yellow-200"><p class="text-xs text-gray-500">QKEY</p><p class="font-bold text-yellow-600 text-sm">' + (u.qkey_balance || 0).toLocaleString() + '</p>' + ((u.qkey_balance || 0) > 0 ? '<button onclick="resetCoinBalance(' + u.id + ',&quot;QKEY&quot;)" class="mt-1 px-2 py-0.5 bg-red-500 text-white text-[10px] rounded hover:bg-red-600">0 리셋</button>' : '') + '</div>' +
+                        '<div class="grid grid-cols-4 gap-2 mb-2">' +
+                            '<div class="bg-blue-50 rounded-lg p-2 text-center border border-blue-200"><p class="text-xs text-gray-500">QTA</p><p class="font-bold text-blue-600 text-sm">' + (u.qta_balance || 0).toLocaleString() + '</p></div>' +
+                            '<div class="bg-purple-50 rounded-lg p-2 text-center border border-purple-200"><p class="text-xs text-gray-500">QX</p><p class="font-bold text-purple-600 text-sm">' + (u.qx_balance || 0).toLocaleString() + '</p></div>' +
+                            '<div class="bg-yellow-50 rounded-lg p-2 text-center border border-yellow-200"><p class="text-xs text-gray-500">QKEY</p><p class="font-bold text-yellow-600 text-sm">' + (u.qkey_balance || 0).toLocaleString() + '</p></div>' +
                             '<div class="bg-green-50 rounded-lg p-2 text-center border border-green-200"><p class="text-xs text-gray-500">USDT</p><p class="font-bold text-green-600 text-sm">' + (u.usdt_balance || 0).toFixed(2) + '</p></div>' +
                         '</div>' +
+                        (((u.qta_balance || 0) > 0 || (u.qx_balance || 0) > 0 || (u.qkey_balance || 0) > 0) ? '<div class="text-center mb-4"><button onclick="resetAllCoins(' + u.id + ')" class="px-4 py-1.5 bg-red-600 text-white text-xs font-bold rounded-lg hover:bg-red-700 shadow"><i class="fas fa-undo mr-1"></i>코인 리셋 (QTA·QX·QKEY 전체 0 + 기록 삭제)</button></div>' : '<div class="mb-4"></div>') +
                         // 스테이킹
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-chart-line mr-1 text-purple-600"></i>' + I18N.t('admin.staking_section') + ' (' + stakings.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (stakings.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.amount_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.status_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.period_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.rate_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.start_date') + '</th><th class="px-2 py-1">' + I18N.t('admin.end_date') + '</th></tr></thead><tbody class="divide-y">' +
@@ -7604,28 +7660,30 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById('userDetailModal').classList.add('hidden');
             }
 
-            // 코인 잔액 0 리셋 + 관련 기록 전부 삭제
-            async function resetCoinBalance(userId, coinType) {
-                if (!confirm(coinType + ' 잔액을 0으로 리셋하시겠습니까?\\n\\n⚠️ 잔액뿐 아니라 해당 코인의 거래내역, 출금내역' + (coinType === 'QKEY' ? ', 일일배당, 추천보상' : '') + ' 기록이 모두 삭제됩니다.\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
+            // 코인 3종 전체 리셋 (QTA+QX+QKEY 잔액 0 + 관련 기록 전부 삭제)
+            async function resetAllCoins(userId) {
+                if (!confirm('이 사용자의 QTA, QX, QKEY 잔액을 모두 0으로 리셋하시겠습니까?\n\n⚠️ 잔액뿐 아니라 해당 코인의 거래내역, 출금내역, 일일배당, 추천보상, 주문내역이 모두 삭제됩니다.\n\n이 작업은 되돌릴 수 없습니다.')) return;
                 try {
-                    var res = await axios.post('/api/admin/user/' + userId + '/reset-balance', { coinType: coinType });
+                    var res = await axios.post('/api/admin/user/' + userId + '/reset-all');
                     if (res.data.success) {
                         var del = res.data.deletedRecords || {};
-                        var msg = coinType + ' 리셋 완료\\n';
-                        msg += '잔액: ' + (res.data.previousBalance || 0).toLocaleString() + ' → 0\\n';
-                        msg += '삭제된 기록:\\n';
-                        msg += '  - 거래내역: ' + (del.transactions || 0) + '건\\n';
-                        msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건';
-                        if (coinType === 'QKEY') {
-                            msg += '\\n  - 일일배당: ' + (del.dailyRewards || 0) + '건';
-                            msg += '\\n  - 추천보상: ' + (del.referralRewards || 0) + '건';
-                        }
+                        var prev = res.data.previousBalances || {};
+                        var msg = '전체 코인 리셋 완료\n';
+                        msg += 'QTA: ' + (prev.QTA || 0).toLocaleString() + ' → 0\n';
+                        msg += 'QX: ' + (prev.QX || 0).toLocaleString() + ' → 0\n';
+                        msg += 'QKEY: ' + (prev.QKEY || 0).toLocaleString() + ' → 0\n';
+                        msg += '\n삭제된 기록:\n';
+                        msg += '  - 거래내역: ' + (del.transactions || 0) + '건\n';
+                        msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건\n';
+                        msg += '  - 일일배당: ' + (del.dailyRewards || 0) + '건\n';
+                        msg += '  - 추천보상: ' + (del.referralRewards || 0) + '건\n';
+                        msg += '  - 주문내역: ' + (del.orders || 0) + '건';
                         alert(msg);
-                        showUserDetail(userId); // 상세 모달 새로고침
-                        loadUsers(); // 목록도 새로고침
+                        showUserDetail(userId);
+                        loadUsers();
                     }
                 } catch (err) {
-                    alert(coinType + ' 잔액 리셋 실패: ' + (err.response?.data?.error || err.message));
+                    alert('코인 리셋 실패: ' + (err.response?.data?.error || err.message));
                 }
             }
 
