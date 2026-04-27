@@ -8084,8 +8084,8 @@ app.get('/admin/dashboard', (c) => {
                 reader.onload = function(e) {
                     var img = new Image();
                     img.onload = function() {
-                        var maxW = type === 'thumb' ? 600 : 1200;
-                        var maxH = type === 'thumb' ? 600 : 1600;
+                        var maxW = type === 'thumb' ? 600 : 1000;
+                        var maxH = type === 'thumb' ? 600 : 8000;
                         var w = img.width, h = img.height;
                         if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
                         if (h > maxH) { w = Math.round(w * maxH / h); h = maxH; }
@@ -8097,7 +8097,8 @@ app.get('/admin/dashboard', (c) => {
                         var quality = 0.8;
                         var dataUrl = canvas.toDataURL('image/jpeg', quality);
                         // 300KB 초과 시 품질 낮추기
-                        while (dataUrl.length > 300*1024 && quality > 0.3) {
+                        var maxBytes = type === 'thumb' ? 300*1024 : 450*1024;
+                        while (dataUrl.length > maxBytes && quality > 0.3) {
                             quality -= 0.1;
                             dataUrl = canvas.toDataURL('image/jpeg', quality);
                         }

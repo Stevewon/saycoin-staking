@@ -1,32 +1,28 @@
-# Dependencies
-node_modules/
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Compiled binary addons
-build
-dist
-
-# dotenv environment variables file
-.env
-.dev.vars
-
-# PM2
-.pm2/
-pids/
-logs/
-*.log
-
-# Wrangler
-.wrangler/
-.mf/
 
 # Backup files
+# Compiled binary addons
+# Dependencies
+# PM2
+# Runtime data
+# Wrangler
+# dotenv environment variables file
 *.backup
 *.bak
+*.log
+*.pid
+*.pid.lock
+*.seed
 *.tar.gz
 *.zip
+.dev.vars
+.env
+.mf/
+.pm2/
+.wrangler/
+build
+core
+dist
+logs/
+node_modules/
+pids
+pids/
