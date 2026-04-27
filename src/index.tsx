@@ -5715,8 +5715,7 @@ app.get('/dashboard', (c) => {
                 const qxReward = _isP2 ? 0 : (amount / 1000) * 10000;
                 const qkeyReward = _isP2 ? 0 : (amount / 1000) * 5000;
                 
-                var _msg = '$' + amount.toLocaleString() + ' / ' + policy.periodText + '\\n\\n' + I18N.t('dash.daily_rate') + ': ' + policy.rate + '
-' + I18N.t('dash.period') + ': ' + policy.periodText + '\\n\\n• QTA ' + qtaReward.toLocaleString();
+                var _msg = '$' + amount.toLocaleString() + ' / ' + policy.periodText + '\\n\\n' + I18N.t('dash.daily_rate') + ': ' + policy.rate + '\\n' + I18N.t('dash.period') + ': ' + policy.periodText + '\\n\\n• QTA ' + qtaReward.toLocaleString();
                 if (!_isP2) _msg += '\\n• QX ' + qxReward.toLocaleString() + '\\n• QKEY ' + qkeyReward.toLocaleString();
                 _msg += '\\n\\n• ' + I18N.t('dash.daily_rate') + ' QKEY (' + policy.rate + ')';
                 if (confirm(_msg)) {
