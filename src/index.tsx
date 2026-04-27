@@ -7662,21 +7662,21 @@ app.get('/admin/dashboard', (c) => {
 
             // 코인 3종 전체 리셋 (QTA+QX+QKEY 잔액 0 + 관련 기록 전부 삭제)
             async function resetAllCoins(userId) {
-                if (!confirm('이 사용자의 QTA, QX, QKEY 잔액을 모두 0으로 리셋하시겠습니까?\n\n⚠️ 잔액뿐 아니라 해당 코인의 거래내역, 출금내역, 일일배당, 추천보상, 주문내역이 모두 삭제됩니다.\n\n이 작업은 되돌릴 수 없습니다.')) return;
+                if (!confirm('이 사용자의 QTA, QX, QKEY 잔액을 모두 0으로 리셋하시겠습니까?\\n\\n⚠️ 잔액뿐 아니라 해당 코인의 거래내역, 출금내역, 일일배당, 추천보상, 주문내역이 모두 삭제됩니다.\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
                 try {
                     var res = await axios.post('/api/admin/user/' + userId + '/reset-all');
                     if (res.data.success) {
                         var del = res.data.deletedRecords || {};
                         var prev = res.data.previousBalances || {};
-                        var msg = '전체 코인 리셋 완료\n';
-                        msg += 'QTA: ' + (prev.QTA || 0).toLocaleString() + ' → 0\n';
-                        msg += 'QX: ' + (prev.QX || 0).toLocaleString() + ' → 0\n';
-                        msg += 'QKEY: ' + (prev.QKEY || 0).toLocaleString() + ' → 0\n';
-                        msg += '\n삭제된 기록:\n';
-                        msg += '  - 거래내역: ' + (del.transactions || 0) + '건\n';
-                        msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건\n';
-                        msg += '  - 일일배당: ' + (del.dailyRewards || 0) + '건\n';
-                        msg += '  - 추천보상: ' + (del.referralRewards || 0) + '건\n';
+                        var msg = '전체 코인 리셋 완료\\n';
+                        msg += 'QTA: ' + (prev.QTA || 0).toLocaleString() + ' → 0\\n';
+                        msg += 'QX: ' + (prev.QX || 0).toLocaleString() + ' → 0\\n';
+                        msg += 'QKEY: ' + (prev.QKEY || 0).toLocaleString() + ' → 0\\n';
+                        msg += '\\n삭제된 기록:\\n';
+                        msg += '  - 거래내역: ' + (del.transactions || 0) + '건\\n';
+                        msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건\\n';
+                        msg += '  - 일일배당: ' + (del.dailyRewards || 0) + '건\\n';
+                        msg += '  - 추천보상: ' + (del.referralRewards || 0) + '건\\n';
                         msg += '  - 주문내역: ' + (del.orders || 0) + '건';
                         alert(msg);
                         showUserDetail(userId);
