@@ -1799,9 +1799,32 @@ app.get('/api/staking/list/:userId', async (c) => {
       ORDER BY created_at DESC
     `).bind(userId).all()
 
+    // ★★ 리셋 이력 판별 ★★
+    //   - 같은 사용자의 스테이킹 중 reset_at이 있는 것이 1건이라도 있으면 = 리셋 당한 회원
+    //   - 리셋 당한 회원은 새 스테이킹의 카드에서도 코인 3종 보상값(qta/qx/qkey_reward)을 0으로 표시
+    //   - 단, 만기 시 실제 지급되는 보상은 백엔드에서 그대로 처리됨
+    //     (단순히 사용자 화면 표시만 0으로 가린다)
+    const resetCheck = await db.prepare(`
+      SELECT COUNT(*) as cnt FROM staking WHERE user_id = ? AND reset_at IS NOT NULL
+    `).bind(userId).first() as any
+    const isResetUser = (resetCheck?.cnt || 0) > 0
+
+    const result = stakings.results.map((s: any) => {
+      if (isResetUser) {
+        return {
+          ...s,
+          qta_reward: 0,
+          qx_reward: 0,
+          qkey_reward: 0
+        }
+      }
+      return s
+    })
+
     return c.json({ 
       success: true, 
-      stakings: stakings.results 
+      stakings: result,
+      is_reset_user: isResetUser
     })
   } catch (error) {
     return c.json({ error: t(c, 'staking.list_error') }, 500)
