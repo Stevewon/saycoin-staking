@@ -2537,6 +2537,20 @@ app.get('/api/admin/user/:userId', async (c) => {
 })
 
 // 관리자: 회원 코인 잔액 리셋 (잔액 0 + 관련 거래내역/출금/보상 기록 전부 삭제)
+// 관리자: 특정 스테이킹의 reset_at 마킹을 해제 (잘못 리셋된 건 복구용)
+app.post('/api/admin/staking/:stakingId/unmark-reset', async (c) => {
+  try {
+    const db = c.env.DB
+    const stakingId = c.req.param('stakingId')
+    const s = await db.prepare(`SELECT id, user_id, amount, reset_at FROM staking WHERE id = ?`).bind(stakingId).first() as any
+    if (!s) return c.json({ error: '스테이킹을 찾을 수 없습니다' }, 404)
+    if (!s.reset_at) return c.json({ error: '이 스테이킹은 리셋된 적이 없습니다' }, 400)
+    await db.prepare(`UPDATE staking SET reset_at = NULL WHERE id = ?`).bind(stakingId).run()
+    const after = await db.prepare(`SELECT id, user_id, amount, reset_at FROM staking WHERE id = ?`).bind(stakingId).first()
+    return c.json({ success: true, message: 'reset_at 마킹 해제됨', before: s, after })
+  } catch (e: any) { return c.json({ error: e.message }, 500) }
+})
+
 app.post('/api/admin/user/:userId/reset-balance', async (c) => {
   try {
     const db = c.env.DB
