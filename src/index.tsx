@@ -2547,50 +2547,31 @@ app.post('/api/admin/user/:userId/reset-all', async (c) => {
       USDT: user.usdt_balance || 0
     }
 
-    // 전체 잔액 0으로 리셋 (USDT 포함)
-    await db.prepare(`UPDATE users SET qta_balance = 0, qx_balance = 0, qkey_balance = 0, usdt_balance = 0 WHERE id = ?`).bind(userId).run()
+    // 코인3종(QTA/QX/QKEY) 0으로 리셋 (USDT는 유지)
+    await db.prepare(`UPDATE users SET qta_balance = 0, qx_balance = 0, qkey_balance = 0 WHERE id = ?`).bind(userId).run()
 
     const deleted: Record<string, number> = {}
 
-    // 해당 사용자의 모든 거래내역 삭제 (USDT 포함)
+    // 코인3종 관련 거래내역만 삭제 (daily_qkey, referral_reward, swap, staking 관련)
     try {
-      const r = await db.prepare(`DELETE FROM transactions WHERE user_id = ?`).bind(userId).run()
+      const r = await db.prepare(`DELETE FROM transactions WHERE user_id = ? AND coin_type IN ('QTA','QX','QKEY')`).bind(userId).run()
       deleted.transactions = r.meta?.changes || 0
     } catch (e) { deleted.transactions = 0 }
 
-    // 해당 사용자의 모든 출금내역 삭제 (USDT 포함)
-    try {
-      const r = await db.prepare(`DELETE FROM withdrawals WHERE user_id = ?`).bind(userId).run()
-      deleted.withdrawals = r.meta?.changes || 0
-    } catch (e) { deleted.withdrawals = 0 }
-
-    // 일일배당 삭제
-    try {
-      const r = await db.prepare(`DELETE FROM daily_rewards WHERE user_id = ?`).bind(userId).run()
-      deleted.dailyRewards = r.meta?.changes || 0
-    } catch (e) { deleted.dailyRewards = 0 }
-
-    // 추천보상 삭제
+    // 추천수당 삭제 (이 사용자가 받은 추천수당)
     try {
       const r = await db.prepare(`DELETE FROM referral_rewards WHERE referrer_id = ?`).bind(userId).run()
       deleted.referralRewards = r.meta?.changes || 0
     } catch (e) { deleted.referralRewards = 0 }
 
-    // 주문내역 삭제
-    try {
-      const r = await db.prepare(`DELETE FROM orders WHERE user_id = ?`).bind(userId).run()
-      deleted.orders = r.meta?.changes || 0
-    } catch (e) { deleted.orders = 0 }
-
-    // 스테이킹 삭제
-    try {
-      const r = await db.prepare(`DELETE FROM staking WHERE user_id = ?`).bind(userId).run()
-      deleted.stakings = r.meta?.changes || 0
-    } catch (e) { deleted.stakings = 0 }
+    // ★ 데일리배당(daily_rewards)은 유지 - 삭제하지 않음
+    // ★ 스테이킹은 유지 - 데일리배당이 계속 쌍여야 하므로
+    // ★ 출금내역은 유지
+    // ★ 주문내역은 유지
 
     return c.json({
       success: true,
-      message: '전체 코인 리셋 및 관련 기록 삭제 완료',
+      message: '코인 3종(QTA/QX/QKEY) 리셋 + 추천수당 삭제 완료 (데일리배당/스테이킹 유지)',
       previousBalances: prevBalances,
       deletedRecords: deleted
     })
@@ -3670,12 +3651,20 @@ app.get('/api/admin/shop/orders', async (c) => {
   }
 })
 
-// 어드민: 주문 상태 변경
+// 어드민: 주문 상태 변경 (+송장번호)
 app.put('/api/admin/shop/order/:id/status', async (c) => {
   try {
-    const { status } = await c.req.json()
+    const { status, trackingNo, courier } = await c.req.json()
     const db = c.env.DB
-    await db.prepare(`UPDATE orders SET status = ? WHERE id = ?`).bind(status, c.req.param('id')).run()
+    // shipping_memo에 송장정보 추가
+    if (trackingNo) {
+      const order = await db.prepare(`SELECT shipping_memo FROM orders WHERE id = ?`).bind(c.req.param('id')).first() as any
+      const trackingInfo = (courier ? '[' + courier + '] ' : '') + '송장: ' + trackingNo
+      const memo = order?.shipping_memo ? order.shipping_memo + ' | ' + trackingInfo : trackingInfo
+      await db.prepare(`UPDATE orders SET status = ?, shipping_memo = ? WHERE id = ?`).bind(status, memo, c.req.param('id')).run()
+    } else {
+      await db.prepare(`UPDATE orders SET status = ? WHERE id = ?`).bind(status, c.req.param('id')).run()
+    }
     return c.json({ success: true })
   } catch(e) {
     return c.json({ error: '상태 변경 중 오류가 발생했습니다' }, 500)
@@ -5280,24 +5269,54 @@ app.get('/dashboard', (c) => {
                     el.innerHTML = '<p class="col-span-2 sm:col-span-3 lg:col-span-4 text-center text-gray-400 py-8 text-sm">등록된 상품이 없습니다</p>';
                     return;
                 }
-                el.innerHTML = products.map(function(p) {
+                el.innerHTML = '';
+                products.forEach(function(p) {
+                    try {
                     var priceQkey = Math.ceil(p.price_krw / 10);
+                    var card = document.createElement('div');
+                    card.className = 'border-2 border-pink-200 rounded-xl p-3 hover:border-pink-400 transition' + (p.stock === 0 ? ' opacity-50 pointer-events-none' : '');
+                    // 이미지 영역
+                    if (p.image_url) {
+                        var img = document.createElement('img');
+                        img.src = p.image_url;
+                        img.className = 'w-full h-28 object-cover rounded-lg mb-2 cursor-pointer';
+                        img.onerror = function(){ this.style.display='none'; };
+                        img.onclick = function(){ showProductDetail(p.id); };
+                        card.appendChild(img);
+                    } else {
+                        var ph = document.createElement('div');
+                        ph.className = 'w-full h-28 bg-gradient-to-br from-pink-100 to-purple-100 rounded-lg mb-2 flex items-center justify-center';
+                        ph.innerHTML = '<i class="fas fa-box text-4xl text-pink-300"></i>';
+                        card.appendChild(ph);
+                    }
+                    // 텍스트 정보
                     var stockText = p.stock === -1 ? '' : (p.stock <= 0 ? '<span class="text-red-500 text-xs font-bold">품절</span>' : '<span class="text-xs text-gray-500">재고 ' + p.stock + '</span>');
-                    var disabled = p.stock === 0 ? 'opacity-50 pointer-events-none' : '';
-                    var detailBtn = p.detail_image_url ? '<button onclick="showProductDetail(' + p.id + ')" class="w-full mb-1 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs transition"><i class="fas fa-search-plus mr-1"></i>상세보기</button>' : '';
-                    return '<div class="border-2 border-pink-200 rounded-xl p-3 hover:border-pink-400 transition ' + disabled + '">' +
-                        (p.image_url ? '<img src="' + escapeHtml(p.image_url) + '" class="w-full h-28 object-cover rounded-lg mb-2 cursor-pointer" onclick="showProductDetail(' + p.id + ')" onerror="this.style.display=\\'none\\'">' : '<div class="w-full h-28 bg-gradient-to-br from-pink-100 to-purple-100 rounded-lg mb-2 flex items-center justify-center"><i class="fas fa-box text-4xl text-pink-300"></i></div>') +
-                        '<h4 class="font-bold text-sm text-gray-800 truncate">' + escapeHtml(p.name) + '</h4>' +
-                        '<p class="text-xs text-gray-500 truncate mb-1">' + escapeHtml(p.description || '') + '</p>' +
+                    var bal = currentUser ? (currentUser.qkey_balance || 0) : 0;
+                    var shortageHtml = bal < priceQkey ? '<p class="text-xs text-red-500 font-bold mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>QKEY 부족 (' + (priceQkey - bal).toLocaleString() + ' 부족)</p>' : '';
+                    // 옵션 HTML
+                    var optsHtml = '';
+                    try { var opts=[]; if(p.options) opts=JSON.parse(p.options); optsHtml = opts.map(function(o,idx){ return '<div class="mt-1"><label class="text-xs text-gray-500">' + escapeHtml(o.name) + '</label><select id="opt_' + p.id + '_' + idx + '" class="w-full px-2 py-1 border rounded text-xs bg-white"><option value="">선택</option>' + (o.values||[]).map(function(v){ return '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; }).join('') + '</select></div>'; }).join(''); } catch(e){}
+                    // 상세보기 버튼
+                    var detailBtnHtml = p.detail_image_url ? '<button class="shopDetailBtn w-full mb-1 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs transition" data-pid="' + p.id + '"><i class="fas fa-search-plus mr-1"></i>상세보기</button>' : '';
+                    var infoDiv = document.createElement('div');
+                    infoDiv.innerHTML = '<h4 class="font-bold text-sm text-gray-800 truncate">' + escapeHtml(p.name) + '</h4>' +
+                        '<p class="text-xs text-gray-500 truncate mb-1">' + escapeHtml((p.description||'').replace(/<[^>]*>/g,'').substring(0,80)) + '</p>' +
                         '<p class="text-xs text-gray-600 mb-1">' + Number(p.price_krw).toLocaleString() + '원</p>' +
                         '<p class="text-sm font-bold text-pink-600 mb-1">' + priceQkey.toLocaleString() + ' QKEY</p>' +
-                        (function(){ var bal = currentUser ? (currentUser.qkey_balance || 0) : 0; return bal < priceQkey ? '<p class="text-xs text-red-500 font-bold mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>QKEY 부족 (' + (priceQkey - bal).toLocaleString() + ' 부족)</p>' : ''; })() +
-                        stockText +
-                        (function(){ var opts=[]; try { if(p.options) opts=JSON.parse(p.options); } catch(e){} return opts.map(function(o,idx){ return '<div class="mt-1"><label class="text-xs text-gray-500">' + escapeHtml(o.name) + '</label><select id="opt_' + p.id + '_' + idx + '" class="w-full px-2 py-1 border rounded text-xs bg-white"><option value="">선택</option>' + (o.values||[]).map(function(v){ return '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; }).join('') + '</select></div>'; }).join(''); })() +
-                        detailBtn +
-                        '<button onclick="buyProduct(' + p.id + ',\\'' + escapeHtml(p.name).replace(/'/g,"\\\\'") + '\\',' + priceQkey + ')" class="w-full mt-1 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg text-xs font-bold transition"><i class="fas fa-shopping-bag mr-1"></i>구매</button>' +
-                    '</div>';
-                }).join('');
+                        shortageHtml + stockText + optsHtml + detailBtnHtml;
+                    card.appendChild(infoDiv);
+                    // 상세보기 버튼 이벤트 바인딩
+                    var detBtn = infoDiv.querySelector('.shopDetailBtn');
+                    if (detBtn) { detBtn.onclick = function(){ showProductDetail(p.id); }; }
+                    // 구매 버튼
+                    var buyBtn = document.createElement('button');
+                    buyBtn.className = 'w-full mt-1 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg text-xs font-bold transition';
+                    buyBtn.innerHTML = '<i class="fas fa-shopping-bag mr-1"></i>구매';
+                    buyBtn.onclick = (function(pid, pname, pq){ return function(){ buyProduct(pid, pname, pq); }; })(p.id, p.name, priceQkey);
+                    card.appendChild(buyBtn);
+                    el.appendChild(card);
+                    } catch(cardErr) { console.error('Card render error for product', p.id, cardErr); }
+                });
             }
 
             async function loadMyOrders() {
@@ -5393,42 +5412,53 @@ app.get('/dashboard', (c) => {
                 var p = products.find(function(x) { return x.id === productId; });
                 if (!p) return;
                 var priceQkey = Math.ceil(p.price_krw / 10);
-                // 상세이미지: JSON 배열이면 여러장, 아니면 단일
-                var imgHtml = '';
-                if (p.detail_image_url) {
-                    var detailImgs = [];
-                    try { var parsed = JSON.parse(p.detail_image_url); if (Array.isArray(parsed)) detailImgs = parsed; } catch(e) {}
-                    if (detailImgs.length > 0) {
-                        imgHtml = detailImgs.map(function(url) { return '<img src="' + escapeHtml(url) + '" class="w-full rounded-lg mb-2" onerror="this.style.display=\\'none\\'">'; }).join('');
-                    } else {
-                        imgHtml = '<img src="' + escapeHtml(p.detail_image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">';
-                    }
-                } else if (p.image_url) {
-                    imgHtml = '<img src="' + escapeHtml(p.image_url) + '" class="w-full rounded-lg mb-3" onerror="this.style.display=\\'none\\'">';
-                }
                 var modal = document.createElement('div');
                 modal.id = 'productDetailModal';
                 modal.className = 'fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4';
                 modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
                 modal.innerHTML = '<div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">' +
-                    '<div class="sticky top-0 bg-white p-4 border-b flex items-center justify-between rounded-t-2xl">' +
+                    '<div class="sticky top-0 bg-white p-4 border-b flex items-center justify-between rounded-t-2xl z-10">' +
                         '<h3 class="font-bold text-lg text-gray-800">' + escapeHtml(p.name) + '</h3>' +
                         '<button onclick="document.getElementById(\\'productDetailModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>' +
                     '</div>' +
                     '<div class="p-4">' +
-                        imgHtml +
-                        '<p class="text-sm text-gray-600 mb-3">' + escapeHtml(p.description || '') + '</p>' +
+                        '<div id="pdImgArea"></div>' +
+                        '<div id="pdDescArea" class="text-sm text-gray-600 mb-3"></div>' +
                         '<div class="flex items-center justify-between bg-pink-50 rounded-lg p-3 mb-3">' +
                             '<span class="text-sm text-gray-700">가격</span>' +
                             '<div class="text-right"><p class="text-lg font-bold text-pink-600">' + priceQkey.toLocaleString() + ' QKEY</p><p class="text-xs text-gray-500">' + Number(p.price_krw).toLocaleString() + '원</p></div>' +
                         '</div>' +
                         (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-3">재고: ' + (p.stock <= 0 ? '<span class="text-red-500 font-bold">품절</span>' : p.stock + '개') + '</p>' : '') +
-                        (p.stock === 0 ? '' : '<button onclick="document.getElementById(\\'productDetailModal\\').remove(); buyProduct(' + p.id + ',\\'' + escapeHtml(p.name).replace(/'/g,"\\\\\\\\'") + '\\',' + priceQkey + ')" class="w-full py-3 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold transition"><i class="fas fa-shopping-bag mr-1"></i>구매하기</button>') +
+                        '<button id="pdBuyBtn" class="w-full py-3 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold transition' + (p.stock === 0 ? ' hidden' : '') + '"><i class="fas fa-shopping-bag mr-1"></i>구매하기</button>' +
                     '</div>' +
                 '</div>';
                 var old = document.getElementById('productDetailModal');
                 if (old) old.remove();
                 document.body.appendChild(modal);
+                // 이미지를 JS로 동적 삽입 (base64 따옴표 깨짐 방지)
+                var imgArea = document.getElementById('pdImgArea');
+                if (p.detail_image_url) {
+                    var detailImgs = [];
+                    try { var parsed = JSON.parse(p.detail_image_url); if (Array.isArray(parsed)) detailImgs = parsed; } catch(e) {}
+                    if (detailImgs.length > 0) {
+                        detailImgs.forEach(function(url) { var img = document.createElement('img'); img.src = url; img.className = 'w-full rounded-lg mb-2'; img.onerror = function(){this.style.display='none'}; imgArea.appendChild(img); });
+                    } else {
+                        var img = document.createElement('img'); img.src = p.detail_image_url; img.className = 'w-full rounded-lg mb-3'; img.onerror = function(){this.style.display='none'}; imgArea.appendChild(img);
+                    }
+                } else if (p.image_url) {
+                    var img = document.createElement('img'); img.src = p.image_url; img.className = 'w-full rounded-lg mb-3'; img.onerror = function(){this.style.display='none'}; imgArea.appendChild(img);
+                }
+                // 설명: HTML 태그가 포함되어 있으면 HTML로, 아니면 텍스트로
+                var descArea = document.getElementById('pdDescArea');
+                var desc = p.description || '';
+                if (desc.indexOf('<') >= 0 && desc.indexOf('>') >= 0) {
+                    descArea.innerHTML = desc;
+                } else {
+                    descArea.textContent = desc;
+                }
+                // 구매 버튼 이벤트
+                var buyBtn = document.getElementById('pdBuyBtn');
+                if (buyBtn) buyBtn.onclick = function() { modal.remove(); buyProduct(p.id, p.name, priceQkey); };
             }
 
             // 쇼핑몰 초기 로딩
@@ -6915,7 +6945,14 @@ app.get('/admin/dashboard', (c) => {
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                             <input type="text" id="shopProdName" placeholder="상품명 *" class="px-3 py-2 border rounded-lg text-sm">
                             <input type="number" id="shopProdPrice" placeholder="가격 (원) *" class="px-3 py-2 border rounded-lg text-sm">
-                            <input type="text" id="shopProdDesc" placeholder="상품 설명" class="px-3 py-2 border rounded-lg text-sm sm:col-span-2">
+                            <div class="sm:col-span-2">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <label class="text-xs font-bold text-gray-600">상품 설명</label>
+                                    <button type="button" onclick="toggleDescMode()" id="descModeBtn" class="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs font-bold">HTML 모드</button>
+                                </div>
+                                <input type="text" id="shopProdDesc" placeholder="상품 설명 (텍스트)" class="w-full px-3 py-2 border rounded-lg text-sm">
+                                <textarea id="shopProdDescHtml" placeholder="HTML 코드 직접 입력 (예: <h2>상세설명</h2><p>내용...</p>)" class="w-full px-3 py-2 border rounded-lg text-sm hidden" rows="5" style="font-family:monospace;font-size:12px"></textarea>
+                            </div>
                             <select id="shopProdCategory" class="px-3 py-2 border rounded-lg text-sm bg-white">
                                 <option value="일반">일반</option>
                                 <option value="식품">식품</option>
@@ -6970,6 +7007,18 @@ app.get('/admin/dashboard', (c) => {
                         </button>
                     </div>
 
+                    <!-- 상품 대량등록 -->
+                    <div class="bg-yellow-50 rounded-lg p-4 mb-4 border border-yellow-200">
+                        <h3 class="font-bold text-gray-700 mb-2"><i class="fas fa-file-upload mr-1 text-yellow-600"></i>상품 대량등록 (CSV/엑셀)</h3>
+                        <p class="text-xs text-gray-500 mb-2">CSV 형식: 상품명, 가격(원), 설명, 카테고리, 재고, 옵션(사이즈:S,M,L|컬러:블랙,화이트)</p>
+                        <div class="flex gap-2 items-center">
+                            <button onclick="downloadBulkTemplate()" class="px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-xs font-bold"><i class="fas fa-download mr-1"></i>템플릿 다운로드</button>
+                            <input type="file" id="bulkProductFile" accept=".csv,.xlsx,.xls" class="hidden" onchange="handleBulkProductUpload(this)">
+                            <button onclick="document.getElementById('bulkProductFile').click()" class="px-3 py-1.5 bg-yellow-500 hover:bg-yellow-600 text-white rounded text-xs font-bold"><i class="fas fa-upload mr-1"></i>CSV 파일 업로드</button>
+                            <span id="bulkProductStatus" class="text-xs text-gray-500"></span>
+                        </div>
+                    </div>
+
                     <!-- 등록된 상품 목록 -->
                     <div class="mb-6">
                         <h3 class="font-bold text-gray-700 mb-3"><i class="fas fa-box mr-1"></i>등록 상품</h3>
@@ -6982,7 +7031,10 @@ app.get('/admin/dashboard', (c) => {
                     <div>
                         <div class="flex items-center justify-between mb-3">
                             <h3 class="font-bold text-gray-700"><i class="fas fa-receipt mr-1"></i>실시간 주문 현황</h3>
-                            <div class="flex gap-2">
+                            <div class="flex gap-2 flex-wrap">
+                                <input type="file" id="trackingFile" accept=".csv,.xlsx,.xls" class="hidden" onchange="handleTrackingUpload(this)">
+                                <button onclick="document.getElementById('trackingFile').click()" class="px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded text-xs font-medium"><i class="fas fa-file-excel mr-1"></i>송장 일괄등록</button>
+                                <button onclick="downloadTrackingTemplate()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-download mr-1"></i>송장 템플릿</button>
                                 <button onclick="exportShopOrders()" class="px-3 py-1 bg-green-500 hover:bg-green-600 text-white rounded text-xs font-medium"><i class="fas fa-file-csv mr-1"></i>CSV 다운로드</button>
                                 <button onclick="loadAdminShopOrders()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
                             </div>
@@ -7697,7 +7749,7 @@ app.get('/admin/dashboard', (c) => {
                             '<div class="bg-yellow-50 rounded-lg p-2 text-center border border-yellow-200"><p class="text-xs text-gray-500">QKEY</p><p class="font-bold text-yellow-600 text-sm">' + (u.qkey_balance || 0).toLocaleString() + '</p></div>' +
                             '<div class="bg-green-50 rounded-lg p-2 text-center border border-green-200"><p class="text-xs text-gray-500">USDT</p><p class="font-bold text-green-600 text-sm">' + (u.usdt_balance || 0).toFixed(2) + '</p></div>' +
                         '</div>' +
-                        (((u.qta_balance || 0) > 0 || (u.qx_balance || 0) > 0 || (u.qkey_balance || 0) > 0 || (u.usdt_balance || 0) > 0) ? '<div class="text-center mb-4"><button onclick="resetAllCoins(' + u.id + ')" class="px-4 py-1.5 bg-red-600 text-white text-xs font-bold rounded-lg hover:bg-red-700 shadow"><i class="fas fa-undo mr-1"></i>전체 리셋 (잔액 0 + 모든 기록 삭제)</button></div>' : '<div class="mb-4"></div>') +
+                        (((u.qta_balance || 0) > 0 || (u.qx_balance || 0) > 0 || (u.qkey_balance || 0) > 0) ? '<div class="text-center mb-4"><button onclick="resetAllCoins(' + u.id + ')" class="px-4 py-1.5 bg-red-600 text-white text-xs font-bold rounded-lg hover:bg-red-700 shadow"><i class="fas fa-undo mr-1"></i>코인 3종 리셋 (QTA/QX/QKEY + 추천수당 삭제)</button></div>' : '<div class="mb-4"></div>') +
                         // 스테이킹
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-chart-line mr-1 text-purple-600"></i>' + I18N.t('admin.staking_section') + ' (' + stakings.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (stakings.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.amount_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.status_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.period_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.rate_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.start_date') + '</th><th class="px-2 py-1">' + I18N.t('admin.end_date') + '</th></tr></thead><tbody class="divide-y">' +
@@ -7743,24 +7795,20 @@ app.get('/admin/dashboard', (c) => {
 
             // 코인 3종 전체 리셋 (QTA+QX+QKEY 잔액 0 + 관련 기록 전부 삭제)
             async function resetAllCoins(userId) {
-                if (!confirm('이 사용자의 모든 잔액(QTA/QX/QKEY/USDT)을 0으로 리셋하시겠습니까?\\n\\n⚠️ 잔액 + 모든 거래내역, 출금내역, 일일배당, 추천보상, 주문내역이 완전히 삭제됩니다.\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
+                if (!confirm('이 사용자의 코인 3종(QTA/QX/QKEY)을 0으로 리셋하시겠습니까?\\n\\n⚠️ 삭제 대상:\\n  - QTA/QX/QKEY 잔액 → 0\\n  - 코인3종 관련 거래내역 삭제\\n  - 추천수당(referral_rewards) 삭제\\n\\n✅ 유지 대상:\\n  - USDT 잔액\\n  - 데일리배당 (daily_rewards)\\n  - 스테이킹 (계속 배당 적립)\\n  - 출금내역\\n  - 주문내역\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
                 try {
                     var res = await axios.post('/api/admin/user/' + userId + '/reset-all');
                     if (res.data.success) {
                         var del = res.data.deletedRecords || {};
                         var prev = res.data.previousBalances || {};
-                        var msg = '전체 리셋 완료\\n';
+                        var msg = '코인 3종 리셋 완료!\\n\\n';
                         msg += 'QTA: ' + (prev.QTA || 0).toLocaleString() + ' → 0\\n';
                         msg += 'QX: ' + (prev.QX || 0).toLocaleString() + ' → 0\\n';
                         msg += 'QKEY: ' + (prev.QKEY || 0).toLocaleString() + ' → 0\\n';
-                        msg += 'USDT: ' + (prev.USDT || 0).toLocaleString() + ' → 0\\n';
                         msg += '\\n삭제된 기록:\\n';
-                        msg += '  - 거래내역: ' + (del.transactions || 0) + '건\\n';
-                        msg += '  - 출금내역: ' + (del.withdrawals || 0) + '건\\n';
-                        msg += '  - 일일배당: ' + (del.dailyRewards || 0) + '건\\n';
-                        msg += '  - 추천보상: ' + (del.referralRewards || 0) + '건\\n';
-                        msg += '  - 주문내역: ' + (del.orders || 0) + '건\\n';
-                        msg += '  - 스테이킹: ' + (del.stakings || 0) + '건';
+                        msg += '  - 코인3종 거래내역: ' + (del.transactions || 0) + '건\\n';
+                        msg += '  - 추천수당: ' + (del.referralRewards || 0) + '건\\n';
+                        msg += '\\n유지된 항목: USDT잔액, 데일리배당, 스테이킹, 출금내역, 주문내역';
                         alert(msg);
                         showUserDetail(userId);
                         loadUsers();
@@ -8180,14 +8228,28 @@ app.get('/admin/dashboard', (c) => {
             function renderDetailImageList() {
                 var container = document.getElementById('detailImageList');
                 if (!container) return;
-                container.innerHTML = detailImagesArray.map(function(url, idx) {
-                    return '<div class="flex items-center gap-2 bg-gray-50 rounded p-2 border">' +
-                        '<img src="' + url.substring(0, 50) + '..." class="hidden">' +
-                        '<div class="w-16 h-16 flex-shrink-0 rounded overflow-hidden bg-gray-200"><img src="' + url + '" class="w-full h-full object-cover"></div>' +
-                        '<span class="text-xs text-gray-600 flex-1">상세이미지 ' + (idx+1) + ' (' + Math.round(url.length/1024) + 'KB)</span>' +
-                        '<button onclick="removeDetailImage(' + idx + ')" class="px-2 py-1 bg-red-100 hover:bg-red-200 text-red-600 rounded text-xs font-bold"><i class="fas fa-trash mr-1"></i>삭제</button>' +
-                        '</div>';
-                }).join('');
+                container.innerHTML = '';
+                detailImagesArray.forEach(function(url, idx) {
+                    var row = document.createElement('div');
+                    row.className = 'flex items-center gap-2 bg-gray-50 rounded p-2 border';
+                    var imgWrap = document.createElement('div');
+                    imgWrap.className = 'w-16 h-16 flex-shrink-0 rounded overflow-hidden bg-gray-200';
+                    var img = document.createElement('img');
+                    img.src = url;
+                    img.className = 'w-full h-full object-cover';
+                    imgWrap.appendChild(img);
+                    row.appendChild(imgWrap);
+                    var info = document.createElement('span');
+                    info.className = 'text-xs text-gray-600 flex-1';
+                    info.textContent = '상세이미지 ' + (idx+1) + ' (' + Math.round(url.length/1024) + 'KB)';
+                    row.appendChild(info);
+                    var delBtn = document.createElement('button');
+                    delBtn.className = 'px-2 py-1 bg-red-100 hover:bg-red-200 text-red-600 rounded text-xs font-bold';
+                    delBtn.innerHTML = '<i class="fas fa-trash mr-1"></i>삭제';
+                    delBtn.onclick = (function(i){ return function(){ removeDetailImage(i); }; })(idx);
+                    row.appendChild(delBtn);
+                    container.appendChild(row);
+                });
             }
 
             function removeDetailImage(idx) {
@@ -8261,7 +8323,7 @@ app.get('/admin/dashboard', (c) => {
                         '<div class="space-y-3">' +
                         '<input type="text" id="editProdName" placeholder="상품명 *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
                         '<input type="number" id="editProdPrice" placeholder="가격 (원) *" class="w-full px-3 py-2 border rounded-lg text-sm">' +
-                        '<input type="text" id="editProdDesc" placeholder="상품 설명" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                        '<div><div class="flex items-center gap-2 mb-1"><label class="text-xs font-bold text-gray-600">상품 설명</label><button type="button" id="editDescModeBtn" class="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs font-bold">HTML 모드</button></div><input type="text" id="editProdDesc" placeholder="상품 설명 (텍스트)" class="w-full px-3 py-2 border rounded-lg text-sm"><textarea id="editProdDescHtml" placeholder="HTML 코드 직접 입력" class="w-full px-3 py-2 border rounded-lg text-sm hidden" rows="5" style="font-family:monospace;font-size:12px"></textarea></div>' +
                         '<select id="editProdCategory" class="w-full px-3 py-2 border rounded-lg text-sm bg-white"><option value="일반">일반</option><option value="식품">식품</option><option value="건강">건강</option><option value="생활">생활</option><option value="패션">패션</option><option value="뷰티">뷰티</option><option value="전자기기">전자기기</option><option value="기타">기타</option></select>' +
                         '<input type="number" id="editProdStock" placeholder="재고 (-1=무제한)" class="w-full px-3 py-2 border rounded-lg text-sm">' +
                         '<div><label class="block text-xs font-bold text-gray-600 mb-1"><i class="fas fa-list-ul mr-1 text-orange-500"></i>옵션 설정</label><div id="editProdOptions" class="space-y-2">' + optsHtml + '</div>' +
@@ -8290,7 +8352,31 @@ app.get('/admin/dashboard', (c) => {
                     // JS로 값 설정 (base64를 HTML attribute에 직접 넣으면 깨짐)
                     document.getElementById('editProdName').value = p.name || '';
                     document.getElementById('editProdPrice').value = p.price_krw || 0;
-                    document.getElementById('editProdDesc').value = p.description || '';
+                    var descVal = p.description || '';
+                    var isHtml = descVal.indexOf('<') >= 0 && descVal.indexOf('>') >= 0;
+                    var _editDescHtmlMode = false;
+                    document.getElementById('editProdDesc').value = descVal;
+                    document.getElementById('editProdDescHtml').value = descVal;
+                    if (isHtml) {
+                        _editDescHtmlMode = true;
+                        document.getElementById('editProdDesc').classList.add('hidden');
+                        document.getElementById('editProdDescHtml').classList.remove('hidden');
+                        document.getElementById('editDescModeBtn').textContent = '텍스트 모드';
+                        document.getElementById('editDescModeBtn').className = 'px-2 py-0.5 bg-green-100 text-green-700 rounded text-xs font-bold';
+                    }
+                    document.getElementById('editDescModeBtn').onclick = function() {
+                        _editDescHtmlMode = !_editDescHtmlMode;
+                        var btn = document.getElementById('editDescModeBtn');
+                        var txtEl = document.getElementById('editProdDesc');
+                        var htmlEl = document.getElementById('editProdDescHtml');
+                        if (_editDescHtmlMode) {
+                            btn.textContent = '텍스트 모드'; btn.className = 'px-2 py-0.5 bg-green-100 text-green-700 rounded text-xs font-bold';
+                            htmlEl.value = txtEl.value; txtEl.classList.add('hidden'); htmlEl.classList.remove('hidden');
+                        } else {
+                            btn.textContent = 'HTML 모드'; btn.className = 'px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs font-bold';
+                            txtEl.value = htmlEl.value; htmlEl.classList.add('hidden'); txtEl.classList.remove('hidden');
+                        }
+                    };
                     document.getElementById('editProdCategory').value = p.category || '일반';
                     document.getElementById('editProdStock').value = p.stock != null ? p.stock : -1;
                     // 썸네일 미리보기 설정
@@ -8384,9 +8470,13 @@ app.get('/admin/dashboard', (c) => {
                     } else if (editDetailImagesArray.length === 1) {
                         finalDetail = editDetailImagesArray[0];
                     }
+                    // 설명: HTML 모드 확인 후 적절한 필드에서 가져오기
+                    var editDescHtmlEl = document.getElementById('editProdDescHtml');
+                    var editDescTxtEl = document.getElementById('editProdDesc');
+                    var editDesc = (editDescHtmlEl && !editDescHtmlEl.classList.contains('hidden')) ? editDescHtmlEl.value.trim() : editDescTxtEl.value.trim();
                     await axios.put('/api/admin/shop/product/' + productId, {
                         name: name,
-                        description: document.getElementById('editProdDesc').value.trim(),
+                        description: editDesc,
                         price_krw: price,
                         image_url: finalThumb,
                         detail_image_url: finalDetail,
@@ -8403,10 +8493,111 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // HTML/텍스트 모드 전환
+            var _descHtmlMode = false;
+            function toggleDescMode() {
+                _descHtmlMode = !_descHtmlMode;
+                var btn = document.getElementById('descModeBtn');
+                var txtEl = document.getElementById('shopProdDesc');
+                var htmlEl = document.getElementById('shopProdDescHtml');
+                if (_descHtmlMode) {
+                    btn.textContent = '텍스트 모드';
+                    btn.className = 'px-2 py-0.5 bg-green-100 text-green-700 rounded text-xs font-bold';
+                    txtEl.classList.add('hidden');
+                    htmlEl.classList.remove('hidden');
+                    htmlEl.value = txtEl.value;
+                } else {
+                    btn.textContent = 'HTML 모드';
+                    btn.className = 'px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs font-bold';
+                    htmlEl.classList.add('hidden');
+                    txtEl.classList.remove('hidden');
+                    txtEl.value = htmlEl.value;
+                }
+            }
+
+            // 대량등록 템플릿 다운로드
+            function downloadBulkTemplate() {
+                var csv = '\uFEFF상품명,가격(원),설명,카테고리,재고,옵션\n예시상품,15000,좋은 상품입니다,뷰티,-1,사이즈:S\\,M\\,L|컬러:블랙\\,화이트\n';
+                var blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+                var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'bulk_product_template.csv'; a.click();
+            }
+
+            // 대량등록 CSV 처리
+            function handleBulkProductUpload(input) {
+                if (!input.files || !input.files[0]) return;
+                var file = input.files[0];
+                var reader = new FileReader();
+                reader.onload = async function(e) {
+                    var text = e.target.result;
+                    var lines = text.split('\n').filter(function(l) { return l.trim(); });
+                    if (lines.length < 2) { alert('데이터가 없습니다'); return; }
+                    var count = 0; var errors = [];
+                    for (var i = 1; i < lines.length; i++) {
+                        var cols = lines[i].match(/(".*?"|[^,]+)/g);
+                        if (!cols || cols.length < 2) continue;
+                        var clean = cols.map(function(c) { return c.replace(/^"|"$/g,'').trim(); });
+                        var pName = clean[0], pPrice = parseInt(clean[1]) || 0;
+                        var pDesc = clean[2] || '', pCat = clean[3] || '일반';
+                        var pStock = parseInt(clean[4]); if (isNaN(pStock)) pStock = -1;
+                        var pOpts = '';
+                        if (clean[5]) {
+                            try {
+                                var optGroups = clean[5].split('|');
+                                var optArr = optGroups.map(function(g) { var parts = g.split(':'); return {name:parts[0],values:parts[1]?parts[1].split(','):[]}; });
+                                pOpts = JSON.stringify(optArr);
+                            } catch(e) {}
+                        }
+                        if (!pName || pPrice <= 0) { errors.push((i+1)+'행: 상품명/가격 누락'); continue; }
+                        try {
+                            await axios.post('/api/admin/shop/product', {name:pName,description:pDesc,price_krw:pPrice,image_url:'',detail_image_url:'',category:pCat,stock:pStock,options:pOpts});
+                            count++;
+                        } catch(e) { errors.push((i+1)+'행: ' + (e.response?.data?.error || '오류')); }
+                    }
+                    alert(count + '개 상품 등록 완료!' + (errors.length > 0 ? '\n\n오류:\n' + errors.join('\n') : ''));
+                    loadAdminShopProducts();
+                    document.getElementById('bulkProductStatus').textContent = count + '개 등록됨';
+                };
+                reader.readAsText(file, 'UTF-8');
+                input.value = '';
+            }
+
+            // 송장 템플릿 다운로드
+            function downloadTrackingTemplate() {
+                var csv = '\uFEFF주문번호,송장번호,택배사\n1,1234567890,CJ대한통운\n';
+                var blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+                var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'tracking_template.csv'; a.click();
+            }
+
+            // 송장 엑셀 일괄등록
+            function handleTrackingUpload(input) {
+                if (!input.files || !input.files[0]) return;
+                var file = input.files[0];
+                var reader = new FileReader();
+                reader.onload = async function(e) {
+                    var text = e.target.result;
+                    var lines = text.split('\n').filter(function(l) { return l.trim(); });
+                    if (lines.length < 2) { alert('데이터가 없습니다'); return; }
+                    var count = 0; var errors = [];
+                    for (var i = 1; i < lines.length; i++) {
+                        var cols = lines[i].split(',').map(function(c) { return c.replace(/^"|"$/g,'').trim(); });
+                        var orderId = cols[0], trackingNo = cols[1], courier = cols[2] || '';
+                        if (!orderId || !trackingNo) { errors.push((i+1)+'행: 주문번호/송장번호 누락'); continue; }
+                        try {
+                            await axios.put('/api/admin/shop/order/' + orderId + '/status', {status:'shipping', trackingNo:trackingNo, courier:courier});
+                            count++;
+                        } catch(e) { errors.push((i+1)+'행: ' + (e.response?.data?.error || '오류')); }
+                    }
+                    alert(count + '건 송장 등록 완료!' + (errors.length > 0 ? '\n\n오류:\n' + errors.join('\n') : ''));
+                    loadAdminShopOrders();
+                };
+                reader.readAsText(file, 'UTF-8');
+                input.value = '';
+            }
+
             async function adminAddProduct() {
                 var name = document.getElementById('shopProdName').value.trim();
                 var price = parseInt(document.getElementById('shopProdPrice').value) || 0;
-                var desc = document.getElementById('shopProdDesc').value.trim();
+                var desc = _descHtmlMode ? document.getElementById('shopProdDescHtml').value.trim() : document.getElementById('shopProdDesc').value.trim();
                 var image = document.getElementById('shopProdImage').value.trim();
                 // 상세이미지: 여러장이면 JSON 배열, 1장이면 그대로
                 var detailImage = '';
@@ -8440,6 +8631,8 @@ app.get('/admin/dashboard', (c) => {
                         document.getElementById('shopProdName').value = '';
                         document.getElementById('shopProdPrice').value = '';
                         document.getElementById('shopProdDesc').value = '';
+                        document.getElementById('shopProdDescHtml').value = '';
+                        if (_descHtmlMode) { toggleDescMode(); } // reset to text mode
                         document.getElementById('shopProdImage').value = '';
                         document.getElementById('shopProdCategory').value = '';
                         document.getElementById('shopProdStock').value = '-1';
@@ -8475,7 +8668,7 @@ app.get('/admin/dashboard', (c) => {
                                     activeLabel +
                                     '<span class="text-xs text-gray-400">[' + esc(p.category) + ']</span>' +
                                 '</div>' +
-                                '<p class="text-xs text-gray-500">' + esc(p.description || '-') + '</p>' +
+                                '<p class="text-xs text-gray-500 truncate">' + esc((p.description || '-').replace(/<[^>]*>/g,'').substring(0,100)) + '</p>' +
                                 '<p class="text-xs text-gray-600 mt-1">' + Number(p.price_krw).toLocaleString() + '원 / ' + qkeyPrice.toLocaleString() + ' QKEY | 재고: ' + stockLabel + '</p>' +
                                 '<p class="text-xs mt-1">' +
                                     (p.image_url ? '<span class="text-blue-500"><i class="fas fa-image mr-1"></i>썸네일✓</span> ' : '<span class="text-gray-300">썸네일✗</span> ') +
