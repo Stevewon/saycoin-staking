@@ -1788,11 +1788,13 @@ app.get('/api/staking/list/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
-    // 어드민이 코인 3종을 리셋한 스테이킹은 사용자 화면에서 숨김 (reset_at IS NULL)
+    // 스테이킹 목록은 리셋 여부와 무관하게 모두 노출 (사용자가 진입금액/데일리배당 진행 상황을 볼 수 있어야 함)
+    // ★ 코인 3종(QTA/QX/QKEY) 잔액만 어드민이 리셋하더라도 스테이킹 자체는 그대로 진행
+    //    → 데일리 배당이 계속 들어와 QKEY 잔액으로 누적되고, 추천인 매칭수당도 정상 지급됨
     const stakings = await db.prepare(`
-      SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, txid, created_at
+      SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, txid, created_at, reset_at
       FROM staking
-      WHERE user_id = ? AND reset_at IS NULL
+      WHERE user_id = ?
       ORDER BY created_at DESC
     `).bind(userId).all()
 
@@ -2577,28 +2579,29 @@ app.post('/api/admin/user/:userId/reset-all', async (c) => {
       deleted.referralRewards = r.meta?.changes || 0
     } catch (e) { deleted.referralRewards = 0 }
 
-    // ★ 스테이킹: 유지하되 사용자 화면에서 숨김 처리 (reset_at 기록)
-    //   - 사용자 「내 스테이킹 목록」에서는 보이지 않음
-    //   - 데일리 배당은 계속 지급 (jeu기/매칭수당 포함)
-    //   - 어드민 통계에서는 별도 표시 (전체 직판/리셋된 직판 분리)
-    let hiddenStakings = 0
+    // ★ 스테이킹: 그대로 유지 — 사용자 화면에서도 정상 노출됨
+    //   - 사용자 「내 스테이킹 목록」: 그대로 표시 (진입금액/데일리배당 진행 상황 모두 보임)
+    //   - 진입금액(주황색 박스 "퀀타리움구매") = active 스테이킹 amount 합계 그대로 유지
+    //   - 데일리 배당: 계속 지급되어 QKEY 잔액으로 누적됨
+    //   - 추천인 매칭수당: 추천인에게 계속 지급
+    //   - 어드민 매출 통계: reset_at 마킹으로 「리셋된 매출」을 별도 식별 가능
+    let markedStakings = 0
     try {
       const r = await db.prepare(`
         UPDATE staking SET reset_at = CURRENT_TIMESTAMP
         WHERE user_id = ? AND reset_at IS NULL
       `).bind(userId).run()
-      hiddenStakings = r.meta?.changes || 0
-    } catch (e) { hiddenStakings = 0 }
-    deleted.hiddenStakings = hiddenStakings
+      markedStakings = r.meta?.changes || 0
+    } catch (e) { markedStakings = 0 }
+    deleted.markedStakings = markedStakings
 
     // ★ 데일리배당(daily_rewards)은 유지 - 삭제하지 않음
     // ★ 스테이킹 row 자체는 유지 - 데일리배당이 계속 쌓여야 하므로
-    // ★ 출금내역은 유지
-    // ★ 주문내역은 유지
+    // ★ 출금내역/주문내역은 유지
 
     return c.json({
       success: true,
-      message: '코인 3종(QTA/QX/QKEY) 리셋 완료 (스테이킹 화면숨김, 배당/매칭수당은 계속 지급)',
+      message: '코인 3종(QTA/QX/QKEY) 잔액 리셋 완료 (스테이킹/진입금액/배당/매칭수당은 계속 유지)',
       previousBalances: prevBalances,
       deletedRecords: deleted
     })
@@ -3361,11 +3364,11 @@ app.get('/api/referrals/:userId', async (c) => {
     const db = c.env.DB
 
     // <span data-i18n="dash.level1_referral">Level 1 Referrals</span> (직접 추천)
-    // - 사용자 화면에서는 리셋된 스테이킹(reset_at IS NOT NULL)을 직판 실적에서 제외
+    // 산하 회원의 staking_count/total_staking은 그 회원 본인의 진입현황을 그대로 표시
     const level1 = await db.prepare(`
       SELECT id, name, email, wallet_address, created_at, 
-             (SELECT COUNT(*) FROM staking WHERE user_id = users.id AND status = 'active' AND reset_at IS NULL) as staking_count,
-             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = users.id AND status = 'active' AND reset_at IS NULL) as total_staking
+             (SELECT COUNT(*) FROM staking WHERE user_id = users.id AND status = 'active') as staking_count,
+             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = users.id AND status = 'active') as total_staking
       FROM users
       WHERE referrer_id = ?
       ORDER BY created_at DESC
@@ -3374,8 +3377,8 @@ app.get('/api/referrals/:userId', async (c) => {
     // <span data-i18n="dash.level2_referral">Level 2 Referrals</span> (간접 추천)
     const level2 = await db.prepare(`
       SELECT u2.id, u2.name, u2.email, u2.wallet_address, u2.created_at,
-             (SELECT COUNT(*) FROM staking WHERE user_id = u2.id AND status = 'active' AND reset_at IS NULL) as staking_count,
-             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = u2.id AND status = 'active' AND reset_at IS NULL) as total_staking
+             (SELECT COUNT(*) FROM staking WHERE user_id = u2.id AND status = 'active') as staking_count,
+             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = u2.id AND status = 'active') as total_staking
       FROM users u1
       JOIN users u2 ON u2.referrer_id = u1.id
       WHERE u1.referrer_id = ?
@@ -7869,9 +7872,9 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById('userDetailModal').classList.add('hidden');
             }
 
-            // 코인 3종 전체 리셋 (QTA+QX+QKEY 잔액 0 + 관련 기록 전부 삭제 + 스테이킹 사용자화면 숨김)
+            // 코인 3종 잔액 리셋 (QTA+QX+QKEY 잔액 0, 스테이킹/진입금액/데일리배당은 계속 진행)
             async function resetAllCoins(userId) {
-                if (!confirm('이 사용자의 코인 3종(QTA/QX/QKEY)을 0으로 리셋하시겠습니까?\\n\\n⚠️ 처리 내용:\\n  - QTA/QX/QKEY 잔액 → 0\\n  - 코인3종 관련 거래내역 삭제\\n  - 추천수당(이 사용자가 받은) 삭제\\n  - 스테이킹: 사용자 화면에서 숨김 처리\\n  - 사용자 직접판매 실적: 자동 0\\n\\n✅ 유지 대상:\\n  - USDT 잔액\\n  - 데일리배당: 계속 지급 (잔액 누적)\\n  - 매칭 추천수당: 추천인에게 계속 지급\\n  - 출금/주문 내역\\n  - 어드민 매출 통계: 「리셋된 매출」로 별도 표시\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
+                if (!confirm('이 사용자의 코인 3종(QTA/QX/QKEY) 잔액을 0으로 리셋하시겠습니까?\\n\\n⚠️ 0으로 리셋되는 항목:\\n  - QTA 잔액 → 0\\n  - QX 잔액 → 0\\n  - QKEY 잔액 → 0\\n  - 본인의 코인3종 거래내역 삭제\\n  - 본인이 받은 직판수당(direct_referral) 삭제\\n     → 사용자 화면 「Direct Sales」가 자동 0으로 표시됨\\n\\n✅ 그대로 유지되는 항목:\\n  - USDT 잔액\\n  - 스테이킹: 사용자 「내 스테이킹 목록」에 그대로 노출\\n  - 진입금액(\"퀀타리움구매\" 박스): 원래 금액 그대로\\n  - 데일리 배당: 매일 지급 → QKEY 잔액으로 누적\\n  - 추천인 매칭수당: 추천인에게 정상 지급\\n  - 출금내역 / 주문내역\\n\\n📊 어드민 매출 통계: 「리셋된 매출」로 별도 식별됨.\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
                 try {
                     var res = await axios.post('/api/admin/user/' + userId + '/reset-all');
                     if (res.data.success) {
@@ -7883,11 +7886,12 @@ app.get('/admin/dashboard', (c) => {
                         msg += 'QKEY: ' + (prev.QKEY || 0).toLocaleString() + ' → 0\\n';
                         msg += '\\n처리된 기록:\\n';
                         msg += '  - 코인3종 거래내역 삭제: ' + (del.transactions || 0) + '건\\n';
-                        msg += '  - 추천수당 삭제: ' + (del.referralRewards || 0) + '건\\n';
-                        msg += '  - 스테이킹 화면숨김: ' + (del.hiddenStakings || 0) + '건\\n';
-                        msg += '\\n계속 지급되는 항목:\\n';
-                        msg += '  - 데일리 배당 (사용자 잔액으로 누적)\\n';
-                        msg += '  - 매칭 추천수당 (추천인에게)';
+                        msg += '  - 직판수당 삭제(본인이 받은): ' + (del.referralRewards || 0) + '건\\n';
+                        msg += '  - 스테이킹 리셋 마킹(매출 통계용): ' + (del.markedStakings || 0) + '건\\n';
+                        msg += '\\n그대로 유지되는 항목:\\n';
+                        msg += '  - 「내 스테이킹 목록」 — 진입금액/데일리 진행 그대로 표시\\n';
+                        msg += '  - 데일리 배당 — 매일 QKEY 잔액으로 누적\\n';
+                        msg += '  - 추천인 매칭수당 — 추천인에게 정상 지급';
                         alert(msg);
                         showUserDetail(userId);
                         loadUsers();
