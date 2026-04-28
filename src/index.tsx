@@ -5132,10 +5132,13 @@ app.get('/dashboard', (c) => {
 
             // 스테이킹 현황 업데이트
             function updateStakingStatus(stakings) {
-                // 진행중인 스테이킹 (active) 필터링
-                const activeStakings = stakings.filter(s => s.status === 'active');
+                // 진행중인 스테이킹 (active 이면서 어드민에 의해 리셋되지 않은 것만)
+                // ★ reset_at이 NULL이 아닌 스테이킹은 어드민이 코인3종 리셋 처리한 건이므로
+                //    "퀀타리움구매(USDT)" 진입금액 박스 합계에서 제외해야 한다.
+                //    (스테이킹 목록 자체는 그대로 보이게 두어 데일리 배당이 누적되는 걸 확인 가능)
+                const activeStakings = stakings.filter(s => s.status === 'active' && !s.reset_at);
                 
-                // 전체 위탁 수량 계산
+                // 전체 위탁 수량 계산 (리셋된 건은 빠짐)
                 const totalAmount = activeStakings.reduce((sum, s) => sum + s.amount, 0);
                 
                 // 스테이킹 현황 카드 업데이트
@@ -5179,9 +5182,15 @@ app.get('/dashboard', (c) => {
                             const isCompleted = s.status === 'active' && endDateTime && endDateTime <= now;
                             
                             let statusColor, statusText;
+                            // ★ 어드민이 리셋 처리한 스테이킹은 진입금액 합계에서 제외되었으므로
+                            //   사용자가 알아볼 수 있도록 별도의 회색 "리셋됨" 배지로 표시
+                            const isReset = !!s.reset_at;
                             if (s.status === 'pending') {
                                 statusColor = 'yellow';
                                 statusText = I18N.t('dash.status_pending');
+                            } else if (isReset) {
+                                statusColor = 'gray';
+                                statusText = '리셋됨';
                             } else if (s.status === 'active' && isCompleted) {
                                 statusColor = 'blue';
                                 statusText = I18N.t('dash.status_period_end');
