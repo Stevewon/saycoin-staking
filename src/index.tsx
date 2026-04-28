@@ -1788,13 +1788,14 @@ app.get('/api/staking/list/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
-    // 스테이킹 목록은 리셋 여부와 무관하게 모두 노출 (사용자가 진입금액/데일리배당 진행 상황을 볼 수 있어야 함)
-    // ★ 코인 3종(QTA/QX/QKEY) 잔액만 어드민이 리셋하더라도 스테이킹 자체는 그대로 진행
-    //    → 데일리 배당이 계속 들어와 QKEY 잔액으로 누적되고, 추천인 매칭수당도 정상 지급됨
+    // ★★ 사용자 화면에는 어드민이 리셋한 스테이킹을 절대 노출하지 않음 ★★
+    //   - reset_at IS NOT NULL  → 어드민이 코인3종(QTA/QX/QKEY) 리셋 처리 = 사용자에게는 없는 셈으로 처리
+    //   - 어드민 화면(/api/admin/staking/all)에서만 리셋 내역 식별/관리 가능
+    //   - 데일리 배당 cron 및 매칭수당 지급은 백엔드에서 별도 처리 (status='active' 기준)
     const stakings = await db.prepare(`
       SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, txid, created_at, reset_at
       FROM staking
-      WHERE user_id = ?
+      WHERE user_id = ? AND reset_at IS NULL
       ORDER BY created_at DESC
     `).bind(userId).all()
 
