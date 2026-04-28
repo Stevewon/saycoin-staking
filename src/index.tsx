@@ -7013,12 +7013,13 @@ app.get('/admin/dashboard', (c) => {
                             <input type="text" id="shopProdName" placeholder="상품명 *" class="px-3 py-2 border rounded-lg text-sm">
                             <input type="number" id="shopProdPrice" placeholder="가격 (원) *" class="px-3 py-2 border rounded-lg text-sm">
                             <div class="sm:col-span-2">
-                                <div class="flex items-center gap-2 mb-1">
+                                <div class="flex items-center gap-2 mb-1 flex-wrap">
                                     <label class="text-xs font-bold text-gray-600">상품 설명</label>
                                     <button type="button" onclick="toggleDescMode()" id="descModeBtn" class="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs font-bold">HTML 모드</button>
+                                    <span class="text-xs text-gray-400">(텍스트 또는 HTML 태그 직접 입력 가능)</span>
                                 </div>
                                 <input type="text" id="shopProdDesc" placeholder="상품 설명 (텍스트)" class="w-full px-3 py-2 border rounded-lg text-sm">
-                                <textarea id="shopProdDescHtml" placeholder="HTML 코드 직접 입력 (예: <h2>상세설명</h2><p>내용...</p>)" class="w-full px-3 py-2 border rounded-lg text-sm hidden" rows="5" style="font-family:monospace;font-size:12px"></textarea>
+                                <textarea id="shopProdDescHtml" placeholder="HTML 코드 직접 입력 — 예) &lt;h2&gt;상품 상세&lt;/h2&gt;&lt;p&gt;설명...&lt;/p&gt;&lt;img src=&quot;https://...&quot;/&gt;&lt;ul&gt;&lt;li&gt;특징1&lt;/li&gt;&lt;/ul&gt;" class="w-full px-3 py-2 border rounded-lg text-sm hidden" rows="6" style="font-family:monospace;font-size:12px"></textarea>
                             </div>
                             <select id="shopProdCategory" class="px-3 py-2 border rounded-lg text-sm bg-white">
                                 <option value="일반">일반</option>
@@ -7076,12 +7077,18 @@ app.get('/admin/dashboard', (c) => {
 
                     <!-- 상품 대량등록 -->
                     <div class="bg-yellow-50 rounded-lg p-4 mb-4 border border-yellow-200">
-                        <h3 class="font-bold text-gray-700 mb-2"><i class="fas fa-file-upload mr-1 text-yellow-600"></i>상품 대량등록 (CSV/엑셀)</h3>
-                        <p class="text-xs text-gray-500 mb-2">CSV 형식: 상품명, 가격(원), 설명, 카테고리, 재고, 옵션(사이즈:S,M,L|컬러:블랙,화이트)</p>
-                        <div class="flex gap-2 items-center">
-                            <button onclick="downloadBulkTemplate()" class="px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-xs font-bold"><i class="fas fa-download mr-1"></i>템플릿 다운로드</button>
+                        <h3 class="font-bold text-gray-700 mb-2"><i class="fas fa-file-upload mr-1 text-yellow-600"></i>상품 대량등록 (엑셀 .xlsx / .xls / CSV)</h3>
+                        <p class="text-xs text-gray-600 mb-1"><strong>컬럼 순서:</strong> 상품명, 가격(원), 설명/HTML, 카테고리, 재고, 옵션, 이미지URL, 상세이미지URL</p>
+                        <ul class="text-xs text-gray-500 mb-2 list-disc list-inside space-y-0.5">
+                            <li><strong>설명/HTML</strong>: 일반 텍스트 또는 <code>&lt;h3&gt;...&lt;/h3&gt;&lt;p&gt;...&lt;/p&gt;</code> 같은 HTML 태그 직접 사용 가능</li>
+                            <li><strong>옵션</strong>: <code>사이즈:S,M,L|컬러:블랙,화이트</code> 형식 (없으면 비움)</li>
+                            <li><strong>재고</strong>: -1 = 무제한</li>
+                            <li><strong>이미지URL</strong>: 외부 이미지 링크 (https://...) — 비우면 등록 후 개별 업로드 가능</li>
+                        </ul>
+                        <div class="flex gap-2 items-center flex-wrap">
+                            <button onclick="downloadBulkTemplate()" class="px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-xs font-bold"><i class="fas fa-download mr-1"></i>엑셀 템플릿 다운로드</button>
                             <input type="file" id="bulkProductFile" accept=".csv,.xlsx,.xls" class="hidden" onchange="handleBulkProductUpload(this)">
-                            <button onclick="document.getElementById('bulkProductFile').click()" class="px-3 py-1.5 bg-yellow-500 hover:bg-yellow-600 text-white rounded text-xs font-bold"><i class="fas fa-upload mr-1"></i>CSV 파일 업로드</button>
+                            <button onclick="document.getElementById('bulkProductFile').click()" class="px-3 py-1.5 bg-yellow-500 hover:bg-yellow-600 text-white rounded text-xs font-bold"><i class="fas fa-upload mr-1"></i>엑셀/CSV 파일 업로드</button>
                             <span id="bulkProductStatus" class="text-xs text-gray-500"></span>
                         </div>
                     </div>
@@ -7100,8 +7107,8 @@ app.get('/admin/dashboard', (c) => {
                             <h3 class="font-bold text-gray-700"><i class="fas fa-receipt mr-1"></i>실시간 주문 현황</h3>
                             <div class="flex gap-2 flex-wrap">
                                 <input type="file" id="trackingFile" accept=".csv,.xlsx,.xls" class="hidden" onchange="handleTrackingUpload(this)">
-                                <button onclick="document.getElementById('trackingFile').click()" class="px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded text-xs font-medium"><i class="fas fa-file-excel mr-1"></i>송장 일괄등록</button>
-                                <button onclick="downloadTrackingTemplate()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-download mr-1"></i>송장 템플릿</button>
+                                <button onclick="document.getElementById('trackingFile').click()" class="px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded text-xs font-medium" title="엑셀(.xlsx/.xls) 또는 CSV 파일로 송장번호 일괄 등록"><i class="fas fa-file-excel mr-1"></i>송장 일괄등록 (엑셀)</button>
+                                <button onclick="downloadTrackingTemplate()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-download mr-1"></i>엑셀 템플릿</button>
                                 <button onclick="exportShopOrders()" class="px-3 py-1 bg-green-500 hover:bg-green-600 text-white rounded text-xs font-medium"><i class="fas fa-file-csv mr-1"></i>CSV 다운로드</button>
                                 <button onclick="loadAdminShopOrders()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
                             </div>
@@ -7176,6 +7183,8 @@ app.get('/admin/dashboard', (c) => {
 
         <script src="/static/axios.min.js"></script>
         <script src="/static/i18n.js?v=20260427c"></script>
+        <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
+        <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
             // Initialize i18n
             I18N.init();
@@ -8601,81 +8610,190 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 대량등록 템플릿 다운로드
-            function downloadBulkTemplate() {
-                var csv = '\uFEFF상품명,가격(원),설명,카테고리,재고,옵션\\n예시상품,15000,좋은 상품입니다,뷰티,-1,사이즈:S\\\\,M\\\\,L|컬러:블랙\\\\,화이트\\n';
-                var blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
-                var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'bulk_product_template.csv'; a.click();
+            // ============================================
+            // 대량등록 / 송장 일괄등록 (CSV + 엑셀 xlsx/xls 지원)
+            // ============================================
+            // CSV 한 줄 파싱 (큰따옴표 안의 쉼표/줄바꿈 안전 처리)
+            function _parseCsvLine(line) {
+                var out = []; var cur = ''; var inQ = false;
+                for (var i = 0; i < line.length; i++) {
+                    var ch = line[i];
+                    if (ch === '"') {
+                        if (inQ && line[i+1] === '"') { cur += '"'; i++; }
+                        else { inQ = !inQ; }
+                    } else if (ch === ',' && !inQ) {
+                        out.push(cur); cur = '';
+                    } else { cur += ch; }
+                }
+                out.push(cur);
+                return out.map(function(s){ return s.trim(); });
+            }
+            // CSV 텍스트 → 행 배열(2D)
+            function _parseCsv(text) {
+                // BOM 제거 + 줄바꿈 정규화
+                text = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                var rows = []; var cur = ''; var inQ = false;
+                for (var i = 0; i < text.length; i++) {
+                    var ch = text[i];
+                    if (ch === '"') {
+                        if (inQ && text[i+1] === '"') { cur += '""'; i++; }
+                        else { cur += ch; inQ = !inQ; }
+                    } else if (ch === '\n' && !inQ) {
+                        rows.push(_parseCsvLine(cur)); cur = '';
+                    } else { cur += ch; }
+                }
+                if (cur.trim()) rows.push(_parseCsvLine(cur));
+                return rows.filter(function(r){ return r.length > 0 && r.some(function(c){ return c && c.length; }); });
+            }
+            // 엑셀(.xlsx/.xls) 또는 CSV 통합 읽기 → 행 배열(2D) 반환
+            function _readSpreadsheet(file) {
+                return new Promise(function(resolve, reject) {
+                    var name = (file.name || '').toLowerCase();
+                    var isExcel = name.endsWith('.xlsx') || name.endsWith('.xls');
+                    var reader = new FileReader();
+                    if (isExcel) {
+                        if (typeof XLSX === 'undefined') {
+                            return reject(new Error('엑셀 라이브러리(XLSX)가 로드되지 않았습니다. 페이지를 새로고침하세요.'));
+                        }
+                        reader.onload = function(e) {
+                            try {
+                                var data = new Uint8Array(e.target.result);
+                                var wb = XLSX.read(data, { type: 'array' });
+                                var ws = wb.Sheets[wb.SheetNames[0]];
+                                var rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });
+                                resolve(rows.filter(function(r){ return r && r.some(function(c){ return c !== null && c !== undefined && (''+c).length; }); }));
+                            } catch(err) { reject(err); }
+                        };
+                        reader.onerror = function(){ reject(reader.error); };
+                        reader.readAsArrayBuffer(file);
+                    } else {
+                        reader.onload = function(e) {
+                            try { resolve(_parseCsv(e.target.result)); } catch(err) { reject(err); }
+                        };
+                        reader.onerror = function(){ reject(reader.error); };
+                        reader.readAsText(file, 'UTF-8');
+                    }
+                });
             }
 
-            // 대량등록 CSV 처리
+            // 상품 대량등록 템플릿 다운로드 (확장: 이미지URL, 상세설명HTML 컬럼 추가)
+            function downloadBulkTemplate() {
+                var rows = [
+                    ['상품명','가격(원)','설명/HTML','카테고리','재고','옵션','이미지URL','상세이미지URL'],
+                    ['예시상품A',15000,'<h3>좋은 상품</h3><p>설명</p>','뷰티',-1,'사이즈:S,M,L|컬러:블랙,화이트','https://example.com/thumb.jpg','https://example.com/detail.jpg'],
+                    ['예시상품B',9900,'간단 텍스트 설명도 OK','식품',100,'','','']
+                ];
+                if (typeof XLSX !== 'undefined') {
+                    var ws = XLSX.utils.aoa_to_sheet(rows);
+                    var wb = XLSX.utils.book_new();
+                    XLSX.utils.book_append_sheet(wb, ws, '상품');
+                    XLSX.writeFile(wb, 'bulk_product_template.xlsx');
+                } else {
+                    // fallback CSV
+                    var csvBody = rows.map(function(r){
+                        return r.map(function(c){
+                            var s = (c == null ? '' : String(c));
+                            if (/[,"\n]/.test(s)) s = '"' + s.replace(/"/g,'""') + '"';
+                            return s;
+                        }).join(',');
+                    }).join('\n');
+                    var blob = new Blob(['\uFEFF' + csvBody], {type:'text/csv;charset=utf-8'});
+                    var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'bulk_product_template.csv'; a.click();
+                }
+            }
+
+            // 상품 대량등록 (CSV + 엑셀 통합) — HTML 설명, 이미지URL, 옵션 모두 지원
             function handleBulkProductUpload(input) {
                 if (!input.files || !input.files[0]) return;
                 var file = input.files[0];
-                var reader = new FileReader();
-                reader.onload = async function(e) {
-                    var text = e.target.result;
-                    var lines = text.split('\\n').filter(function(l) { return l.trim(); });
-                    if (lines.length < 2) { alert('데이터가 없습니다'); return; }
+                var statusEl = document.getElementById('bulkProductStatus');
+                if (statusEl) statusEl.textContent = '읽는 중...';
+                _readSpreadsheet(file).then(async function(rows) {
+                    if (!rows || rows.length < 2) { alert('데이터가 없습니다 (헤더 1행 + 데이터 1행 이상 필요)'); if(statusEl) statusEl.textContent=''; return; }
+                    // 첫 행은 헤더로 간주하고 스킵
                     var count = 0; var errors = [];
-                    for (var i = 1; i < lines.length; i++) {
-                        var cols = lines[i].match(/(".*?"|[^,]+)/g);
-                        if (!cols || cols.length < 2) continue;
-                        var clean = cols.map(function(c) { return c.replace(/^"|"$/g,'').trim(); });
-                        var pName = clean[0], pPrice = parseInt(clean[1]) || 0;
-                        var pDesc = clean[2] || '', pCat = clean[3] || '일반';
-                        var pStock = parseInt(clean[4]); if (isNaN(pStock)) pStock = -1;
+                    for (var i = 1; i < rows.length; i++) {
+                        var r = rows[i];
+                        var pName = (r[0]||'').toString().trim();
+                        var pPrice = parseInt((r[1]||'').toString().replace(/[^\d-]/g,'')) || 0;
+                        var pDesc = (r[2]||'').toString();  // HTML 또는 텍스트 모두 허용
+                        var pCat = (r[3]||'').toString().trim() || '일반';
+                        var pStockRaw = (r[4]||'').toString().trim();
+                        var pStock = pStockRaw === '' ? -1 : (parseInt(pStockRaw) ?? -1);
+                        if (isNaN(pStock)) pStock = -1;
+                        var pOptsRaw = (r[5]||'').toString().trim();
+                        var pImage = (r[6]||'').toString().trim();
+                        var pDetail = (r[7]||'').toString().trim();
                         var pOpts = '';
-                        if (clean[5]) {
+                        if (pOptsRaw) {
                             try {
-                                var optGroups = clean[5].split('|');
-                                var optArr = optGroups.map(function(g) { var parts = g.split(':'); return {name:parts[0],values:parts[1]?parts[1].split(','):[]}; });
-                                pOpts = JSON.stringify(optArr);
+                                var optArr = pOptsRaw.split('|').map(function(g){ var p=g.split(':'); return {name:(p[0]||'').trim(), values:(p[1]||'').split(',').map(function(x){return x.trim();}).filter(function(x){return x;})}; }).filter(function(o){return o.name && o.values.length;});
+                                if (optArr.length) pOpts = JSON.stringify(optArr);
                             } catch(e) {}
                         }
                         if (!pName || pPrice <= 0) { errors.push((i+1)+'행: 상품명/가격 누락'); continue; }
+                        if (statusEl) statusEl.textContent = '등록 중... (' + i + '/' + (rows.length-1) + ')';
                         try {
-                            await axios.post('/api/admin/shop/product', {name:pName,description:pDesc,price_krw:pPrice,image_url:'',detail_image_url:'',category:pCat,stock:pStock,options:pOpts});
+                            await axios.post('/api/admin/shop/product', {
+                                name: pName, description: pDesc, price_krw: pPrice,
+                                image_url: pImage, detail_image_url: pDetail,
+                                category: pCat, stock: pStock, options: pOpts
+                            });
                             count++;
                         } catch(e) { errors.push((i+1)+'행: ' + (e.response?.data?.error || '오류')); }
                     }
-                    alert(count + '개 상품 등록 완료!' + (errors.length > 0 ? '\\n\\n오류:\\n' + errors.join('\\n') : ''));
+                    alert(count + '개 상품 등록 완료!' + (errors.length > 0 ? '\\n\\n오류 ' + errors.length + '건:\\n' + errors.slice(0,10).join('\\n') + (errors.length>10?'\\n...':'') : ''));
+                    if (statusEl) statusEl.textContent = count + '개 등록됨' + (errors.length ? ' / 오류 ' + errors.length + '건' : '');
                     loadAdminShopProducts();
-                    document.getElementById('bulkProductStatus').textContent = count + '개 등록됨';
-                };
-                reader.readAsText(file, 'UTF-8');
+                }).catch(function(err) {
+                    alert('파일 읽기 실패: ' + (err.message || err));
+                    if (statusEl) statusEl.textContent = '';
+                });
                 input.value = '';
             }
 
-            // 송장 템플릿 다운로드
+            // 송장 템플릿 다운로드 (엑셀 우선)
             function downloadTrackingTemplate() {
-                var csv = '\uFEFF주문번호,송장번호,택배사\\n1,1234567890,CJ대한통운\\n';
-                var blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
-                var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'tracking_template.csv'; a.click();
+                var rows = [
+                    ['주문번호','송장번호','택배사'],
+                    [1,'1234567890','CJ대한통운'],
+                    [2,'9876543210','우체국택배']
+                ];
+                if (typeof XLSX !== 'undefined') {
+                    var ws = XLSX.utils.aoa_to_sheet(rows);
+                    var wb = XLSX.utils.book_new();
+                    XLSX.utils.book_append_sheet(wb, ws, '송장');
+                    XLSX.writeFile(wb, 'tracking_template.xlsx');
+                } else {
+                    var csvBody = rows.map(function(r){ return r.join(','); }).join('\n');
+                    var blob = new Blob(['\uFEFF' + csvBody], {type:'text/csv;charset=utf-8'});
+                    var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'tracking_template.csv'; a.click();
+                }
             }
 
-            // 송장 엑셀 일괄등록
+            // 송장 일괄등록 (CSV + 엑셀 통합)
             function handleTrackingUpload(input) {
                 if (!input.files || !input.files[0]) return;
                 var file = input.files[0];
-                var reader = new FileReader();
-                reader.onload = async function(e) {
-                    var text = e.target.result;
-                    var lines = text.split('\\n').filter(function(l) { return l.trim(); });
-                    if (lines.length < 2) { alert('데이터가 없습니다'); return; }
+                _readSpreadsheet(file).then(async function(rows) {
+                    if (!rows || rows.length < 2) { alert('데이터가 없습니다 (헤더 1행 + 데이터 1행 이상 필요)'); return; }
                     var count = 0; var errors = [];
-                    for (var i = 1; i < lines.length; i++) {
-                        var cols = lines[i].split(',').map(function(c) { return c.replace(/^"|"$/g,'').trim(); });
-                        var orderId = cols[0], trackingNo = cols[1], courier = cols[2] || '';
+                    for (var i = 1; i < rows.length; i++) {
+                        var r = rows[i];
+                        var orderId = (r[0]||'').toString().trim();
+                        var trackingNo = (r[1]||'').toString().trim();
+                        var courier = (r[2]||'').toString().trim();
                         if (!orderId || !trackingNo) { errors.push((i+1)+'행: 주문번호/송장번호 누락'); continue; }
                         try {
                             await axios.put('/api/admin/shop/order/' + orderId + '/status', {status:'shipping', trackingNo:trackingNo, courier:courier});
                             count++;
                         } catch(e) { errors.push((i+1)+'행: ' + (e.response?.data?.error || '오류')); }
                     }
-                    alert(count + '건 송장 등록 완료!' + (errors.length > 0 ? '\\n\\n오류:\\n' + errors.join('\\n') : ''));
+                    alert(count + '건 송장 등록 완료!' + (errors.length > 0 ? '\\n\\n오류 ' + errors.length + '건:\\n' + errors.slice(0,10).join('\\n') + (errors.length>10?'\\n...':'') : ''));
                     loadAdminShopOrders();
-                };
-                reader.readAsText(file, 'UTF-8');
+                }).catch(function(err) {
+                    alert('파일 읽기 실패: ' + (err.message || err));
+                });
                 input.value = '';
             }
 
@@ -8777,13 +8895,20 @@ app.get('/admin/dashboard', (c) => {
 
             async function adminToggleProduct(id, newActive, btnEl) {
                 try {
-                    // 기존 상품 정보를 가져와서 is_active만 변경
+                    // 기존 상품 정보를 가져와서 is_active만 변경 (options/description 포함 모든 필드 유지)
                     var res = await axios.get('/api/admin/shop/products');
                     var product = (res.data.products || []).find(function(p) { return p.id === id; });
                     if (!product) { alert('상품을 찾을 수 없습니다'); return; }
                     await axios.put('/api/admin/shop/product/' + id, {
-                        name: product.name, description: product.description, price_krw: product.price_krw,
-                        image_url: product.image_url, detail_image_url: product.detail_image_url || '', category: product.category, stock: product.stock, is_active: newActive
+                        name: product.name,
+                        description: product.description,
+                        price_krw: product.price_krw,
+                        image_url: product.image_url || '',
+                        detail_image_url: product.detail_image_url || '',
+                        category: product.category,
+                        stock: product.stock,
+                        is_active: newActive,
+                        options: product.options || ''  // ★ 옵션 보존 (누락 시 기존 옵션 손실)
                     });
                     loadAdminShopProducts();
                 } catch(e) {
