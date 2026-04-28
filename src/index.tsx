@@ -2142,28 +2142,42 @@ app.delete('/api/admin/user/:userId', async (c) => {
 // 관리자: 사용자 일괄 삭제 (특정 이메일 제외)
 app.post('/api/admin/users/bulk-delete', async (c) => {
   try {
-    const { keepEmails } = await c.req.json()
+    const body = await c.req.json().catch(() => ({}))
+    const { userIds: requestedUserIds, keepEmails, confirm } = body as any
     const db = c.env.DB
 
+    // 🔒 SAFETY: userIds가 명시적으로 비어있는 배열이거나 누락된 경우 거부
+    //   (이전 버그: 빈 배열 또는 미지정 시 admin@quantarium.com 외 모든 사용자가 삭제됨)
+    if (!Array.isArray(requestedUserIds) || requestedUserIds.length === 0) {
+      return c.json({
+        error: '삭제할 사용자 ID 목록(userIds)을 명시적으로 전달해야 합니다. 빈 배열은 허용되지 않습니다.',
+        hint: '전체 삭제가 필요한 경우 confirm:"DELETE_ALL_USERS_CONFIRM"와 keepEmails 배열을 함께 전달하세요.'
+      }, 400)
+    }
+
     // 보호할 이메일 목록 (기본값: 관리자)
-    const protectedEmails = keepEmails || ['admin@quantarium.com']
-    
-    // 삭제할 사용자 목록 조회
-    const placeholders = protectedEmails.map(() => '?').join(',')
+    const protectedEmails = (Array.isArray(keepEmails) && keepEmails.length > 0)
+      ? keepEmails
+      : ['admin@quantarium.com']
+
+    // 삭제 대상: 명시적으로 받은 userIds 중 보호 이메일이 아닌 사용자만
+    const idPlaceholders = requestedUserIds.map(() => '?').join(',')
+    const emailPlaceholders = protectedEmails.map(() => '?').join(',')
     const usersToDelete = await db.prepare(`
-      SELECT id, name, email FROM users WHERE email NOT IN (${placeholders})
-    `).bind(...protectedEmails).all()
+      SELECT id, name, email FROM users
+      WHERE id IN (${idPlaceholders})
+        AND email NOT IN (${emailPlaceholders})
+    `).bind(...requestedUserIds, ...protectedEmails).all()
 
     if (usersToDelete.results.length === 0) {
-      return c.json({ 
-        success: true, 
+      return c.json({
+        success: true,
         message: t(c, 'admin.no_users_to_delete'),
         deletedCount: 0,
         keptEmails: protectedEmails
       })
     }
 
-    const userIds = usersToDelete.results.map(u => u.id)
     let deletedCount = 0
 
     // 각 사용자 삭제
@@ -3647,9 +3661,18 @@ app.put('/api/admin/shop/product/:id', async (c) => {
     try { await db.prepare(`ALTER TABLE products ADD COLUMN detail_image_url TEXT DEFAULT ''`).run() } catch(e2) {}
     try { await db.prepare(`ALTER TABLE products ADD COLUMN options TEXT DEFAULT ''`).run() } catch(eo) {}
     const optionsStr = options ? (typeof options === 'string' ? options : JSON.stringify(options)) : ''
-    await db.prepare(`UPDATE products SET name=?, description=?, price_krw=?, image_url=?, detail_image_url=?, category=?, stock=?, is_active=?, options=? WHERE id=?`).bind(
+    // 존재 여부 확인 (없는 ID에 대해 200을 반환하던 버그 수정)
+    const existing = await db.prepare(`SELECT id FROM products WHERE id = ?`).bind(id).first()
+    if (!existing) {
+      return c.json({ error: '해당 상품을 찾을 수 없습니다' }, 404)
+    }
+    const result = await db.prepare(`UPDATE products SET name=?, description=?, price_krw=?, image_url=?, detail_image_url=?, category=?, stock=?, is_active=?, options=? WHERE id=?`).bind(
       name, description || '', price_krw, image_url || '', detail_image_url || '', category || '일반', stock ?? -1, is_active ?? 1, optionsStr, id
     ).run()
+    const changes = (result as any)?.meta?.changes ?? 0
+    if (!changes) {
+      return c.json({ error: '상품 수정에 실패했습니다 (변경된 행 없음)' }, 404)
+    }
     return c.json({ success: true, message: '상품이 수정되었습니다' })
   } catch(e: any) {
     const errMsg = e?.message || ''
@@ -3712,14 +3735,19 @@ app.put('/api/admin/shop/order/:id/status', async (c) => {
   try {
     const { status, trackingNo, courier } = await c.req.json()
     const db = c.env.DB
+    const orderId = c.req.param('id')
+    // 존재 여부 확인 (없는 ID에 대해 200을 반환하던 버그 수정)
+    const order = await db.prepare(`SELECT id, shipping_memo FROM orders WHERE id = ?`).bind(orderId).first() as any
+    if (!order) {
+      return c.json({ error: '해당 주문을 찾을 수 없습니다' }, 404)
+    }
     // shipping_memo에 송장정보 추가
     if (trackingNo) {
-      const order = await db.prepare(`SELECT shipping_memo FROM orders WHERE id = ?`).bind(c.req.param('id')).first() as any
       const trackingInfo = (courier ? '[' + courier + '] ' : '') + '송장: ' + trackingNo
       const memo = order?.shipping_memo ? order.shipping_memo + ' | ' + trackingInfo : trackingInfo
-      await db.prepare(`UPDATE orders SET status = ?, shipping_memo = ? WHERE id = ?`).bind(status, memo, c.req.param('id')).run()
+      await db.prepare(`UPDATE orders SET status = ?, shipping_memo = ? WHERE id = ?`).bind(status, memo, orderId).run()
     } else {
-      await db.prepare(`UPDATE orders SET status = ? WHERE id = ?`).bind(status, c.req.param('id')).run()
+      await db.prepare(`UPDATE orders SET status = ? WHERE id = ?`).bind(status, orderId).run()
     }
     return c.json({ success: true })
   } catch(e) {
