@@ -1788,10 +1788,11 @@ app.get('/api/staking/list/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
+    // 어드민이 코인 3종을 리셋한 스테이킹은 사용자 화면에서 숨김 (reset_at IS NULL)
     const stakings = await db.prepare(`
       SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, txid, created_at
       FROM staking
-      WHERE user_id = ?
+      WHERE user_id = ? AND reset_at IS NULL
       ORDER BY created_at DESC
     `).bind(userId).all()
 
@@ -2576,14 +2577,28 @@ app.post('/api/admin/user/:userId/reset-all', async (c) => {
       deleted.referralRewards = r.meta?.changes || 0
     } catch (e) { deleted.referralRewards = 0 }
 
+    // ★ 스테이킹: 유지하되 사용자 화면에서 숨김 처리 (reset_at 기록)
+    //   - 사용자 「내 스테이킹 목록」에서는 보이지 않음
+    //   - 데일리 배당은 계속 지급 (jeu기/매칭수당 포함)
+    //   - 어드민 통계에서는 별도 표시 (전체 직판/리셋된 직판 분리)
+    let hiddenStakings = 0
+    try {
+      const r = await db.prepare(`
+        UPDATE staking SET reset_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND reset_at IS NULL
+      `).bind(userId).run()
+      hiddenStakings = r.meta?.changes || 0
+    } catch (e) { hiddenStakings = 0 }
+    deleted.hiddenStakings = hiddenStakings
+
     // ★ 데일리배당(daily_rewards)은 유지 - 삭제하지 않음
-    // ★ 스테이킹은 유지 - 데일리배당이 계속 쌍여야 하므로
+    // ★ 스테이킹 row 자체는 유지 - 데일리배당이 계속 쌓여야 하므로
     // ★ 출금내역은 유지
     // ★ 주문내역은 유지
 
     return c.json({
       success: true,
-      message: '코인 3종(QTA/QX/QKEY) 리셋 + 추천수당 삭제 완료 (데일리배당/스테이킹 유지)',
+      message: '코인 3종(QTA/QX/QKEY) 리셋 완료 (스테이킹 화면숨김, 배당/매칭수당은 계속 지급)',
       previousBalances: prevBalances,
       deletedRecords: deleted
     })
@@ -2647,6 +2662,7 @@ app.get('/api/admin/signups', async (c) => {
 app.get('/api/admin/sales', async (c) => {
   try {
     const db = c.env.DB
+    // 어드민용 매출 목록: 리셋된 항목도 함께 반환하되 reset_at 컬럼으로 식별 가능하게 함
     const sales = await db.prepare(`
       SELECT 
         s.id as staking_id,
@@ -2661,14 +2677,15 @@ app.get('/api/admin/sales', async (c) => {
         s.start_date,
         s.end_date,
         s.period_days,
-        s.daily_rate
+        s.daily_rate,
+        s.reset_at
       FROM staking s
       JOIN users u ON s.user_id = u.id
       WHERE s.status IN ('active', 'completed')
       ORDER BY s.created_at DESC
     `).all()
 
-    // 총 매출 집계
+    // 총 매출 집계 (전체)
     const totalSales = await db.prepare(`
       SELECT 
         COALESCE(SUM(amount), 0) as total_amount,
@@ -2691,6 +2708,24 @@ app.get('/api/admin/sales', async (c) => {
       FROM staking WHERE status IN ('active', 'completed') AND start_date >= DATE('now', '-30 days')
     `).first()
 
+    // 리셋된(=어드민 강제 리셋 처리된) 매출 별도 집계
+    const resetSales = await db.prepare(`
+      SELECT 
+        COALESCE(SUM(amount), 0) as amount,
+        COUNT(*) as count
+      FROM staking
+      WHERE status IN ('active', 'completed') AND reset_at IS NOT NULL
+    `).first()
+
+    // 정상(=리셋되지 않은) 매출 별도 집계
+    const activeSales = await db.prepare(`
+      SELECT 
+        COALESCE(SUM(amount), 0) as amount,
+        COUNT(*) as count
+      FROM staking
+      WHERE status IN ('active', 'completed') AND reset_at IS NULL
+    `).first()
+
     return c.json({
       success: true,
       stats: {
@@ -2701,7 +2736,12 @@ app.get('/api/admin/sales', async (c) => {
         weekAmount: weekSales?.amount || 0,
         weekCount: weekSales?.count || 0,
         monthAmount: monthSales?.amount || 0,
-        monthCount: monthSales?.count || 0
+        monthCount: monthSales?.count || 0,
+        // 리셋 분리 통계
+        activeAmount: activeSales?.amount || 0,
+        activeCount: activeSales?.count || 0,
+        resetAmount: resetSales?.amount || 0,
+        resetCount: resetSales?.count || 0
       },
       sales: sales.results
     })
@@ -3321,10 +3361,11 @@ app.get('/api/referrals/:userId', async (c) => {
     const db = c.env.DB
 
     // <span data-i18n="dash.level1_referral">Level 1 Referrals</span> (직접 추천)
+    // - 사용자 화면에서는 리셋된 스테이킹(reset_at IS NOT NULL)을 직판 실적에서 제외
     const level1 = await db.prepare(`
       SELECT id, name, email, wallet_address, created_at, 
-             (SELECT COUNT(*) FROM staking WHERE user_id = users.id AND status = 'active') as staking_count,
-             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = users.id AND status = 'active') as total_staking
+             (SELECT COUNT(*) FROM staking WHERE user_id = users.id AND status = 'active' AND reset_at IS NULL) as staking_count,
+             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = users.id AND status = 'active' AND reset_at IS NULL) as total_staking
       FROM users
       WHERE referrer_id = ?
       ORDER BY created_at DESC
@@ -3333,8 +3374,8 @@ app.get('/api/referrals/:userId', async (c) => {
     // <span data-i18n="dash.level2_referral">Level 2 Referrals</span> (간접 추천)
     const level2 = await db.prepare(`
       SELECT u2.id, u2.name, u2.email, u2.wallet_address, u2.created_at,
-             (SELECT COUNT(*) FROM staking WHERE user_id = u2.id AND status = 'active') as staking_count,
-             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = u2.id AND status = 'active') as total_staking
+             (SELECT COUNT(*) FROM staking WHERE user_id = u2.id AND status = 'active' AND reset_at IS NULL) as staking_count,
+             (SELECT COALESCE(SUM(amount), 0) FROM staking WHERE user_id = u2.id AND status = 'active' AND reset_at IS NULL) as total_staking
       FROM users u1
       JOIN users u2 ON u2.referrer_id = u1.id
       WHERE u1.referrer_id = ?
@@ -6769,7 +6810,7 @@ app.get('/admin/dashboard', (c) => {
                         </button>
                     </div>
                     <!-- 매출 통계 -->
-                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-2 sm:mb-3">
                         <div class="bg-blue-50 rounded-lg p-3 sm:p-4 border border-blue-200">
                             <p class="text-xs text-gray-600 mb-1" data-i18n="admin.total_sales">총 매출</p>
                             <p id="salesTotalAmount" class="text-lg sm:text-xl font-bold text-blue-700">$0</p>
@@ -6791,6 +6832,19 @@ app.get('/admin/dashboard', (c) => {
                             <p id="salesMonthCount" class="text-xs text-gray-500">0</p>
                         </div>
                     </div>
+                    <!-- 정상/리셋 분리 통계 -->
+                    <div class="grid grid-cols-2 gap-2 sm:gap-4 mb-4 sm:mb-6">
+                        <div class="bg-emerald-50 rounded-lg p-3 sm:p-4 border border-emerald-200">
+                            <p class="text-xs text-gray-600 mb-1"><i class="fas fa-check-circle text-emerald-600 mr-1"></i>정상 매출 (사용자 화면 노출)</p>
+                            <p id="salesActiveAmount" class="text-lg sm:text-xl font-bold text-emerald-700">$0</p>
+                            <p id="salesActiveCount" class="text-xs text-gray-500">0건</p>
+                        </div>
+                        <div class="bg-red-50 rounded-lg p-3 sm:p-4 border border-red-200">
+                            <p class="text-xs text-gray-600 mb-1"><i class="fas fa-undo-alt text-red-600 mr-1"></i>리셋된 매출 (사용자 화면 숨김, 배당은 계속 지급)</p>
+                            <p id="salesResetAmount" class="text-lg sm:text-xl font-bold text-red-700">$0</p>
+                            <p id="salesResetCount" class="text-xs text-gray-500">0건</p>
+                        </div>
+                    </div>
                     <!-- 매출 목록 -->
                     <div class="overflow-x-auto">
                         <table class="w-full text-xs sm:text-sm">
@@ -6801,11 +6855,12 @@ app.get('/admin/dashboard', (c) => {
                                     <th class="px-2 sm:px-3 py-2 text-center" data-i18n="admin.col_country">국가</th>
                                     <th class="px-2 sm:px-3 py-2 text-right" data-i18n="admin.col_sale_amount">판매금액</th>
                                     <th class="px-2 sm:px-3 py-2 text-center" data-i18n="admin.col_status">상태</th>
+                                    <th class="px-2 sm:px-3 py-2 text-center">리셋</th>
                                     <th class="px-2 sm:px-3 py-2 text-left" data-i18n="admin.col_sale_date">판매일</th>
                                 </tr>
                             </thead>
                             <tbody id="salesTableBody" class="divide-y divide-gray-200">
-                                <tr><td colspan="6" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
+                                <tr><td colspan="7" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -7805,9 +7860,9 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById('userDetailModal').classList.add('hidden');
             }
 
-            // 코인 3종 전체 리셋 (QTA+QX+QKEY 잔액 0 + 관련 기록 전부 삭제)
+            // 코인 3종 전체 리셋 (QTA+QX+QKEY 잔액 0 + 관련 기록 전부 삭제 + 스테이킹 사용자화면 숨김)
             async function resetAllCoins(userId) {
-                if (!confirm('이 사용자의 코인 3종(QTA/QX/QKEY)을 0으로 리셋하시겠습니까?\\n\\n⚠️ 삭제 대상:\\n  - QTA/QX/QKEY 잔액 → 0\\n  - 코인3종 관련 거래내역 삭제\\n  - 추천수당(referral_rewards) 삭제\\n\\n✅ 유지 대상:\\n  - USDT 잔액\\n  - 데일리배당 (daily_rewards)\\n  - 스테이킹 (계속 배당 적립)\\n  - 출금내역\\n  - 주문내역\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
+                if (!confirm('이 사용자의 코인 3종(QTA/QX/QKEY)을 0으로 리셋하시겠습니까?\\n\\n⚠️ 처리 내용:\\n  - QTA/QX/QKEY 잔액 → 0\\n  - 코인3종 관련 거래내역 삭제\\n  - 추천수당(이 사용자가 받은) 삭제\\n  - 스테이킹: 사용자 화면에서 숨김 처리\\n  - 사용자 직접판매 실적: 자동 0\\n\\n✅ 유지 대상:\\n  - USDT 잔액\\n  - 데일리배당: 계속 지급 (잔액 누적)\\n  - 매칭 추천수당: 추천인에게 계속 지급\\n  - 출금/주문 내역\\n  - 어드민 매출 통계: 「리셋된 매출」로 별도 표시\\n\\n이 작업은 되돌릴 수 없습니다.')) return;
                 try {
                     var res = await axios.post('/api/admin/user/' + userId + '/reset-all');
                     if (res.data.success) {
@@ -7817,10 +7872,13 @@ app.get('/admin/dashboard', (c) => {
                         msg += 'QTA: ' + (prev.QTA || 0).toLocaleString() + ' → 0\\n';
                         msg += 'QX: ' + (prev.QX || 0).toLocaleString() + ' → 0\\n';
                         msg += 'QKEY: ' + (prev.QKEY || 0).toLocaleString() + ' → 0\\n';
-                        msg += '\\n삭제된 기록:\\n';
-                        msg += '  - 코인3종 거래내역: ' + (del.transactions || 0) + '건\\n';
-                        msg += '  - 추천수당: ' + (del.referralRewards || 0) + '건\\n';
-                        msg += '\\n유지된 항목: USDT잔액, 데일리배당, 스테이킹, 출금내역, 주문내역';
+                        msg += '\\n처리된 기록:\\n';
+                        msg += '  - 코인3종 거래내역 삭제: ' + (del.transactions || 0) + '건\\n';
+                        msg += '  - 추천수당 삭제: ' + (del.referralRewards || 0) + '건\\n';
+                        msg += '  - 스테이킹 화면숨김: ' + (del.hiddenStakings || 0) + '건\\n';
+                        msg += '\\n계속 지급되는 항목:\\n';
+                        msg += '  - 데일리 배당 (사용자 잔액으로 누적)\\n';
+                        msg += '  - 매칭 추천수당 (추천인에게)';
                         alert(msg);
                         showUserDetail(userId);
                         loadUsers();
@@ -7929,19 +7987,34 @@ app.get('/admin/dashboard', (c) => {
                     document.getElementById('salesMonthAmount').textContent = '$' + stats.monthAmount.toLocaleString();
                     document.getElementById('salesMonthCount').textContent = stats.monthCount + I18N.t('admin.cases_unit');
 
+                    // 리셋 분리 통계
+                    var activeAmtEl = document.getElementById('salesActiveAmount');
+                    var activeCntEl = document.getElementById('salesActiveCount');
+                    var resetAmtEl = document.getElementById('salesResetAmount');
+                    var resetCntEl = document.getElementById('salesResetCount');
+                    if (activeAmtEl) activeAmtEl.textContent = '$' + (stats.activeAmount || 0).toLocaleString();
+                    if (activeCntEl) activeCntEl.textContent = (stats.activeCount || 0) + '건';
+                    if (resetAmtEl) resetAmtEl.textContent = '$' + (stats.resetAmount || 0).toLocaleString();
+                    if (resetCntEl) resetCntEl.textContent = (stats.resetCount || 0) + '건';
+
                     var tbody = document.getElementById('salesTableBody');
                     if (sales.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_sales') + '</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_sales') + '</td></tr>';
                     } else {
                         tbody.innerHTML = sales.map(function(s) {
                             var stColor = s.status === 'active' ? 'green' : 'gray';
                             var stText = s.status === 'active' ? I18N.t('admin.status_active') : I18N.t('admin.status_completed');
-                            return '<tr class="hover:bg-gray-50">' +
+                            var rowClass = s.reset_at ? 'hover:bg-gray-50 bg-red-50' : 'hover:bg-gray-50';
+                            var resetCell = s.reset_at
+                                ? '<span class="px-2 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold" title="' + esc(s.reset_at) + '"><i class="fas fa-undo-alt mr-1"></i>리셋</span>'
+                                : '<span class="text-gray-300 text-xs">-</span>';
+                            return '<tr class="' + rowClass + '">' +
                                 '<td class="px-2 sm:px-3 py-2"><span class="text-xs">' + esc(s.email) + '</span></td>' +
                                 '<td class="px-2 sm:px-3 py-2 font-medium">' + esc(s.name) + '</td>' +
                                 '<td class="px-2 sm:px-3 py-2 text-center text-xs">' + esc(s.country || '-') + '</td>' +
                                 '<td class="px-2 sm:px-3 py-2 text-right font-bold text-blue-600">$' + s.amount.toLocaleString() + '</td>' +
                                 '<td class="px-2 sm:px-3 py-2 text-center"><span class="px-2 py-0.5 bg-' + stColor + '-100 text-' + stColor + '-700 rounded text-xs">' + stText + '</span></td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-center">' + resetCell + '</td>' +
                                 '<td class="px-2 sm:px-3 py-2 whitespace-nowrap text-xs">' + (s.sale_date ? new Date(s.sale_date).toLocaleDateString(I18N.getLang()) : '-') + '</td>' +
                             '</tr>';
                         }).join('');
