@@ -8529,7 +8529,7 @@ app.get('/admin/dashboard', (c) => {
 
             // 대량등록 템플릿 다운로드
             function downloadBulkTemplate() {
-                var csv = '\uFEFF상품명,가격(원),설명,카테고리,재고,옵션\n예시상품,15000,좋은 상품입니다,뷰티,-1,사이즈:S\\,M\\,L|컬러:블랙\\,화이트\n';
+                var csv = '\uFEFF상품명,가격(원),설명,카테고리,재고,옵션\\n예시상품,15000,좋은 상품입니다,뷰티,-1,사이즈:S\\\\,M\\\\,L|컬러:블랙\\\\,화이트\\n';
                 var blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
                 var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'bulk_product_template.csv'; a.click();
             }
@@ -8541,7 +8541,7 @@ app.get('/admin/dashboard', (c) => {
                 var reader = new FileReader();
                 reader.onload = async function(e) {
                     var text = e.target.result;
-                    var lines = text.split('\n').filter(function(l) { return l.trim(); });
+                    var lines = text.split('\\n').filter(function(l) { return l.trim(); });
                     if (lines.length < 2) { alert('데이터가 없습니다'); return; }
                     var count = 0; var errors = [];
                     for (var i = 1; i < lines.length; i++) {
@@ -8565,7 +8565,7 @@ app.get('/admin/dashboard', (c) => {
                             count++;
                         } catch(e) { errors.push((i+1)+'행: ' + (e.response?.data?.error || '오류')); }
                     }
-                    alert(count + '개 상품 등록 완료!' + (errors.length > 0 ? '\n\n오류:\n' + errors.join('\n') : ''));
+                    alert(count + '개 상품 등록 완료!' + (errors.length > 0 ? '\\n\\n오류:\\n' + errors.join('\\n') : ''));
                     loadAdminShopProducts();
                     document.getElementById('bulkProductStatus').textContent = count + '개 등록됨';
                 };
@@ -8575,7 +8575,7 @@ app.get('/admin/dashboard', (c) => {
 
             // 송장 템플릿 다운로드
             function downloadTrackingTemplate() {
-                var csv = '\uFEFF주문번호,송장번호,택배사\n1,1234567890,CJ대한통운\n';
+                var csv = '\uFEFF주문번호,송장번호,택배사\\n1,1234567890,CJ대한통운\\n';
                 var blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
                 var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'tracking_template.csv'; a.click();
             }
@@ -8587,7 +8587,7 @@ app.get('/admin/dashboard', (c) => {
                 var reader = new FileReader();
                 reader.onload = async function(e) {
                     var text = e.target.result;
-                    var lines = text.split('\n').filter(function(l) { return l.trim(); });
+                    var lines = text.split('\\n').filter(function(l) { return l.trim(); });
                     if (lines.length < 2) { alert('데이터가 없습니다'); return; }
                     var count = 0; var errors = [];
                     for (var i = 1; i < lines.length; i++) {
@@ -8599,7 +8599,7 @@ app.get('/admin/dashboard', (c) => {
                             count++;
                         } catch(e) { errors.push((i+1)+'행: ' + (e.response?.data?.error || '오류')); }
                     }
-                    alert(count + '건 송장 등록 완료!' + (errors.length > 0 ? '\n\n오류:\n' + errors.join('\n') : ''));
+                    alert(count + '건 송장 등록 완료!' + (errors.length > 0 ? '\\n\\n오류:\\n' + errors.join('\\n') : ''));
                     loadAdminShopOrders();
                 };
                 reader.readAsText(file, 'UTF-8');
