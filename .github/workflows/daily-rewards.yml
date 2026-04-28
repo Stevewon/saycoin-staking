@@ -21,20 +21,60 @@ jobs:
           ADMIN_PW: ${{ secrets.ADMIN_PW }}
           API_BASE: https://pqcpay.co.kr
         run: |
-          set -euo pipefail
-          if [ -z "${ADMIN_ID:-}" ] || [ -z "${ADMIN_PW:-}" ]; then
-            echo "::error::ADMIN_ID / ADMIN_PW secrets are not set"
-            exit 1
-          fi
+          node <<'EOF'
+          const https = require('https');
+          const { URL } = require('url');
 
-          echo "[1/2] Admin login -> ${API_BASE}/api/auth/admin-login"
-          LOGIN_JSON=$(curl -sS -X POST "${API_BASE}/api/auth/admin-login" \
-            -H "Content-Type: application/json" \
-            -d "{\"adminId\":\"${ADMIN_ID}\",\"password\":\"${ADMIN_PW}\"}")
-          TOKEN=$(echo "$LOGIN_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(j.token||'')}catch(e){}})")
-          if [ -z "$TOKEN" ]; then
-            echo "::error::Admin login failed"
-            echo "$LOGIN_JSON"
-            exit 1
-          fi
-          echo "<span class="cursor">█</span>
+          const apiBase = process.env.API_BASE;
+          const adminId = (process.env.ADMIN_ID || '').trim();
+          const adminPw = (process.env.ADMIN_PW || '').trim();
+
+          if (!adminId || !adminPw) {
+            console.error('::error::ADMIN_ID / ADMIN_PW secrets are not set');
+            process.exit(1);
+          }
+          console.log('ADMIN_ID length =', adminId.length, ', ADMIN_PW length =', adminPw.length);
+
+          function post(url, body, headers = {}) {
+            return new Promise((resolve, reject) => {
+              const u = new URL(url);
+              const data = JSON.stringify(body);
+              const req = https.request({
+                hostname: u.hostname,
+                path: u.pathname,
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(data),
+                  ...headers
+                }
+              }, (res) => {
+                let chunks = '';
+                res.on('data', d => chunks += d);
+                res.on('end', () => resolve({ status: res.statusCode, body: chunks }));
+              });
+              req.on('error', reject);
+              req.write(data);
+              req.end();
+            });
+          }
+
+          (async () => {
+            try {
+              console.log('[1/2] Admin login -> ' + apiBase + '/api/auth/admin-login');
+              const loginRes = await post(apiBase + '/api/auth/admin-login', {
+                adminId: adminId,
+                password: adminPw
+              });
+              console.log('Login HTTP', loginRes.status);
+              let loginJson;
+              try { loginJson = JSON.parse(loginRes.body); }
+              catch (e) { console.error('Invalid JSON:', loginRes.body); process.exit(1); }
+              if (!loginJson.success || !loginJson.token) {
+                console.error('::error::Admin login failed:', JSON.stringify(loginJson));
+                process.exit(1);
+              }
+              const token = loginJson.token;
+              console.log('Admin login OK (token length=' + token.length + ')');
+
+              console<span class="cursor">█</span>
