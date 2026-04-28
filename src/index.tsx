@@ -2603,7 +2603,14 @@ app.post('/api/admin/user/:userId/restore-balance', async (c) => {
   try {
     const db = c.env.DB
     const userId = c.req.param('userId')
-    const { qta, qx, qkey, usdt } = await c.req.json()
+
+    // 사용자 존재 확인
+    const exists = await db.prepare(`SELECT id FROM users WHERE id = ?`).bind(userId).first()
+    if (!exists) {
+      return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
+    }
+
+    const { qta, qx, qkey, usdt } = await c.req.json().catch(() => ({}))
     await db.prepare(`UPDATE users SET qta_balance = COALESCE(qta_balance,0) + ?, qx_balance = COALESCE(qx_balance,0) + ?, qkey_balance = COALESCE(qkey_balance,0) + ?, usdt_balance = COALESCE(usdt_balance,0) + ? WHERE id = ?`).bind(qta||0, qx||0, qkey||0, usdt||0, userId).run()
     const user = await db.prepare(`SELECT id,name,qta_balance,qx_balance,qkey_balance,usdt_balance FROM users WHERE id = ?`).bind(userId).first()
     return c.json({ success: true, user })
@@ -3606,9 +3613,18 @@ app.get('/api/shop/products', async (c) => {
 // 상품 구매
 app.post('/api/shop/order', async (c) => {
   try {
-    const { userId, productId, quantity, shippingName, shippingPhone, shippingAddress, shippingMemo, selectedOptions } = await c.req.json()
+    const body = await c.req.json().catch(() => ({}))
+    const { userId, productId, quantity, shippingName, shippingPhone, shippingAddress, shippingMemo, selectedOptions } = body || {}
     const db = c.env.DB
     const qty = quantity || 1
+
+    // 입력 검증
+    if (!userId || !productId) {
+      return c.json({ error: '필수 정보(userId, productId)가 누락되었습니다' }, 400)
+    }
+    if (!shippingName || !shippingPhone || !shippingAddress) {
+      return c.json({ error: '배송지 정보(이름/전화/주소)를 모두 입력해주세요' }, 400)
+    }
 
     const product = await db.prepare(`SELECT * FROM products WHERE id = ? AND is_active = 1`).bind(productId).first()
     if (!product) return c.json({ error: '상품을 찾을 수 없습니다' }, 404)
@@ -3739,7 +3755,15 @@ app.put('/api/admin/shop/product/:id', async (c) => {
 app.delete('/api/admin/shop/product/:id', async (c) => {
   try {
     const db = c.env.DB
-    await db.prepare(`DELETE FROM products WHERE id = ?`).bind(c.req.param('id')).run()
+    const id = c.req.param('id')
+
+    // 존재 확인
+    const exists = await db.prepare(`SELECT id FROM products WHERE id = ?`).bind(id).first()
+    if (!exists) {
+      return c.json({ error: '해당 상품을 찾을 수 없습니다' }, 404)
+    }
+
+    await db.prepare(`DELETE FROM products WHERE id = ?`).bind(id).run()
     return c.json({ success: true })
   } catch(e) {
     return c.json({ error: '상품 삭제 중 오류가 발생했습니다' }, 500)
