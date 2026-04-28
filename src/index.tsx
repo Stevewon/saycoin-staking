@@ -8630,15 +8630,15 @@ app.get('/admin/dashboard', (c) => {
             }
             // CSV 텍스트 → 행 배열(2D)
             function _parseCsv(text) {
-                // BOM 제거 + 줄바꿈 정규화
-                text = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                // BOM 제거 + 줄바꿈 정규화 (백틱 안에서 보존되도록 이중 이스케이프)
+                text = text.replace(/^\\uFEFF/, '').replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
                 var rows = []; var cur = ''; var inQ = false;
                 for (var i = 0; i < text.length; i++) {
                     var ch = text[i];
                     if (ch === '"') {
                         if (inQ && text[i+1] === '"') { cur += '""'; i++; }
                         else { cur += ch; inQ = !inQ; }
-                    } else if (ch === '\n' && !inQ) {
+                    } else if (ch === '\\n' && !inQ) {
                         rows.push(_parseCsvLine(cur)); cur = '';
                     } else { cur += ch; }
                 }
@@ -8693,11 +8693,11 @@ app.get('/admin/dashboard', (c) => {
                     var csvBody = rows.map(function(r){
                         return r.map(function(c){
                             var s = (c == null ? '' : String(c));
-                            if (/[,"\n]/.test(s)) s = '"' + s.replace(/"/g,'""') + '"';
+                            if (/[,"\\n]/.test(s)) s = '"' + s.replace(/"/g,'""') + '"';
                             return s;
                         }).join(',');
-                    }).join('\n');
-                    var blob = new Blob(['\uFEFF' + csvBody], {type:'text/csv;charset=utf-8'});
+                    }).join('\\n');
+                    var blob = new Blob(['\\uFEFF' + csvBody], {type:'text/csv;charset=utf-8'});
                     var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'bulk_product_template.csv'; a.click();
                 }
             }
@@ -8765,8 +8765,8 @@ app.get('/admin/dashboard', (c) => {
                     XLSX.utils.book_append_sheet(wb, ws, '송장');
                     XLSX.writeFile(wb, 'tracking_template.xlsx');
                 } else {
-                    var csvBody = rows.map(function(r){ return r.join(','); }).join('\n');
-                    var blob = new Blob(['\uFEFF' + csvBody], {type:'text/csv;charset=utf-8'});
+                    var csvBody = rows.map(function(r){ return r.join(','); }).join('\\n');
+                    var blob = new Blob(['\\uFEFF' + csvBody], {type:'text/csv;charset=utf-8'});
                     var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'tracking_template.csv'; a.click();
                 }
             }
