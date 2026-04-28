@@ -2000,7 +2000,7 @@ app.get('/api/admin/users', async (c) => {
   try {
     const db = c.env.DB
     
-    // 사용자 목록 조회 (스테이킹 총 수량 포함)
+    // 사용자 목록 조회 (스테이킹 총 수량 + 추천인 정보 포함)
     const users = await db.prepare(`
       SELECT 
         u.id, 
@@ -2015,12 +2015,16 @@ app.get('/api/admin/users', async (c) => {
         u.usdt_balance, 
         u.country,
         u.language,
+        u.referral_code,
+        u.referrer_id,
+        (SELECT name FROM users r WHERE r.id = u.referrer_id) as referrer_name,
         u.created_at,
         COALESCE(SUM(CASE WHEN s.status = 'active' THEN s.amount ELSE 0 END), 0) as staking_amount
       FROM users u
       LEFT JOIN staking s ON u.id = s.user_id
       GROUP BY u.id, u.name, u.email, u.phone, u.wallet_address, u.usdt_wallet_address,
-               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance, u.country, u.language, u.created_at
+               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance, u.country, u.language,
+               u.referral_code, u.referrer_id, u.created_at
       ORDER BY u.created_at DESC
     `).all()
 
@@ -2140,18 +2144,51 @@ app.delete('/api/admin/user/:userId', async (c) => {
 })
 
 // 관리자: 사용자 일괄 삭제 (특정 이메일 제외)
+//
+// ⚠️⚠️⚠️ 이 API는 사고 발생 후 강력한 안전장치가 적용되어 있습니다 ⚠️⚠️⚠️
+// 한 번이라도 사고가 나면 회복이 어려우므로 다음 모든 조건을 통과해야 실제 삭제가 진행됩니다:
+//  1. userIds(숫자 배열)가 명시적으로 전달되어야 함 (빈 배열, 미지정 모두 거부)
+//  2. confirm === "I_UNDERSTAND_THIS_DELETES_USERS_PERMANENTLY" 이중 확인 문자열 필요
+//  3. 한 번에 처리 가능한 최대 사용자 수 50명 제한
+//  4. active 스테이킹이 있는 회원은 자동 제외 (실수로 운영 중인 회원 삭제 방지)
+//  5. 모든 삭제 대상은 응답에 deletedUsers로 기록
 app.post('/api/admin/users/bulk-delete', async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}))
     const { userIds: requestedUserIds, keepEmails, confirm } = body as any
     const db = c.env.DB
 
-    // 🔒 SAFETY: userIds가 명시적으로 비어있는 배열이거나 누락된 경우 거부
-    //   (이전 버그: 빈 배열 또는 미지정 시 admin@quantarium.com 외 모든 사용자가 삭제됨)
+    // 🔒 SAFETY 1: userIds가 명시적으로 전달되지 않으면 거부
     if (!Array.isArray(requestedUserIds) || requestedUserIds.length === 0) {
       return c.json({
         error: '삭제할 사용자 ID 목록(userIds)을 명시적으로 전달해야 합니다. 빈 배열은 허용되지 않습니다.',
-        hint: '전체 삭제가 필요한 경우 confirm:"DELETE_ALL_USERS_CONFIRM"와 keepEmails 배열을 함께 전달하세요.'
+        hint: 'userIds: [숫자배열], confirm: "I_UNDERSTAND_THIS_DELETES_USERS_PERMANENTLY" 두 값을 모두 전달하세요.'
+      }, 400)
+    }
+
+    // 🔒 SAFETY 2: 이중 confirm 토큰 필요 (실수로 호출 못 하게)
+    const REQUIRED_CONFIRM = 'I_UNDERSTAND_THIS_DELETES_USERS_PERMANENTLY'
+    if (confirm !== REQUIRED_CONFIRM) {
+      return c.json({
+        error: '삭제 확인 토큰이 일치하지 않습니다.',
+        hint: `confirm 필드에 정확히 "${REQUIRED_CONFIRM}" 문자열을 전달해야 합니다.`
+      }, 400)
+    }
+
+    // 🔒 SAFETY 3: 한 번에 50명 이상 처리 금지
+    if (requestedUserIds.length > 50) {
+      return c.json({
+        error: '한 번에 50명 이상은 삭제할 수 없습니다. 분할해서 호출하세요.',
+        attempted: requestedUserIds.length
+      }, 400)
+    }
+
+    // 🔒 SAFETY 4: 모든 ID가 유효한 숫자인지 확인
+    const validIds = requestedUserIds.filter((id: any) => typeof id === 'number' && Number.isInteger(id) && id > 0)
+    if (validIds.length !== requestedUserIds.length) {
+      return c.json({
+        error: 'userIds 배열은 양의 정수만 포함해야 합니다.',
+        invalid: requestedUserIds.filter((id: any) => !validIds.includes(id))
       }, 400)
     }
 
@@ -2161,13 +2198,15 @@ app.post('/api/admin/users/bulk-delete', async (c) => {
       : ['admin@quantarium.com']
 
     // 삭제 대상: 명시적으로 받은 userIds 중 보호 이메일이 아닌 사용자만
-    const idPlaceholders = requestedUserIds.map(() => '?').join(',')
+    const idPlaceholders = validIds.map(() => '?').join(',')
     const emailPlaceholders = protectedEmails.map(() => '?').join(',')
     const usersToDelete = await db.prepare(`
-      SELECT id, name, email FROM users
-      WHERE id IN (${idPlaceholders})
-        AND email NOT IN (${emailPlaceholders})
-    `).bind(...requestedUserIds, ...protectedEmails).all()
+      SELECT u.id, u.name, u.email,
+             (SELECT COUNT(*) FROM staking WHERE user_id = u.id AND status = 'active') as active_staking_count
+      FROM users u
+      WHERE u.id IN (${idPlaceholders})
+        AND u.email NOT IN (${emailPlaceholders})
+    `).bind(...validIds, ...protectedEmails).all()
 
     if (usersToDelete.results.length === 0) {
       return c.json({
@@ -2178,10 +2217,22 @@ app.post('/api/admin/users/bulk-delete', async (c) => {
       })
     }
 
+    // 🔒 SAFETY 5: active 스테이킹이 있는 회원은 자동 제외
+    const safeToDelete = usersToDelete.results.filter((u: any) => (u.active_staking_count || 0) === 0)
+    const skippedActive = usersToDelete.results.filter((u: any) => (u.active_staking_count || 0) > 0)
+
+    if (safeToDelete.length === 0) {
+      return c.json({
+        success: false,
+        error: '삭제 대상 회원이 모두 active 스테이킹을 가지고 있어 삭제할 수 없습니다.',
+        skippedActive: skippedActive.map((u: any) => ({ id: u.id, name: u.name, email: u.email, active_staking_count: u.active_staking_count }))
+      }, 400)
+    }
+
     let deletedCount = 0
 
     // 각 사용자 삭제
-    for (const user of usersToDelete.results) {
+    for (const user of safeToDelete as any[]) {
       try {
         const userId = user.id
 
@@ -2205,7 +2256,7 @@ app.post('/api/admin/users/bulk-delete', async (c) => {
           await db.prepare(`DELETE FROM withdrawals WHERE user_id = ?`).bind(userId).run()
         } catch (e) { }
 
-        // 5. staking 삭제
+        // 5. staking 삭제 (active는 위에서 제외했지만, pending/rejected 등은 함께 삭제됨)
         try {
           await db.prepare(`DELETE FROM staking WHERE user_id = ?`).bind(userId).run()
         } catch (e) { }
@@ -2220,7 +2271,7 @@ app.post('/api/admin/users/bulk-delete', async (c) => {
         
         deletedCount++
       } catch (error) {
-        console.error(`사용자 ${user.email} 삭제 실패:`, error)
+        console.error(`사용자 ${(user as any).email} 삭제 실패:`, error)
       }
     }
 
@@ -2228,7 +2279,8 @@ app.post('/api/admin/users/bulk-delete', async (c) => {
       success: true, 
       message: `${deletedCount}${t(c, 'admin.bulk_delete_success')}`,
       deletedCount: deletedCount,
-      deletedUsers: usersToDelete.results.map(u => ({ name: u.name, email: u.email })),
+      deletedUsers: safeToDelete.map((u: any) => ({ id: u.id, name: u.name, email: u.email })),
+      skippedActive: skippedActive.map((u: any) => ({ id: u.id, name: u.name, email: u.email, active_staking_count: u.active_staking_count })),
       keptEmails: protectedEmails
     })
   } catch (error) {
