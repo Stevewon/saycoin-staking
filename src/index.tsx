@@ -2507,11 +2507,11 @@ app.post('/api/admin/user/:userId/reset-balance', async (c) => {
       deleted.withdrawals = r.meta?.changes || 0
     } catch (e) { deleted.withdrawals = 0 }
 
-    // 3. QKEY 리셋 → 일일배당, 추천보상, 쇼핑몰 주문도 삭제 (보상/구매 모두 QKEY)
+    // 3. QKEY 리셋 → 추천보상만 삭제 (데일리배당/스테이킹/주문내역은 유지)
     if (coinType === 'QKEY') {
-      try { const r = await db.prepare(`DELETE FROM daily_rewards WHERE user_id = ?`).bind(userId).run(); deleted.dailyRewards = r.meta?.changes || 0 } catch (e) { deleted.dailyRewards = 0 }
+      // ★ daily_rewards는 유지 - 배당 기록이 남아야 다음 배당이 정상 동작
+      // ★ orders는 유지 - 주문 이력은 보존
       try { const r = await db.prepare(`DELETE FROM referral_rewards WHERE referrer_id = ?`).bind(userId).run(); deleted.referralRewards = r.meta?.changes || 0 } catch (e) { deleted.referralRewards = 0 }
-      try { const r = await db.prepare(`DELETE FROM orders WHERE user_id = ?`).bind(userId).run(); deleted.orders = r.meta?.changes || 0 } catch (e) { deleted.orders = 0 }
     }
 
     // 4. QTA 리셋 → 스테이킹 보상으로 받은 QTA이므로, 관련 스왑 거래(swap_in QTA)는 이미 위에서 삭제됨
@@ -2527,6 +2527,18 @@ app.post('/api/admin/user/:userId/reset-balance', async (c) => {
     console.error('잔액 리셋 오류:', error)
     return c.json({ error: 'Balance reset failed' }, 500)
   }
+})
+
+// 관리자: 잔액 복구 API (긴급용)
+app.post('/api/admin/user/:userId/restore-balance', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = c.req.param('userId')
+    const { qta, qx, qkey, usdt } = await c.req.json()
+    await db.prepare(`UPDATE users SET qta_balance = COALESCE(qta_balance,0) + ?, qx_balance = COALESCE(qx_balance,0) + ?, qkey_balance = COALESCE(qkey_balance,0) + ?, usdt_balance = COALESCE(usdt_balance,0) + ? WHERE id = ?`).bind(qta||0, qx||0, qkey||0, usdt||0, userId).run()
+    const user = await db.prepare(`SELECT id,name,qta_balance,qx_balance,qkey_balance,usdt_balance FROM users WHERE id = ?`).bind(userId).first()
+    return c.json({ success: true, user })
+  } catch(e: any) { return c.json({ error: e.message }, 500) }
 })
 
 // 관리자: 전체 코인 리셋 (QTA + QX + QKEY 잔액 0 + 모든 관련 기록 삭제)
