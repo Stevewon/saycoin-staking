@@ -5364,10 +5364,10 @@ app.get('/dashboard', (c) => {
                 
                 if (myQkey < priceQkey) {
                     var shortage = priceQkey - myQkey;
-                    alert('❌ QKEY 잔액이 부족합니다!\n\n' +
-                        '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\n' +
-                        '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\n' +
-                        '부족 금액: ' + shortage.toLocaleString() + ' QKEY\n\n' +
+                    alert('❌ QKEY 잔액이 부족합니다!\\n\\n' +
+                        '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\\n' +
+                        '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\\n' +
+                        '부족 금액: ' + shortage.toLocaleString() + ' QKEY\\n\\n' +
                         'QKEY를 충전하거나 스테이킹 배당으로 적립 후 다시 시도해주세요.');
                     return;
                 }
@@ -5384,11 +5384,11 @@ app.get('/dashboard', (c) => {
                         selectedOptions.push(opts[oi].name + ': ' + val);
                     }
                 }
-                var optionText = selectedOptions.length > 0 ? '\n선택옵션: ' + selectedOptions.join(', ') : '';
-                if (!confirm(productName + optionText + '\n\n' +
-                    '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\n' +
-                    '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\n' +
-                    '결제 후 잔액: ' + (myQkey - priceQkey).toLocaleString() + ' QKEY\n\n' +
+                var optionText = selectedOptions.length > 0 ? '\\n선택옵션: ' + selectedOptions.join(', ') : '';
+                if (!confirm(productName + optionText + '\\n\\n' +
+                    '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\\n' +
+                    '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\\n' +
+                    '결제 후 잔액: ' + (myQkey - priceQkey).toLocaleString() + ' QKEY\\n\\n' +
                     '구매하시겠습니까?')) return;
 
                 var shippingName = prompt('수령인 이름:');
