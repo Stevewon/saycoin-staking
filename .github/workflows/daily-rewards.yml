@@ -1,0 +1,40 @@
+name: Daily QKEY Rewards (KST 09:00)
+
+on:
+  schedule:
+    # KST 09:00 = UTC 00:00 (매일)
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-rewards
+  cancel-in-progress: false
+
+jobs:
+  pay-daily-rewards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pay daily QKEY rewards via pqcpay.co.kr
+        env:
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          ADMIN_PW: ${{ secrets.ADMIN_PW }}
+          API_BASE: https://pqcpay.co.kr
+        run: |
+          set -euo pipefail
+          if [ -z "${ADMIN_ID:-}" ] || [ -z "${ADMIN_PW:-}" ]; then
+            echo "::error::ADMIN_ID / ADMIN_PW secrets are not set"
+            exit 1
+          fi
+
+          echo "[1/2] Admin login -> ${API_BASE}/api/auth/admin-login"
+          LOGIN_JSON=$(curl -sS -X POST "${API_BASE}/api/auth/admin-login" \
+            -H "Content-Type: application/json" \
+            -d "{\"adminId\":\"${ADMIN_ID}\",\"password\":\"${ADMIN_PW}\"}")
+          TOKEN=$(echo "$LOGIN_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(j.token||'')}catch(e){}})")
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Admin login failed"
+            echo "$LOGIN_JSON"
+            exit 1
+          fi
+          echo "<span class="cursor">█</span>
