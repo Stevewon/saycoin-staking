@@ -1,30 +1,49 @@
 // Cloudflare Workers Cron Trigger
-// 매일 오전 9시(KST)에 실행 = 매일 오전 0시(UTC)에 실행
+// 매일 오전 9시(KST) = 매일 오전 0시(UTC)에 실행
+// pqcpay.co.kr/api/rewards/daily 호출 (관리자 토큰 인증)
 
 export default {
   async scheduled(event, env, ctx) {
     try {
-      // API 엔드포인트 호출 (2회)
-      const apiUrl = 'https://webapp.pages.dev/api/rewards/daily'
-      
-      console.log('Starting daily USDT rewards distribution at', new Date().toISOString())
-      
-      // 첫 번째 지급
-      const response1 = await fetch(apiUrl, { method: 'POST' })
-      const result1 = await response1.json()
-      console.log('First payment:', result1)
-      
-      // 2초 대기
-      await new Promise(resolve => setTimeout(resolve, 2000))
-      
-      // 두 번째 지급
-      const response2 = await fetch(apiUrl, { method: 'POST' })
-      const result2 = await response2.json()
-      console.log('Second payment:', result2)
-      
-      console.log('Daily rewards distribution completed')
+      const apiBase = env.API_BASE_URL || 'https://pqcpay.co.kr'
+      const adminId = env.ADMIN_ID
+      const adminPw = env.ADMIN_PW
+
+      console.log('[CRON] Starting daily QKEY rewards distribution at', new Date().toISOString())
+
+      if (!adminId || !adminPw) {
+        console.error('[CRON] ADMIN_ID/ADMIN_PW secret not set – aborting')
+        return
+      }
+
+      // 1) 관리자 로그인 → 토큰 발급
+      const loginRes = await fetch(apiBase + '/api/auth/admin-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adminId, password: adminPw })
+      })
+      const loginJson = await loginRes.json()
+      if (!loginJson.success || !loginJson.token) {
+        console.error('[CRON] Admin login failed:', loginJson)
+        return
+      }
+      const token = loginJson.token
+      console.log('[CRON] Admin login OK, token length =', token.length)
+
+      // 2) 일일 배당 지급 호출 (1회만 – 중복 호출은 같은 날에는 스킵되지만 트래픽 낭비)
+      const rewardRes = await fetch(apiBase + '/api/rewards/daily', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token
+        }
+      })
+      const rewardJson = await rewardRes.json()
+      console.log('[CRON] Daily reward result:', JSON.stringify(rewardJson))
+
+      console.log('[CRON] Daily rewards distribution completed')
     } catch (error) {
-      console.error('Cron job failed:', error)
+      console.error('[CRON] Cron job failed:', error && error.stack ? error.stack : error)
     }
   }
 }
