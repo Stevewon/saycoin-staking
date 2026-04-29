@@ -3191,6 +3191,51 @@ app.get('/api/admin/export/sales', async (c) => {
 })
 
 // 엑셀 다운로드 API - CSV 형식 (전체 회원)
+// 엑셀 다운로드 API - CSV 형식 (회원 명단 + 지갑주소만, 단순 백업용)
+//   - id, 이름, 이메일(아이디), 전화번호, QKEY 지갑주소, USDT 지갑주소, 가입일자만 포함
+//   - 잔액/스테이킹/추천코드 등은 포함하지 않음 (지갑 백업/일반 명단 용도)
+app.get('/api/admin/export/wallets', async (c) => {
+  try {
+    const db = c.env.DB
+    const users = await db.prepare(`
+      SELECT id, name, email, phone, wallet_address, usdt_wallet_address, created_at
+      FROM users
+      ORDER BY id ASC
+    `).all()
+
+    // CSV 안전 처리 (쉼표/따옴표/줄바꿈 포함 시)
+    const csvEsc = (v: any): string => {
+      if (v === null || v === undefined) return ''
+      const s = String(v).replace(/"/g, '""')
+      return `"${s}"`
+    }
+
+    let csv = '\uFEFF' + ['ID','이름','아이디(이메일)','전화번호','QKEY 지갑주소','USDT 지갑주소','가입일자'].join(',') + '\n'
+    for (const u of (users.results || []) as any[]) {
+      csv += [
+        u.id,
+        csvEsc(u.name),
+        csvEsc(u.email),
+        csvEsc(u.phone || ''),
+        csvEsc(u.wallet_address || ''),
+        csvEsc(u.usdt_wallet_address || ''),
+        csvEsc(u.created_at || '')
+      ].join(',') + '\n'
+    }
+
+    // 파일명에 날짜 포함
+    const today = new Date().toISOString().slice(0,10)
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="members_wallets_${today}.csv"`
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '회원 지갑주소 내보내기 실패' }, 500)
+  }
+})
+
 app.get('/api/admin/export/users', async (c) => {
   try {
     const db = c.env.DB
@@ -6942,12 +6987,15 @@ app.get('/admin/dashboard', (c) => {
                         <h2 class="text-xl font-bold text-gray-800">
                             <i class="fas fa-users text-purple-600 mr-2"></i><span data-i18n="admin.user_list">사용자 목록</span>
                         </h2>
-                        <div class="flex gap-2">
+                        <div class="flex flex-wrap gap-2">
                             <button onclick="openDownlineModal()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
                                 <i class="fas fa-sitemap mr-1"></i><span data-i18n="admin.downline_sales_btn">산하매출 조회</span>
                             </button>
                             <button onclick="exportCSV('users')" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-bold transition">
                                 <i class="fas fa-file-excel mr-1"></i><span data-i18n="admin.export_csv">엑셀 다운로드</span>
+                            </button>
+                            <button onclick="exportCSV('wallets')" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-sm font-bold transition" title="회원 명단과 QKEY/USDT 지갑주소만 CSV로 다운로드">
+                                <i class="fas fa-wallet mr-1"></i>회원명단+지갑주소
                             </button>
                         </div>
                     </div>
@@ -9283,7 +9331,15 @@ app.get('/admin/dashboard', (c) => {
                     var link = document.createElement('a');
                     link.href = URL.createObjectURL(blob);
                     var now = new Date().toISOString().slice(0,10);
-                    link.download = type + '_export_' + now + '.csv';
+                    // 타입별 파일명 매핑
+                    var fileNameMap = {
+                        'users': 'users_export_' + now + '.csv',
+                        'rewards': 'member_rewards_' + now + '.csv',
+                        'sales': 'sales_export_' + now + '.csv',
+                        'withdrawals': 'withdrawals_export_' + now + '.csv',
+                        'wallets': 'members_wallets_' + now + '.csv'
+                    };
+                    link.download = fileNameMap[type] || (type + '_export_' + now + '.csv');
                     link.click();
                     URL.revokeObjectURL(link.href);
                 }).catch(function(error) {
