@@ -1788,29 +1788,22 @@ app.get('/api/staking/list/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
-    // ★★ 사용자 화면에는 어드민이 리셋한 스테이킹을 절대 노출하지 않음 ★★
-    //   - reset_at IS NOT NULL  → 어드민이 코인3종(QTA/QX/QKEY) 리셋 처리 = 사용자에게는 없는 셈으로 처리
-    //   - 어드민 화면(/api/admin/staking/all)에서만 리셋 내역 식별/관리 가능
-    //   - 데일리 배당 cron 및 매칭수당 지급은 백엔드에서 별도 처리 (status='active' 기준)
+    // ★★ 룰 (확정) ★★
+    //   1) 진입금액(USDT)은 메인 카드 + 하단 스테이킹 목록 모두에서 무조건 표시
+    //      (리셋 회원이라도 자기가 얼마 넣었는지는 봐야 함)
+    //   2) 리셋된 스테이킹도 사용자 화면에 그대로 노출 (단, 코인 3종 보상값만 0으로 표시)
+    //   3) 어드민 화면(/api/admin/staking/all)도 동일하게 모든 스테이킹 노출
+    //   4) 코인 3종은 어드민이 리셋한 시점에만 0이 되고, 그 이후 데일리 배당은 정상 누적
     const stakings = await db.prepare(`
       SELECT id, amount, period_months, period_days, qta_reward, qx_reward, qkey_reward, daily_rate, start_date, end_date, status, txid, created_at, reset_at
       FROM staking
-      WHERE user_id = ? AND reset_at IS NULL
+      WHERE user_id = ?
       ORDER BY created_at DESC
     `).bind(userId).all()
 
-    // ★★ 리셋 이력 판별 ★★
-    //   - 같은 사용자의 스테이킹 중 reset_at이 있는 것이 1건이라도 있으면 = 리셋 당한 회원
-    //   - 리셋 당한 회원은 새 스테이킹의 카드에서도 코인 3종 보상값(qta/qx/qkey_reward)을 0으로 표시
-    //   - 단, 만기 시 실제 지급되는 보상은 백엔드에서 그대로 처리됨
-    //     (단순히 사용자 화면 표시만 0으로 가린다)
-    const resetCheck = await db.prepare(`
-      SELECT COUNT(*) as cnt FROM staking WHERE user_id = ? AND reset_at IS NOT NULL
-    `).bind(userId).first() as any
-    const isResetUser = (resetCheck?.cnt || 0) > 0
-
+    // ★ 리셋 이력 판별: 본 스테이킹 row에 reset_at이 찍혀 있으면 그 row만 보상값 0 처리
     const result = stakings.results.map((s: any) => {
-      if (isResetUser) {
+      if (s.reset_at) {
         return {
           ...s,
           qta_reward: 0,
@@ -1820,6 +1813,9 @@ app.get('/api/staking/list/:userId', async (c) => {
       }
       return s
     })
+
+    // is_reset_user: 한 건이라도 reset_at이 있으면 true (UI에서 안내용)
+    const isResetUser = stakings.results.some((s: any) => !!s.reset_at)
 
     return c.json({ 
       success: true, 
@@ -3331,9 +3327,12 @@ app.post('/api/rewards/daily', async (c) => {
     }
 
     // 활성 투자 조회 (승인일 익일부터 거치기간 종료일까지)
-    // ★★ 어드민이 리셋한 스테이킹(reset_at IS NOT NULL)은 배당 지급 대상에서 제외 ★★
-    //   - 리셋된 스테이킹은 사용자에게 사라진 셈으로 처리되므로 배당도 지급되면 안 됨
-    //   - 매칭수당도 같은 cron 안에서 이 스테이킹을 기준으로 계산되므로 함께 제외됨
+    // ★★ 룰 (확정) ★★
+    //   - 리셋되지 않은 스테이킹: 본인 배당 + Level 1 + Level 2 매칭수당 모두 정상 지급
+    //   - 리셋된 스테이킹(reset_at IS NOT NULL): 본인 배당 ❌ / Level 1 매칭수당 ✅ / Level 2 매칭수당 ❌
+    //     → 직접 추천한 추천인은 자기가 만든 매출에 대한 성과금을 받아야 정당하므로 1대만 지급
+    //     → 단, 리셋 스테이킹의 amount는 매출(직접판매) 통계에 절대 포함되지 않음 (별도 SQL에서 처리)
+    //   - 따라서 cron은 리셋 여부 상관없이 모든 active 스테이킹을 가져온 뒤, 분기 처리한다
     const activeStakings = await db.prepare(`
       SELECT 
         s.user_id, 
@@ -3344,10 +3343,10 @@ app.post('/api/rewards/daily', async (c) => {
         s.daily_rate,
         s.start_date,
         s.end_date,
+        s.reset_at,
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count
       FROM staking s
       WHERE s.status = 'active' 
-        AND s.reset_at IS NULL
         AND date(s.end_date) >= date('now')
         AND date('now') >= date(s.start_date, '+1 day')
     `).all()
@@ -3390,29 +3389,37 @@ app.post('/api/rewards/daily', async (c) => {
           // USD를 QKEY로 변환 (1 USD = 150 QKEY)
           const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
 
-          // 일일 보상 기록 (usdt_amount 컬럼에 QKEY 수량 저장)
-          await db.prepare(`
-            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date)
-            VALUES (?, ?, ?, ?)
-          `).bind(staking.user_id, staking.staking_id, qkeyAmount, today).run()
+          // ★ 리셋 여부에 따라 분기 처리 ★
+          //   - 일반(reset_at IS NULL): 본인 배당 + Level 1 + Level 2 모두 정상 지급
+          //   - 리셋(reset_at IS NOT NULL): 본인 배당 ❌ / Level 1 매칭수당 ✅ / Level 2 매칭수당 ❌
+          const isResetStaking = !!staking.reset_at
 
-          // 사용자 QKEY 잔액 업데이트
-          await db.prepare(`
-            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-          `).bind(qkeyAmount, staking.user_id).run()
+          if (!isResetStaking) {
+            // [정상 스테이킹] 본인 배당 지급
+            // 일일 보상 기록 (usdt_amount 컬럼에 QKEY 수량 저장)
+            await db.prepare(`
+              INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date)
+              VALUES (?, ?, ?, ?)
+            `).bind(staking.user_id, staking.staking_id, qkeyAmount, today).run()
 
-          const newCount = staking.rewarded_count + 1
-          await db.prepare(`
-            INSERT INTO transactions (user_id, type, coin_type, amount, description)
-            VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-          `).bind(staking.user_id, qkeyAmount, `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d)`).run()
+            // 사용자 QKEY 잔액 업데이트
+            await db.prepare(`
+              UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+            `).bind(qkeyAmount, staking.user_id).run()
 
-          rewardedCount++
-          totalQkeyRewarded += qkeyAmount
+            const newCount = staking.rewarded_count + 1
+            await db.prepare(`
+              INSERT INTO transactions (user_id, type, coin_type, amount, description)
+              VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+            `).bind(staking.user_id, qkeyAmount, `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d)`).run()
+
+            rewardedCount++
+            totalQkeyRewarded += qkeyAmount
+          }
 
           // 매칭추천수당 지급 (QKEY)
           try {
-            // 1대 매칭추천수당 (20%)
+            // 1대 매칭추천수당 (20%) — 리셋 스테이킹도 직접 추천인은 정상 지급
             const level1Referrer = await db.prepare(`
               SELECT referrer_id FROM users WHERE id = ?
             `).bind(staking.user_id).first()
@@ -3429,32 +3436,37 @@ app.post('/api/rewards/daily', async (c) => {
                 VALUES (?, ?, 1, ?, ?, ?)
               `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, today).run()
 
+              const desc1 = isResetStaking
+                ? `Level 1 referral bonus [reset referee] (${qkeyAmount.toLocaleString()} QKEY x 20%)`
+                : `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%)`
               await db.prepare(`
                 INSERT INTO transactions (user_id, type, coin_type, amount, description)
                 VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-              `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%)`).run()
+              `).bind(level1Referrer.referrer_id, level1Reward, desc1).run()
 
-              // 2대 매칭추천수당 (10%)
-              const level2Referrer = await db.prepare(`
-                SELECT referrer_id FROM users WHERE id = ?
-              `).bind(level1Referrer.referrer_id).first()
+              // 2대 매칭추천수당 (10%) — 리셋 스테이킹은 Level 2 지급 ❌
+              if (!isResetStaking) {
+                const level2Referrer = await db.prepare(`
+                  SELECT referrer_id FROM users WHERE id = ?
+                `).bind(level1Referrer.referrer_id).first()
 
-              if (level2Referrer && level2Referrer.referrer_id) {
-                const level2Reward = Math.round(qkeyAmount * 0.10)
-                
-                await db.prepare(`
-                  UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-                `).bind(level2Reward, level2Referrer.referrer_id).run()
+                if (level2Referrer && level2Referrer.referrer_id) {
+                  const level2Reward = Math.round(qkeyAmount * 0.10)
+                  
+                  await db.prepare(`
+                    UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+                  `).bind(level2Reward, level2Referrer.referrer_id).run()
 
-                await db.prepare(`
-                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
-                  VALUES (?, ?, 2, ?, ?, ?)
-                `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, today).run()
+                  await db.prepare(`
+                    INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
+                    VALUES (?, ?, 2, ?, ?, ?)
+                  `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, today).run()
 
-                await db.prepare(`
-                  INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                  VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%)`).run()
+                  await db.prepare(`
+                    INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                    VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                  `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%)`).run()
+                }
               }
             }
           } catch (referralError) {
@@ -5284,13 +5296,12 @@ app.get('/dashboard', (c) => {
 
             // 스테이킹 현황 업데이트
             function updateStakingStatus(stakings) {
-                // 진행중인 스테이킹 (active 이면서 어드민에 의해 리셋되지 않은 것만)
-                // ★ reset_at이 NULL이 아닌 스테이킹은 어드민이 코인3종 리셋 처리한 건이므로
-                //    "퀀타리움구매(USDT)" 진입금액 박스 합계에서 제외해야 한다.
-                //    (스테이킹 목록 자체는 그대로 보이게 두어 데일리 배당이 누적되는 걸 확인 가능)
-                const activeStakings = stakings.filter(s => s.status === 'active' && !s.reset_at);
+                // ★ 룰: 진입금액(USDT)과 진행중 건수는 리셋 여부와 상관없이 무조건 표시한다.
+                //   리셋된 스테이킹도 본인이 입금한 금액이므로 메인 카드(퀀타리움구매)에 합산해 보여줘야 한다.
+                //   코인 3종(QTA/QX/QKEY) 보상값만 리셋된 row에서 0으로 표시되도록 백엔드에서 이미 처리되어 있다.
+                const activeStakings = stakings.filter(s => s.status === 'active');
                 
-                // 전체 위탁 수량 계산 (리셋된 건은 빠짐)
+                // 전체 위탁 수량 계산 (리셋된 건도 포함)
                 const totalAmount = activeStakings.reduce((sum, s) => sum + s.amount, 0);
                 
                 // 스테이킹 현황 카드 업데이트
