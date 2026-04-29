@@ -2574,6 +2574,92 @@ app.post('/api/admin/staking/:stakingId/unmark-reset', async (c) => {
   } catch (e: any) { return c.json({ error: e.message }, 500) }
 })
 
+// 관리자: 리셋된 스테이킹에 잘못 지급된 배당/매칭수당 환수 처리
+//  - reset_at IS NOT NULL인 스테이킹의 daily_rewards를 모두 찾아서 환수
+//  - 사용자 QKEY 잔액 차감 + 매칭수당 받은 추천인 잔액도 차감
+//  - daily_rewards / 관련 transactions 행은 삭제하여 다음 cron에서 중복 미발생
+app.post('/api/admin/clawback-reset-rewards', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const targetUserId = body.userId  // 선택적: 특정 사용자만 처리. 없으면 전체
+
+    // 리셋된 스테이킹 + 그에 연결된 daily_rewards 조회
+    let query = `
+      SELECT dr.id as reward_id, dr.user_id, dr.staking_id, dr.usdt_amount as qkey_amount, dr.reward_date,
+             s.amount as staking_amount, s.reset_at,
+             u.referrer_id
+      FROM daily_rewards dr
+      JOIN staking s ON dr.staking_id = s.id
+      JOIN users u ON dr.user_id = u.id
+      WHERE s.reset_at IS NOT NULL
+    `
+    const params: any[] = []
+    if (targetUserId) {
+      query += ` AND dr.user_id = ?`
+      params.push(targetUserId)
+    }
+    const wrongRewards = await db.prepare(query).bind(...params).all()
+
+    const summary = {
+      reward_rows: wrongRewards.results.length,
+      total_qkey_clawback: 0,
+      affected_users: new Set<number>(),
+      level1_clawback: 0,
+      level2_clawback: 0,
+      affected_referrers: new Set<number>(),
+    }
+
+    for (const r of wrongRewards.results as any[]) {
+      const qkey = r.qkey_amount || 0
+      // 1. 사용자 QKEY 잔액에서 환수 (음수 방지: GREATEST 효과를 위해 0 이하로 안 내려감)
+      await db.prepare(`UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?`).bind(qkey, r.user_id).run()
+      summary.total_qkey_clawback += qkey
+      summary.affected_users.add(r.user_id)
+
+      // 2. 매칭수당 환수 — 1대 추천인(20%)
+      if (r.referrer_id) {
+        const lv1 = Math.round(qkey * 0.2)
+        await db.prepare(`UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?`).bind(lv1, r.referrer_id).run()
+        summary.level1_clawback += lv1
+        summary.affected_referrers.add(r.referrer_id)
+
+        // 1대 추천인의 추천인 = 2대 (10%)
+        const lv1User = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(r.referrer_id).first() as any
+        if (lv1User?.referrer_id) {
+          const lv2 = Math.round(qkey * 0.1)
+          await db.prepare(`UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?`).bind(lv2, lv1User.referrer_id).run()
+          summary.level2_clawback += lv2
+          summary.affected_referrers.add(lv1User.referrer_id)
+        }
+      }
+
+      // 3. 잘못된 daily_rewards 행 삭제 (다음 cron에서 다시 지급되도록 하려면 유지하지만,
+      //    리셋된 스테이킹은 이제 reset_at 필터로 cron에서 제외되므로 삭제해도 안전)
+      await db.prepare(`DELETE FROM daily_rewards WHERE id = ?`).bind(r.reward_id).run()
+    }
+
+    // 4. 관련 transactions(daily_qkey, referral_reward 중 오늘 reset 스테이킹 관련)도 정리
+    //    - 단순 식별이 어려우므로 보수적으로 그대로 두고, 사용자/추천인 잔액만 환수 (감사 추적 가능)
+
+    return c.json({
+      success: true,
+      message: '리셋된 스테이킹에 잘못 지급된 배당/매칭수당 환수 완료',
+      summary: {
+        reward_rows_removed: summary.reward_rows,
+        total_qkey_clawback_from_users: summary.total_qkey_clawback,
+        affected_user_count: summary.affected_users.size,
+        level1_referral_clawback: summary.level1_clawback,
+        level2_referral_clawback: summary.level2_clawback,
+        affected_referrer_count: summary.affected_referrers.size,
+      }
+    })
+  } catch (e: any) {
+    console.error('clawback error:', e)
+    return c.json({ error: e.message || 'clawback failed' }, 500)
+  }
+})
+
 app.post('/api/admin/user/:userId/reset-balance', async (c) => {
   try {
     const db = c.env.DB
@@ -3245,6 +3331,9 @@ app.post('/api/rewards/daily', async (c) => {
     }
 
     // 활성 투자 조회 (승인일 익일부터 거치기간 종료일까지)
+    // ★★ 어드민이 리셋한 스테이킹(reset_at IS NOT NULL)은 배당 지급 대상에서 제외 ★★
+    //   - 리셋된 스테이킹은 사용자에게 사라진 셈으로 처리되므로 배당도 지급되면 안 됨
+    //   - 매칭수당도 같은 cron 안에서 이 스테이킹을 기준으로 계산되므로 함께 제외됨
     const activeStakings = await db.prepare(`
       SELECT 
         s.user_id, 
@@ -3258,6 +3347,7 @@ app.post('/api/rewards/daily', async (c) => {
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count
       FROM staking s
       WHERE s.status = 'active' 
+        AND s.reset_at IS NULL
         AND date(s.end_date) >= date('now')
         AND date('now') >= date(s.start_date, '+1 day')
     `).all()
