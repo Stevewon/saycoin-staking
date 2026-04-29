@@ -2063,6 +2063,12 @@ app.delete('/api/admin/user/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
+    // ★ 강제 삭제 옵션 (?force=1) ★
+    //   - force=1: 진행 중인 스테이킹이 있어도 모든 데이터 삭제
+    //   - force 미지정: 기존처럼 active 스테이킹 있으면 차단 (안전장치)
+    const url = new URL(c.req.url)
+    const force = url.searchParams.get('force') === '1'
+
     // 사용자 존재 확인
     const user = await db.prepare(`
       SELECT id, name, email FROM users WHERE id = ?
@@ -2072,17 +2078,20 @@ app.delete('/api/admin/user/:userId', async (c) => {
       return c.json({ error: t(c, 'admin.user_not_found') }, 404)
     }
 
-    // 진행 중인 스테이킹 확인
-    const activeStaking = await db.prepare(`
-      SELECT COUNT(*) as count FROM staking 
-      WHERE user_id = ? AND status = 'active'
-    `).bind(userId).first()
+    // 진행 중인 스테이킹 확인 (force=1이면 차단 우회)
+    if (!force) {
+      const activeStaking = await db.prepare(`
+        SELECT COUNT(*) as count FROM staking 
+        WHERE user_id = ? AND status = 'active' AND reset_at IS NULL
+      `).bind(userId).first()
 
-    if (activeStaking && activeStaking.count > 0) {
-      return c.json({ 
-        error: t(c, 'admin.active_staking_block'),
-        activeStakingCount: activeStaking.count
-      }, 400)
+      if (activeStaking && activeStaking.count > 0) {
+        return c.json({ 
+          error: t(c, 'admin.active_staking_block'),
+          activeStakingCount: activeStaking.count,
+          hint: '강제 삭제하려면 ?force=1 쿼리 파라미터를 추가하세요.'
+        }, 400)
+      }
     }
 
     // 관련 데이터 삭제 (순서 중요: 외래키 제약조건)
@@ -8155,44 +8164,48 @@ app.get('/admin/dashboard', (c) => {
 
             // 사용자 강제 탈퇴
             async function deleteUser(userId, userName, userEmail, stakingAmount) {
-                // 진행 중인 스테이킹이 있는지 확인
+                // 1차 확인 — 진행 중 스테이킹이 있어도 일단 경고만 띄우고 진행 가능하게 함
+                let confirmMsg = (I18N.t('admin.delete_confirm1') || '회원을 삭제하시겠습니까?') + '\\n\\n' +
+                                 (I18N.t('admin.delete_user_label') || '회원: ') + userName + '\\n' +
+                                 (I18N.t('admin.delete_email_label') || '이메일: ') + userEmail + '\\n\\n';
                 if (stakingAmount > 0) {
-                    alert(I18N.t('admin.delete_has_staking') + '\\n\\n' + 
-                          I18N.t('admin.delete_user_label') + userName + '\\n' +
-                          I18N.t('admin.delete_email_label') + userEmail + '\\n' +
-                          I18N.t('admin.delete_staking_label') + stakingAmount.toLocaleString());
-                    return;
+                    confirmMsg += '⚠️ 진행 중인 스테이킹: ' + stakingAmount.toLocaleString() + ' USDT\\n' +
+                                  '   (강제 삭제 시 스테이킹/배당/추천관계까지 모두 영구 삭제됩니다)\\n\\n';
                 }
+                confirmMsg += (I18N.t('admin.delete_irreversible') || '이 작업은 되돌릴 수 없습니다.');
+                if (!confirm(confirmMsg)) return;
 
-                if (!confirm(I18N.t('admin.delete_confirm1') + '\\n\\n' + 
-                             I18N.t('admin.delete_user_label') + userName + '\\n' +
-                             I18N.t('admin.delete_email_label') + userEmail + '\\n\\n' +
-                             I18N.t('admin.delete_irreversible'))) {
-                    return;
-                }
-
-                // 두 번째 확인
-                if (!confirm(I18N.t('admin.delete_confirm2'))) {
-                    return;
+                // 2차 확인 (강제 삭제 케이스에는 추가 확인)
+                if (stakingAmount > 0) {
+                    if (!confirm('정말로 진행 중 스테이킹을 가진 회원을 강제 삭제하시겠습니까?\\n\\n[' + userName + '] ' + userEmail)) {
+                        return;
+                    }
+                } else {
+                    if (!confirm(I18N.t('admin.delete_confirm2') || '한 번 더 확인합니다. 정말 삭제하시겠습니까?')) {
+                        return;
+                    }
                 }
 
                 try {
-                    const response = await axios.delete('/api/admin/user/' + userId);
+                    // 진행 중 스테이킹이 있으면 ?force=1 쿼리로 강제 삭제
+                    const url = '/api/admin/user/' + userId + (stakingAmount > 0 ? '?force=1' : '');
+                    const response = await axios.delete(url);
                     if (response.data.success) {
-                        alert(I18N.t('admin.delete_success') + '\\n\\n' +
-                              I18N.t('admin.delete_name_label') + response.data.deletedUser.name + '\\n' +
-                              I18N.t('admin.delete_email_label') + response.data.deletedUser.email);
+                        alert((I18N.t('admin.delete_success') || '삭제 완료') + '\\n\\n' +
+                              (I18N.t('admin.delete_name_label') || '이름: ') + response.data.deletedUser.name + '\\n' +
+                              (I18N.t('admin.delete_email_label') || '이메일: ') + response.data.deletedUser.email);
                         await loadUsers();
                         await loadSignups();
                     }
                 } catch (error) {
                     console.error('User delete failed:', error);
                     if (error.response && error.response.data && error.response.data.error) {
-                        alert(I18N.t('admin.delete_fail') + error.response.data.error + 
+                        alert((I18N.t('admin.delete_fail') || '삭제 실패: ') + error.response.data.error + 
                               (error.response.data.activeStakingCount ? 
-                               '\\n' + I18N.t('admin.delete_active_staking') + error.response.data.activeStakingCount + I18N.t('admin.cases_unit') : ''));
+                               '\\n진행 중 스테이킹: ' + error.response.data.activeStakingCount + '건' : '') +
+                              (error.response.data.hint ? '\\n\\n' + error.response.data.hint : ''));
                     } else {
-                        alert(I18N.t('admin.delete_error'));
+                        alert(I18N.t('admin.delete_error') || '삭제 중 오류가 발생했습니다.');
                     }
                 }
             }
