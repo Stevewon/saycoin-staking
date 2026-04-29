@@ -1671,18 +1671,41 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
 // API Routes - Staking
 // ============================================
 
+// 정책 변경 적용 시점: 2026-04-30 00:00 KST (UTC 2026-04-29 15:00)
+//   - $1,000~$4,000 구간: 일일 배당률 0.3%/0.5% → 0.5% 통일
+//   - $1,000~$4,000 구간: 거치기간 60일/90일 → 90일 통일
+//   - $5,000 이상 구간(0.7% 120일, 1.0% 180일)은 변경 없음
+//   - 기존 스테이킹은 staking row에 daily_rate/period_days가 고정 저장되어 영향 없음
+const POLICY_V2_DATE = new Date('2026-04-30T00:00:00+09:00')
+
 // 투자금액별 일일 배당률 계산
-function getDailyRate(amount: number): number {
+function getDailyRate(amount: number, asOf?: Date): number {
+  const now = asOf || new Date()
+  const isV2 = now >= POLICY_V2_DATE
+
   if (amount >= 10000) return 0.01    // $10,000+: 1.0%
   if (amount >= 5000) return 0.007    // $5,000~$9,000: 0.7%
+  if (isV2) {
+    // [V2 / 2026-04-30~] $1,000~$4,000: 0.5% 통일
+    return 0.005
+  }
+  // [V1 / ~2026-04-29] 기존 룰
   if (amount >= 3000) return 0.005    // $3,000~$4,000: 0.5%
   return 0.003                         // $1,000~$2,000: 0.3%
 }
 
 // 투자금액별 자동 거치기간 결정
-function getAutoPeriodDays(amount: number): number {
+function getAutoPeriodDays(amount: number, asOf?: Date): number {
+  const now = asOf || new Date()
+  const isV2 = now >= POLICY_V2_DATE
+
   if (amount >= 10000) return 180     // $10,000+: 180일
   if (amount >= 5000) return 120      // $5,000~$9,000: 120일
+  if (isV2) {
+    // [V2 / 2026-04-30~] $1,000~$4,000: 90일 통일
+    return 90
+  }
+  // [V1 / ~2026-04-29] 기존 룰
   if (amount >= 3000) return 90       // $3,000~$4,000: 90일
   return 60                            // $1,000~$2,000: 60일
 }
@@ -4805,27 +4828,8 @@ app.get('/dashboard', (c) => {
                                             <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.period">거치기간</th>
                                         </tr>
                                     </thead>
-                                    <tbody class="divide-y divide-gray-200">
-                                        <tr id="policyRow1" class="">
-                                            <td class="px-2 sm:px-3 py-2 font-medium">$1,000 ~ $2,000</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">0.3%</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">60 <span data-i18n="dash.days">days</span></td>
-                                        </tr>
-                                        <tr id="policyRow2" class="">
-                                            <td class="px-2 sm:px-3 py-2 font-medium">$3,000 ~ $4,000</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">0.5%</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">90 <span data-i18n="dash.days">days</span></td>
-                                        </tr>
-                                        <tr id="policyRow3" class="">
-                                            <td class="px-2 sm:px-3 py-2 font-medium">$5,000 ~ $9,000</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">0.7%</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">120 <span data-i18n="dash.days">days</span></td>
-                                        </tr>
-                                        <tr id="policyRow4" class="">
-                                            <td class="px-2 sm:px-3 py-2 font-medium">$10,000+</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">1.0%</td>
-                                            <td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">180 <span data-i18n="dash.days">days</span></td>
-                                        </tr>
+                                    <tbody id="policyTableBody" class="divide-y divide-gray-200">
+                                        <!-- 정책 표는 클라이언트에서 V1/V2 시점에 따라 동적으로 렌더링됨 (renderPolicyTable) -->
                                     </tbody>
                                 </table>
                             </div>
@@ -5293,6 +5297,9 @@ app.get('/dashboard', (c) => {
             async function loadDashboard() {
                 currentUser = checkAuth();
                 if (!currentUser) return;
+
+                // 정책 표 동적 렌더링 (V1/V2 시점에 따라 자동 분기)
+                try { renderPolicyTable(); } catch (e) { console.error('renderPolicyTable error:', e); }
 
                 document.getElementById('userName').textContent = currentUser.name;
                 // 추천인 코드 표시
@@ -6135,12 +6142,56 @@ app.get('/dashboard', (c) => {
             // 유저 스테이킹 목록 저장용
             let userStakings = [];
 
+            // 정책 V2 적용 시점: 2026-04-30 00:00 KST
+            //   - $1,000~$4,000 구간: 0.5% / 90일 통일
+            //   - 그 이전(V1): $1,000~$2,000=0.3%/60일, $3,000~$4,000=0.5%/90일
+            var POLICY_V2_DATE = new Date('2026-04-30T00:00:00+09:00');
+            function isPolicyV2() {
+                return new Date() >= POLICY_V2_DATE;
+            }
+
             // 금액별 정책 정보 반환
             function getPolicy(amount) {
+                var v2 = isPolicyV2();
                 if (amount >= 10000) return { rate: '1.0%', rateNum: 0.01, period: 180, periodText: '180' + I18N.t('dash.days') };
                 if (amount >= 5000) return { rate: '0.7%', rateNum: 0.007, period: 120, periodText: '120' + I18N.t('dash.days') };
+                if (v2) {
+                    return { rate: '0.5%', rateNum: 0.005, period: 90, periodText: '90' + I18N.t('dash.days') };
+                }
                 if (amount >= 3000) return { rate: '0.5%', rateNum: 0.005, period: 90, periodText: '90' + I18N.t('dash.days') };
                 return { rate: '0.3%', rateNum: 0.003, period: 60, periodText: '60' + I18N.t('dash.days') };
+            }
+
+            // 정책 표 동적 렌더링 (V1/V2 분기)
+            function renderPolicyTable() {
+                var tbody = document.getElementById('policyTableBody');
+                if (!tbody) return;
+                var v2 = isPolicyV2();
+                var rows;
+                if (v2) {
+                    // V2: 1,000~4,000 통합
+                    rows = [
+                        { id: 'policyRow1', amount: '$1,000 ~ $4,000', rate: '0.5%', days: '90' },
+                        { id: 'policyRow3', amount: '$5,000 ~ $9,000', rate: '0.7%', days: '120' },
+                        { id: 'policyRow4', amount: '$10,000+',         rate: '1.0%', days: '180' }
+                    ];
+                } else {
+                    // V1: 기존
+                    rows = [
+                        { id: 'policyRow1', amount: '$1,000 ~ $2,000', rate: '0.3%', days: '60' },
+                        { id: 'policyRow2', amount: '$3,000 ~ $4,000', rate: '0.5%', days: '90' },
+                        { id: 'policyRow3', amount: '$5,000 ~ $9,000', rate: '0.7%', days: '120' },
+                        { id: 'policyRow4', amount: '$10,000+',         rate: '1.0%', days: '180' }
+                    ];
+                }
+                var daysLabel = I18N.t('dash.days') || 'days';
+                tbody.innerHTML = rows.map(function(r) {
+                    return '<tr id="' + r.id + '" class="">' +
+                           '<td class="px-2 sm:px-3 py-2 font-medium">' + r.amount + '</td>' +
+                           '<td class="px-2 sm:px-3 py-2 text-center font-bold text-green-600">' + r.rate + '</td>' +
+                           '<td class="px-2 sm:px-3 py-2 text-center font-bold text-blue-600">' + r.days + ' <span>' + daysLabel + '</span></td>' +
+                           '</tr>';
+                }).join('');
             }
 
             // $1,000 추가 (누적)
@@ -6160,9 +6211,10 @@ app.get('/dashboard', (c) => {
                 document.getElementById('stakingAmount').value = accumulatedAmount;
                 document.getElementById('accumulatedAmountText').textContent = '$' + accumulatedAmount.toLocaleString();
                 
-                // 정책 테이블 하이라이트 초기화
-                ['policyRow1', 'policyRow2', 'policyRow3', 'policyRow4'].forEach(id => {
-                    document.getElementById(id).className = '';
+                // 정책 테이블 하이라이트 초기화 (V1/V2 모두 처리: 존재하는 row만 초기화)
+                ['policyRow1', 'policyRow2', 'policyRow3', 'policyRow4'].forEach(function(id) {
+                    var el = document.getElementById(id);
+                    if (el) el.className = '';
                 });
 
                 if (accumulatedAmount <= 0) {
@@ -6176,16 +6228,20 @@ app.get('/dashboard', (c) => {
                 document.getElementById('autoRateDisplay').textContent = policy.rate;
                 document.getElementById('autoPeriodDisplay').textContent = policy.periodText;
 
-                // 해당 정책 행 하이라이트
+                // 해당 정책 행 하이라이트 (V2: row1=$1,000~$4,000 통합 / V1: row1=$1,000~$2,000, row2=$3,000~$4,000)
+                var v2 = isPolicyV2();
+                var targetRowId = null;
                 if (accumulatedAmount >= 10000) {
-                    document.getElementById('policyRow4').className = 'bg-purple-100 font-bold';
+                    targetRowId = 'policyRow4';
                 } else if (accumulatedAmount >= 5000) {
-                    document.getElementById('policyRow3').className = 'bg-purple-100 font-bold';
-                } else if (accumulatedAmount >= 3000) {
-                    document.getElementById('policyRow2').className = 'bg-purple-100 font-bold';
+                    targetRowId = 'policyRow3';
+                } else if (!v2 && accumulatedAmount >= 3000) {
+                    targetRowId = 'policyRow2';
                 } else {
-                    document.getElementById('policyRow1').className = 'bg-purple-100 font-bold';
+                    targetRowId = 'policyRow1';
                 }
+                var targetEl = document.getElementById(targetRowId);
+                if (targetEl) targetEl.className = 'bg-purple-100 font-bold';
 
                 // 보상 미리보기 (날짜별 정책: ~5/3 QTA 75k + QX 10k + QKEY 5k, 5/4~ QTA 75k only)
                 var PHASE2 = new Date('2026-05-04T00:00:00+09:00');
