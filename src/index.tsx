@@ -9797,9 +9797,8 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 개별 송장 등록 모달
-            // 송장 메모에서 택배사/송장번호 안전 파싱 (정규식/이스케이프 이슈 완전 회피)
-            // 백틱 템플릿 리터럴 안에서는 '\n','\r','\t' 가 실제 줄바꿈/탭으로 해석되어
-            // 문법 오류를 일으키므로 String.fromCharCode 로 안전하게 처리
+            // 송장 메모에서 택배사/송장번호 안전 파싱
+            // 정규식/이스케이프 이슈 완전 회피 - charCode로 공백문자 비교
             function parseTrackingFromMemo(memo) {
                 var result = { courier: '', no: '' };
                 if (!memo) return result;
