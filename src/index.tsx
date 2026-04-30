@@ -7796,13 +7796,19 @@ app.get('/admin/dashboard', (c) => {
                             <div class="flex gap-2 items-center flex-wrap">
                                 <div class="relative">
                                     <i class="fas fa-search absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 text-xs"></i>
-                                    <input type="text" id="adminProductSearch" placeholder="상품명/카테고리/설명 검색" class="pl-7 pr-7 py-1.5 border rounded text-xs w-56" oninput="renderAdminProducts()">
-                                    <button onclick="document.getElementById('adminProductSearch').value=''; renderAdminProducts();" class="absolute right-1 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-xs px-1" title="검색 초기화"><i class="fas fa-times"></i></button>
+                                    <input type="text" id="adminProductSearch" placeholder="상품명/카테고리/설명 검색" class="pl-7 pr-7 py-1.5 border rounded text-xs w-56" oninput="onAdminProductSearchChange()">
+                                    <button onclick="document.getElementById('adminProductSearch').value=''; onAdminProductSearchChange();" class="absolute right-1 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-xs px-1" title="검색 초기화"><i class="fas fa-times"></i></button>
                                 </div>
-                                <select id="adminProductFilterStatus" onchange="renderAdminProducts()" class="text-xs border rounded px-2 py-1.5">
+                                <select id="adminProductFilterStatus" onchange="onAdminProductSearchChange()" class="text-xs border rounded px-2 py-1.5">
                                     <option value="">전체상태</option>
                                     <option value="active">판매중</option>
                                     <option value="inactive">비활성</option>
+                                </select>
+                                <select id="adminProductPageSize" onchange="onAdminProductPageSizeChange()" class="text-xs border rounded px-2 py-1.5">
+                                    <option value="10">10개씩</option>
+                                    <option value="20" selected>20개씩</option>
+                                    <option value="50">50개씩</option>
+                                    <option value="100">100개씩</option>
                                 </select>
                                 <button onclick="loadAdminShopProducts()" class="px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-xs font-bold"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
                             </div>
@@ -7810,6 +7816,8 @@ app.get('/admin/dashboard', (c) => {
                         <div id="adminProductList" class="space-y-2">
                             <p class="text-gray-400 text-center py-4">로딩 중...</p>
                         </div>
+                        <!-- 페이지네이션 -->
+                        <div id="adminProductPagination" class="flex items-center justify-center gap-1 mt-4 flex-wrap"></div>
                     </div>
 
                     <!-- 실시간 주문 현황 -->
@@ -9806,24 +9814,51 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
-            // 어드민 상품 캐시 (검색/필터링 위해 클라이언트에 보관)
+            // 어드민 상품 캐시 (검색/필터링/페이지네이션 위해 클라이언트에 보관)
             var _adminProductsCache = [];
+            var _adminProductPage = 1;
+            var _adminProductPageSize = 20;
 
             async function loadAdminShopProducts() {
                 try {
                     var res = await axios.get('/api/admin/shop/products');
                     if (!res.data.success) return;
                     _adminProductsCache = res.data.products || [];
+                    _adminProductPage = 1;
                     renderAdminProducts();
                 } catch(e) {
                     console.error('Admin products load error:', e);
                 }
             }
 
+            // 검색/필터 변경 시 1페이지로 리셋
+            function onAdminProductSearchChange() {
+                _adminProductPage = 1;
+                renderAdminProducts();
+            }
+
+            // 페이지 사이즈 변경
+            function onAdminProductPageSizeChange() {
+                var sel = document.getElementById('adminProductPageSize');
+                _adminProductPageSize = parseInt(sel ? sel.value : '20') || 20;
+                _adminProductPage = 1;
+                renderAdminProducts();
+            }
+
+            // 페이지 이동
+            function gotoAdminProductPage(p) {
+                _adminProductPage = p;
+                renderAdminProducts();
+                // 상품 목록 상단으로 스크롤
+                var listTop = document.getElementById('adminProductList');
+                if (listTop) listTop.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+
             function renderAdminProducts() {
                 var el = document.getElementById('adminProductList');
                 if (!el) return;
                 var countEl = document.getElementById('adminProductCount');
+                var pagEl = document.getElementById('adminProductPagination');
                 var q = ((document.getElementById('adminProductSearch') || {}).value || '').toLowerCase().trim();
                 var statusF = (document.getElementById('adminProductFilterStatus') || {}).value || '';
 
@@ -9837,17 +9872,33 @@ app.get('/admin/dashboard', (c) => {
                     return true;
                 });
 
-                if (countEl) countEl.textContent = '(' + filtered.length + '/' + _adminProductsCache.length + ')';
+                var total = filtered.length;
+                var pageSize = _adminProductPageSize || 20;
+                var totalPages = Math.max(1, Math.ceil(total / pageSize));
+                if (_adminProductPage > totalPages) _adminProductPage = totalPages;
+                if (_adminProductPage < 1) _adminProductPage = 1;
+
+                if (countEl) {
+                    countEl.textContent = '(' + total + '/' + _adminProductsCache.length + ' / ' + _adminProductPage + '/' + totalPages + ' 페이지)';
+                }
 
                 if (_adminProductsCache.length === 0) {
                     el.innerHTML = '<p class="text-gray-400 text-center py-4">등록된 상품이 없습니다</p>';
+                    if (pagEl) pagEl.innerHTML = '';
                     return;
                 }
                 if (filtered.length === 0) {
                     el.innerHTML = '<p class="text-gray-400 text-center py-4">검색/필터 조건에 맞는 상품이 없습니다</p>';
+                    if (pagEl) pagEl.innerHTML = '';
                     return;
                 }
-                el.innerHTML = filtered.map(function(p) {
+
+                // 현재 페이지 슬라이스
+                var startIdx = (_adminProductPage - 1) * pageSize;
+                var endIdx = Math.min(startIdx + pageSize, total);
+                var pageItems = filtered.slice(startIdx, endIdx);
+
+                el.innerHTML = pageItems.map(function(p) {
                     var qkeyPrice = Math.ceil(p.price_krw / 10);
                     var activeLabel = p.is_active ? '<span class="text-green-600 text-xs font-bold">판매중</span>' : '<span class="text-red-500 text-xs font-bold">비활성</span>';
                     var stockLabel = p.stock === -1 ? '무제한' : p.stock;
@@ -9875,6 +9926,65 @@ app.get('/admin/dashboard', (c) => {
                         '</div>' +
                     '</div>';
                 }).join('');
+
+                // 페이지네이션 컨트롤 렌더링
+                if (pagEl) {
+                    pagEl.innerHTML = buildPaginationHtml(_adminProductPage, totalPages, 'gotoAdminProductPage');
+                }
+            }
+
+            // 공용 페이지네이션 HTML 빌더 (이전/다음/페이지번호/처음/끝)
+            function buildPaginationHtml(currentPage, totalPages, fnName) {
+                if (totalPages <= 1) {
+                    return '<span class="text-xs text-gray-500">' + (totalPages === 1 ? '1 페이지' : '내역 없음') + '</span>';
+                }
+                var html = '';
+                var btnBase = 'min-w-[36px] px-3 py-1.5 text-xs font-bold rounded transition border';
+                var btnActive = 'bg-blue-600 text-white border-blue-600 shadow';
+                var btnIdle = 'bg-white text-gray-700 border-gray-300 hover:bg-gray-100';
+                var btnDisabled = 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed';
+
+                // 처음
+                if (currentPage > 1) {
+                    html += '<button onclick="' + fnName + '(1)" class="' + btnBase + ' ' + btnIdle + '" title="처음"><i class="fas fa-angle-double-left"></i></button>';
+                } else {
+                    html += '<button disabled class="' + btnBase + ' ' + btnDisabled + '"><i class="fas fa-angle-double-left"></i></button>';
+                }
+                // 이전
+                if (currentPage > 1) {
+                    html += '<button onclick="' + fnName + '(' + (currentPage - 1) + ')" class="' + btnBase + ' ' + btnIdle + '" title="이전"><i class="fas fa-angle-left mr-1"></i>이전</button>';
+                } else {
+                    html += '<button disabled class="' + btnBase + ' ' + btnDisabled + '"><i class="fas fa-angle-left mr-1"></i>이전</button>';
+                }
+
+                // 페이지 번호 (현재 ±2 범위)
+                var startP = Math.max(1, currentPage - 2);
+                var endP = Math.min(totalPages, currentPage + 2);
+                if (startP > 1) html += '<span class="px-1 text-xs text-gray-400">...</span>';
+                for (var pn = startP; pn <= endP; pn++) {
+                    if (pn === currentPage) {
+                        html += '<button class="' + btnBase + ' ' + btnActive + '">' + pn + '</button>';
+                    } else {
+                        html += '<button onclick="' + fnName + '(' + pn + ')" class="' + btnBase + ' ' + btnIdle + '">' + pn + '</button>';
+                    }
+                }
+                if (endP < totalPages) html += '<span class="px-1 text-xs text-gray-400">...</span>';
+
+                // 다음
+                if (currentPage < totalPages) {
+                    html += '<button onclick="' + fnName + '(' + (currentPage + 1) + ')" class="' + btnBase + ' ' + btnIdle + '" title="다음">다음<i class="fas fa-angle-right ml-1"></i></button>';
+                } else {
+                    html += '<button disabled class="' + btnBase + ' ' + btnDisabled + '">다음<i class="fas fa-angle-right ml-1"></i></button>';
+                }
+                // 끝
+                if (currentPage < totalPages) {
+                    html += '<button onclick="' + fnName + '(' + totalPages + ')" class="' + btnBase + ' ' + btnIdle + '" title="끝"><i class="fas fa-angle-double-right"></i></button>';
+                } else {
+                    html += '<button disabled class="' + btnBase + ' ' + btnDisabled + '"><i class="fas fa-angle-double-right"></i></button>';
+                }
+
+                html += '<span class="ml-2 text-xs text-gray-500">' + currentPage + ' / ' + totalPages + '</span>';
+                return html;
             }
 
             async function adminToggleProduct(id, newActive, btnEl) {
