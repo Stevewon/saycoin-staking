@@ -9764,15 +9764,16 @@ app.get('/admin/dashboard', (c) => {
                     selectHtml += '</select>';
                     var shippingInfo = [o.shipping_name, o.shipping_phone, o.shipping_address].filter(Boolean).join(' / ') || '-';
                     // 송장 정보 추출 (shipping_memo에 "[택배사] 송장: 번호" 형식으로 저장됨)
+                    // ★ 정규식 대신 안전한 문자열 파싱 사용 (백틱 템플릿 이스케이프 문제 회피)
                     var trackingDisplay = '';
                     var memo = o.shipping_memo || '';
-                    var trackMatch = memo.match(/(?:\[([^\]]+)\]\s*)?송장:\s*([^\s|]+)/);
-                    if (trackMatch) {
-                        trackingDisplay = '<div class="text-xs text-blue-600 mt-1"><i class="fas fa-truck mr-1"></i>' + (trackMatch[1] ? '[' + esc(trackMatch[1]) + '] ' : '') + esc(trackMatch[2]) + '</div>';
+                    var trackInfo = parseTrackingFromMemo(memo);
+                    if (trackInfo.no) {
+                        trackingDisplay = '<div class="text-xs text-blue-600 mt-1"><i class="fas fa-truck mr-1"></i>' + (trackInfo.courier ? '[' + esc(trackInfo.courier) + '] ' : '') + esc(trackInfo.no) + '</div>';
                     }
                     // 개별 송장 등록/수정 버튼
-                    var trackBtnLabel = trackMatch ? '<i class="fas fa-edit mr-1"></i>송장수정' : '<i class="fas fa-truck mr-1"></i>송장등록';
-                    var trackBtnColor = trackMatch ? 'bg-purple-500 hover:bg-purple-600' : 'bg-blue-500 hover:bg-blue-600';
+                    var trackBtnLabel = trackInfo.no ? '<i class="fas fa-edit mr-1"></i>송장수정' : '<i class="fas fa-truck mr-1"></i>송장등록';
+                    var trackBtnColor = trackInfo.no ? 'bg-purple-500 hover:bg-purple-600' : 'bg-blue-500 hover:bg-blue-600';
                     var trackBtn = '<button onclick="openTrackingModal(' + o.id + ')" class="px-2 py-1 text-xs ' + trackBtnColor + ' text-white rounded font-bold shadow mt-1 w-full">' + trackBtnLabel + '</button>';
                     return '<tr class="hover:bg-gray-50">' +
                         '<td class="px-3 py-2 text-xs"><span class="font-medium">' + esc(o.user_name || '-') + '</span><br><span class="text-gray-400">' + esc(o.user_email || '') + '</span></td>' +
@@ -9796,16 +9797,40 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 개별 송장 등록 모달
+            // 송장 메모에서 택배사/송장번호 안전 파싱 (정규식 백슬래시 이스케이프 이슈 회피)
+            function parseTrackingFromMemo(memo) {
+                var result = { courier: '', no: '' };
+                if (!memo) return result;
+                // shipping_memo는 "[택배사] 송장: 번호" 또는 "송장: 번호" 형식
+                var idx = memo.indexOf('송장:');
+                if (idx === -1) return result;
+                // 택배사 추출: 송장: 앞쪽에서 [택배사] 패턴 찾기
+                var prefix = memo.substring(0, idx);
+                var lb = prefix.lastIndexOf('[');
+                var rb = prefix.lastIndexOf(']');
+                if (lb !== -1 && rb !== -1 && rb > lb) {
+                    result.courier = prefix.substring(lb + 1, rb).trim();
+                }
+                // 송장번호 추출: '송장:' 뒤 공백 제거 후 다음 공백/| 이전까지
+                var rest = memo.substring(idx + 3).replace(/^\s+/, '');
+                var endIdx = rest.length;
+                for (var i = 0; i < rest.length; i++) {
+                    var ch = rest.charAt(i);
+                    if (ch === ' ' || ch === '\t' || ch === '|' || ch === '\n' || ch === '\r') { endIdx = i; break; }
+                }
+                result.no = rest.substring(0, endIdx).trim();
+                return result;
+            }
+
             function openTrackingModal(orderId) {
                 var order = (_adminShopOrdersCache || []).find(function(x){ return x.id === orderId; });
                 if (!order) { alert('주문 정보를 찾을 수 없습니다'); return; }
 
                 // 기존 송장 정보 파싱
-                var existingNo = '';
-                var existingCourier = '';
                 var memo = order.shipping_memo || '';
-                var m = memo.match(/(?:\[([^\]]+)\]\s*)?송장:\s*([^\s|]+)/);
-                if (m) { existingCourier = m[1] || ''; existingNo = m[2] || ''; }
+                var parsed = parseTrackingFromMemo(memo);
+                var existingNo = parsed.no;
+                var existingCourier = parsed.courier;
 
                 var courierList = ['CJ대한통운','한진택배','롯데택배','우체국택배','로젠택배','경동택배','쿠팡로지스틱스','GS택배','직접배송','기타'];
                 var courierOpts = courierList.map(function(c) {
