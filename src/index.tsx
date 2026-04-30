@@ -9003,15 +9003,26 @@ app.get('/admin/dashboard', (c) => {
             }
             // CSV 텍스트 → 행 배열(2D)
             function _parseCsv(text) {
-                // BOM 제거 + 줄바꿈 정규화 (백틱 안에서 보존되도록 이중 이스케이프)
-                text = text.replace(/^\\uFEFF/, '').replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
+                // BOM 제거 + 줄바꿈 정규화 (정규식은 RegExp 생성자로 만들어 백틱 이스케이프 회피)
+                var BOM = String.fromCharCode(0xFEFF);
+                if (text.charAt(0) === BOM) text = text.slice(1);
+                var CR = String.fromCharCode(13);
+                var LF = String.fromCharCode(10);
+                // CRLF, CR → LF 단일화
+                var out = '';
+                for (var k = 0; k < text.length; k++) {
+                    var c = text.charAt(k);
+                    if (c === CR) { out += LF; if (text.charAt(k+1) === LF) k++; }
+                    else { out += c; }
+                }
+                text = out;
                 var rows = []; var cur = ''; var inQ = false;
                 for (var i = 0; i < text.length; i++) {
                     var ch = text[i];
                     if (ch === '"') {
                         if (inQ && text[i+1] === '"') { cur += '""'; i++; }
                         else { cur += ch; inQ = !inQ; }
-                    } else if (ch === '\\n' && !inQ) {
+                    } else if (ch === LF && !inQ) {
                         rows.push(_parseCsvLine(cur)); cur = '';
                     } else { cur += ch; }
                 }
@@ -9076,23 +9087,54 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 상품 대량등록 (CSV + 엑셀 통합) — HTML 설명, 이미지URL, 옵션 모두 지원
+            // ★ 헤더 자동 감지: 첫 행이 헤더(상품명/가격...)인지 데이터인지 자동 판별
+            // ★ 빈 행 자동 스킵 + 상세 진단 메시지로 누락 원인 정확히 안내
             function handleBulkProductUpload(input) {
                 if (!input.files || !input.files[0]) return;
                 var file = input.files[0];
                 var statusEl = document.getElementById('bulkProductStatus');
                 if (statusEl) statusEl.textContent = '읽는 중...';
                 _readSpreadsheet(file).then(async function(rows) {
-                    if (!rows || rows.length < 2) { alert('데이터가 없습니다 (헤더 1행 + 데이터 1행 이상 필요)'); if(statusEl) statusEl.textContent=''; return; }
-                    // 첫 행은 헤더로 간주하고 스킵
-                    var count = 0; var errors = [];
-                    for (var i = 1; i < rows.length; i++) {
-                        var r = rows[i];
+                    if (!rows || rows.length === 0) {
+                        alert('파일에 읽을 수 있는 데이터가 없습니다.\\n\\n확인사항:\\n• 엑셀 첫 시트에 데이터가 있는지\\n• 셀이 텍스트/숫자로 채워져 있는지\\n• 빈 시트가 아닌지');
+                        if(statusEl) statusEl.textContent='';
+                        return;
+                    }
+
+                    // ★ 헤더 자동 감지: 첫 행 1번 컬럼이 '상품명' 또는 가격이 0/문자면 헤더로 간주
+                    var firstRow = rows[0] || [];
+                    var firstColRaw = (firstRow[0]||'').toString().trim();
+                    var firstPriceRaw = (firstRow[1]||'').toString().trim();
+                    var firstPriceNum = parseInt(firstPriceRaw.replace(/[^\\d-]/g,'')) || 0;
+                    var headerKeywords = ['상품명','상품 명','품명','이름','name','product','product name'];
+                    var looksLikeHeader = headerKeywords.indexOf(firstColRaw.toLowerCase()) !== -1
+                                          || firstColRaw === '상품명'
+                                          || (firstPriceRaw && firstPriceNum === 0 && !/^\\d/.test(firstPriceRaw));
+                    var startIdx = looksLikeHeader ? 1 : 0;
+
+                    if (rows.length - startIdx < 1) {
+                        alert('헤더 행은 있지만 데이터 행이 없습니다.\\n\\n첫 행에 헤더(상품명, 가격, ...)을 두고\\n두 번째 행부터 실제 상품 데이터를 입력하세요.');
+                        if(statusEl) statusEl.textContent='';
+                        return;
+                    }
+
+                    var count = 0; var errors = []; var skippedEmpty = 0;
+                    var processed = 0;
+                    var totalDataRows = rows.length - startIdx;
+
+                    for (var i = startIdx; i < rows.length; i++) {
+                        var r = rows[i] || [];
+                        // 행 자체가 완전히 비어있으면 조용히 스킵
+                        var hasAnyValue = r.some(function(c){ return c !== null && c !== undefined && (''+c).trim().length; });
+                        if (!hasAnyValue) { skippedEmpty++; continue; }
+
                         var pName = (r[0]||'').toString().trim();
-                        var pPrice = parseInt((r[1]||'').toString().replace(/[^\d-]/g,'')) || 0;
+                        var priceRaw = (r[1]||'').toString().trim();
+                        var pPrice = parseInt(priceRaw.replace(/[^\\d-]/g,'')) || 0;
                         var pDesc = (r[2]||'').toString();  // HTML 또는 텍스트 모두 허용
                         var pCat = (r[3]||'').toString().trim() || '일반';
                         var pStockRaw = (r[4]||'').toString().trim();
-                        var pStock = pStockRaw === '' ? -1 : (parseInt(pStockRaw) ?? -1);
+                        var pStock = pStockRaw === '' ? -1 : parseInt(pStockRaw);
                         if (isNaN(pStock)) pStock = -1;
                         var pOptsRaw = (r[5]||'').toString().trim();
                         var pImage = (r[6]||'').toString().trim();
@@ -9104,8 +9146,24 @@ app.get('/admin/dashboard', (c) => {
                                 if (optArr.length) pOpts = JSON.stringify(optArr);
                             } catch(e) {}
                         }
-                        if (!pName || pPrice <= 0) { errors.push((i+1)+'행: 상품명/가격 누락'); continue; }
-                        if (statusEl) statusEl.textContent = '등록 중... (' + i + '/' + (rows.length-1) + ')';
+
+                        // 상세 진단 메시지
+                        if (!pName && !priceRaw) {
+                            errors.push((i+1)+'행: 상품명, 가격 모두 비어있음');
+                            continue;
+                        }
+                        if (!pName) {
+                            errors.push((i+1)+'행: 상품명(A열)이 비어있음');
+                            continue;
+                        }
+                        if (pPrice <= 0) {
+                            if (!priceRaw) errors.push((i+1)+'행: 가격(B열)이 비어있음 [상품명: ' + pName + ']');
+                            else errors.push((i+1)+'행: 가격(B열) 인식 실패 "' + priceRaw + '" → 숫자만 입력하세요 [상품명: ' + pName + ']');
+                            continue;
+                        }
+
+                        processed++;
+                        if (statusEl) statusEl.textContent = '등록 중... (' + processed + '/' + totalDataRows + ')';
                         try {
                             await axios.post('/api/admin/shop/product', {
                                 name: pName, description: pDesc, price_krw: pPrice,
@@ -9113,13 +9171,20 @@ app.get('/admin/dashboard', (c) => {
                                 category: pCat, stock: pStock, options: pOpts
                             });
                             count++;
-                        } catch(e) { errors.push((i+1)+'행: ' + (e.response?.data?.error || '오류')); }
+                        } catch(e) { errors.push((i+1)+'행: ' + ((e.response && e.response.data && e.response.data.error) || '서버 오류') + ' [상품명: ' + pName + ']'); }
                     }
-                    alert(count + '개 상품 등록 완료!' + (errors.length > 0 ? '\\n\\n오류 ' + errors.length + '건:\\n' + errors.slice(0,10).join('\\n') + (errors.length>10?'\\n...':'') : ''));
+
+                    var summary = count + '개 상품 등록 완료!';
+                    if (skippedEmpty > 0) summary += '\\n빈 행 ' + skippedEmpty + '건 자동 스킵.';
+                    if (errors.length > 0) {
+                        summary += '\\n\\n오류 ' + errors.length + '건:\\n' + errors.slice(0,10).join('\\n') + (errors.length>10?'\\n... 외 ' + (errors.length-10) + '건':'');
+                        summary += '\\n\\n💡 도움말:\\n• 「엑셀 템플릿 다운로드」 버튼으로 정확한 컬럼 순서 확인\\n• A열=상품명, B열=가격(숫자만), C열=설명, D열=카테고리\\n• 가격은 콤마/원 표시 없이 숫자만 (예: 15000)';
+                    }
+                    alert(summary);
                     if (statusEl) statusEl.textContent = count + '개 등록됨' + (errors.length ? ' / 오류 ' + errors.length + '건' : '');
                     loadAdminShopProducts();
                 }).catch(function(err) {
-                    alert('파일 읽기 실패: ' + (err.message || err));
+                    alert('파일 읽기 실패: ' + (err.message || err) + '\\n\\n• 엑셀(.xlsx/.xls) 또는 CSV 파일만 지원\\n• 페이지 새로고침 후 다시 시도하세요');
                     if (statusEl) statusEl.textContent = '';
                 });
                 input.value = '';
