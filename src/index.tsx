@@ -3966,6 +3966,45 @@ app.get('/api/shop/orders/:userId', async (c) => {
   }
 })
 
+// 사용자: 주문 취소 (paid 상태에서만 가능, QKEY 환불 + 재고 복구)
+app.post('/api/shop/order/:orderId/cancel', async (c) => {
+  try {
+    const db = c.env.DB
+    const orderId = c.req.param('orderId')
+    const body = await c.req.json().catch(() => ({}))
+    const { userId } = body || {}
+    if (!userId) return c.json({ error: '사용자 정보가 필요합니다' }, 400)
+
+    const order = await db.prepare(`SELECT * FROM orders WHERE id = ? AND user_id = ?`).bind(orderId, userId).first()
+    if (!order) return c.json({ error: '주문을 찾을 수 없습니다' }, 404)
+    if (order.status !== 'paid') {
+      const labelMap: Record<string,string> = { shipping:'배송중', delivered:'배송완료', cancelled:'이미 취소됨' }
+      return c.json({ error: `취소할 수 없는 상태입니다 (현재: ${labelMap[order.status as string] || order.status}). 결제완료(paid) 상태에서만 취소 가능합니다.` }, 400)
+    }
+
+    // 상태 변경 (경쟁조건 방지: paid 상태에서만)
+    const upd = await db.prepare(`UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = 'paid'`).bind(orderId).run()
+    if (!upd.meta.changes) return c.json({ error: '이미 처리된 주문입니다' }, 400)
+
+    // QKEY 환불
+    await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(order.qkey_used, userId).run()
+
+    // 재고 복구 (재고 관리하는 상품만)
+    try {
+      await db.prepare(`UPDATE products SET stock = stock + ? WHERE id = ? AND stock != -1`).bind(order.quantity, order.product_id).run()
+    } catch(eStock) {}
+
+    // 환불 거래 기록
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'shop_refund', 'QKEY', ?, ?)`).bind(
+      userId, order.qkey_used, `쇼핑몰 구매취소 환불: ${order.product_name} x${order.quantity}`
+    ).run()
+
+    return c.json({ success: true, message: `구매가 취소되었습니다. ${Number(order.qkey_used).toLocaleString()} QKEY가 환불되었습니다.`, refunded: order.qkey_used })
+  } catch (error) {
+    return c.json({ error: '주문 취소 처리 중 오류가 발생했습니다' }, 500)
+  }
+})
+
 // 어드민: 상품 등록
 app.post('/api/admin/shop/product', async (c) => {
   try {
@@ -4093,9 +4132,28 @@ app.put('/api/admin/shop/order/:id/status', async (c) => {
     const db = c.env.DB
     const orderId = c.req.param('id')
     // 존재 여부 확인 (없는 ID에 대해 200을 반환하던 버그 수정)
-    const order = await db.prepare(`SELECT id, shipping_memo FROM orders WHERE id = ?`).bind(orderId).first() as any
+    const order = await db.prepare(`SELECT * FROM orders WHERE id = ?`).bind(orderId).first() as any
     if (!order) {
       return c.json({ error: '해당 주문을 찾을 수 없습니다' }, 404)
+    }
+    // ★ cancelled 로 변경하는 경우: 자동 환불 + 재고 복구 (이미 취소된 주문은 중복환불 방지)
+    let refundedQkey = 0
+    if (status === 'cancelled' && order.status !== 'cancelled') {
+      const upd = await db.prepare(`UPDATE orders SET status = 'cancelled' WHERE id = ? AND status != 'cancelled'`).bind(orderId).run()
+      if (upd.meta.changes) {
+        // QKEY 환불
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(order.qkey_used, order.user_id).run()
+        // 재고 복구 (재고 관리하는 상품만)
+        try {
+          await db.prepare(`UPDATE products SET stock = stock + ? WHERE id = ? AND stock != -1`).bind(order.quantity, order.product_id).run()
+        } catch(eStock) {}
+        // 환불 거래 기록
+        await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'shop_refund', 'QKEY', ?, ?)`).bind(
+          order.user_id, order.qkey_used, `[관리자] 쇼핑몰 구매취소 환불: ${order.product_name} x${order.quantity}`
+        ).run()
+        refundedQkey = order.qkey_used as number
+      }
+      return c.json({ success: true, refunded: refundedQkey, message: refundedQkey ? `취소 처리 완료. ${Number(refundedQkey).toLocaleString()} QKEY 환불됨.` : '취소 처리 완료' })
     }
     // shipping_memo에 송장정보 추가
     if (trackingNo) {
@@ -5771,13 +5829,46 @@ app.get('/dashboard', (c) => {
                         var date = new Date(o.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
                         var statusMap = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'};
                         var statusColor = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
-                        return '<div class="flex items-center justify-between bg-gray-50 rounded-lg p-2">' +
-                            '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-gray-800 truncate">' + escapeHtml(o.product_name) + ' x' + o.quantity + '</p>' +
-                            '<p class="text-xs text-gray-500">' + date + '</p></div>' +
-                            '<div class="text-right ml-2"><p class="text-sm font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + ' QKEY</p>' +
-                            '<span class="text-xs px-2 py-0.5 bg-' + (statusColor[o.status]||'gray') + '-100 text-' + (statusColor[o.status]||'gray') + '-700 rounded-full">' + (statusMap[o.status]||o.status) + '</span></div></div>';
+                        // 결제완료(paid) 상태에서만 취소 버튼 노출
+                        var cancelBtn = o.status === 'paid'
+                            ? '<button onclick="cancelMyOrder(' + o.id + ', \\'' + escapeHtml(o.product_name).replace(/'/g,"\\\\'") + '\\', ' + Number(o.qkey_used) + ')" class="mt-2 w-full py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-xs font-extrabold transition shadow border-2 border-red-700"><i class="fas fa-ban mr-1"></i>구매취소</button>'
+                            : '';
+                        return '<div class="bg-gray-50 rounded-lg p-3 mb-2">' +
+                                '<div class="flex items-center justify-between">' +
+                                    '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-gray-800 truncate">' + escapeHtml(o.product_name) + ' x' + o.quantity + '</p>' +
+                                    '<p class="text-xs text-gray-500">' + date + '</p></div>' +
+                                    '<div class="text-right ml-2"><p class="text-sm font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + ' QKEY</p>' +
+                                    '<span class="text-xs px-2 py-0.5 bg-' + (statusColor[o.status]||'gray') + '-100 text-' + (statusColor[o.status]||'gray') + '-700 rounded-full">' + (statusMap[o.status]||o.status) + '</span></div>' +
+                                '</div>' +
+                                cancelBtn +
+                            '</div>';
                     }).join('');
                 } catch(e) {}
+            }
+
+            // 사용자: 내 주문 취소 (결제완료 상태에서만 가능, QKEY 자동 환불)
+            async function cancelMyOrder(orderId, productName, qkeyAmount) {
+                if (!confirm('정말 [' + productName + '] 주문을 취소하시겠습니까?\\n\\n취소 시 ' + Number(qkeyAmount).toLocaleString() + ' QKEY가 즉시 환불됩니다.\\n(배송중/배송완료 상태는 취소 불가)')) return;
+                try {
+                    var res = await axios.post('/api/shop/order/' + orderId + '/cancel', { userId: currentUser.id });
+                    if (res.data.success) {
+                        alert(res.data.message || '구매가 취소되었습니다.');
+                        // QKEY 잔액 갱신
+                        try {
+                            var balRes = await axios.get('/api/user/' + currentUser.id);
+                            if (balRes.data.success && balRes.data.user) {
+                                currentUser.qkey_balance = balRes.data.user.qkey_balance;
+                                if (typeof refreshDashboard === 'function') refreshDashboard();
+                            }
+                        } catch(eb) {}
+                        loadMyOrders();
+                        loadShopProducts();
+                    } else {
+                        alert(res.data.error || '취소 처리 실패');
+                    }
+                } catch(e) {
+                    alert((e.response && e.response.data && e.response.data.error) || '취소 처리 중 오류가 발생했습니다');
+                }
             }
 
             async function buyProduct(productId, productName, priceQkey) {
