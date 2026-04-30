@@ -5745,10 +5745,11 @@ app.get('/dashboard', (c) => {
                     // 상세보기 버튼 이벤트 바인딩
                     var detBtn = infoDiv.querySelector('.shopDetailBtn');
                     if (detBtn) { detBtn.onclick = function(){ showProductDetail(p.id); }; }
-                    // 구매 버튼
+                    // 구매 버튼 (눈에 잘 띄게 진한 파란색 + 큰 글씨 + 그림자)
                     var buyBtn = document.createElement('button');
-                    buyBtn.className = 'w-full mt-1 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg text-xs font-bold transition';
-                    buyBtn.innerHTML = '<i class="fas fa-shopping-bag mr-1"></i>구매';
+                    buyBtn.className = 'w-full mt-2 py-3 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-extrabold transition shadow-lg border-2 border-blue-700';
+                    buyBtn.style.cssText = 'display:block !important; visibility:visible !important; opacity:1 !important;';
+                    buyBtn.innerHTML = '<i class="fas fa-shopping-cart mr-2"></i>구매하기';
                     buyBtn.onclick = (function(pid, pname, pq){ return function(){ buyProduct(pid, pname, pq); }; })(p.id, p.name, priceQkey);
                     card.appendChild(buyBtn);
                     el.appendChild(card);
@@ -5880,7 +5881,7 @@ app.get('/dashboard', (c) => {
                                  'style="padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));">' +
                                 (p.stock === 0
                                     ? '<button disabled class="w-full py-4 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed text-base"><i class="fas fa-times-circle mr-1"></i>품절</button>'
-                                    : '<button id="pdBuyBtn" class="w-full py-4 bg-pink-600 hover:bg-pink-700 active:bg-pink-800 text-white rounded-lg font-bold transition shadow-lg text-base"><i class="fas fa-shopping-bag mr-2"></i>구매하기 (' + priceQkey.toLocaleString() + ' QKEY)</button>') +
+                                    : '<button id="pdBuyBtn" style="display:block !important; visibility:visible !important; opacity:1 !important;" class="w-full py-5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg font-extrabold transition shadow-2xl text-lg border-2 border-blue-700"><i class="fas fa-shopping-cart mr-2"></i>구매하기 (' + priceQkey.toLocaleString() + ' QKEY)</button>') +
                             '</div>' +
                         '</div>' +
                     '</div>';
