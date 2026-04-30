@@ -9797,26 +9797,36 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 개별 송장 등록 모달
-            // 송장 메모에서 택배사/송장번호 안전 파싱 (정규식 백슬래시 이스케이프 이슈 회피)
+            // 송장 메모에서 택배사/송장번호 안전 파싱 (정규식/이스케이프 이슈 완전 회피)
+            // 백틱 템플릿 리터럴 안에서는 '\n','\r','\t' 가 실제 줄바꿈/탭으로 해석되어
+            // 문법 오류를 일으키므로 String.fromCharCode 로 안전하게 처리
             function parseTrackingFromMemo(memo) {
                 var result = { courier: '', no: '' };
                 if (!memo) return result;
-                // shipping_memo는 "[택배사] 송장: 번호" 또는 "송장: 번호" 형식
-                var idx = memo.indexOf('송장:');
+                var keyword = '\uC1A1\uC7A5:'; // '송장:'
+                var idx = memo.indexOf(keyword);
                 if (idx === -1) return result;
-                // 택배사 추출: 송장: 앞쪽에서 [택배사] 패턴 찾기
+                // 택배사 추출: '송장:' 앞쪽에서 [택배사] 패턴 찾기
                 var prefix = memo.substring(0, idx);
                 var lb = prefix.lastIndexOf('[');
                 var rb = prefix.lastIndexOf(']');
                 if (lb !== -1 && rb !== -1 && rb > lb) {
                     result.courier = prefix.substring(lb + 1, rb).trim();
                 }
-                // 송장번호 추출: '송장:' 뒤 공백 제거 후 다음 공백/| 이전까지
-                var rest = memo.substring(idx + 3).replace(/^\s+/, '');
+                // 송장번호 추출: '송장:' 뒤 공백 제거 후 다음 공백/탭/개행/| 이전까지
+                var rest = memo.substring(idx + keyword.length);
+                // 앞쪽 공백류(스페이스/탭/개행) 제거
+                var startI = 0;
+                while (startI < rest.length) {
+                    var c0 = rest.charCodeAt(startI);
+                    if (c0 === 32 || c0 === 9 || c0 === 10 || c0 === 13) { startI++; } else { break; }
+                }
+                rest = rest.substring(startI);
                 var endIdx = rest.length;
                 for (var i = 0; i < rest.length; i++) {
-                    var ch = rest.charAt(i);
-                    if (ch === ' ' || ch === '\t' || ch === '|' || ch === '\n' || ch === '\r') { endIdx = i; break; }
+                    var c = rest.charCodeAt(i);
+                    // 32:space 9:tab 10:LF 13:CR 124:|
+                    if (c === 32 || c === 9 || c === 10 || c === 13 || c === 124) { endIdx = i; break; }
                 }
                 result.no = rest.substring(0, endIdx).trim();
                 return result;
