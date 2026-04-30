@@ -2602,6 +2602,68 @@ app.post('/api/admin/staking/:stakingId/unmark-reset', async (c) => {
   } catch (e: any) { return c.json({ error: e.message }, 500) }
 })
 
+// 관리자: V2 정책($1,000~$4,000 = 90일/0.5%) 기존 row 일괄 보정
+//  - 대상: status='active' AND amount in [1000, 4000] AND (period_days != 90 OR daily_rate != 0.005)
+//  - period_days = 90, daily_rate = 0.005 강제 변경
+//  - end_date = start_date + 90일 재계산
+//  - reset_at 여부와 무관 (리셋된 스테이킹도 보정)
+//  - dryRun=true 면 실제 수정 없이 대상만 반환
+app.post('/api/admin/staking/migrate-v2', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body.dryRun === true
+
+    const targets = await db.prepare(`
+      SELECT id, user_id, amount, period_days, daily_rate, start_date, end_date, reset_at
+      FROM staking
+      WHERE status = 'active'
+        AND amount >= 1000 AND amount <= 4000
+        AND (period_days != 90 OR daily_rate != 0.005)
+    `).all()
+
+    const updated: any[] = []
+    for (const s of (targets.results as any[])) {
+      let newEnd = s.end_date
+      try {
+        if (s.start_date) {
+          const sd = new Date(s.start_date)
+          if (!isNaN(sd.getTime())) {
+            const ed = new Date(sd.getTime() + 90 * 24 * 60 * 60 * 1000)
+            newEnd = ed.toISOString()
+          }
+        }
+      } catch (_) {}
+
+      const before = {
+        id: s.id, user_id: s.user_id, amount: s.amount,
+        period_days: s.period_days, daily_rate: s.daily_rate, end_date: s.end_date
+      }
+      const after = {
+        id: s.id, user_id: s.user_id, amount: s.amount,
+        period_days: 90, daily_rate: 0.005, end_date: newEnd
+      }
+
+      if (!dryRun) {
+        await db.prepare(`
+          UPDATE staking
+          SET period_days = 90, daily_rate = 0.005, end_date = ?
+          WHERE id = ?
+        `).bind(newEnd, s.id).run()
+      }
+      updated.push({ before, after })
+    }
+
+    return c.json({
+      success: true,
+      dryRun,
+      target_count: updated.length,
+      message: dryRun ? `대상 ${updated.length}건 (dry-run, 변경 안 함)` : `${updated.length}건 보정 완료 (90일/0.5%)`,
+      items: updated
+    })
+  } catch (e: any) { return c.json({ error: e.message }, 500) }
+})
+
 // 관리자: 리셋된 스테이킹에 잘못 지급된 배당/매칭수당 환수 처리
 //  - reset_at IS NOT NULL인 스테이킹의 daily_rewards를 모두 찾아서 환수
 //  - 사용자 QKEY 잔액 차감 + 매칭수당 받은 추천인 잔액도 차감
@@ -3404,12 +3466,11 @@ app.post('/api/rewards/daily', async (c) => {
     }
 
     // 활성 투자 조회 (승인일 익일부터 거치기간 종료일까지)
-    // ★★ 룰 (확정) ★★
-    //   - 리셋되지 않은 스테이킹: 본인 배당 + Level 1 + Level 2 매칭수당 모두 정상 지급
-    //   - 리셋된 스테이킹(reset_at IS NOT NULL): 본인 배당 ❌ / Level 1 매칭수당 ✅ / Level 2 매칭수당 ❌
-    //     → 직접 추천한 추천인은 자기가 만든 매출에 대한 성과금을 받아야 정당하므로 1대만 지급
-    //     → 단, 리셋 스테이킹의 amount는 매출(직접판매) 통계에 절대 포함되지 않음 (별도 SQL에서 처리)
-    //   - 따라서 cron은 리셋 여부 상관없이 모든 active 스테이킹을 가져온 뒤, 분기 처리한다
+    // ★★ 룰 (재확정 2026-04-30) ★★
+    //   - 리셋은 [잔액(QTA/QX/QKEY)을 0으로 만드는 일회성 이벤트]일 뿐
+    //   - 리셋된 스테이킹도 그 다음날부터 본인 데일리 배당 + Level 1 + Level 2 매칭수당 모두 정상 지급
+    //   - 즉 cron은 reset_at 여부와 무관하게 일반 룰을 그대로 적용한다
+    //   - 단, 리셋 스테이킹의 amount는 매출(직접판매) 통계에서만 별도 처리 (sales API에서 분리)
     const activeStakings = await db.prepare(`
       SELECT 
         s.user_id, 
@@ -3466,44 +3527,40 @@ app.post('/api/rewards/daily', async (c) => {
           // USD를 QKEY로 변환 (1 USD = 150 QKEY)
           const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
 
-          // ★ 리셋 여부에 따라 분기 처리 ★
-          //   - 일반(reset_at IS NULL): 본인 배당 + Level 1 + Level 2 모두 정상 지급
-          //   - 리셋(reset_at IS NOT NULL): 본인 배당 ❌ / Level 1 매칭수당 ✅ / Level 2 매칭수당 ❌
-          const isResetStaking = !!staking.reset_at
+          // ★ 리셋 여부와 무관하게 일반 룰 그대로 적용 ★
+          //   리셋은 잔액 0으로 초기화한 일회성 이벤트일 뿐, 그 다음날부터는 정상 누적
 
-          if (!isResetStaking) {
-            // [정상 스테이킹] 본인 배당 지급
-            // 일일 보상 기록 (usdt_amount 컬럼에 QKEY 수량 저장)
-            await db.prepare(`
-              INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date)
-              VALUES (?, ?, ?, ?)
-            `).bind(staking.user_id, staking.staking_id, qkeyAmount, today).run()
+          // [본인 배당 지급]
+          // 일일 보상 기록 (usdt_amount 컬럼에 QKEY 수량 저장)
+          await db.prepare(`
+            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date)
+            VALUES (?, ?, ?, ?)
+          `).bind(staking.user_id, staking.staking_id, qkeyAmount, today).run()
 
-            // 사용자 QKEY 잔액 업데이트
-            await db.prepare(`
-              UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-            `).bind(qkeyAmount, staking.user_id).run()
+          // 사용자 QKEY 잔액 업데이트
+          await db.prepare(`
+            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+          `).bind(qkeyAmount, staking.user_id).run()
 
-            const newCount = staking.rewarded_count + 1
-            await db.prepare(`
-              INSERT INTO transactions (user_id, type, coin_type, amount, description)
-              VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-            `).bind(staking.user_id, qkeyAmount, `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d)`).run()
+          const newCount = staking.rewarded_count + 1
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+          `).bind(staking.user_id, qkeyAmount, `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d)`).run()
 
-            rewardedCount++
-            totalQkeyRewarded += qkeyAmount
-          }
+          rewardedCount++
+          totalQkeyRewarded += qkeyAmount
 
-          // 매칭추천수당 지급 (QKEY)
+          // 매칭추천수당 지급 (QKEY) — 일반 룰 그대로
           try {
-            // 1대 매칭추천수당 (20%) — 리셋 스테이킹도 직접 추천인은 정상 지급
+            // 1대 매칭추천수당 (20%)
             const level1Referrer = await db.prepare(`
               SELECT referrer_id FROM users WHERE id = ?
             `).bind(staking.user_id).first()
 
             if (level1Referrer && level1Referrer.referrer_id) {
               const level1Reward = Math.round(qkeyAmount * 0.20)
-              
+
               await db.prepare(`
                 UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
               `).bind(level1Reward, level1Referrer.referrer_id).run()
@@ -3513,37 +3570,32 @@ app.post('/api/rewards/daily', async (c) => {
                 VALUES (?, ?, 1, ?, ?, ?)
               `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, today).run()
 
-              const desc1 = isResetStaking
-                ? `Level 1 referral bonus [reset referee] (${qkeyAmount.toLocaleString()} QKEY x 20%)`
-                : `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%)`
               await db.prepare(`
                 INSERT INTO transactions (user_id, type, coin_type, amount, description)
                 VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-              `).bind(level1Referrer.referrer_id, level1Reward, desc1).run()
+              `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%)`).run()
 
-              // 2대 매칭추천수당 (10%) — 리셋 스테이킹은 Level 2 지급 ❌
-              if (!isResetStaking) {
-                const level2Referrer = await db.prepare(`
-                  SELECT referrer_id FROM users WHERE id = ?
-                `).bind(level1Referrer.referrer_id).first()
+              // 2대 매칭추천수당 (10%)
+              const level2Referrer = await db.prepare(`
+                SELECT referrer_id FROM users WHERE id = ?
+              `).bind(level1Referrer.referrer_id).first()
 
-                if (level2Referrer && level2Referrer.referrer_id) {
-                  const level2Reward = Math.round(qkeyAmount * 0.10)
-                  
-                  await db.prepare(`
-                    UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-                  `).bind(level2Reward, level2Referrer.referrer_id).run()
+              if (level2Referrer && level2Referrer.referrer_id) {
+                const level2Reward = Math.round(qkeyAmount * 0.10)
 
-                  await db.prepare(`
-                    INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
-                    VALUES (?, ?, 2, ?, ?, ?)
-                  `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, today).run()
+                await db.prepare(`
+                  UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+                `).bind(level2Reward, level2Referrer.referrer_id).run()
 
-                  await db.prepare(`
-                    INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                    VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                  `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%)`).run()
-                }
+                await db.prepare(`
+                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
+                  VALUES (?, ?, 2, ?, ?, ?)
+                `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, today).run()
+
+                await db.prepare(`
+                  INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                  VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%)`).run()
               }
             }
           } catch (referralError) {
