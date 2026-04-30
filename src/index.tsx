@@ -8437,10 +8437,19 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
-            // 스테이킹 승인
+            // 스테이킹 승인 — 즉시 카드 제거 + 통계 갱신 + 이중 재검증으로 카드 부활 차단
             async function approveStaking(stakingId) {
                 if (!confirm(I18N.t('admin.approve_confirm'))) {
                     return;
+                }
+
+                // ★ 1단계: 사용자가 승인 버튼을 한 번 더 못 누르도록 즉시 비활성화 + 카드 제거
+                const cardEl = document.querySelector('[data-staking-id="' + stakingId + '"]');
+                if (cardEl) {
+                    cardEl.style.opacity = '0.4';
+                    cardEl.style.pointerEvents = 'none';
+                    const btns = cardEl.querySelectorAll('button');
+                    btns.forEach(b => { b.disabled = true; });
                 }
 
                 try {
@@ -8448,26 +8457,58 @@ app.get('/admin/dashboard', (c) => {
                         headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
                     });
                     if (response.data.success) {
-                        alert(response.data.message);
-                        // ★ 즉시 화면에서 해당 카드 제거 (DB 반영 지연 대비)
-                        const cardEl = document.querySelector('[data-staking-id="' + stakingId + '"]');
+                        // ★ 2단계: 즉시 DOM에서 카드 완전 제거 (재조회 결과를 기다리지 않음)
                         if (cardEl) cardEl.remove();
-                        await loadStatistics();
-                        // ★ 약간 지연 후 재로드: D1 write→read 일관성 대기
-                        await new Promise(r => setTimeout(r, 300));
+
+                        // ★ 3단계: 메시지/통계 갱신 (병렬)
+                        alert(response.data.message);
+                        loadStatistics();
+
+                        // ★ 4단계: D1 write→read 일관성 보장을 위한 이중 재조회
+                        //   첫 재조회에서 같은 id가 또 나오면 1초 후 한 번 더 (write 전파 지연 보정)
+                        await new Promise(r => setTimeout(r, 400));
                         await loadPendingStakings();
+
+                        // 5단계: 1초 후 같은 id가 여전히 보이면 강제로 또 제거 후 재조회
+                        setTimeout(async function() {
+                            const stillThere = document.querySelector('[data-staking-id="' + stakingId + '"]');
+                            if (stillThere) {
+                                stillThere.remove();
+                                await loadPendingStakings();
+                            }
+                        }, 1000);
+                    } else {
+                        // 응답은 받았지만 success=false인 경우 카드 복구
+                        if (cardEl) {
+                            cardEl.style.opacity = '';
+                            cardEl.style.pointerEvents = '';
+                            cardEl.querySelectorAll('button').forEach(b => { b.disabled = false; });
+                        }
+                        alert(response.data.error || I18N.t('admin.approve_fail'));
                     }
                 } catch (error) {
+                    // 네트워크/서버 에러: 카드 복구
+                    if (cardEl) {
+                        cardEl.style.opacity = '';
+                        cardEl.style.pointerEvents = '';
+                        cardEl.querySelectorAll('button').forEach(b => { b.disabled = false; });
+                    }
                     alert(error.response?.data?.error || I18N.t('admin.approve_fail'));
-                    // 실패 시에도 최신 상태 재조회
                     await loadPendingStakings();
                 }
             }
 
-            // 스테이킹 거절
+            // 스테이킹 거절 — 승인과 동일 패턴: 즉시 비활성화 + 카드 제거 + 이중 재검증
             async function rejectStaking(stakingId) {
                 if (!confirm(I18N.t('admin.reject_confirm'))) {
                     return;
+                }
+
+                const cardEl = document.querySelector('[data-staking-id="' + stakingId + '"]');
+                if (cardEl) {
+                    cardEl.style.opacity = '0.4';
+                    cardEl.style.pointerEvents = 'none';
+                    cardEl.querySelectorAll('button').forEach(b => { b.disabled = true; });
                 }
 
                 try {
@@ -8475,14 +8516,32 @@ app.get('/admin/dashboard', (c) => {
                         headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
                     });
                     if (response.data.success) {
-                        alert(response.data.message);
-                        const cardEl = document.querySelector('[data-staking-id="' + stakingId + '"]');
                         if (cardEl) cardEl.remove();
-                        await loadStatistics();
-                        await new Promise(r => setTimeout(r, 300));
+                        alert(response.data.message);
+                        loadStatistics();
+                        await new Promise(r => setTimeout(r, 400));
                         await loadPendingStakings();
+                        setTimeout(async function() {
+                            const stillThere = document.querySelector('[data-staking-id="' + stakingId + '"]');
+                            if (stillThere) {
+                                stillThere.remove();
+                                await loadPendingStakings();
+                            }
+                        }, 1000);
+                    } else {
+                        if (cardEl) {
+                            cardEl.style.opacity = '';
+                            cardEl.style.pointerEvents = '';
+                            cardEl.querySelectorAll('button').forEach(b => { b.disabled = false; });
+                        }
+                        alert(response.data.error || I18N.t('admin.reject_fail'));
                     }
                 } catch (error) {
+                    if (cardEl) {
+                        cardEl.style.opacity = '';
+                        cardEl.style.pointerEvents = '';
+                        cardEl.querySelectorAll('button').forEach(b => { b.disabled = false; });
+                    }
                     alert(error.response?.data?.error || I18N.t('admin.reject_fail'));
                     await loadPendingStakings();
                 }
