@@ -5315,8 +5315,13 @@ app.get('/dashboard', (c) => {
                     </div>
                     <!-- 구매내역 패널 -->
                     <div id="shopPanel-orders" class="hidden">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-gray-700 text-sm"><i class="fas fa-receipt mr-1 text-pink-500"></i>내 구매 내역</h3>
+                            <button onclick="loadMyOrders()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-3"><i class="fas fa-info-circle mr-1"></i>구매한 상품의 결제·배송 상태를 실시간으로 확인할 수 있습니다.</p>
                         <div id="shopMyOrders" class="space-y-2 max-h-[70vh] overflow-y-auto">
-                            <p class="text-center text-gray-400 text-sm py-8">구매 내역이 없습니다</p>
+                            <p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-shopping-bag text-3xl text-gray-200 mb-2 block"></i>아직 구매 내역이 없습니다</p>
                         </div>
                     </div>
                 </div>
@@ -5837,20 +5842,26 @@ app.get('/dashboard', (c) => {
                 modal.id = 'productDetailModal';
                 modal.className = 'fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4';
                 modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
-                modal.innerHTML = '<div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">' +
-                    '<div class="sticky top-0 bg-white p-4 border-b flex items-center justify-between rounded-t-2xl z-10">' +
-                        '<h3 class="font-bold text-lg text-gray-800">' + escapeHtml(p.name) + '</h3>' +
-                        '<button onclick="document.getElementById(\\'productDetailModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>' +
+                // ★ flex 레이아웃: 헤더(상단 고정) + 본문(스크롤) + 푸터 구매버튼(하단 고정)
+                modal.innerHTML = '<div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] flex flex-col">' +
+                    '<div class="bg-white p-4 border-b flex items-center justify-between rounded-t-2xl flex-shrink-0">' +
+                        '<h3 class="font-bold text-lg text-gray-800 truncate pr-2">' + escapeHtml(p.name) + '</h3>' +
+                        '<button onclick="document.getElementById(\\'productDetailModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none flex-shrink-0">&times;</button>' +
                     '</div>' +
-                    '<div class="p-4">' +
+                    '<div class="p-4 overflow-y-auto flex-1">' +
                         '<div id="pdImgArea"></div>' +
                         '<div id="pdDescArea" class="text-sm text-gray-600 mb-3"></div>' +
                         '<div class="flex items-center justify-between bg-pink-50 rounded-lg p-3 mb-3">' +
                             '<span class="text-sm text-gray-700">가격</span>' +
                             '<div class="text-right"><p class="text-lg font-bold text-pink-600">' + priceQkey.toLocaleString() + ' QKEY</p><p class="text-xs text-gray-500">' + Number(p.price_krw).toLocaleString() + '원</p></div>' +
                         '</div>' +
-                        (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-3">재고: ' + (p.stock <= 0 ? '<span class="text-red-500 font-bold">품절</span>' : p.stock + '개') + '</p>' : '') +
-                        '<button id="pdBuyBtn" class="w-full py-3 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold transition' + (p.stock === 0 ? ' hidden' : '') + '"><i class="fas fa-shopping-bag mr-1"></i>구매하기</button>' +
+                        (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-2">재고: ' + (p.stock <= 0 ? '<span class="text-red-500 font-bold">품절</span>' : p.stock + '개') + '</p>' : '') +
+                    '</div>' +
+                    // 항상 보이는 sticky-bottom 구매 버튼 영역
+                    '<div class="bg-white p-4 border-t rounded-b-2xl flex-shrink-0 shadow-[0_-2px_8px_rgba(0,0,0,0.05)]">' +
+                        (p.stock === 0
+                            ? '<button disabled class="w-full py-3 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed"><i class="fas fa-times-circle mr-1"></i>품절</button>'
+                            : '<button id="pdBuyBtn" class="w-full py-3 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold transition shadow-md"><i class="fas fa-shopping-bag mr-1"></i>구매하기 (' + priceQkey.toLocaleString() + ' QKEY)</button>') +
                     '</div>' +
                 '</div>';
                 var old = document.getElementById('productDetailModal');
@@ -7532,6 +7543,37 @@ app.get('/admin/dashboard', (c) => {
                                 <button onclick="exportShopOrders()" class="px-3 py-1 bg-green-500 hover:bg-green-600 text-white rounded text-xs font-medium"><i class="fas fa-file-csv mr-1"></i>CSV 다운로드</button>
                                 <button onclick="loadAdminShopOrders()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
                             </div>
+                        </div>
+                        <!-- 주문 통계 요약 카드 -->
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+                            <div class="bg-blue-50 border border-blue-200 rounded-lg p-2 text-center">
+                                <div class="text-xs text-gray-600">총 주문</div>
+                                <div class="text-lg font-bold text-blue-700"><span id="shopStatOrders">0</span> 건</div>
+                            </div>
+                            <div class="bg-pink-50 border border-pink-200 rounded-lg p-2 text-center">
+                                <div class="text-xs text-gray-600">사용 QKEY</div>
+                                <div class="text-lg font-bold text-pink-700"><span id="shopStatQkey">0</span></div>
+                            </div>
+                            <div class="bg-green-50 border border-green-200 rounded-lg p-2 text-center">
+                                <div class="text-xs text-gray-600">총 매출</div>
+                                <div class="text-lg font-bold text-green-700"><span id="shopStatKrw">0</span>원</div>
+                            </div>
+                            <div class="bg-purple-50 border border-purple-200 rounded-lg p-2 text-center">
+                                <div class="text-xs text-gray-600">구매자수</div>
+                                <div class="text-lg font-bold text-purple-700"><span id="shopStatBuyers">0</span> 명</div>
+                            </div>
+                        </div>
+                        <!-- 필터: 상태 + 주문자/상품 검색 -->
+                        <div class="flex flex-wrap gap-2 mb-3 items-center bg-gray-50 rounded-lg p-2">
+                            <select id="adminOrderFilterStatus" onchange="renderAdminOrders()" class="text-xs border rounded px-2 py-1 bg-white">
+                                <option value="">전체 상태</option>
+                                <option value="paid">결제완료</option>
+                                <option value="shipping">배송중</option>
+                                <option value="delivered">배송완료</option>
+                                <option value="cancelled">취소</option>
+                            </select>
+                            <input id="adminOrderFilterText" oninput="renderAdminOrders()" type="text" placeholder="주문자/이메일/상품명 검색" class="text-xs border rounded px-2 py-1 flex-1 min-w-[160px] bg-white">
+                            <span class="text-xs text-gray-500"><i class="fas fa-filter mr-1"></i>실시간 필터</span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm">
@@ -9417,49 +9459,28 @@ app.get('/admin/dashboard', (c) => {
             }
 
             var shopOrderRefreshTimer = null;
+            // 캐시: 최근 fetch한 주문 원본 (필터링은 클라이언트에서)
+            var _adminShopOrdersCache = [];
+
             async function loadAdminShopOrders() {
                 try {
                     var res = await axios.get('/api/admin/shop/orders');
                     if (!res.data.success) return;
                     var orders = res.data.orders || [];
                     var stats = res.data.stats || {};
+                    _adminShopOrdersCache = orders;
 
-                    // 통계 업데이트
+                    // 통계 업데이트 (전체 기준)
                     document.getElementById('shopStatOrders').textContent = (stats.total_orders || 0).toLocaleString();
                     document.getElementById('shopStatQkey').textContent = Math.round(stats.total_qkey || 0).toLocaleString();
                     document.getElementById('shopStatKrw').textContent = Number(stats.total_krw || 0).toLocaleString();
                     document.getElementById('shopStatBuyers').textContent = (stats.unique_buyers || 0).toLocaleString();
 
-                    var tbody = document.getElementById('adminOrderTableBody');
-                    if (orders.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-400">주문 내역이 없습니다</td></tr>';
-                        return;
-                    }
-                    tbody.innerHTML = orders.map(function(o) {
-                        var date = new Date(o.created_at).toLocaleString('ko-KR', {timeZone: 'Asia/Seoul'});
-                        var statusOptions = ['paid','shipping','delivered','cancelled'];
-                        var statusLabels = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'};
-                        var statusColors = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
-                        var selectHtml = '<select onchange="adminUpdateOrderStatus(' + o.id + ', this.value)" class="text-xs border rounded px-1 py-0.5 bg-' + (statusColors[o.status]||'gray') + '-50">';
-                        statusOptions.forEach(function(s) {
-                            selectHtml += '<option value="' + s + '"' + (o.status === s ? ' selected' : '') + '>' + statusLabels[s] + '</option>';
-                        });
-                        selectHtml += '</select>';
-                        var shippingInfo = [o.shipping_name, o.shipping_phone, o.shipping_address].filter(Boolean).join(' / ') || '-';
-                        return '<tr class="hover:bg-gray-50">' +
-                            '<td class="px-3 py-2 text-xs"><span class="font-medium">' + esc(o.user_name || '-') + '</span><br><span class="text-gray-400">' + esc(o.user_email || '') + '</span></td>' +
-                            '<td class="px-3 py-2 text-xs font-medium">' + esc(o.product_name) + ' x' + o.quantity + '</td>' +
-                            '<td class="px-3 py-2 text-xs text-right">' + Number(o.price_krw).toLocaleString() + '원</td>' +
-                            '<td class="px-3 py-2 text-xs text-right font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + '</td>' +
-                            '<td class="px-3 py-2 text-xs max-w-[200px] truncate" title="' + esc(shippingInfo) + '">' + esc(shippingInfo) + '</td>' +
-                            '<td class="px-3 py-2 text-center">' + selectHtml + '</td>' +
-                            '<td class="px-3 py-2 text-xs text-gray-500">' + date + '</td>' +
-                        '</tr>';
-                    }).join('');
+                    renderAdminOrders();
                 } catch(e) {
                     console.error('Admin orders load error:', e);
                 }
-                
+
                 // 실시간 자동 새로고침 (10초마다)
                 if (shopOrderRefreshTimer) clearInterval(shopOrderRefreshTimer);
                 if (currentTab === 'shop') {
@@ -9468,6 +9489,52 @@ app.get('/admin/dashboard', (c) => {
                         else clearInterval(shopOrderRefreshTimer);
                     }, 10000);
                 }
+            }
+
+            // 클라이언트 사이드 필터링/렌더링
+            function renderAdminOrders() {
+                var tbody = document.getElementById('adminOrderTableBody');
+                if (!tbody) return;
+                var statusFilter = (document.getElementById('adminOrderFilterStatus') || {}).value || '';
+                var textFilter = ((document.getElementById('adminOrderFilterText') || {}).value || '').toLowerCase().trim();
+
+                var filtered = _adminShopOrdersCache.filter(function(o) {
+                    if (statusFilter && o.status !== statusFilter) return false;
+                    if (textFilter) {
+                        var hay = ((o.user_name||'') + ' ' + (o.user_email||'') + ' ' + (o.product_name||'')).toLowerCase();
+                        if (hay.indexOf(textFilter) === -1) return false;
+                    }
+                    return true;
+                });
+
+                if (filtered.length === 0) {
+                    var msg = (statusFilter || textFilter)
+                        ? '필터 조건에 맞는 주문이 없습니다'
+                        : '주문 내역이 없습니다';
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-400">' + msg + '</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = filtered.map(function(o) {
+                    var date = new Date(o.created_at).toLocaleString('ko-KR', {timeZone: 'Asia/Seoul'});
+                    var statusOptions = ['paid','shipping','delivered','cancelled'];
+                    var statusLabels = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'};
+                    var statusColors = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
+                    var selectHtml = '<select onchange="adminUpdateOrderStatus(' + o.id + ', this.value)" class="text-xs border rounded px-1 py-0.5 bg-' + (statusColors[o.status]||'gray') + '-50">';
+                    statusOptions.forEach(function(s) {
+                        selectHtml += '<option value="' + s + '"' + (o.status === s ? ' selected' : '') + '>' + statusLabels[s] + '</option>';
+                    });
+                    selectHtml += '</select>';
+                    var shippingInfo = [o.shipping_name, o.shipping_phone, o.shipping_address].filter(Boolean).join(' / ') || '-';
+                    return '<tr class="hover:bg-gray-50">' +
+                        '<td class="px-3 py-2 text-xs"><span class="font-medium">' + esc(o.user_name || '-') + '</span><br><span class="text-gray-400">' + esc(o.user_email || '') + '</span></td>' +
+                        '<td class="px-3 py-2 text-xs font-medium">' + esc(o.product_name) + ' x' + o.quantity + '</td>' +
+                        '<td class="px-3 py-2 text-xs text-right">' + Number(o.price_krw).toLocaleString() + '원</td>' +
+                        '<td class="px-3 py-2 text-xs text-right font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + '</td>' +
+                        '<td class="px-3 py-2 text-xs max-w-[200px] truncate" title="' + esc(shippingInfo) + '">' + esc(shippingInfo) + '</td>' +
+                        '<td class="px-3 py-2 text-center">' + selectHtml + '</td>' +
+                        '<td class="px-3 py-2 text-xs text-gray-500">' + date + '</td>' +
+                    '</tr>';
+                }).join('');
             }
 
             async function adminUpdateOrderStatus(orderId, newStatus) {
