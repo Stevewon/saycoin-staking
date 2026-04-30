@@ -5840,33 +5840,44 @@ app.get('/dashboard', (c) => {
                 var priceQkey = Math.ceil(p.price_krw / 10);
                 var modal = document.createElement('div');
                 modal.id = 'productDetailModal';
-                modal.className = 'fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4';
-                modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
-                // ★ flex 레이아웃: 헤더(상단 고정) + 본문(스크롤) + 푸터 구매버튼(하단 고정)
-                modal.innerHTML = '<div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] flex flex-col">' +
-                    '<div class="bg-white p-4 border-b flex items-center justify-between rounded-t-2xl flex-shrink-0">' +
-                        '<h3 class="font-bold text-lg text-gray-800 truncate pr-2">' + escapeHtml(p.name) + '</h3>' +
-                        '<button onclick="document.getElementById(\\'productDetailModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none flex-shrink-0">&times;</button>' +
-                    '</div>' +
-                    '<div class="p-4 overflow-y-auto flex-1">' +
-                        '<div id="pdImgArea"></div>' +
-                        '<div id="pdDescArea" class="text-sm text-gray-600 mb-3"></div>' +
-                        '<div class="flex items-center justify-between bg-pink-50 rounded-lg p-3 mb-3">' +
-                            '<span class="text-sm text-gray-700">가격</span>' +
-                            '<div class="text-right"><p class="text-lg font-bold text-pink-600">' + priceQkey.toLocaleString() + ' QKEY</p><p class="text-xs text-gray-500">' + Number(p.price_krw).toLocaleString() + '원</p></div>' +
+                // ★ 모바일: 화면 전체 점유, body 스크롤 방지. 푸터는 절대로 화면 밖에 안 나감
+                modal.className = 'fixed inset-0 bg-black bg-opacity-60 z-50';
+                modal.style.cssText = 'overflow: hidden;';
+                modal.onclick = function(e) { if (e.target === modal) { modal.remove(); document.body.style.overflow=''; } };
+                // 모바일에선 모달이 화면 100% 채우고, sm+ 데스크톱에선 가운데 정렬 카드
+                // height: 100dvh (동적 viewport, 주소창 제외) 사용. 미지원 브라우저는 100vh로 폴백
+                // 본문은 flex-1 + min-h-0로 진짜 스크롤 가능하게, 푸터는 flex-shrink-0로 항상 보임
+                modal.innerHTML =
+                    '<div class="absolute inset-0 sm:flex sm:items-center sm:justify-center sm:p-4">' +
+                        '<div class="bg-white sm:rounded-2xl shadow-2xl w-full sm:max-w-md flex flex-col" ' +
+                             'style="height: 100vh; height: 100dvh; max-height: 100vh; max-height: 100dvh;">' +
+                            '<div class="bg-white p-4 border-b flex items-center justify-between sm:rounded-t-2xl flex-shrink-0">' +
+                                '<h3 class="font-bold text-lg text-gray-800 truncate pr-2">' + escapeHtml(p.name) + '</h3>' +
+                                '<button onclick="document.getElementById(\\'productDetailModal\\').remove(); document.body.style.overflow=\\'\\';" class="text-gray-400 hover:text-gray-600 text-3xl leading-none flex-shrink-0 w-10 h-10 flex items-center justify-center">&times;</button>' +
+                            '</div>' +
+                            '<div class="p-4 overflow-y-auto flex-1 min-h-0" style="-webkit-overflow-scrolling: touch;">' +
+                                '<div id="pdImgArea"></div>' +
+                                '<div id="pdDescArea" class="text-sm text-gray-600 mb-3"></div>' +
+                                '<div class="flex items-center justify-between bg-pink-50 rounded-lg p-3 mb-3">' +
+                                    '<span class="text-sm text-gray-700">가격</span>' +
+                                    '<div class="text-right"><p class="text-lg font-bold text-pink-600">' + priceQkey.toLocaleString() + ' QKEY</p><p class="text-xs text-gray-500">' + Number(p.price_krw).toLocaleString() + '원</p></div>' +
+                                '</div>' +
+                                (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-2">재고: ' + (p.stock <= 0 ? '<span class="text-red-500 font-bold">품절</span>' : p.stock + '개') + '</p>' : '') +
+                            '</div>' +
+                            // 푸터: 화면 하단에 절대 고정, safe-area 대응
+                            '<div class="bg-white p-4 border-t sm:rounded-b-2xl flex-shrink-0 shadow-[0_-4px_12px_rgba(0,0,0,0.08)]" ' +
+                                 'style="padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));">' +
+                                (p.stock === 0
+                                    ? '<button disabled class="w-full py-4 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed text-base"><i class="fas fa-times-circle mr-1"></i>품절</button>'
+                                    : '<button id="pdBuyBtn" class="w-full py-4 bg-pink-600 hover:bg-pink-700 active:bg-pink-800 text-white rounded-lg font-bold transition shadow-lg text-base"><i class="fas fa-shopping-bag mr-2"></i>구매하기 (' + priceQkey.toLocaleString() + ' QKEY)</button>') +
+                            '</div>' +
                         '</div>' +
-                        (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-2">재고: ' + (p.stock <= 0 ? '<span class="text-red-500 font-bold">품절</span>' : p.stock + '개') + '</p>' : '') +
-                    '</div>' +
-                    // 항상 보이는 sticky-bottom 구매 버튼 영역
-                    '<div class="bg-white p-4 border-t rounded-b-2xl flex-shrink-0 shadow-[0_-2px_8px_rgba(0,0,0,0.05)]">' +
-                        (p.stock === 0
-                            ? '<button disabled class="w-full py-3 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed"><i class="fas fa-times-circle mr-1"></i>품절</button>'
-                            : '<button id="pdBuyBtn" class="w-full py-3 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-bold transition shadow-md"><i class="fas fa-shopping-bag mr-1"></i>구매하기 (' + priceQkey.toLocaleString() + ' QKEY)</button>') +
-                    '</div>' +
-                '</div>';
+                    '</div>';
                 var old = document.getElementById('productDetailModal');
                 if (old) old.remove();
                 document.body.appendChild(modal);
+                document.body.style.overflow = 'hidden';
+                // 구매 버튼 클릭 / 모달 제거 시 body 스크롤 복구
                 // 이미지를 JS로 동적 삽입 (base64 따옴표 깨짐 방지)
                 var imgArea = document.getElementById('pdImgArea');
                 if (p.detail_image_url) {
@@ -5888,9 +5899,13 @@ app.get('/dashboard', (c) => {
                 } else {
                     descArea.textContent = desc;
                 }
-                // 구매 버튼 이벤트
+                // 구매 버튼 이벤트 — 모달 닫고 body 스크롤 복구 후 구매 진행
                 var buyBtn = document.getElementById('pdBuyBtn');
-                if (buyBtn) buyBtn.onclick = function() { modal.remove(); buyProduct(p.id, p.name, priceQkey); };
+                if (buyBtn) buyBtn.onclick = function() {
+                    modal.remove();
+                    document.body.style.overflow = '';
+                    buyProduct(p.id, p.name, priceQkey);
+                };
             }
 
             // 쇼핑몰 초기 로딩
