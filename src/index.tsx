@@ -7644,7 +7644,22 @@ app.get('/admin/dashboard', (c) => {
 
                     <!-- 등록된 상품 목록 -->
                     <div class="mb-6">
-                        <h3 class="font-bold text-gray-700 mb-3"><i class="fas fa-box mr-1"></i>등록 상품</h3>
+                        <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                            <h3 class="font-bold text-gray-700"><i class="fas fa-box mr-1"></i>등록 상품 <span id="adminProductCount" class="text-xs text-gray-500 font-normal ml-1"></span></h3>
+                            <div class="flex gap-2 items-center flex-wrap">
+                                <div class="relative">
+                                    <i class="fas fa-search absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 text-xs"></i>
+                                    <input type="text" id="adminProductSearch" placeholder="상품명/카테고리/설명 검색" class="pl-7 pr-7 py-1.5 border rounded text-xs w-56" oninput="renderAdminProducts()">
+                                    <button onclick="document.getElementById('adminProductSearch').value=''; renderAdminProducts();" class="absolute right-1 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-xs px-1" title="검색 초기화"><i class="fas fa-times"></i></button>
+                                </div>
+                                <select id="adminProductFilterStatus" onchange="renderAdminProducts()" class="text-xs border rounded px-2 py-1.5">
+                                    <option value="">전체상태</option>
+                                    <option value="active">판매중</option>
+                                    <option value="inactive">비활성</option>
+                                </select>
+                                <button onclick="loadAdminShopProducts()" class="px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-xs font-bold"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                            </div>
+                        </div>
                         <div id="adminProductList" class="space-y-2">
                             <p class="text-gray-400 text-center py-4">로딩 중...</p>
                         </div>
@@ -9577,47 +9592,75 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // 어드민 상품 캐시 (검색/필터링 위해 클라이언트에 보관)
+            var _adminProductsCache = [];
+
             async function loadAdminShopProducts() {
                 try {
                     var res = await axios.get('/api/admin/shop/products');
                     if (!res.data.success) return;
-                    var products = res.data.products || [];
-                    var el = document.getElementById('adminProductList');
-                    if (products.length === 0) {
-                        el.innerHTML = '<p class="text-gray-400 text-center py-4">등록된 상품이 없습니다</p>';
-                        return;
-                    }
-                    el.innerHTML = products.map(function(p) {
-                        var qkeyPrice = Math.ceil(p.price_krw / 10);
-                        var activeLabel = p.is_active ? '<span class="text-green-600 text-xs font-bold">판매중</span>' : '<span class="text-red-500 text-xs font-bold">비활성</span>';
-                        var stockLabel = p.stock === -1 ? '무제한' : p.stock;
-                        return '<div class="flex items-center justify-between border rounded-lg p-3 hover:bg-gray-50">' +
-                            '<div class="flex-1 min-w-0">' +
-                                '<div class="flex items-center gap-2 mb-1">' +
-                                    '<span class="font-bold text-sm text-gray-800">' + esc(p.name) + '</span>' +
-                                    activeLabel +
-                                    '<span class="text-xs text-gray-400">[' + esc(p.category) + ']</span>' +
-                                '</div>' +
-                                '<p class="text-xs text-gray-500 truncate">' + esc((p.description || '-').replace(/<[^>]*>/g,'').substring(0,100)) + '</p>' +
-                                '<p class="text-xs text-gray-600 mt-1">' + Number(p.price_krw).toLocaleString() + '원 / ' + qkeyPrice.toLocaleString() + ' QKEY | 재고: ' + stockLabel + '</p>' +
-                                '<p class="text-xs mt-1">' +
-                                    (p.image_url ? '<span class="text-blue-500"><i class="fas fa-image mr-1"></i>썸네일✓</span> ' : '<span class="text-gray-300">썸네일✗</span> ') +
-                                    (p.detail_image_url ? '<span class="text-purple-500"><i class="fas fa-file-image mr-1"></i>상세이미지✓</span>' : '<span class="text-gray-300">상세이미지✗</span>') +
-                                '</p>' +
-                                (p.options ? '<p class="text-xs mt-1 text-orange-600"><i class="fas fa-list-ul mr-1"></i>' + (function(){ try { var opts=JSON.parse(p.options); return opts.map(function(o){return o.name+':'+o.values.join(',')}).join(' | '); } catch(e){ return p.options; } })() + '</p>' : '') +
-                            '</div>' +
-                            '<div class="flex flex-col gap-1 ml-3">' +
-                                '<button onclick="adminEditProduct(' + p.id + ')" class="px-3 py-2 text-xs bg-blue-600 text-white hover:bg-blue-700 rounded font-bold shadow"><i class="fas fa-edit mr-1"></i>수정/저장</button>' +
-                                '<button onclick="adminToggleProduct(' + p.id + ',' + (p.is_active ? 0 : 1) + ',this)" class="px-2 py-1 text-xs rounded ' + (p.is_active ? 'bg-red-100 text-red-600 hover:bg-red-200' : 'bg-green-100 text-green-600 hover:bg-green-200') + '">' +
-                                    (p.is_active ? '<i class="fas fa-ban mr-1"></i>비활성' : '<i class="fas fa-check mr-1"></i>활성화') +
-                                '</button>' +
-                                '<button onclick="adminDeleteProduct(' + p.id + ')" class="px-2 py-1 text-xs bg-gray-100 text-gray-600 hover:bg-gray-200 rounded"><i class="fas fa-trash mr-1"></i>삭제</button>' +
-                            '</div>' +
-                        '</div>';
-                    }).join('');
+                    _adminProductsCache = res.data.products || [];
+                    renderAdminProducts();
                 } catch(e) {
                     console.error('Admin products load error:', e);
                 }
+            }
+
+            function renderAdminProducts() {
+                var el = document.getElementById('adminProductList');
+                if (!el) return;
+                var countEl = document.getElementById('adminProductCount');
+                var q = ((document.getElementById('adminProductSearch') || {}).value || '').toLowerCase().trim();
+                var statusF = (document.getElementById('adminProductFilterStatus') || {}).value || '';
+
+                var filtered = _adminProductsCache.filter(function(p) {
+                    if (statusF === 'active' && !p.is_active) return false;
+                    if (statusF === 'inactive' && p.is_active) return false;
+                    if (q) {
+                        var hay = ((p.name||'') + ' ' + (p.category||'') + ' ' + ((p.description||'').replace(/<[^>]*>/g,''))).toLowerCase();
+                        if (hay.indexOf(q) === -1) return false;
+                    }
+                    return true;
+                });
+
+                if (countEl) countEl.textContent = '(' + filtered.length + '/' + _adminProductsCache.length + ')';
+
+                if (_adminProductsCache.length === 0) {
+                    el.innerHTML = '<p class="text-gray-400 text-center py-4">등록된 상품이 없습니다</p>';
+                    return;
+                }
+                if (filtered.length === 0) {
+                    el.innerHTML = '<p class="text-gray-400 text-center py-4">검색/필터 조건에 맞는 상품이 없습니다</p>';
+                    return;
+                }
+                el.innerHTML = filtered.map(function(p) {
+                    var qkeyPrice = Math.ceil(p.price_krw / 10);
+                    var activeLabel = p.is_active ? '<span class="text-green-600 text-xs font-bold">판매중</span>' : '<span class="text-red-500 text-xs font-bold">비활성</span>';
+                    var stockLabel = p.stock === -1 ? '무제한' : p.stock;
+                    return '<div class="flex items-center justify-between border rounded-lg p-3 hover:bg-gray-50">' +
+                        '<div class="flex-1 min-w-0">' +
+                            '<div class="flex items-center gap-2 mb-1">' +
+                                '<span class="font-bold text-sm text-gray-800">' + esc(p.name) + '</span>' +
+                                activeLabel +
+                                '<span class="text-xs text-gray-400">[' + esc(p.category) + ']</span>' +
+                            '</div>' +
+                            '<p class="text-xs text-gray-500 truncate">' + esc((p.description || '-').replace(/<[^>]*>/g,'').substring(0,100)) + '</p>' +
+                            '<p class="text-xs text-gray-600 mt-1">' + Number(p.price_krw).toLocaleString() + '원 / ' + qkeyPrice.toLocaleString() + ' QKEY | 재고: ' + stockLabel + '</p>' +
+                            '<p class="text-xs mt-1">' +
+                                (p.image_url ? '<span class="text-blue-500"><i class="fas fa-image mr-1"></i>썸네일✓</span> ' : '<span class="text-gray-300">썸네일✗</span> ') +
+                                (p.detail_image_url ? '<span class="text-purple-500"><i class="fas fa-file-image mr-1"></i>상세이미지✓</span>' : '<span class="text-gray-300">상세이미지✗</span>') +
+                            '</p>' +
+                            (p.options ? '<p class="text-xs mt-1 text-orange-600"><i class="fas fa-list-ul mr-1"></i>' + (function(){ try { var opts=JSON.parse(p.options); return opts.map(function(o){return o.name+':'+o.values.join(',')}).join(' | '); } catch(e){ return p.options; } })() + '</p>' : '') +
+                        '</div>' +
+                        '<div class="flex flex-col gap-1 ml-3">' +
+                            '<button onclick="adminEditProduct(' + p.id + ')" class="px-3 py-2 text-xs bg-blue-600 text-white hover:bg-blue-700 rounded font-bold shadow"><i class="fas fa-edit mr-1"></i>수정/저장</button>' +
+                            '<button onclick="adminToggleProduct(' + p.id + ',' + (p.is_active ? 0 : 1) + ',this)" class="px-2 py-1 text-xs rounded ' + (p.is_active ? 'bg-red-100 text-red-600 hover:bg-red-200' : 'bg-green-100 text-green-600 hover:bg-green-200') + '">' +
+                                (p.is_active ? '<i class="fas fa-ban mr-1"></i>비활성' : '<i class="fas fa-check mr-1"></i>활성화') +
+                            '</button>' +
+                            '<button onclick="adminDeleteProduct(' + p.id + ')" class="px-2 py-1 text-xs bg-gray-100 text-gray-600 hover:bg-gray-200 rounded"><i class="fas fa-trash mr-1"></i>삭제</button>' +
+                        '</div>' +
+                    '</div>';
+                }).join('');
             }
 
             async function adminToggleProduct(id, newActive, btnEl) {
@@ -9720,13 +9763,24 @@ app.get('/admin/dashboard', (c) => {
                     });
                     selectHtml += '</select>';
                     var shippingInfo = [o.shipping_name, o.shipping_phone, o.shipping_address].filter(Boolean).join(' / ') || '-';
+                    // 송장 정보 추출 (shipping_memo에 "[택배사] 송장: 번호" 형식으로 저장됨)
+                    var trackingDisplay = '';
+                    var memo = o.shipping_memo || '';
+                    var trackMatch = memo.match(/(?:\[([^\]]+)\]\s*)?송장:\s*([^\s|]+)/);
+                    if (trackMatch) {
+                        trackingDisplay = '<div class="text-xs text-blue-600 mt-1"><i class="fas fa-truck mr-1"></i>' + (trackMatch[1] ? '[' + esc(trackMatch[1]) + '] ' : '') + esc(trackMatch[2]) + '</div>';
+                    }
+                    // 개별 송장 등록/수정 버튼
+                    var trackBtnLabel = trackMatch ? '<i class="fas fa-edit mr-1"></i>송장수정' : '<i class="fas fa-truck mr-1"></i>송장등록';
+                    var trackBtnColor = trackMatch ? 'bg-purple-500 hover:bg-purple-600' : 'bg-blue-500 hover:bg-blue-600';
+                    var trackBtn = '<button onclick="openTrackingModal(' + o.id + ')" class="px-2 py-1 text-xs ' + trackBtnColor + ' text-white rounded font-bold shadow mt-1 w-full">' + trackBtnLabel + '</button>';
                     return '<tr class="hover:bg-gray-50">' +
                         '<td class="px-3 py-2 text-xs"><span class="font-medium">' + esc(o.user_name || '-') + '</span><br><span class="text-gray-400">' + esc(o.user_email || '') + '</span></td>' +
                         '<td class="px-3 py-2 text-xs font-medium">' + esc(o.product_name) + ' x' + o.quantity + '</td>' +
                         '<td class="px-3 py-2 text-xs text-right">' + Number(o.price_krw).toLocaleString() + '원</td>' +
                         '<td class="px-3 py-2 text-xs text-right font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + '</td>' +
-                        '<td class="px-3 py-2 text-xs max-w-[200px] truncate" title="' + esc(shippingInfo) + '">' + esc(shippingInfo) + '</td>' +
-                        '<td class="px-3 py-2 text-center">' + selectHtml + '</td>' +
+                        '<td class="px-3 py-2 text-xs max-w-[200px]"><div class="truncate" title="' + esc(shippingInfo) + '">' + esc(shippingInfo) + '</div>' + trackingDisplay + '</td>' +
+                        '<td class="px-3 py-2 text-center">' + selectHtml + trackBtn + '</td>' +
                         '<td class="px-3 py-2 text-xs text-gray-500">' + date + '</td>' +
                     '</tr>';
                 }).join('');
@@ -9738,6 +9792,84 @@ app.get('/admin/dashboard', (c) => {
                     loadAdminShopOrders();
                 } catch(e) {
                     alert('상태 변경 중 오류');
+                }
+            }
+
+            // 개별 송장 등록 모달
+            function openTrackingModal(orderId) {
+                var order = (_adminShopOrdersCache || []).find(function(x){ return x.id === orderId; });
+                if (!order) { alert('주문 정보를 찾을 수 없습니다'); return; }
+
+                // 기존 송장 정보 파싱
+                var existingNo = '';
+                var existingCourier = '';
+                var memo = order.shipping_memo || '';
+                var m = memo.match(/(?:\[([^\]]+)\]\s*)?송장:\s*([^\s|]+)/);
+                if (m) { existingCourier = m[1] || ''; existingNo = m[2] || ''; }
+
+                var courierList = ['CJ대한통운','한진택배','롯데택배','우체국택배','로젠택배','경동택배','쿠팡로지스틱스','GS택배','직접배송','기타'];
+                var courierOpts = courierList.map(function(c) {
+                    return '<option value="' + c + '"' + (existingCourier === c ? ' selected' : '') + '>' + c + '</option>';
+                }).join('');
+
+                var modal = document.createElement('div');
+                modal.id = 'trackingEditModal';
+                modal.className = 'fixed inset-0 bg-black bg-opacity-60 z-50 flex items-center justify-center p-4';
+                modal.onclick = function(e){ if (e.target === modal) modal.remove(); };
+                modal.innerHTML =
+                    '<div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">' +
+                        '<div class="p-4 border-b flex items-center justify-between">' +
+                            '<h3 class="font-bold text-lg text-gray-800"><i class="fas fa-truck mr-2 text-blue-600"></i>송장 ' + (m ? '수정' : '등록') + '</h3>' +
+                            '<button onclick="document.getElementById(\\'trackingEditModal\\').remove()" class="text-gray-400 hover:text-gray-600 text-3xl leading-none">&times;</button>' +
+                        '</div>' +
+                        '<div class="p-4 space-y-3">' +
+                            '<div class="bg-gray-50 rounded-lg p-3 text-xs space-y-1">' +
+                                '<p><span class="text-gray-500">주문번호:</span> <span class="font-bold">#' + order.id + '</span></p>' +
+                                '<p><span class="text-gray-500">수령인:</span> ' + esc(order.shipping_name || '-') + ' / ' + esc(order.shipping_phone || '-') + '</p>' +
+                                '<p><span class="text-gray-500">주소:</span> ' + esc(order.shipping_address || '-') + '</p>' +
+                                '<p><span class="text-gray-500">상품:</span> ' + esc(order.product_name) + ' x' + order.quantity + '</p>' +
+                            '</div>' +
+                            '<div>' +
+                                '<label class="block text-xs font-bold text-gray-700 mb-1">택배사</label>' +
+                                '<select id="trkCourier" class="w-full px-3 py-2 border rounded-lg text-sm">' + courierOpts + '</select>' +
+                            '</div>' +
+                            '<div>' +
+                                '<label class="block text-xs font-bold text-gray-700 mb-1">송장번호 <span class="text-red-500">*</span></label>' +
+                                '<input id="trkNumber" type="text" value="' + esc(existingNo) + '" placeholder="송장번호 입력" class="w-full px-3 py-2 border rounded-lg text-sm">' +
+                            '</div>' +
+                            '<div class="flex items-center gap-2 pt-2">' +
+                                '<input type="checkbox" id="trkAutoShipping" checked class="w-4 h-4">' +
+                                '<label for="trkAutoShipping" class="text-xs text-gray-600">송장 등록 시 상태를 <span class="font-bold text-blue-600">배송중</span>으로 자동 변경</label>' +
+                            '</div>' +
+                        '</div>' +
+                        '<div class="p-4 border-t flex gap-2">' +
+                            '<button onclick="document.getElementById(\\'trackingEditModal\\').remove()" class="flex-1 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-bold text-sm">취소</button>' +
+                            '<button onclick="submitTracking(' + orderId + ')" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-sm shadow"><i class="fas fa-save mr-1"></i>저장</button>' +
+                        '</div>' +
+                    '</div>';
+                document.body.appendChild(modal);
+                setTimeout(function(){ var inp = document.getElementById('trkNumber'); if (inp) inp.focus(); }, 100);
+            }
+
+            async function submitTracking(orderId) {
+                var trackingNo = (document.getElementById('trkNumber').value || '').trim();
+                var courier = (document.getElementById('trkCourier').value || '').trim();
+                var autoShipping = document.getElementById('trkAutoShipping').checked;
+                if (!trackingNo) { alert('송장번호를 입력해주세요'); return; }
+                try {
+                    var order = (_adminShopOrdersCache || []).find(function(x){ return x.id === orderId; });
+                    var newStatus = autoShipping ? 'shipping' : (order ? order.status : 'shipping');
+                    await axios.put('/api/admin/shop/order/' + orderId + '/status', {
+                        status: newStatus,
+                        trackingNo: trackingNo,
+                        courier: courier
+                    });
+                    var modalEl = document.getElementById('trackingEditModal');
+                    if (modalEl) modalEl.remove();
+                    alert('송장 등록 완료!\\n[' + courier + '] ' + trackingNo + (autoShipping ? '\\n주문 상태: 배송중' : ''));
+                    loadAdminShopOrders();
+                } catch(e) {
+                    alert('송장 등록 중 오류: ' + ((e.response && e.response.data && e.response.data.error) || e.message || ''));
                 }
             }
 
