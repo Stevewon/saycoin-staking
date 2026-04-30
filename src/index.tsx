@@ -1999,18 +1999,29 @@ app.post('/api/admin/staking/reject/:stakingId', async (c) => {
 app.get('/api/admin/staking/pending', async (c) => {
   try {
     const db = c.env.DB
-    
+
+    // ★ 안전장치: status='pending'만 정확히 조회 (active/rejected/completed는 절대 제외)
+    //   이미 처리된 row가 화면에 다시 뜨던 문제를 차단
     const stakings = await db.prepare(`
       SELECT s.*, u.name, u.email, u.wallet_address
       FROM staking s
       JOIN users u ON s.user_id = u.id
       WHERE s.status = 'pending'
+        AND s.status != 'active'
+        AND s.status != 'rejected'
+        AND s.status != 'completed'
       ORDER BY s.created_at DESC
     `).all()
 
-    return c.json({ 
-      success: true, 
-      stakings: stakings.results 
+    // 브라우저/CDN 캐시 완전 차단: 승인 직후 즉시 최신 상태 반영
+    c.header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+    c.header('Pragma', 'no-cache')
+    c.header('Expires', '0')
+
+    return c.json({
+      success: true,
+      stakings: stakings.results,
+      _ts: Date.now()
     })
   } catch (error) {
     return c.json({ error: t(c, 'admin.pending_list_error') }, 500)
@@ -7749,7 +7760,10 @@ app.get('/admin/dashboard', (c) => {
             async function loadPendingStakings() {
                 console.log('Loading pending stakings...');
                 try {
-                    const response = await axios.get('/api/admin/staking/pending');
+                    // ★ 캐시 우회: timestamp 쿼리 + no-store 헤더로 항상 최신 상태 fetch
+                    const response = await axios.get('/api/admin/staking/pending?_t=' + Date.now(), {
+                        headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
+                    });
                     console.log('Pending stakings response:', response.data);
                     const stakings = response.data.stakings || [];
                     const listEl = document.getElementById('pendingList');
@@ -7761,7 +7775,7 @@ app.get('/admin/dashboard', (c) => {
                     }
 
                     listEl.innerHTML = stakings.map(s => \`
-                        <div class="border border-yellow-200 bg-yellow-50 rounded-lg p-6">
+                        <div class="border border-yellow-200 bg-yellow-50 rounded-lg p-6" data-staking-id="\${s.id}">
                             <div class="flex justify-between items-start mb-4">
                                 <div class="flex-1">
                                     <div class="flex items-center gap-2 mb-2">
@@ -8430,14 +8444,23 @@ app.get('/admin/dashboard', (c) => {
                 }
 
                 try {
-                    const response = await axios.post(\`/api/admin/staking/approve/\${stakingId}\`);
+                    const response = await axios.post(\`/api/admin/staking/approve/\${stakingId}?_t=\` + Date.now(), null, {
+                        headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
+                    });
                     if (response.data.success) {
                         alert(response.data.message);
+                        // ★ 즉시 화면에서 해당 카드 제거 (DB 반영 지연 대비)
+                        const cardEl = document.querySelector('[data-staking-id="' + stakingId + '"]');
+                        if (cardEl) cardEl.remove();
                         await loadStatistics();
+                        // ★ 약간 지연 후 재로드: D1 write→read 일관성 대기
+                        await new Promise(r => setTimeout(r, 300));
                         await loadPendingStakings();
                     }
                 } catch (error) {
                     alert(error.response?.data?.error || I18N.t('admin.approve_fail'));
+                    // 실패 시에도 최신 상태 재조회
+                    await loadPendingStakings();
                 }
             }
 
@@ -8448,14 +8471,20 @@ app.get('/admin/dashboard', (c) => {
                 }
 
                 try {
-                    const response = await axios.post(\`/api/admin/staking/reject/\${stakingId}\`);
+                    const response = await axios.post(\`/api/admin/staking/reject/\${stakingId}?_t=\` + Date.now(), null, {
+                        headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
+                    });
                     if (response.data.success) {
                         alert(response.data.message);
+                        const cardEl = document.querySelector('[data-staking-id="' + stakingId + '"]');
+                        if (cardEl) cardEl.remove();
                         await loadStatistics();
+                        await new Promise(r => setTimeout(r, 300));
                         await loadPendingStakings();
                     }
                 } catch (error) {
                     alert(error.response?.data?.error || I18N.t('admin.reject_fail'));
+                    await loadPendingStakings();
                 }
             }
 
