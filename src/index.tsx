@@ -2400,6 +2400,26 @@ app.get('/api/admin/rewards', async (c) => {
       FROM referral_rewards
     `).first()
 
+    // 추천 보상 상세 내역 (최근 100건, 직판/성과금 구분)
+    let recentReferrals: any[] = []
+    try {
+      const refRows = await db.prepare(`
+        SELECT 
+          rr.id, rr.referrer_id, rr.referee_id, rr.level, rr.original_amount, rr.reward_amount,
+          rr.reward_date, rr.created_at,
+          ru.name as referrer_name, ru.email as referrer_email,
+          re.name as referee_name, re.email as referee_email
+        FROM referral_rewards rr
+        LEFT JOIN users ru ON rr.referrer_id = ru.id
+        LEFT JOIN users re ON rr.referee_id = re.id
+        ORDER BY rr.created_at DESC
+        LIMIT 100
+      `).all()
+      recentReferrals = refRows.results || []
+    } catch (e) {
+      recentReferrals = []
+    }
+
     return c.json({
       success: true,
       stats: {
@@ -2419,11 +2439,103 @@ app.get('/api/admin/rewards', async (c) => {
         level1Total: referralStats?.level1_total || 0,
         level2Total: referralStats?.level2_total || 0
       },
-      rewards: recentRewards.results
+      rewards: recentRewards.results,
+      referrals: recentReferrals
     })
   } catch (error) {
     console.error('배당 현황 조회 오류:', error)
     return c.json({ error: t(c, 'admin.rewards_error') }, 500)
+  }
+})
+
+// 어드민: 직접판매/성과금 CSV 다운로드 (referral_rewards 전체)
+app.get('/api/admin/export/referrals', async (c) => {
+  try {
+    const db = c.env.DB
+    const rows = await db.prepare(`
+      SELECT 
+        rr.id, rr.level, rr.original_amount, rr.reward_amount,
+        rr.reward_date, rr.created_at,
+        ru.name as referrer_name, ru.email as referrer_email,
+        re.name as referee_name, re.email as referee_email
+      FROM referral_rewards rr
+      LEFT JOIN users ru ON rr.referrer_id = ru.id
+      LEFT JOIN users re ON rr.referee_id = re.id
+      ORDER BY rr.created_at DESC
+    `).all()
+    const BOM = String.fromCharCode(0xFEFF)
+    const LF = String.fromCharCode(10)
+    const headers = ['ID','구분','지급일','수령자(추천인)','수령자이메일','피추천인','피추천인이메일','원금(USD)','지급QKEY','등록시각']
+    let csv = BOM + headers.join(',') + LF
+    const labels: Record<number,string> = { 0: '직접판매', 1: '1대성과금', 2: '2대성과금' }
+    for (const r of (rows.results || []) as any[]) {
+      const safe = (v: any) => '"' + String(v == null ? '' : v).split('"').join('""') + '"'
+      csv += [
+        r.id,
+        safe(labels[r.level as number] || ('레벨'+r.level)),
+        safe(r.reward_date || ''),
+        safe(r.referrer_name || ''),
+        safe(r.referrer_email || ''),
+        safe(r.referee_name || ''),
+        safe(r.referee_email || ''),
+        Number(r.original_amount || 0),
+        Math.round(Number(r.reward_amount || 0)),
+        safe(r.created_at || '')
+      ].join(',') + LF
+    }
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="referral_rewards_export.csv"'
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '추천 보상 CSV 생성 중 오류' }, 500)
+  }
+})
+
+// 어드민: 일일배당 CSV 다운로드 (daily_rewards 전체)
+app.get('/api/admin/export/daily-rewards', async (c) => {
+  try {
+    const db = c.env.DB
+    const rows = await db.prepare(`
+      SELECT 
+        d.id, d.user_id, d.staking_id, d.usdt_amount as qkey_amount, 
+        d.reward_date, d.created_at,
+        u.name, u.email,
+        s.amount as staking_amount, s.daily_rate, s.period_days
+      FROM daily_rewards d
+      LEFT JOIN users u ON d.user_id = u.id
+      LEFT JOIN staking s ON d.staking_id = s.id
+      ORDER BY d.created_at DESC
+    `).all()
+    const BOM = String.fromCharCode(0xFEFF)
+    const LF = String.fromCharCode(10)
+    const headers = ['ID','지급일','회원명','이메일','투자금(USD)','일배당률(%)','기간(일)','지급QKEY','등록시각']
+    let csv = BOM + headers.join(',') + LF
+    for (const r of (rows.results || []) as any[]) {
+      const safe = (v: any) => '"' + String(v == null ? '' : v).split('"').join('""') + '"'
+      const ratePct = r.daily_rate ? (Number(r.daily_rate) * 100).toFixed(2) : ''
+      csv += [
+        r.id,
+        safe(r.reward_date || ''),
+        safe(r.name || ''),
+        safe(r.email || ''),
+        Number(r.staking_amount || 0),
+        ratePct,
+        Number(r.period_days || 0),
+        Math.round(Number(r.qkey_amount || 0)),
+        safe(r.created_at || '')
+      ].join(',') + LF
+    }
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="daily_rewards_export.csv"'
+      }
+    })
+  } catch (error) {
+    return c.json({ error: '일일배당 CSV 생성 중 오류' }, 500)
   }
 })
 
@@ -7243,9 +7355,16 @@ app.get('/admin/dashboard', (c) => {
 
                 <!-- 배당 현황 (숨김) -->
                 <div id="content-rewards" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
-                    <h2 class="text-xl font-bold text-gray-800 mb-4">
-                        <i class="fas fa-coins text-yellow-600 mr-2"></i><span data-i18n="admin.rewards_title">배당 현황</span>
-                    </h2>
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
+                        <h2 class="text-xl font-bold text-gray-800">
+                            <i class="fas fa-coins text-yellow-600 mr-2"></i><span data-i18n="admin.rewards_title">배당 현황</span>
+                        </h2>
+                        <div class="flex gap-2 flex-wrap">
+                            <button onclick="exportDailyRewardsCSV()" class="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg text-xs sm:text-sm font-bold transition shadow"><i class="fas fa-file-excel mr-1"></i>일일배당 엑셀</button>
+                            <button onclick="exportReferralRewardsCSV()" class="px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-xs sm:text-sm font-bold transition shadow"><i class="fas fa-file-excel mr-1"></i>직판/성과금 엑셀</button>
+                            <button onclick="exportCSV('rewards')" class="px-3 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-xs sm:text-sm font-bold transition shadow"><i class="fas fa-file-excel mr-1"></i>회원별 합계 엑셀</button>
+                        </div>
+                    </div>
                     <!-- 배당 통계 -->
                     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
                         <div class="bg-yellow-50 rounded-lg p-3 sm:p-4 border border-yellow-200">
@@ -7280,9 +7399,9 @@ app.get('/admin/dashboard', (c) => {
                             <p id="rewardsLevel2Total" class="text-sm sm:text-base font-bold text-purple-600">0</p>
                         </div>
                     </div>
-                    <!-- 최근 배당 내역 -->
-                    <h3 class="text-base font-bold text-gray-700 mb-2" data-i18n="admin.recent_rewards">최근 배당 내역</h3>
-                    <div class="overflow-x-auto">
+                    <!-- 최근 일일배당 내역 -->
+                    <h3 class="text-base font-bold text-gray-700 mb-2"><i class="fas fa-coins text-yellow-600 mr-1"></i><span data-i18n="admin.recent_rewards">최근 배당 내역</span> <span class="text-xs text-gray-500 font-normal">(일일배당 최근 100건)</span></h3>
+                    <div class="overflow-x-auto mb-6">
                         <table class="w-full text-xs sm:text-sm">
                             <thead class="bg-gray-100">
                                 <tr>
@@ -7295,6 +7414,34 @@ app.get('/admin/dashboard', (c) => {
                             </thead>
                             <tbody id="rewardsTableBody" class="divide-y divide-gray-200">
                                 <tr><td colspan="5" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- 최근 직접판매/성과금 내역 -->
+                    <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+                        <h3 class="text-base font-bold text-gray-700"><i class="fas fa-users text-purple-600 mr-1"></i>직접판매 / 성과금(매칭) 내역 <span class="text-xs text-gray-500 font-normal">(최근 100건)</span></h3>
+                        <select id="referralFilterLevel" onchange="renderReferralTable()" class="text-xs border rounded px-2 py-1">
+                            <option value="">전체</option>
+                            <option value="0">직접판매(레벨0)</option>
+                            <option value="1">1대 성과금</option>
+                            <option value="2">2대 성과금</option>
+                        </select>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-xs sm:text-sm">
+                            <thead class="bg-gray-100">
+                                <tr>
+                                    <th class="px-2 sm:px-3 py-2 text-left">날짜</th>
+                                    <th class="px-2 sm:px-3 py-2 text-center">구분</th>
+                                    <th class="px-2 sm:px-3 py-2 text-left">수령자(추천인)</th>
+                                    <th class="px-2 sm:px-3 py-2 text-left">피추천인</th>
+                                    <th class="px-2 sm:px-3 py-2 text-right">원금(USD)</th>
+                                    <th class="px-2 sm:px-3 py-2 text-right">지급 QKEY</th>
+                                </tr>
+                            </thead>
+                            <tbody id="referralRewardsTableBody" class="divide-y divide-gray-200">
+                                <tr><td colspan="6" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -8225,11 +8372,14 @@ app.get('/admin/dashboard', (c) => {
             // ============================================
             // 배당 현황 로드
             // ============================================
+            // 추천 보상 캐시 (필터링용)
+            var _referralRewardsCache = [];
+
             async function loadRewardsStatus() {
                 try {
                     const response = await axios.get('/api/admin/rewards');
                     if (!response.data.success) return;
-                    const { stats, today, referralStats, rewards } = response.data;
+                    const { stats, today, referralStats, rewards, referrals } = response.data;
 
                     document.getElementById('rewardsTotalQkey').textContent = Math.round(stats.totalQkey).toLocaleString() + ' QKEY';
                     document.getElementById('rewardsTodayQkey').textContent = Math.round(today.totalQkey).toLocaleString() + ' QKEY';
@@ -8253,9 +8403,73 @@ app.get('/admin/dashboard', (c) => {
                             '</tr>';
                         }).join('');
                     }
+
+                    // 직접판매/성과금 내역 렌더링
+                    _referralRewardsCache = referrals || [];
+                    renderReferralTable();
                 } catch (error) {
                     console.error('Rewards status load failed:', error);
                 }
+            }
+
+            // 직접판매/성과금 내역 렌더 (필터 적용)
+            function renderReferralTable() {
+                var tbody = document.getElementById('referralRewardsTableBody');
+                if (!tbody) return;
+                var filterEl = document.getElementById('referralFilterLevel');
+                var filter = filterEl ? filterEl.value : '';
+                var rows = _referralRewardsCache || [];
+                if (filter !== '') {
+                    var lv = parseInt(filter);
+                    rows = rows.filter(function(r) { return Number(r.level) === lv; });
+                }
+                if (rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-gray-500">내역이 없습니다</td></tr>';
+                    return;
+                }
+                var labels = { 0: '직접판매', 1: '1대성과금', 2: '2대성과금' };
+                var colors = { 0: 'orange', 1: 'blue', 2: 'purple' };
+                tbody.innerHTML = rows.map(function(r) {
+                    var lv = Number(r.level);
+                    var label = labels[lv] || ('레벨' + lv);
+                    var color = colors[lv] || 'gray';
+                    return '<tr class="hover:bg-gray-50">' +
+                        '<td class="px-2 sm:px-3 py-2 whitespace-nowrap text-xs">' + esc(r.reward_date || '') + '</td>' +
+                        '<td class="px-2 sm:px-3 py-2 text-center"><span class="text-xs px-2 py-0.5 bg-' + color + '-100 text-' + color + '-700 rounded-full font-bold">' + label + '</span></td>' +
+                        '<td class="px-2 sm:px-3 py-2"><span class="font-medium">' + esc(r.referrer_name || '-') + '</span><br><span class="text-xs text-gray-500">' + esc(r.referrer_email || '') + '</span></td>' +
+                        '<td class="px-2 sm:px-3 py-2"><span class="font-medium">' + esc(r.referee_name || '-') + '</span><br><span class="text-xs text-gray-500">' + esc(r.referee_email || '') + '</span></td>' +
+                        '<td class="px-2 sm:px-3 py-2 text-right">$' + Number(r.original_amount || 0).toLocaleString() + '</td>' +
+                        '<td class="px-2 sm:px-3 py-2 text-right font-bold text-' + color + '-600">' + Math.round(Number(r.reward_amount || 0)).toLocaleString() + '</td>' +
+                    '</tr>';
+                }).join('');
+            }
+
+            // 일일배당 CSV 다운로드
+            function exportDailyRewardsCSV() {
+                axios.get('/api/admin/export/daily-rewards', { responseType: 'blob' }).then(function(response) {
+                    var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
+                    var link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    var now = new Date().toISOString().slice(0, 10);
+                    link.download = 'daily_rewards_' + now + '.csv';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                }).catch(function(e) { alert('일일배당 다운로드 실패'); });
+            }
+
+            // 직접판매/성과금 CSV 다운로드
+            function exportReferralRewardsCSV() {
+                axios.get('/api/admin/export/referrals', { responseType: 'blob' }).then(function(response) {
+                    var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
+                    var link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    var now = new Date().toISOString().slice(0, 10);
+                    link.download = 'referral_rewards_' + now + '.csv';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                }).catch(function(e) { alert('직판/성과금 다운로드 실패'); });
             }
 
             // ============================================
