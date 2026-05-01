@@ -3689,9 +3689,10 @@ app.post('/api/rewards/daily', async (c) => {
   try {
     const db = c.env.DB
     const now = new Date()
-    const today = now.toISOString().split('T')[0]
+    // ★ KST 기준 날짜 사용 (UTC가 아니라) — 한국 새벽시간대 휴일 판정 누락 방지
+    const today = kstDateStr(now)
 
-    // 영업일 체크: 토/일/공휴일이면 지급 불가
+    // 영업일 체크: 토/일/공휴일이면 지급 불가 (KST 기준)
     const { isBusinessDay, reason } = isKoreanBusinessDay(now)
     if (!isBusinessDay) {
       const reasonText = reason === 'saturday' ? '토요일' : reason === 'sunday' ? '일요일' : '공휴일/국경일'
