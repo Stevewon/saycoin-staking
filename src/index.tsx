@@ -6583,6 +6583,7 @@ app.get('/dashboard', (c) => {
             }
 
             // 사용자: 내 출금 신청 내역 조회 + 렌더링
+            var _myWithdrawalsRefreshTimer = null;
             async function loadMyWithdrawals() {
                 var listEl = document.getElementById('myWithdrawList');
                 var countEl = document.getElementById('withdrawHistoryCount');
@@ -6670,9 +6671,9 @@ app.get('/dashboard', (c) => {
                     var res = await axios.post('/api/withdrawal/cancel/' + withdrawalId, { userId: currentUser.id });
                     if (res.data && res.data.success) {
                         alert(res.data.message || '출금 신청이 취소되었습니다.');
-                        // 잔액 즉시 갱신
+                        // 잔액 즉시 갱신 + 출금 버튼 상태 갱신
                         try {
-                            var u = await axios.get('/api/user/' + currentUser.id);
+                            var u = await axios.get('/api/user/' + currentUser.id + '?t=' + Date.now());
                             if (u.data && u.data.success && u.data.user) {
                                 currentUser.qta_balance = u.data.user.qta_balance;
                                 currentUser.qx_balance = u.data.user.qx_balance;
@@ -6681,6 +6682,7 @@ app.get('/dashboard', (c) => {
                                 if (typeof refreshDashboard === 'function') refreshDashboard();
                             }
                         } catch(eb) {}
+                        try { if (typeof updateWithdrawalButtons === 'function') updateWithdrawalButtons(); } catch(eUB) {}
                         // 출금 잔액 카드 + 내역 동시 갱신
                         await updateWithdrawalBalances();
                         await loadMyWithdrawals();
@@ -9131,13 +9133,14 @@ app.get('/admin/dashboard', (c) => {
                     console.error('Withdrawals load failed:', error);
                 }
 
-                // 실시간 자동 새로고침 (10초마다, 출금탭이 활성일 때만)
+                // 실시간 자동 새로고침 (5초마다, 출금탭이 활성일 때만)
+                // 사용자가 출금 취소하면 5초 이내 어드민 화면에 자동 반영
                 if (_adminWithdrawalsRefreshTimer) clearInterval(_adminWithdrawalsRefreshTimer);
                 if (currentTab === 'withdrawals') {
                     _adminWithdrawalsRefreshTimer = setInterval(function() {
                         if (currentTab === 'withdrawals') loadWithdrawals();
-                        else clearInterval(_adminWithdrawalsRefreshTimer);
-                    }, 10000);
+                        else { clearInterval(_adminWithdrawalsRefreshTimer); _adminWithdrawalsRefreshTimer = null; }
+                    }, 5000);
                 }
             }
 
