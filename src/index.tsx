@@ -3619,7 +3619,7 @@ function getKoreanHolidays(year: number): string[] {
   const holidays: Record<number, string[]> = {
     2025: [
       '2025-01-01','2025-01-28','2025-01-29','2025-01-30',
-      '2025-03-01','2025-05-05','2025-05-06','2025-06-06',
+      '2025-03-01','2025-05-01','2025-05-05','2025-05-06','2025-06-06',
       '2025-08-15','2025-10-03','2025-10-05','2025-10-06','2025-10-07',
       '2025-10-09','2025-12-25'
     ],
@@ -3627,6 +3627,7 @@ function getKoreanHolidays(year: number): string[] {
       '2026-01-01',                        // 신정
       '2026-02-16','2026-02-17','2026-02-18', // 설날
       '2026-03-01',                        // 삼일절
+      '2026-05-01',                        // 근로자의 날
       '2026-05-05',                        // 어린이날
       '2026-05-24',                        // 부처님오신날
       '2026-06-06',                        // 현충일
@@ -3639,7 +3640,7 @@ function getKoreanHolidays(year: number): string[] {
     2027: [
       '2027-01-01',
       '2027-02-05','2027-02-06','2027-02-07',
-      '2027-03-01','2027-05-05','2027-05-13','2027-06-06',
+      '2027-03-01','2027-05-01','2027-05-05','2027-05-13','2027-06-06',
       '2027-08-15','2027-10-03','2027-10-09',
       '2027-10-14','2027-10-15','2027-10-16',
       '2027-12-25'
@@ -3861,6 +3862,83 @@ app.post('/api/rewards/daily', async (c) => {
   } catch (error) {
     console.error('Daily reward error:', error)
     return c.json({ error: t(c, 'rewards.daily_error') }, 500)
+  }
+})
+
+// 어드민: 특정 날짜의 일일 배당 + 1대/2대 매칭수당 전체 회수 (잘못 지급된 휴일 배당 롤백용)
+//   - daily_rewards 의 해당 reward_date 행 전부 삭제
+//   - users.qkey_balance 에서 해당 금액 차감
+//   - referral_rewards 의 해당 reward_date 행 전부 삭제
+//   - users.qkey_balance 에서 매칭수당 금액 차감
+//   - transactions 에 회수 로그 INSERT (type='daily_reward_rollback' / 'referral_reward_rollback')
+app.post('/api/admin/rewards/rollback-daily', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const targetDate = (body && body.date) ? String(body.date) : ''
+    if (!targetDate || !/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      return c.json({ error: 'date 파라미터(YYYY-MM-DD)가 필요합니다' }, 400)
+    }
+
+    // 1) 본인 일일 배당 회수
+    const dailyRows = await db.prepare(
+      `SELECT id, user_id, staking_id, usdt_amount FROM daily_rewards WHERE reward_date = ?`
+    ).bind(targetDate).all()
+
+    let dailyCount = 0
+    let dailyQkeyTotal = 0
+    for (const r of (dailyRows.results || [])) {
+      const amt = Number(r.usdt_amount) || 0
+      try {
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amt, r.user_id).run()
+        await db.prepare(`DELETE FROM daily_rewards WHERE id = ?`).bind(r.id).run()
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'daily_reward_rollback', 'QKEY', ?, ?)
+        `).bind(r.user_id, -amt, `[휴일 회수] ${targetDate} 일일배당 회수 (-${amt.toLocaleString()} QKEY, staking #${r.staking_id})`).run()
+        dailyCount++
+        dailyQkeyTotal += amt
+      } catch (e) {
+        console.error('daily rollback row error:', e)
+      }
+    }
+
+    // 2) 매칭수당(1대/2대) 회수
+    const refRows = await db.prepare(
+      `SELECT id, referrer_id, referee_id, level, reward_amount FROM referral_rewards WHERE reward_date = ?`
+    ).bind(targetDate).all()
+
+    let refCount = 0
+    let refQkeyTotal = 0
+    for (const r of (refRows.results || [])) {
+      const amt = Number(r.reward_amount) || 0
+      try {
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amt, r.referrer_id).run()
+        await db.prepare(`DELETE FROM referral_rewards WHERE id = ?`).bind(r.id).run()
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'referral_reward_rollback', 'QKEY', ?, ?)
+        `).bind(r.referrer_id, -amt, `[휴일 회수] ${targetDate} Level ${r.level} 매칭수당 회수 (-${amt.toLocaleString()} QKEY, referee #${r.referee_id})`).run()
+        refCount++
+        refQkeyTotal += amt
+      } catch (e) {
+        console.error('referral rollback row error:', e)
+      }
+    }
+
+    return c.json({
+      success: true,
+      message: `${targetDate} 배당 회수 완료. 본인 ${dailyCount}건(-${dailyQkeyTotal.toLocaleString()} QKEY), 매칭 ${refCount}건(-${refQkeyTotal.toLocaleString()} QKEY)`,
+      date: targetDate,
+      dailyRolledBack: dailyCount,
+      dailyQkeyTotal,
+      referralRolledBack: refCount,
+      referralQkeyTotal: refQkeyTotal,
+      grandTotalQkey: dailyQkeyTotal + refQkeyTotal
+    })
+  } catch (error) {
+    console.error('Rollback daily error:', error)
+    return c.json({ error: '배당 회수 처리 중 오류가 발생했습니다' }, 500)
   }
 })
 
