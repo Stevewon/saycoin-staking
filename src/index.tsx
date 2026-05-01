@@ -1321,15 +1321,15 @@ app.post('/api/user/update-profile', async (c) => {
 // 출금 신청 (금요일 오전 10시 ~ 오후 2시 KST만 가능)
 app.post('/api/withdrawal/request', async (c) => {
   try {
-    // 금요일 10:00~14:00 KST 체크
+    // 출금 신청 가능 시간 체크 (KST)
+    // 룰:
+    //   - 매주 금요일 10:00~14:00 KST가 출금일
+    //   - 단, 그 주의 금요일이 한국 공휴일이면 직전 영업일(목→수→화→월)로 이동
+    //   - 그 주에 한 번은 반드시 출금 신청 창이 열린다
     const now = new Date()
-    const kst = new Date(now.getTime() + (9 * 60 * 60 * 1000))
-    const kstDay = kst.getUTCDay()   // 0=일, 5=금
-    const kstHour = kst.getUTCHours()
-
-    if (kstDay !== 5 || kstHour < 10 || kstHour >= 14) {
+    if (!isWithdrawalWindowOpen(now)) {
       return c.json({ 
-        error: '출금 신청은 매주 금요일 오전 10시 ~ 오후 2시(KST)에만 가능합니다. / Withdrawals are only available on Fridays 10:00 AM - 2:00 PM (KST).',
+        error: '출금 신청은 매주 금요일 오전 10시 ~ 오후 2시(KST)에만 가능합니다. 금요일이 공휴일인 경우 직전 영업일에 신청 가능합니다. / Withdrawals are only available on Fridays 10:00 AM - 2:00 PM (KST). If Friday is a Korean holiday, the window shifts to the previous business day.',
         withdrawal_closed: true
       }, 400)
     }
@@ -1397,6 +1397,42 @@ app.post('/api/withdrawal/request', async (c) => {
   } catch (error) {
     return c.json({ error: t(c, 'withdrawal.request_error') }, 500)
   }
+})
+
+// 출금 신청 창 상태 조회 (클라이언트 UI 동기화용)
+// 반환: { isOpen, todayKst, withdrawalDate, isToday, hour, minute, openHour, closeHour, fridayHoliday }
+app.get('/api/withdrawal/window', (c) => {
+  const now = new Date()
+  const kst = new Date(now.getTime() + (9 * 60 * 60 * 1000))
+  const todayKst = kst.toISOString().split('T')[0]
+  const targetDate = getWeeklyWithdrawalDateKST(now)
+  const hour = kst.getUTCHours()
+  const minute = kst.getUTCMinutes()
+  const isToday = todayKst === targetDate
+  const isOpen = isToday && hour >= 10 && hour < 14
+  // 그 주 금요일이 공휴일인지 표시 (UI에서 안내 문구 노출)
+  const day = kst.getUTCDay()
+  let diffToFriday: number
+  if (day === 0) diffToFriday = -2
+  else if (day === 6) diffToFriday = -1
+  else diffToFriday = 5 - day
+  const friday = new Date(kst.getTime() + diffToFriday * 24 * 60 * 60 * 1000)
+  const fridayYmd = friday.toISOString().split('T')[0]
+  const fridayHolidays = getKoreanHolidays(friday.getUTCFullYear())
+  const fridayHoliday = fridayHolidays.includes(fridayYmd)
+  return c.json({
+    success: true,
+    isOpen,
+    isToday,
+    todayKst,
+    withdrawalDate: targetDate,
+    fridayDate: fridayYmd,
+    fridayHoliday,
+    hour,
+    minute,
+    openHour: 10,
+    closeHour: 14
+  })
 })
 
 // 출금 신청 목록 조회
@@ -3565,6 +3601,52 @@ function isKoreanBusinessDay(date: Date): { isBusinessDay: boolean, reason: stri
   return { isBusinessDay: true, reason: 'business_day' }
 }
 
+// KST 기준 날짜 -> YYYY-MM-DD
+function kstDateStr(d: Date): string {
+  const kst = new Date(d.getTime() + (9 * 60 * 60 * 1000))
+  return kst.toISOString().split('T')[0]
+}
+
+// 그 주(월~일)의 출금 신청 기준일 계산
+// - 기본: 금요일
+// - 금요일이 한국 공휴일이면 직전 영업일(목 -> 수 -> 화 -> 월)로 이동
+// 입력: 임의의 KST 시점 (Date)
+// 반환: 그 주 출금 기준일의 YYYY-MM-DD (KST)
+function getWeeklyWithdrawalDateKST(d: Date): string {
+  const kst = new Date(d.getTime() + (9 * 60 * 60 * 1000))
+  const day = kst.getUTCDay()
+  let diffToFriday: number
+  if (day === 0) diffToFriday = -2
+  else if (day === 6) diffToFriday = -1
+  else diffToFriday = 5 - day
+
+  const friday = new Date(kst.getTime() + diffToFriday * 24 * 60 * 60 * 1000)
+  let cursor = new Date(friday.getTime())
+  for (let i = 0; i < 7; i++) {
+    const ymd = cursor.toISOString().split('T')[0]
+    const yr = cursor.getUTCFullYear()
+    const holidays = getKoreanHolidays(yr)
+    const dow = cursor.getUTCDay()
+    const isHoliday = holidays.includes(ymd)
+    const isWeekend = dow === 0 || dow === 6
+    if (!isHoliday && !isWeekend) {
+      return ymd
+    }
+    cursor = new Date(cursor.getTime() - 24 * 60 * 60 * 1000)
+  }
+  return friday.toISOString().split('T')[0]
+}
+
+// 출금 신청 창이 열려 있는지 (오늘이 그 주의 출금 기준일이고 10:00~14:00 KST)
+function isWithdrawalWindowOpen(d: Date): boolean {
+  const kst = new Date(d.getTime() + (9 * 60 * 60 * 1000))
+  const todayKst = kst.toISOString().split('T')[0]
+  const targetDate = getWeeklyWithdrawalDateKST(d)
+  if (todayKst !== targetDate) return false
+  const hour = kst.getUTCHours()
+  return hour >= 10 && hour < 14
+}
+
 // 일일 배당금 지급 (하루 1회 자동 지급)
 // 정책: 승인일 익일부터, 거치기간 내 매일 지급, 금액별 차등 배당률
 // 월~금만 지급 (토/일/공휴일/국경일 제외)
@@ -4094,8 +4176,13 @@ app.post('/api/shop/order/:orderId/cancel', async (c) => {
       return c.json({ error: `취소할 수 없는 상태입니다 (현재: ${labelMap[order.status as string] || order.status}). 결제완료(paid) 상태에서만 취소 가능합니다.` }, 400)
     }
 
+    // cancelled_at / cancelled_by / cancel_reason 컬럼 보장
+    try { await db.prepare(`ALTER TABLE orders ADD COLUMN cancelled_at DATETIME`).run() } catch(e) {}
+    try { await db.prepare(`ALTER TABLE orders ADD COLUMN cancelled_by TEXT`).run() } catch(e) {}
+    try { await db.prepare(`ALTER TABLE orders ADD COLUMN cancel_reason TEXT`).run() } catch(e) {}
+
     // 상태 변경 (경쟁조건 방지: paid 상태에서만)
-    const upd = await db.prepare(`UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = 'paid'`).bind(orderId).run()
+    const upd = await db.prepare(`UPDATE orders SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP, cancelled_by = 'user', cancel_reason = '사용자 직접 취소' WHERE id = ? AND status = 'paid'`).bind(orderId).run()
     if (!upd.meta.changes) return c.json({ error: '이미 처리된 주문입니다' }, 400)
 
     // QKEY 환불
@@ -4251,7 +4338,11 @@ app.put('/api/admin/shop/order/:id/status', async (c) => {
     // ★ cancelled 로 변경하는 경우: 자동 환불 + 재고 복구 (이미 취소된 주문은 중복환불 방지)
     let refundedQkey = 0
     if (status === 'cancelled' && order.status !== 'cancelled') {
-      const upd = await db.prepare(`UPDATE orders SET status = 'cancelled' WHERE id = ? AND status != 'cancelled'`).bind(orderId).run()
+      // cancelled_at / cancelled_by / cancel_reason 컬럼 보장
+      try { await db.prepare(`ALTER TABLE orders ADD COLUMN cancelled_at DATETIME`).run() } catch(e) {}
+      try { await db.prepare(`ALTER TABLE orders ADD COLUMN cancelled_by TEXT`).run() } catch(e) {}
+      try { await db.prepare(`ALTER TABLE orders ADD COLUMN cancel_reason TEXT`).run() } catch(e) {}
+      const upd = await db.prepare(`UPDATE orders SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP, cancelled_by = 'admin', cancel_reason = '관리자 처리 취소' WHERE id = ? AND status != 'cancelled'`).bind(orderId).run()
       if (upd.meta.changes) {
         // QKEY 환불
         await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(order.qkey_used, order.user_id).run()
@@ -4302,6 +4393,118 @@ app.get('/api/admin/shop/export/orders', async (c) => {
     return new Response(csv, { headers: { 'Content-Type': 'text/csv;charset=utf-8', 'Content-Disposition': 'attachment;filename=shop_orders_export.csv' } })
   } catch(e) {
     return new Response('주문 데이터가 없습니다', { status: 404 })
+  }
+})
+
+// ============================================
+// Notices (공지사항)
+// ============================================
+
+// 공지사항 테이블 보장
+async function ensureNoticesTable(db: any) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS notices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    is_pinned INTEGER DEFAULT 0,
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`).run()
+}
+
+// 공지사항 목록 (사용자용 - 활성만)
+app.get('/api/notices', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureNoticesTable(db)
+    const list = await db.prepare(`
+      SELECT id, title, content, is_pinned, created_at, updated_at
+      FROM notices
+      WHERE is_active = 1
+      ORDER BY is_pinned DESC, created_at DESC
+      LIMIT 50
+    `).all()
+    return c.json({ success: true, notices: list.results || [] })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message || 'notice_list_error' }, 500)
+  }
+})
+
+// 공지사항 단건 조회 (사용자/어드민 공용)
+app.get('/api/notices/:id', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureNoticesTable(db)
+    const id = c.req.param('id')
+    const row = await db.prepare(`SELECT * FROM notices WHERE id = ?`).bind(id).first()
+    if (!row) return c.json({ success: false, error: 'not_found' }, 404)
+    return c.json({ success: true, notice: row })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message || 'notice_get_error' }, 500)
+  }
+})
+
+// 어드민 - 전체 공지 (비활성 포함)
+app.get('/api/admin/notices', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureNoticesTable(db)
+    const list = await db.prepare(`
+      SELECT * FROM notices
+      ORDER BY is_pinned DESC, created_at DESC
+    `).all()
+    return c.json({ success: true, notices: list.results || [] })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message || 'admin_notice_list_error' }, 500)
+  }
+})
+
+// 어드민 - 공지 등록
+app.post('/api/admin/notices', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureNoticesTable(db)
+    const { title, content, isPinned, isActive } = await c.req.json()
+    if (!title || !content) return c.json({ success: false, error: 'title/content required' }, 400)
+    const r = await db.prepare(`
+      INSERT INTO notices (title, content, is_pinned, is_active)
+      VALUES (?, ?, ?, ?)
+    `).bind(String(title), String(content), isPinned ? 1 : 0, isActive === 0 ? 0 : 1).run()
+    return c.json({ success: true, id: r.meta.last_row_id })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message || 'admin_notice_create_error' }, 500)
+  }
+})
+
+// 어드민 - 공지 수정
+app.put('/api/admin/notices/:id', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureNoticesTable(db)
+    const id = c.req.param('id')
+    const { title, content, isPinned, isActive } = await c.req.json()
+    await db.prepare(`
+      UPDATE notices
+      SET title = ?, content = ?, is_pinned = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(String(title || ''), String(content || ''), isPinned ? 1 : 0, isActive === 0 ? 0 : 1, id).run()
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message || 'admin_notice_update_error' }, 500)
+  }
+})
+
+// 어드민 - 공지 삭제
+app.delete('/api/admin/notices/:id', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureNoticesTable(db)
+    const id = c.req.param('id')
+    await db.prepare(`DELETE FROM notices WHERE id = ?`).bind(id).run()
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message || 'admin_notice_delete_error' }, 500)
   }
 })
 
@@ -4958,6 +5161,11 @@ app.get('/dashboard', (c) => {
                         class="flex items-center gap-1 px-4 py-3 text-sm font-bold text-gray-400 hover:text-pink-600 transition">
                         <i class="fas fa-shopping-cart"></i><span>쇼핑몰</span>
                     </button>
+                    <button onclick="switchDashPage('notice')" id="dashNav-notice"
+                        class="flex items-center gap-1 px-4 py-3 text-sm font-bold text-gray-400 hover:text-blue-600 transition">
+                        <i class="fas fa-bullhorn"></i><span>공지사항</span>
+                        <span id="noticeUnreadBadge" class="hidden ml-1 px-1.5 py-0.5 text-[10px] bg-red-500 text-white rounded-full font-bold">N</span>
+                    </button>
                 </div>
             </nav>
 
@@ -5507,6 +5715,39 @@ app.get('/dashboard', (c) => {
                     </div>
                 </div>
             </div>
+
+            <!-- 공지사항 페이지 (별도) -->
+            <div id="dashPage-notice" class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8 hidden">
+                <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-xl sm:text-2xl font-bold text-gray-800">
+                            <i class="fas fa-bullhorn mr-2 text-blue-600"></i>공지사항
+                        </h2>
+                        <button onclick="loadNotices()" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700">
+                            <i class="fas fa-sync-alt mr-1"></i>새로고침
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-500 mb-4"><i class="fas fa-info-circle mr-1"></i>중요 공지는 상단에 고정 표시됩니다. 항목을 클릭하면 전체 내용을 확인할 수 있습니다.</p>
+                    <div id="noticeList" class="space-y-2">
+                        <p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-bullhorn text-3xl text-gray-200 mb-2 block"></i>공지사항을 불러오는 중...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 공지 상세 모달 -->
+        <div id="noticeDetailModal" class="fixed inset-0 bg-black bg-opacity-60 z-[80] flex items-center justify-center p-4 hidden">
+            <div class="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-hidden flex flex-col">
+                <div class="flex items-center justify-between px-4 py-3 border-b bg-blue-50">
+                    <h3 id="noticeDetailTitle" class="text-base sm:text-lg font-bold text-gray-800 truncate flex-1 pr-2"></h3>
+                    <button onclick="closeNoticeDetail()" class="text-gray-500 hover:text-gray-800 text-xl leading-none">&times;</button>
+                </div>
+                <div class="px-4 py-2 border-b bg-gray-50 flex items-center gap-2 text-[11px] text-gray-500">
+                    <span id="noticeDetailDate"></span>
+                    <span id="noticeDetailPin" class="hidden px-1.5 py-0.5 bg-red-100 text-red-700 rounded font-bold">중요</span>
+                </div>
+                <div id="noticeDetailContent" class="flex-1 overflow-y-auto p-4 text-sm text-gray-700 whitespace-pre-wrap break-words"></div>
+            </div>
         </div>
 
         <script src="/static/axios.min.js"></script>
@@ -5790,7 +6031,7 @@ app.get('/dashboard', (c) => {
             // ============================================
             // 대시보드/쇼핑몰 페이지 전환
             function switchDashPage(page) {
-                ['main','shop'].forEach(function(p) {
+                ['main','shop','notice'].forEach(function(p) {
                     var el = document.getElementById('dashPage-' + p);
                     var nav = document.getElementById('dashNav-' + p);
                     if (p === page) {
@@ -5802,7 +6043,90 @@ app.get('/dashboard', (c) => {
                     }
                 });
                 if (page === 'shop') { loadShopProducts(); loadMyOrders(); }
+                if (page === 'notice') { loadNotices(); markNoticesRead(); }
             }
+
+            // ================== 공지사항 (사용자) ==================
+            var _noticesCache = [];
+            async function loadNotices() {
+                var el = document.getElementById('noticeList');
+                if (!el) return;
+                try {
+                    var res = await axios.get('/api/notices?t=' + Date.now());
+                    var list = (res.data && res.data.notices) || [];
+                    _noticesCache = list;
+                    if (list.length === 0) {
+                        el.innerHTML = '<p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-bullhorn text-3xl text-gray-200 mb-2 block"></i>등록된 공지사항이 없습니다</p>';
+                        return;
+                    }
+                    el.innerHTML = list.map(function(n) {
+                        var date = n.created_at ? new Date(n.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '';
+                        var pinTag = n.is_pinned ? '<span class="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-bold mr-1">중요</span>' : '';
+                        var preview = String(n.content || '').replace(/<[^>]*>/g,'').substring(0,80);
+                        return '<div onclick="openNoticeDetail(' + n.id + ')" class="border rounded-lg p-3 hover:bg-blue-50 cursor-pointer transition">' +
+                            '<div class="flex items-center justify-between gap-2">' +
+                                '<div class="flex-1 min-w-0">' +
+                                    '<p class="text-sm font-bold text-gray-800 truncate">' + pinTag + escapeHtml(n.title) + '</p>' +
+                                    '<p class="text-xs text-gray-500 mt-0.5 truncate">' + escapeHtml(preview) + '</p>' +
+                                '</div>' +
+                                '<span class="text-[10px] text-gray-400 whitespace-nowrap">' + date + '</span>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('');
+                } catch(e) {
+                    el.innerHTML = '<p class="text-center text-red-400 text-sm py-8">공지사항을 불러올 수 없습니다</p>';
+                }
+            }
+
+            async function openNoticeDetail(id) {
+                try {
+                    var res = await axios.get('/api/notices/' + id);
+                    if (!res.data || !res.data.success) return;
+                    var n = res.data.notice;
+                    var titleEl = document.getElementById('noticeDetailTitle');
+                    var dateEl = document.getElementById('noticeDetailDate');
+                    var pinEl = document.getElementById('noticeDetailPin');
+                    var contentEl = document.getElementById('noticeDetailContent');
+                    if (titleEl) titleEl.textContent = n.title || '';
+                    if (dateEl) dateEl.textContent = n.created_at ? new Date(n.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '';
+                    if (pinEl) { if (n.is_pinned) pinEl.classList.remove('hidden'); else pinEl.classList.add('hidden'); }
+                    if (contentEl) contentEl.textContent = n.content || '';
+                    var modal = document.getElementById('noticeDetailModal');
+                    if (modal) modal.classList.remove('hidden');
+                } catch(e) {}
+            }
+            function closeNoticeDetail() {
+                var modal = document.getElementById('noticeDetailModal');
+                if (modal) modal.classList.add('hidden');
+            }
+
+            // 새 공지 배지 표시 (마지막 확인 시간 이후 새 글이 있으면)
+            async function checkNewNotices() {
+                try {
+                    var res = await axios.get('/api/notices?t=' + Date.now());
+                    var list = (res.data && res.data.notices) || [];
+                    if (!list.length) return;
+                    var lastSeen = parseInt(localStorage.getItem('noticeLastSeen') || '0', 10);
+                    var newest = 0;
+                    list.forEach(function(n) {
+                        var t = n.created_at ? new Date(n.created_at).getTime() : 0;
+                        if (t > newest) newest = t;
+                    });
+                    var badge = document.getElementById('noticeUnreadBadge');
+                    if (badge) {
+                        if (newest > lastSeen) badge.classList.remove('hidden');
+                        else badge.classList.add('hidden');
+                    }
+                } catch(e) {}
+            }
+            function markNoticesRead() {
+                localStorage.setItem('noticeLastSeen', String(Date.now()));
+                var badge = document.getElementById('noticeUnreadBadge');
+                if (badge) badge.classList.add('hidden');
+            }
+            // 페이지 로드 직후 + 5분마다 새 공지 확인
+            setTimeout(checkNewNotices, 1500);
+            setInterval(checkNewNotices, 5 * 60 * 1000);
 
             function switchShopTab(tab) {
                 ['products','orders'].forEach(function(t) {
@@ -5939,19 +6263,34 @@ app.get('/dashboard', (c) => {
                     }
                     el.innerHTML = orders.map(function(o) {
                         var date = new Date(o.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
-                        var statusMap = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'};
+                        var statusMap = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소완료'};
                         var statusColor = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
                         // 결제완료(paid) 상태에서만 취소 버튼 노출
                         var cancelBtn = o.status === 'paid'
                             ? '<button onclick="cancelMyOrder(' + o.id + ', \\'' + escapeHtml(o.product_name).replace(/'/g,"\\\\'") + '\\', ' + Number(o.qkey_used) + ')" class="mt-2 w-full py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-xs font-extrabold transition shadow border-2 border-red-700"><i class="fas fa-ban mr-1"></i>구매취소</button>'
                             : '';
-                        return '<div class="bg-gray-50 rounded-lg p-3 mb-2">' +
+                        // 취소된 주문의 경우: 취소 일시/사유/환불 정보 표시
+                        var cancelInfo = '';
+                        if (o.status === 'cancelled') {
+                            var cDate = o.cancelled_at ? new Date(o.cancelled_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
+                            var cBy = o.cancelled_by === 'admin' ? '관리자' : (o.cancelled_by === 'user' ? '본인' : '시스템');
+                            var cReason = o.cancel_reason || '-';
+                            cancelInfo = '<div class="mt-2 p-2 bg-red-50 border border-red-200 rounded text-[11px] text-red-700">' +
+                                '<p class="font-bold"><i class="fas fa-times-circle mr-1"></i>취소 처리됨</p>' +
+                                '<p>· 취소일시: ' + cDate + '</p>' +
+                                '<p>· 처리자: ' + cBy + '</p>' +
+                                '<p>· 사유: ' + escapeHtml(cReason) + '</p>' +
+                                '<p>· 환불: ' + Number(o.qkey_used).toLocaleString() + ' QKEY (즉시 반환됨)</p>' +
+                            '</div>';
+                        }
+                        return '<div class="bg-gray-50 rounded-lg p-3 mb-2 ' + (o.status === 'cancelled' ? 'opacity-90' : '') + '">' +
                                 '<div class="flex items-center justify-between">' +
-                                    '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-gray-800 truncate">' + escapeHtml(o.product_name) + ' x' + o.quantity + '</p>' +
+                                    '<div class="flex-1 min-w-0"><p class="text-sm font-medium text-gray-800 truncate ' + (o.status === 'cancelled' ? 'line-through' : '') + '">' + escapeHtml(o.product_name) + ' x' + o.quantity + '</p>' +
                                     '<p class="text-xs text-gray-500">' + date + '</p></div>' +
                                     '<div class="text-right ml-2"><p class="text-sm font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + ' QKEY</p>' +
                                     '<span class="text-xs px-2 py-0.5 bg-' + (statusColor[o.status]||'gray') + '-100 text-' + (statusColor[o.status]||'gray') + '-700 rounded-full">' + (statusMap[o.status]||o.status) + '</span></div>' +
                                 '</div>' +
+                                cancelInfo +
                                 cancelBtn +
                             '</div>';
                     }).join('');
@@ -6191,20 +6530,45 @@ app.get('/dashboard', (c) => {
                 }
             }
             
-            // 출금 가능 시간 체크 (금요일 10:00~14:00 KST)
+            // 서버에서 받은 출금 창 상태 캐시
+            var _withdrawalWindowState = null;
+            var _withdrawalWindowFetchedAt = 0;
+
+            // 출금 가능 시간 체크
+            // 룰: 매주 금요일 10:00~14:00 KST. 그 금요일이 한국 공휴일이면 직전 영업일로 이동.
+            // 우선 서버 응답을 신뢰, 캐시 없을 때만 클라이언트 fallback 사용
             function isWithdrawalTime() {
-                const now = new Date();
-                // KST = UTC+9
-                const kst = new Date(now.getTime() + (9 * 60 * 60 * 1000));
-                const day = kst.getUTCDay(); // 0=일, 5=금
-                const hour = kst.getUTCHours();
+                if (_withdrawalWindowState && typeof _withdrawalWindowState.isOpen === 'boolean') {
+                    return _withdrawalWindowState.isOpen;
+                }
+                // fallback: 클라이언트 단독 체크 (공휴일 데이터 없음 - 서버 응답 도착 전 짧은 시간만 사용)
+                var now = new Date();
+                var kst = new Date(now.getTime() + (9 * 60 * 60 * 1000));
+                var day = kst.getUTCDay();
+                var hour = kst.getUTCHours();
                 return (day === 5 && hour >= 10 && hour < 14);
+            }
+
+            async function fetchWithdrawalWindow() {
+                try {
+                    var res = await axios.get('/api/withdrawal/window?t=' + Date.now());
+                    if (res.data && res.data.success) {
+                        _withdrawalWindowState = res.data;
+                        _withdrawalWindowFetchedAt = Date.now();
+                    }
+                } catch(e) {
+                    console.error('Failed to fetch withdrawal window:', e);
+                }
             }
 
             // 버튼 원래 색상 저장용
             var _withdrawBtnOriginalClasses = {};
 
-            function updateWithdrawalButtons() {
+            async function updateWithdrawalButtons() {
+                // 30초 이상 지났으면 서버에서 다시 가져오기
+                if (!_withdrawalWindowState || (Date.now() - _withdrawalWindowFetchedAt) > 30000) {
+                    await fetchWithdrawalWindow();
+                }
                 const canWithdraw = isWithdrawalTime();
                 var btns = document.querySelectorAll('.withdraw-btn');
                 var notice = document.getElementById('withdrawalTimeNotice');
@@ -6229,7 +6593,13 @@ app.get('/dashboard', (c) => {
                         // 완전 회색 버튼으로 변경
                         btn.className = 'withdraw-btn w-full bg-gray-400 text-white py-2 rounded-lg font-medium text-xs sm:text-sm cursor-not-allowed';
                     });
-                    if (notice) notice.innerHTML = '<div class="bg-red-50 border border-red-300 rounded-lg p-2 text-center"><p class="text-xs sm:text-sm text-red-700 font-medium"><i class="fas fa-lock mr-1"></i>' + I18N.t('dash.withdrawal_closed') + '</p><p class="text-[10px] sm:text-xs text-red-500 mt-1">' + I18N.t('dash.withdrawal_schedule') + '</p></div>';
+                    var extraInfo = '';
+                    if (_withdrawalWindowState && _withdrawalWindowState.withdrawalDate) {
+                        var dateStr = _withdrawalWindowState.withdrawalDate;
+                        var holidayNote = _withdrawalWindowState.fridayHoliday ? ' (금요일 공휴일 → 직전 영업일로 이동)' : '';
+                        extraInfo = '<p class="text-[10px] sm:text-xs text-red-500 mt-1">이번 주 출금 신청일: ' + dateStr + ' 10:00~14:00 KST' + holidayNote + '</p>';
+                    }
+                    if (notice) notice.innerHTML = '<div class="bg-red-50 border border-red-300 rounded-lg p-2 text-center"><p class="text-xs sm:text-sm text-red-700 font-medium"><i class="fas fa-lock mr-1"></i>' + I18N.t('dash.withdrawal_closed') + '</p><p class="text-[10px] sm:text-xs text-red-500 mt-1">' + I18N.t('dash.withdrawal_schedule') + '</p>' + extraInfo + '</div>';
                 }
             }
 
@@ -7307,6 +7677,10 @@ app.get('/admin/dashboard', (c) => {
                             class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
                             <i class="fas fa-shopping-cart mr-1 sm:mr-2"></i>쇼핑몰
                         </button>
+                        <button onclick="showTab('notices')" id="tab-notices" 
+                            class="px-3 sm:px-6 py-3 sm:py-4 font-medium text-gray-600 hover:text-purple-600 whitespace-nowrap text-xs sm:text-base">
+                            <i class="fas fa-bullhorn mr-1 sm:mr-2"></i>공지사항
+                        </button>
                     </div>
                 </div>
 
@@ -7928,6 +8302,44 @@ app.get('/admin/dashboard', (c) => {
                         <p class="text-center text-gray-500 py-8" data-i18n="admin.loading">로딩 중...</p>
                     </div>
                 </div>
+
+                <!-- 공지사항 관리 -->
+                <div id="content-notices" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4">
+                        <i class="fas fa-bullhorn text-blue-600 mr-2"></i>공지사항 관리
+                    </h2>
+
+                    <!-- 등록/수정 폼 -->
+                    <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 sm:p-4 mb-4">
+                        <h3 class="font-bold text-gray-700 mb-3 text-sm"><i class="fas fa-edit mr-1"></i><span id="noticeFormTitle">새 공지 작성</span></h3>
+                        <input type="hidden" id="noticeEditId" value="">
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-2">
+                            <input type="text" id="noticeTitle" placeholder="제목" class="sm:col-span-2 border rounded px-3 py-2 text-sm" maxlength="200">
+                            <div class="flex items-center gap-3 px-2">
+                                <label class="flex items-center gap-1 text-xs text-gray-700">
+                                    <input type="checkbox" id="noticePinned" class="w-4 h-4"> 상단고정(중요)
+                                </label>
+                                <label class="flex items-center gap-1 text-xs text-gray-700">
+                                    <input type="checkbox" id="noticeActive" class="w-4 h-4" checked> 게시
+                                </label>
+                            </div>
+                        </div>
+                        <textarea id="noticeContent" placeholder="내용을 입력하세요. 줄바꿈 그대로 표시됩니다." rows="6" class="w-full border rounded px-3 py-2 text-sm"></textarea>
+                        <div class="flex justify-end gap-2 mt-2">
+                            <button onclick="resetNoticeForm()" class="px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded text-xs font-bold">초기화</button>
+                            <button onclick="saveNotice()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-bold"><i class="fas fa-save mr-1"></i>저장</button>
+                        </div>
+                    </div>
+
+                    <!-- 목록 -->
+                    <div class="flex items-center justify-between mb-2">
+                        <h3 class="font-bold text-gray-700 text-sm"><i class="fas fa-list mr-1"></i>등록된 공지 <span id="adminNoticeCount" class="text-xs text-gray-500 font-normal ml-1"></span></h3>
+                        <button onclick="loadAdminNotices()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                    </div>
+                    <div id="adminNoticeList" class="space-y-2">
+                        <p class="text-center text-gray-400 text-sm py-4">로딩 중...</p>
+                    </div>
+                </div>
             </main>
         </div>
 
@@ -7973,7 +8385,7 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById(\`tab-\${tab}\`).classList.add('text-purple-600', 'border-b-2', 'border-purple-600');
 
                 // 콘텐츠 표시/숨김
-                var sections = ['pending', 'all', 'rewards', 'withdrawals', 'users', 'signups', 'sales', 'swaps', 'memberRewards', 'shop'];
+                var sections = ['pending', 'all', 'rewards', 'withdrawals', 'users', 'signups', 'sales', 'swaps', 'memberRewards', 'shop', 'notices'];
                 sections.forEach(function(s) {
                     var el = document.getElementById('content-' + s);
                     if (el) el.classList.add('hidden');
@@ -7991,6 +8403,7 @@ app.get('/admin/dashboard', (c) => {
                 else if (tab === 'swaps') loadSwaps();
                 else if (tab === 'memberRewards') loadMemberRewards();
                 else if (tab === 'shop') { loadAdminShopProducts(); loadAdminShopOrders(); }
+                else if (tab === 'notices') loadAdminNotices();
             }
 
             // 통계 로드
@@ -10053,6 +10466,119 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // ================== 어드민: 공지사항 관리 ==================
+            var _adminNoticesCache = [];
+
+            async function loadAdminNotices() {
+                var listEl = document.getElementById('adminNoticeList');
+                var countEl = document.getElementById('adminNoticeCount');
+                if (!listEl) return;
+                try {
+                    var res = await axios.get('/api/admin/notices?t=' + Date.now());
+                    var items = (res.data && res.data.notices) || [];
+                    _adminNoticesCache = items;
+                    if (countEl) countEl.textContent = '(' + items.length + '건)';
+                    if (items.length === 0) {
+                        listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-6">등록된 공지가 없습니다</p>';
+                        return;
+                    }
+                    listEl.innerHTML = items.map(function(n) {
+                        var date = n.created_at ? new Date(n.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
+                        var pinTag = n.is_pinned ? '<span class="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-bold mr-1">중요</span>' : '';
+                        var statusTag = n.is_active ? '<span class="px-1.5 py-0.5 bg-green-100 text-green-700 rounded text-[10px] font-bold">게시중</span>' : '<span class="px-1.5 py-0.5 bg-gray-200 text-gray-600 rounded text-[10px] font-bold">숨김</span>';
+                        var preview = String(n.content || '').replace(/<[^>]*>/g,'').substring(0,100);
+                        return '<div class="border rounded-lg p-3 hover:bg-gray-50">' +
+                            '<div class="flex items-start justify-between gap-2 mb-1">' +
+                                '<div class="flex-1 min-w-0">' +
+                                    '<p class="text-sm font-bold text-gray-800 truncate">' + pinTag + esc(n.title) + ' ' + statusTag + '</p>' +
+                                    '<p class="text-xs text-gray-500 mt-0.5 truncate">' + esc(preview) + '</p>' +
+                                    '<p class="text-[10px] text-gray-400 mt-1">' + date + '</p>' +
+                                '</div>' +
+                                '<div class="flex flex-col gap-1">' +
+                                    '<button onclick="editNotice(' + n.id + ')" class="px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-[11px] font-bold"><i class="fas fa-edit mr-1"></i>수정</button>' +
+                                    '<button onclick="toggleNoticeActive(' + n.id + ',' + (n.is_active ? 0 : 1) + ')" class="px-2 py-1 ' + (n.is_active ? 'bg-gray-200 hover:bg-gray-300 text-gray-700' : 'bg-green-100 hover:bg-green-200 text-green-700') + ' rounded text-[11px] font-bold">' + (n.is_active ? '<i class="fas fa-eye-slash mr-1"></i>숨김' : '<i class="fas fa-eye mr-1"></i>게시') + '</button>' +
+                                    '<button onclick="deleteNotice(' + n.id + ')" class="px-2 py-1 bg-red-100 hover:bg-red-200 text-red-700 rounded text-[11px] font-bold"><i class="fas fa-trash mr-1"></i>삭제</button>' +
+                                '</div>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('');
+                } catch(e) {
+                    listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-6">공지를 불러올 수 없습니다</p>';
+                }
+            }
+
+            function resetNoticeForm() {
+                var idEl = document.getElementById('noticeEditId');
+                var titleEl = document.getElementById('noticeTitle');
+                var contentEl = document.getElementById('noticeContent');
+                var pinEl = document.getElementById('noticePinned');
+                var actEl = document.getElementById('noticeActive');
+                var formTitleEl = document.getElementById('noticeFormTitle');
+                if (idEl) idEl.value = '';
+                if (titleEl) titleEl.value = '';
+                if (contentEl) contentEl.value = '';
+                if (pinEl) pinEl.checked = false;
+                if (actEl) actEl.checked = true;
+                if (formTitleEl) formTitleEl.textContent = '새 공지 작성';
+            }
+
+            function editNotice(id) {
+                var n = _adminNoticesCache.find(function(x){ return x.id === id; });
+                if (!n) return;
+                document.getElementById('noticeEditId').value = String(id);
+                document.getElementById('noticeTitle').value = n.title || '';
+                document.getElementById('noticeContent').value = n.content || '';
+                document.getElementById('noticePinned').checked = !!n.is_pinned;
+                document.getElementById('noticeActive').checked = !!n.is_active;
+                document.getElementById('noticeFormTitle').textContent = '공지 수정 (#' + id + ')';
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+
+            async function saveNotice() {
+                var id = (document.getElementById('noticeEditId').value || '').trim();
+                var title = (document.getElementById('noticeTitle').value || '').trim();
+                var content = (document.getElementById('noticeContent').value || '').trim();
+                var isPinned = document.getElementById('noticePinned').checked;
+                var isActive = document.getElementById('noticeActive').checked;
+                if (!title) { alert('제목을 입력해주세요'); return; }
+                if (!content) { alert('내용을 입력해주세요'); return; }
+                try {
+                    var payload = { title: title, content: content, isPinned: isPinned ? 1 : 0, isActive: isActive ? 1 : 0 };
+                    if (id) {
+                        await axios.put('/api/admin/notices/' + id, payload);
+                        alert('공지가 수정되었습니다');
+                    } else {
+                        await axios.post('/api/admin/notices', payload);
+                        alert('공지가 등록되었습니다');
+                    }
+                    resetNoticeForm();
+                    loadAdminNotices();
+                } catch(e) {
+                    alert((e.response && e.response.data && e.response.data.error) || '저장 실패');
+                }
+            }
+
+            async function toggleNoticeActive(id, newActive) {
+                var n = _adminNoticesCache.find(function(x){ return x.id === id; });
+                if (!n) return;
+                try {
+                    await axios.put('/api/admin/notices/' + id, { title: n.title, content: n.content, isPinned: n.is_pinned ? 1 : 0, isActive: newActive });
+                    loadAdminNotices();
+                } catch(e) {
+                    alert('상태 변경 실패');
+                }
+            }
+
+            async function deleteNotice(id) {
+                if (!confirm('이 공지를 삭제하시겠습니까? 복구할 수 없습니다.')) return;
+                try {
+                    await axios.delete('/api/admin/notices/' + id);
+                    loadAdminNotices();
+                } catch(e) {
+                    alert('삭제 실패');
+                }
+            }
+
             // 클라이언트 사이드 필터링/렌더링
             function renderAdminOrders() {
                 var tbody = document.getElementById('adminOrderTableBody');
@@ -10079,13 +10605,20 @@ app.get('/admin/dashboard', (c) => {
                 tbody.innerHTML = filtered.map(function(o) {
                     var date = new Date(o.created_at).toLocaleString('ko-KR', {timeZone: 'Asia/Seoul'});
                     var statusOptions = ['paid','shipping','delivered','cancelled'];
-                    var statusLabels = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소'};
+                    var statusLabels = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소완료'};
                     var statusColors = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
                     var selectHtml = '<select onchange="adminUpdateOrderStatus(' + o.id + ', this.value)" class="text-xs border rounded px-1 py-0.5 bg-' + (statusColors[o.status]||'gray') + '-50">';
                     statusOptions.forEach(function(s) {
                         selectHtml += '<option value="' + s + '"' + (o.status === s ? ' selected' : '') + '>' + statusLabels[s] + '</option>';
                     });
                     selectHtml += '</select>';
+                    // 취소된 주문: 처리자/사유/일시 표시
+                    var cancelMeta = '';
+                    if (o.status === 'cancelled') {
+                        var cDate = o.cancelled_at ? new Date(o.cancelled_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
+                        var cBy = o.cancelled_by === 'admin' ? '관리자' : (o.cancelled_by === 'user' ? '본인' : '시스템');
+                        cancelMeta = '<div class="text-[10px] text-red-600 mt-1 leading-tight"><i class="fas fa-times-circle mr-1"></i>' + cBy + ' 취소 / ' + cDate + (o.cancel_reason ? ' / ' + esc(o.cancel_reason) : '') + '</div>';
+                    }
                     var shippingInfo = [o.shipping_name, o.shipping_phone, o.shipping_address].filter(Boolean).join(' / ') || '-';
                     // 송장 정보 추출 (shipping_memo에 "[택배사] 송장: 번호" 형식으로 저장됨)
                     // ★ 정규식 대신 안전한 문자열 파싱 사용 (백틱 템플릿 이스케이프 문제 회피)
@@ -10099,13 +10632,13 @@ app.get('/admin/dashboard', (c) => {
                     var trackBtnLabel = trackInfo.no ? '<i class="fas fa-edit mr-1"></i>송장수정' : '<i class="fas fa-truck mr-1"></i>송장등록';
                     var trackBtnColor = trackInfo.no ? 'bg-purple-500 hover:bg-purple-600' : 'bg-blue-500 hover:bg-blue-600';
                     var trackBtn = '<button onclick="openTrackingModal(' + o.id + ')" class="px-2 py-1 text-xs ' + trackBtnColor + ' text-white rounded font-bold shadow mt-1 w-full">' + trackBtnLabel + '</button>';
-                    return '<tr class="hover:bg-gray-50">' +
+                    return '<tr class="hover:bg-gray-50' + (o.status === 'cancelled' ? ' bg-red-50' : '') + '">' +
                         '<td class="px-3 py-2 text-xs"><span class="font-medium">' + esc(o.user_name || '-') + '</span><br><span class="text-gray-400">' + esc(o.user_email || '') + '</span></td>' +
-                        '<td class="px-3 py-2 text-xs font-medium">' + esc(o.product_name) + ' x' + o.quantity + '</td>' +
+                        '<td class="px-3 py-2 text-xs font-medium ' + (o.status === 'cancelled' ? 'line-through text-gray-500' : '') + '">' + esc(o.product_name) + ' x' + o.quantity + '</td>' +
                         '<td class="px-3 py-2 text-xs text-right">' + Number(o.price_krw).toLocaleString() + '원</td>' +
                         '<td class="px-3 py-2 text-xs text-right font-bold text-pink-600">' + Number(o.qkey_used).toLocaleString() + '</td>' +
                         '<td class="px-3 py-2 text-xs max-w-[200px]"><div class="truncate" title="' + esc(shippingInfo) + '">' + esc(shippingInfo) + '</div>' + trackingDisplay + '</td>' +
-                        '<td class="px-3 py-2 text-center">' + selectHtml + trackBtn + '</td>' +
+                        '<td class="px-3 py-2 text-center">' + selectHtml + trackBtn + cancelMeta + '</td>' +
                         '<td class="px-3 py-2 text-xs text-gray-500">' + date + '</td>' +
                     '</tr>';
                 }).join('');
