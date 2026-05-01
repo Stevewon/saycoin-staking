@@ -1321,15 +1321,11 @@ app.post('/api/user/update-profile', async (c) => {
 // 출금 신청 (금요일 오전 10시 ~ 오후 2시 KST만 가능)
 app.post('/api/withdrawal/request', async (c) => {
   try {
-    // 출금 신청 가능 시간 체크 (KST)
-    // 룰:
-    //   - 매주 금요일 10:00~14:00 KST가 출금일
-    //   - 단, 그 주의 금요일이 한국 공휴일이면 직전 영업일(목→수→화→월)로 이동
-    //   - 그 주에 한 번은 반드시 출금 신청 창이 열린다
+    // 출금 신청 가능 시간 체크: 매주 금요일 10:00~14:00 KST (공휴일 무관)
     const now = new Date()
     if (!isWithdrawalWindowOpen(now)) {
       return c.json({ 
-        error: '출금 신청은 매주 금요일 오전 10시 ~ 오후 2시(KST)에만 가능합니다. 금요일이 공휴일인 경우 직전 영업일에 신청 가능합니다. / Withdrawals are only available on Fridays 10:00 AM - 2:00 PM (KST). If Friday is a Korean holiday, the window shifts to the previous business day.',
+        error: '출금 신청은 매주 금요일 오전 10시 ~ 오후 2시(KST)에만 가능합니다. / Withdrawals are only available on Fridays 10:00 AM - 2:00 PM (KST).',
         withdrawal_closed: true
       }, 400)
     }
@@ -1400,34 +1396,26 @@ app.post('/api/withdrawal/request', async (c) => {
 })
 
 // 출금 신청 창 상태 조회 (클라이언트 UI 동기화용)
-// 반환: { isOpen, todayKst, withdrawalDate, isToday, hour, minute, openHour, closeHour, fridayHoliday }
+// 룰: 매주 금요일 10:00~14:00 KST (공휴일 무관)
 app.get('/api/withdrawal/window', (c) => {
   const now = new Date()
   const kst = new Date(now.getTime() + (9 * 60 * 60 * 1000))
   const todayKst = kst.toISOString().split('T')[0]
-  const targetDate = getWeeklyWithdrawalDateKST(now)
+  const day = kst.getUTCDay()
   const hour = kst.getUTCHours()
   const minute = kst.getUTCMinutes()
-  const isToday = todayKst === targetDate
-  const isOpen = isToday && hour >= 10 && hour < 14
-  // 그 주 금요일이 공휴일인지 표시 (UI에서 안내 문구 노출)
-  const day = kst.getUTCDay()
-  let diffToFriday: number
-  if (day === 0) diffToFriday = -2
-  else if (day === 6) diffToFriday = -1
-  else diffToFriday = 5 - day
-  const friday = new Date(kst.getTime() + diffToFriday * 24 * 60 * 60 * 1000)
-  const fridayYmd = friday.toISOString().split('T')[0]
-  const fridayHolidays = getKoreanHolidays(friday.getUTCFullYear())
-  const fridayHoliday = fridayHolidays.includes(fridayYmd)
+  const isOpen = day === 5 && hour >= 10 && hour < 14
+  // 다음 금요일 날짜 계산 (안내용)
+  let diffToNextFriday: number
+  if (day < 5) diffToNextFriday = 5 - day
+  else if (day === 5) diffToNextFriday = 0
+  else diffToNextFriday = 6 // 토요일이면 다음 주 금요일
+  const nextFriday = new Date(kst.getTime() + diffToNextFriday * 24 * 60 * 60 * 1000)
   return c.json({
     success: true,
     isOpen,
-    isToday,
     todayKst,
-    withdrawalDate: targetDate,
-    fridayDate: fridayYmd,
-    fridayHoliday,
+    withdrawalDate: nextFriday.toISOString().split('T')[0],
     hour,
     minute,
     openHour: 10,
@@ -3607,44 +3595,13 @@ function kstDateStr(d: Date): string {
   return kst.toISOString().split('T')[0]
 }
 
-// 그 주(월~일)의 출금 신청 기준일 계산
-// - 기본: 금요일
-// - 금요일이 한국 공휴일이면 직전 영업일(목 -> 수 -> 화 -> 월)로 이동
-// 입력: 임의의 KST 시점 (Date)
-// 반환: 그 주 출금 기준일의 YYYY-MM-DD (KST)
-function getWeeklyWithdrawalDateKST(d: Date): string {
-  const kst = new Date(d.getTime() + (9 * 60 * 60 * 1000))
-  const day = kst.getUTCDay()
-  let diffToFriday: number
-  if (day === 0) diffToFriday = -2
-  else if (day === 6) diffToFriday = -1
-  else diffToFriday = 5 - day
-
-  const friday = new Date(kst.getTime() + diffToFriday * 24 * 60 * 60 * 1000)
-  let cursor = new Date(friday.getTime())
-  for (let i = 0; i < 7; i++) {
-    const ymd = cursor.toISOString().split('T')[0]
-    const yr = cursor.getUTCFullYear()
-    const holidays = getKoreanHolidays(yr)
-    const dow = cursor.getUTCDay()
-    const isHoliday = holidays.includes(ymd)
-    const isWeekend = dow === 0 || dow === 6
-    if (!isHoliday && !isWeekend) {
-      return ymd
-    }
-    cursor = new Date(cursor.getTime() - 24 * 60 * 60 * 1000)
-  }
-  return friday.toISOString().split('T')[0]
-}
-
-// 출금 신청 창이 열려 있는지 (오늘이 그 주의 출금 기준일이고 10:00~14:00 KST)
+// 출금 신청 창 체크
+// 룰: 매주 금요일 10:00~14:00 KST. 공휴일 여부 무관. 실제 지급 처리는 관리자가 수동으로 진행.
 function isWithdrawalWindowOpen(d: Date): boolean {
   const kst = new Date(d.getTime() + (9 * 60 * 60 * 1000))
-  const todayKst = kst.toISOString().split('T')[0]
-  const targetDate = getWeeklyWithdrawalDateKST(d)
-  if (todayKst !== targetDate) return false
+  const day = kst.getUTCDay() // 0=일, 5=금
   const hour = kst.getUTCHours()
-  return hour >= 10 && hour < 14
+  return day === 5 && hour >= 10 && hour < 14
 }
 
 // 일일 배당금 지급 (하루 1회 자동 지급)
@@ -6595,9 +6552,7 @@ app.get('/dashboard', (c) => {
                     });
                     var extraInfo = '';
                     if (_withdrawalWindowState && _withdrawalWindowState.withdrawalDate) {
-                        var dateStr = _withdrawalWindowState.withdrawalDate;
-                        var holidayNote = _withdrawalWindowState.fridayHoliday ? ' (금요일 공휴일 → 직전 영업일로 이동)' : '';
-                        extraInfo = '<p class="text-[10px] sm:text-xs text-red-500 mt-1">이번 주 출금 신청일: ' + dateStr + ' 10:00~14:00 KST' + holidayNote + '</p>';
+                        extraInfo = '<p class="text-[10px] sm:text-xs text-red-500 mt-1">다음 출금 신청일: ' + _withdrawalWindowState.withdrawalDate + ' (금) 10:00~14:00 KST</p>';
                     }
                     if (notice) notice.innerHTML = '<div class="bg-red-50 border border-red-300 rounded-lg p-2 text-center"><p class="text-xs sm:text-sm text-red-700 font-medium"><i class="fas fa-lock mr-1"></i>' + I18N.t('dash.withdrawal_closed') + '</p><p class="text-[10px] sm:text-xs text-red-500 mt-1">' + I18N.t('dash.withdrawal_schedule') + '</p>' + extraInfo + '</div>';
                 }
