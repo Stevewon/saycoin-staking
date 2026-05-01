@@ -1444,6 +1444,76 @@ app.get('/api/withdrawal/list/:userId', async (c) => {
   }
 })
 
+// 사용자: 출금 신청 취소 (pending 상태에서만, 차감된 잔액 즉시 환불)
+app.post('/api/withdrawal/cancel/:withdrawalId', async (c) => {
+  try {
+    const db = c.env.DB
+    const withdrawalId = c.req.param('withdrawalId')
+    const body = await c.req.json().catch(() => ({}))
+    const userId = body?.userId
+
+    if (!userId) return c.json({ error: '사용자 정보가 필요합니다' }, 400)
+
+    // cancelled_at / cancelled_by 컬럼 보장
+    try { await db.prepare(`ALTER TABLE withdrawals ADD COLUMN cancelled_at DATETIME`).run() } catch(e) {}
+    try { await db.prepare(`ALTER TABLE withdrawals ADD COLUMN cancelled_by TEXT`).run() } catch(e) {}
+
+    // 본인 소유 + pending 상태인 출금건만 취소 가능
+    const withdrawal = await db.prepare(`
+      SELECT * FROM withdrawals WHERE id = ? AND user_id = ?
+    `).bind(withdrawalId, userId).first()
+
+    if (!withdrawal) {
+      return c.json({ error: '출금 신청을 찾을 수 없습니다' }, 404)
+    }
+    if (withdrawal.status !== 'pending') {
+      const labelMap: Record<string,string> = { approved: '승인완료', rejected: '거절됨', cancelled: '이미 취소됨' }
+      return c.json({ error: `취소할 수 없는 상태입니다 (현재: ${labelMap[withdrawal.status as string] || withdrawal.status}). 처리 전(pending) 상태에서만 취소 가능합니다.` }, 400)
+    }
+
+    // 상태 변경 (경쟁조건 방지: pending 상태에서만)
+    const upd = await db.prepare(`
+      UPDATE withdrawals SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP, cancelled_by = 'user'
+      WHERE id = ? AND status = 'pending'
+    `).bind(withdrawalId).run()
+
+    if (!upd.meta.changes) {
+      return c.json({ error: '이미 처리된 신청입니다' }, 400)
+    }
+
+    // 차감했던 잔액 복원
+    const balanceField = withdrawal.coin_type === 'QTA' ? 'qta_balance' :
+                         withdrawal.coin_type === 'QX' ? 'qx_balance' :
+                         withdrawal.coin_type === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
+
+    await db.prepare(`
+      UPDATE users SET ${balanceField} = ${balanceField} + ? WHERE id = ?
+    `).bind(withdrawal.amount, withdrawal.user_id).run()
+
+    // 환불 거래 기록
+    try {
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'withdrawal_cancel_refund', ?, ?, ?)
+      `).bind(
+        withdrawal.user_id,
+        withdrawal.coin_type,
+        withdrawal.amount,
+        `출금 신청 취소 환불 (#${withdrawalId})`
+      ).run()
+    } catch(eTx) {}
+
+    return c.json({
+      success: true,
+      message: `출금 신청이 취소되었습니다. ${Number(withdrawal.amount).toLocaleString()} ${withdrawal.coin_type}가 즉시 환불되었습니다.`,
+      refunded: withdrawal.amount,
+      coinType: withdrawal.coin_type
+    })
+  } catch (error) {
+    return c.json({ error: '출금 취소 처리 중 오류가 발생했습니다' }, 500)
+  }
+})
+
 // ============================================
 // API Routes - Swap (QKEY → USDT)
 // ============================================
@@ -2568,20 +2638,26 @@ app.get('/api/admin/withdrawals', async (c) => {
   try {
     const db = c.env.DB
 
+    // cancelled_at / cancelled_by 컬럼 보장 (이미 있으면 무시)
+    try { await db.prepare(`ALTER TABLE withdrawals ADD COLUMN cancelled_at DATETIME`).run() } catch(e) {}
+    try { await db.prepare(`ALTER TABLE withdrawals ADD COLUMN cancelled_by TEXT`).run() } catch(e) {}
+
     // 출금 통계
     const stats = await db.prepare(`
       SELECT
         COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending_count,
         COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) as approved_count,
         COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) as rejected_count,
+        COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) as cancelled_count,
         COUNT(*) as total_count
       FROM withdrawals
     `).first()
 
-    // 전체 출금 목록 (사용자 정보 포함)
+    // 전체 출금 목록 (사용자 정보 + 취소 메타 포함)
     const withdrawals = await db.prepare(`
       SELECT 
         w.id, w.user_id, w.coin_type, w.amount, w.wallet_address, w.status, w.created_at,
+        w.cancelled_at, w.cancelled_by,
         u.name, u.email
       FROM withdrawals w
       JOIN users u ON w.user_id = u.id
@@ -2595,6 +2671,7 @@ app.get('/api/admin/withdrawals', async (c) => {
         pendingCount: stats?.pending_count || 0,
         approvedCount: stats?.approved_count || 0,
         rejectedCount: stats?.rejected_count || 0,
+        cancelledCount: stats?.cancelled_count || 0,
         totalCount: stats?.total_count || 0
       },
       withdrawals: withdrawals.results
@@ -5478,6 +5555,23 @@ app.get('/dashboard', (c) => {
                             </button>
                         </div>
                     </div>
+
+                    <!-- 출금 신청 내역 -->
+                    <div class="mt-6 pt-4 border-t">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-gray-700 text-sm sm:text-base">
+                                <i class="fas fa-history mr-1 text-gray-500"></i>출금 신청 내역
+                                <span id="withdrawHistoryCount" class="text-xs text-gray-500 font-normal ml-1"></span>
+                            </h3>
+                            <button onclick="loadMyWithdrawals()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700">
+                                <i class="fas fa-sync-alt mr-1"></i>새로고침
+                            </button>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-2"><i class="fas fa-info-circle mr-1"></i>처리대기(pending) 상태에서만 취소가 가능하며, 취소 시 신청금액이 즉시 환불됩니다.</p>
+                        <div id="myWithdrawList" class="space-y-2 max-h-[50vh] overflow-y-auto">
+                            <p class="text-center text-gray-400 text-sm py-4">출금 신청 내역을 불러오는 중...</p>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Referral Section -->
@@ -5826,9 +5920,10 @@ app.get('/dashboard', (c) => {
                             return endDate <= now;
                         });
                         
-                        // 출금 섹션 항상 표시 + 잔액 업데이트
+                        // 출금 섹션 항상 표시 + 잔액 업데이트 + 출금 신청 내역
                         updateWithdrawalBalances();
                         updateWithdrawalButtons();
+                        loadMyWithdrawals();
                         
                         if (stakings.length === 0) {
                             listEl.innerHTML = '<p class="text-gray-500 text-center py-8">' + I18N.t('dash.no_staking') + '</p>';
@@ -6486,6 +6581,116 @@ app.get('/dashboard', (c) => {
                     console.error('Failed to load withdrawal balances:', error);
                 }
             }
+
+            // 사용자: 내 출금 신청 내역 조회 + 렌더링
+            async function loadMyWithdrawals() {
+                var listEl = document.getElementById('myWithdrawList');
+                var countEl = document.getElementById('withdrawHistoryCount');
+                if (!listEl || !currentUser || !currentUser.id) return;
+                try {
+                    var res = await axios.get('/api/withdrawal/list/' + currentUser.id + '?t=' + Date.now());
+                    var items = (res.data && res.data.withdrawals) || [];
+                    if (countEl) {
+                        var pendingCount = items.filter(function(w){ return w.status === 'pending'; }).length;
+                        countEl.textContent = '(' + items.length + '건' + (pendingCount > 0 ? ' / 대기 ' + pendingCount + ')' : ')');
+                    }
+                    if (items.length === 0) {
+                        listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-4"><i class="fas fa-inbox text-2xl text-gray-200 mb-1 block"></i>출금 신청 내역이 없습니다</p>';
+                        return;
+                    }
+                    var statusMap = {pending:'처리대기', approved:'승인완료', rejected:'거절됨', cancelled:'취소됨'};
+                    var statusBg = {pending:'bg-yellow-100 text-yellow-800', approved:'bg-green-100 text-green-700', rejected:'bg-red-100 text-red-700', cancelled:'bg-gray-200 text-gray-600'};
+                    var coinColor = {QTA:'text-blue-600', QX:'text-purple-600', QKEY:'text-yellow-600', USDT:'text-green-600'};
+                    listEl.innerHTML = items.map(function(w) {
+                        var date = w.created_at ? new Date(w.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
+                        var amountFmt = w.coin_type === 'USDT' ? Number(w.amount).toFixed(2) : Number(w.amount).toLocaleString();
+                        var cancelBtn = '';
+                        if (w.status === 'pending') {
+                            cancelBtn = '<button onclick="cancelMyWithdrawal(' + w.id + ', \\'' + w.coin_type + '\\', ' + Number(w.amount) + ')" class="mt-2 w-full py-1.5 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded text-xs font-extrabold transition shadow border border-red-700"><i class="fas fa-ban mr-1"></i>출금 신청 취소</button>';
+                        }
+                        var cancelInfo = '';
+                        if (w.status === 'cancelled') {
+                            var cDate = w.cancelled_at ? new Date(w.cancelled_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
+                            var cBy = w.cancelled_by === 'admin' ? '관리자' : (w.cancelled_by === 'user' ? '본인' : '시스템');
+                            cancelInfo = '<div class="mt-1 text-[11px] text-gray-500"><i class="fas fa-times-circle mr-1"></i>' + cBy + ' 취소 / ' + cDate + ' / ' + amountFmt + ' ' + w.coin_type + ' 환불완료</div>';
+                        }
+                        var walletShort = (w.wallet_address || '').length > 18 ? (w.wallet_address.substring(0,8) + '...' + w.wallet_address.substring(w.wallet_address.length-6)) : (w.wallet_address || '-');
+                        return '<div class="bg-gray-50 rounded-lg p-3 border ' + (w.status === 'pending' ? 'border-yellow-300' : (w.status === 'cancelled' ? 'border-gray-200 opacity-90' : 'border-gray-200')) + '">' +
+                                '<div class="flex items-start justify-between gap-2">' +
+                                    '<div class="flex-1 min-w-0">' +
+                                        '<p class="text-sm font-bold ' + (coinColor[w.coin_type] || 'text-gray-700') + ' ' + (w.status === 'cancelled' ? 'line-through' : '') + '">' + amountFmt + ' ' + w.coin_type + '</p>' +
+                                        '<p class="text-[11px] text-gray-500 mt-0.5">신청일: ' + date + '</p>' +
+                                        '<p class="text-[11px] text-gray-500 truncate" title="' + escapeHtml(w.wallet_address || '') + '">지갑: ' + escapeHtml(walletShort) + '</p>' +
+                                    '</div>' +
+                                    '<span class="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap ' + (statusBg[w.status] || 'bg-gray-100 text-gray-700') + '">' + (statusMap[w.status] || w.status) + '</span>' +
+                                '</div>' +
+                                cancelInfo +
+                                cancelBtn +
+                            '</div>';
+                    }).join('');
+                } catch(e) {
+                    listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-4">출금 내역을 불러올 수 없습니다</p>';
+                }
+            }
+
+            // 사용자: 출금 신청 내역 + 잔액 자동 새로고침 (15초마다)
+            // 어드민의 승인/거절/취소 처리가 사용자 화면에 자동 반영
+            var _myWithdrawAutoTimer = null;
+            function startMyWithdrawAutoRefresh() {
+                if (_myWithdrawAutoTimer) clearInterval(_myWithdrawAutoTimer);
+                _myWithdrawAutoTimer = setInterval(async function() {
+                    try {
+                        if (!currentUser || !currentUser.id) return;
+                        // 대시보드 페이지가 보일 때만 새로고침
+                        var mainPage = document.getElementById('dashPage-main');
+                        if (!mainPage || mainPage.classList.contains('hidden')) return;
+                        await loadMyWithdrawals();
+                        // 잔액 카드 동기화
+                        try {
+                            var u = await axios.get('/api/user/' + currentUser.id);
+                            if (u.data && u.data.success && u.data.user) {
+                                currentUser.qta_balance = u.data.user.qta_balance;
+                                currentUser.qx_balance = u.data.user.qx_balance;
+                                currentUser.qkey_balance = u.data.user.qkey_balance;
+                                currentUser.usdt_balance = u.data.user.usdt_balance;
+                            }
+                        } catch(eu) {}
+                        await updateWithdrawalBalances();
+                    } catch(eAuto) {}
+                }, 15000);
+            }
+            // 페이지 로드 후 자동 새로고침 시작
+            try { startMyWithdrawAutoRefresh(); } catch(e) {}
+
+            // 사용자: 내 출금 신청 취소 (pending 상태에서만, 즉시 환불)
+            async function cancelMyWithdrawal(withdrawalId, coinType, amount) {
+                var amountFmt = coinType === 'USDT' ? Number(amount).toFixed(2) : Number(amount).toLocaleString();
+                if (!confirm('이 출금 신청을 취소하시겠습니까?\\n\\n· 코인: ' + coinType + '\\n· 금액: ' + amountFmt + ' ' + coinType + '\\n\\n취소 시 ' + amountFmt + ' ' + coinType + '가 즉시 환불됩니다.')) return;
+                try {
+                    var res = await axios.post('/api/withdrawal/cancel/' + withdrawalId, { userId: currentUser.id });
+                    if (res.data && res.data.success) {
+                        alert(res.data.message || '출금 신청이 취소되었습니다.');
+                        // 잔액 즉시 갱신
+                        try {
+                            var u = await axios.get('/api/user/' + currentUser.id);
+                            if (u.data && u.data.success && u.data.user) {
+                                currentUser.qta_balance = u.data.user.qta_balance;
+                                currentUser.qx_balance = u.data.user.qx_balance;
+                                currentUser.qkey_balance = u.data.user.qkey_balance;
+                                currentUser.usdt_balance = u.data.user.usdt_balance;
+                                if (typeof refreshDashboard === 'function') refreshDashboard();
+                            }
+                        } catch(eb) {}
+                        // 출금 잔액 카드 + 내역 동시 갱신
+                        await updateWithdrawalBalances();
+                        await loadMyWithdrawals();
+                    } else {
+                        alert((res.data && res.data.error) || '취소 처리 실패');
+                    }
+                } catch(e) {
+                    alert((e.response && e.response.data && e.response.data.error) || '취소 처리 중 오류가 발생했습니다');
+                }
+            }
             
             // 서버에서 받은 출금 창 상태 캐시
             var _withdrawalWindowState = null;
@@ -6616,6 +6821,7 @@ app.get('/dashboard', (c) => {
                             alert(I18N.t('alert.withdrawal_applied'));
                             await loadUserInfo();
                             await updateWithdrawalBalances();
+                            await loadMyWithdrawals();
                         }
                     } catch (error) {
                         alert(error.response?.data?.error || I18N.t('withdrawal.request_error'));
@@ -7787,7 +7993,7 @@ app.get('/admin/dashboard', (c) => {
                         </button>
                     </div>
                     <!-- 출금 통계 -->
-                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
+                    <div class="grid grid-cols-2 sm:grid-cols-5 gap-2 sm:gap-4 mb-4 sm:mb-6">
                         <div class="bg-yellow-50 rounded-lg p-3 sm:p-4 border border-yellow-200">
                             <p class="text-xs text-gray-600 mb-1" data-i18n="admin.wd_pending">대기중</p>
                             <p id="wdPendingCount" class="text-lg sm:text-xl font-bold text-yellow-700">0</p>
@@ -7799,6 +8005,10 @@ app.get('/admin/dashboard', (c) => {
                         <div class="bg-red-50 rounded-lg p-3 sm:p-4 border border-red-200">
                             <p class="text-xs text-gray-600 mb-1" data-i18n="admin.wd_rejected">거절됨</p>
                             <p id="wdRejectedCount" class="text-lg sm:text-xl font-bold text-red-700">0</p>
+                        </div>
+                        <div class="bg-gray-100 rounded-lg p-3 sm:p-4 border border-gray-300">
+                            <p class="text-xs text-gray-600 mb-1">취소(환불완료)</p>
+                            <p id="wdCancelledCount" class="text-lg sm:text-xl font-bold text-gray-700">0</p>
                         </div>
                         <div class="bg-gray-50 rounded-lg p-3 sm:p-4 border border-gray-200">
                             <p class="text-xs text-gray-600 mb-1" data-i18n="admin.wd_total">전체</p>
@@ -8851,9 +9061,10 @@ app.get('/admin/dashboard', (c) => {
             // ============================================
             // 출금 관리 로드
             // ============================================
+            var _adminWithdrawalsRefreshTimer = null;
             async function loadWithdrawals() {
                 try {
-                    const response = await axios.get('/api/admin/withdrawals');
+                    const response = await axios.get('/api/admin/withdrawals?t=' + Date.now());
                     if (!response.data.success) return;
                     const { stats, withdrawals } = response.data;
 
@@ -8861,6 +9072,9 @@ app.get('/admin/dashboard', (c) => {
                     document.getElementById('wdApprovedCount').textContent = stats.approvedCount;
                     document.getElementById('wdRejectedCount').textContent = stats.rejectedCount;
                     document.getElementById('wdTotalCount').textContent = stats.totalCount;
+                    // 취소 카운트는 별도 표시 영역이 있으면 갱신
+                    var cancEl = document.getElementById('wdCancelledCount');
+                    if (cancEl) cancEl.textContent = stats.cancelledCount || 0;
 
                     var listEl = document.getElementById('withdrawalsList');
                     if (withdrawals.length === 0) {
@@ -8869,11 +9083,25 @@ app.get('/admin/dashboard', (c) => {
                     }
 
                     listEl.innerHTML = withdrawals.map(function(w) {
-                        var statusColor = w.status === 'pending' ? 'yellow' : w.status === 'approved' ? 'green' : 'red';
-                        var statusText = w.status === 'pending' ? I18N.t('admin.wd_pending') : w.status === 'approved' ? I18N.t('admin.wd_approved') : I18N.t('admin.wd_rejected');
+                        var statusColor = w.status === 'pending' ? 'yellow' : w.status === 'approved' ? 'green' : w.status === 'cancelled' ? 'gray' : 'red';
+                        var statusText = w.status === 'pending' ? I18N.t('admin.wd_pending')
+                            : w.status === 'approved' ? I18N.t('admin.wd_approved')
+                            : w.status === 'cancelled' ? '취소됨(환불완료)'
+                            : I18N.t('admin.wd_rejected');
                         var coinColor = w.coin_type === 'QTA' ? 'blue' : w.coin_type === 'QX' ? 'purple' : w.coin_type === 'QKEY' ? 'yellow' : 'green';
-                        
-                        return '<div class="border rounded-lg p-3 sm:p-4 border-' + statusColor + '-200 bg-' + statusColor + '-50">' +
+                        var amountFmt = w.coin_type === 'USDT' ? Number(w.amount).toFixed(2) : parseFloat(w.amount).toLocaleString();
+
+                        // 취소된 출금: 취소 메타 박스
+                        var cancelInfo = '';
+                        if (w.status === 'cancelled') {
+                            var cDate = w.cancelled_at ? new Date(w.cancelled_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
+                            var cBy = w.cancelled_by === 'admin' ? '관리자' : (w.cancelled_by === 'user' ? '본인' : '시스템');
+                            cancelInfo = '<div class="mt-2 p-2 bg-red-50 border border-red-200 rounded text-[11px] text-red-700">' +
+                                '<i class="fas fa-times-circle mr-1"></i>' + cBy + ' 취소 / ' + cDate + ' / ' + amountFmt + ' ' + w.coin_type + ' 환불완료' +
+                            '</div>';
+                        }
+
+                        return '<div class="border rounded-lg p-3 sm:p-4 border-' + statusColor + '-200 bg-' + statusColor + '-50' + (w.status === 'cancelled' ? ' opacity-90' : '') + '">' +
                             '<div class="flex flex-col sm:flex-row justify-between items-start gap-2 mb-2">' +
                                 '<div class="flex-1">' +
                                     '<div class="flex items-center gap-2 mb-1">' +
@@ -8883,13 +9111,14 @@ app.get('/admin/dashboard', (c) => {
                                     '</div>' +
                                     '<p class="text-sm font-medium text-gray-800">' + esc(w.name) + ' <span class="text-gray-500 font-normal">(' + esc(w.email) + ')</span></p>' +
                                 '</div>' +
-                                '<p class="text-xl sm:text-2xl font-bold text-' + coinColor + '-600">' + parseFloat(w.amount).toLocaleString() + ' ' + w.coin_type + '</p>' +
+                                '<p class="text-xl sm:text-2xl font-bold text-' + coinColor + '-600 ' + (w.status === 'cancelled' ? 'line-through' : '') + '">' + amountFmt + ' ' + w.coin_type + '</p>' +
                             '</div>' +
                             '<div class="flex items-center gap-2 text-xs text-gray-600 mb-2">' +
                                 '<i class="fas fa-wallet"></i>' +
                                 '<span class="font-mono truncate">' + esc(w.wallet_address) + '</span>' +
                                 '<button onclick="copyWalletAddress(\\'' + w.wallet_address + '\\')" class="px-2 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs"><i class="fas fa-copy"></i></button>' +
                             '</div>' +
+                            cancelInfo +
                             (w.status === 'pending' ? 
                                 '<div class="flex gap-2">' +
                                     '<button onclick="approveWithdrawal(' + w.id + ')" class="flex-1 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-bold transition"><i class="fas fa-check mr-1"></i>' + I18N.t('admin.approve') + '</button>' +
@@ -8900,6 +9129,15 @@ app.get('/admin/dashboard', (c) => {
                     }).join('');
                 } catch (error) {
                     console.error('Withdrawals load failed:', error);
+                }
+
+                // 실시간 자동 새로고침 (10초마다, 출금탭이 활성일 때만)
+                if (_adminWithdrawalsRefreshTimer) clearInterval(_adminWithdrawalsRefreshTimer);
+                if (currentTab === 'withdrawals') {
+                    _adminWithdrawalsRefreshTimer = setInterval(function() {
+                        if (currentTab === 'withdrawals') loadWithdrawals();
+                        else clearInterval(_adminWithdrawalsRefreshTimer);
+                    }, 10000);
                 }
             }
 
