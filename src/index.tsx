@@ -2014,29 +2014,47 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
 
     // 직접추천수당 지급 (1회성, 매출의 10%, QKEY로 지급)
     // 환율: 1 USD = 1,500 KRW, 1 QKEY = 10 KRW → 1 USD = 150 QKEY
+    // ★★ 정책 (2026-05-01 확정) ★★
+    //   추천인 본인이 스테이킹을 "완료(승인)"하지 않았으면 직접추천수당도 지급하지 않는다.
+    //   본인 스테이킹이 active 상태(거치기간 내)일 때만 지급.
+    //   pending/없음/end_date 지남 → 0 지급(스킵), referral_rewards에도 기록하지 않음.
     try {
       const referrer = await db.prepare(`
         SELECT referrer_id FROM users WHERE id = ?
       `).bind(staking.user_id).first()
 
       if (referrer && referrer.referrer_id) {
-        const USD_TO_QKEY = 150
-        const directBonusUsd = staking.amount * 0.10 // 매출의 10% (USD)
-        const directBonusQkey = Math.round(directBonusUsd * USD_TO_QKEY) // QKEY로 변환
-        
-        await db.prepare(`
-          UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-        `).bind(directBonusQkey, referrer.referrer_id).run()
+        // 추천인 본인이 active 스테이킹을 보유하고 있는지(거치기간 내) 확인
+        const referrerActive = await db.prepare(`
+          SELECT id FROM staking
+          WHERE user_id = ?
+            AND status = 'active'
+            AND date(start_date) <= date('now')
+            AND date(end_date) >= date('now')
+          LIMIT 1
+        `).bind(referrer.referrer_id).first()
 
-        await db.prepare(`
-          INSERT INTO transactions (user_id, type, coin_type, amount, description)
-          VALUES (?, 'direct_referral', 'QKEY', ?, ?)
-        `).bind(referrer.referrer_id, directBonusQkey, `Direct referral bonus ($${staking.amount.toLocaleString()} x 10% = ${directBonusQkey.toLocaleString()} QKEY)`).run()
+        if (referrerActive) {
+          const USD_TO_QKEY = 150
+          const directBonusUsd = staking.amount * 0.10 // 매출의 10% (USD)
+          const directBonusQkey = Math.round(directBonusUsd * USD_TO_QKEY) // QKEY로 변환
 
-        await db.prepare(`
-          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
-          VALUES (?, ?, 0, ?, ?, date('now'))
-        `).bind(referrer.referrer_id, staking.user_id, staking.amount, directBonusQkey).run()
+          await db.prepare(`
+            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+          `).bind(directBonusQkey, referrer.referrer_id).run()
+
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'direct_referral', 'QKEY', ?, ?)
+          `).bind(referrer.referrer_id, directBonusQkey, `Direct referral bonus ($${staking.amount.toLocaleString()} x 10% = ${directBonusQkey.toLocaleString()} QKEY)`).run()
+
+          await db.prepare(`
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
+            VALUES (?, ?, 0, ?, ?, date('now'))
+          `).bind(referrer.referrer_id, staking.user_id, staking.amount, directBonusQkey).run()
+        } else {
+          console.log(`[직접추천수당 스킵] 추천인 #${referrer.referrer_id} 본인 스테이킹 미완료 (referee #${staking.user_id})`)
+        }
       }
     } catch (e) {
       console.error('직접추천수당 지급 오류:', e)
@@ -3792,51 +3810,79 @@ app.post('/api/rewards/daily', async (c) => {
           rewardedCount++
           totalQkeyRewarded += qkeyAmount
 
-          // 매칭추천수당 지급 (QKEY) — 일반 룰 그대로
+          // 매칭추천수당 지급 (QKEY)
+          // ★★ 정책 (2026-05-01 확정) ★★
+          //   추천인 본인이 스테이킹을 "완료(승인)"한 시점 당일부터 하부 배당이 시작됨.
+          //   즉, 추천인이 active 스테이킹을 1건 이상 보유하고 있고
+          //   그 스테이킹의 start_date <= today (승인 당일 포함)인 경우에만 매칭수당 지급.
+          //   본인 스테이킹이 pending/없음/end_date 지남 → 하부 배당 0 (스킵)
           try {
-            // 1대 매칭추천수당 (20%)
+            // 1대 매칭추천수당 (20%) — 추천인 본인 스테이킹 활성 체크
             const level1Referrer = await db.prepare(`
               SELECT referrer_id FROM users WHERE id = ?
             `).bind(staking.user_id).first()
 
             if (level1Referrer && level1Referrer.referrer_id) {
-              const level1Reward = Math.round(qkeyAmount * 0.20)
+              // 추천인 본인이 active 스테이킹을 보유하고, 승인 당일부터 종료일까지 사이인지 체크
+              const level1Active = await db.prepare(`
+                SELECT id FROM staking
+                WHERE user_id = ?
+                  AND status = 'active'
+                  AND date(start_date) <= date(?)
+                  AND date(end_date) >= date(?)
+                LIMIT 1
+              `).bind(level1Referrer.referrer_id, today, today).first()
 
-              await db.prepare(`
-                UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-              `).bind(level1Reward, level1Referrer.referrer_id).run()
-
-              await db.prepare(`
-                INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
-                VALUES (?, ?, 1, ?, ?, ?)
-              `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, today).run()
-
-              await db.prepare(`
-                INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-              `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%)`).run()
-
-              // 2대 매칭추천수당 (10%)
-              const level2Referrer = await db.prepare(`
-                SELECT referrer_id FROM users WHERE id = ?
-              `).bind(level1Referrer.referrer_id).first()
-
-              if (level2Referrer && level2Referrer.referrer_id) {
-                const level2Reward = Math.round(qkeyAmount * 0.10)
+              if (level1Active) {
+                const level1Reward = Math.round(qkeyAmount * 0.20)
 
                 await db.prepare(`
                   UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-                `).bind(level2Reward, level2Referrer.referrer_id).run()
+                `).bind(level1Reward, level1Referrer.referrer_id).run()
 
                 await db.prepare(`
                   INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
-                  VALUES (?, ?, 2, ?, ?, ?)
-                `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, today).run()
+                  VALUES (?, ?, 1, ?, ?, ?)
+                `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, today).run()
 
                 await db.prepare(`
                   INSERT INTO transactions (user_id, type, coin_type, amount, description)
                   VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%)`).run()
+                `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%)`).run()
+
+                // 2대 매칭추천수당 (10%) — 2대 추천인 본인 스테이킹 활성 체크
+                const level2Referrer = await db.prepare(`
+                  SELECT referrer_id FROM users WHERE id = ?
+                `).bind(level1Referrer.referrer_id).first()
+
+                if (level2Referrer && level2Referrer.referrer_id) {
+                  const level2Active = await db.prepare(`
+                    SELECT id FROM staking
+                    WHERE user_id = ?
+                      AND status = 'active'
+                      AND date(start_date) <= date(?)
+                      AND date(end_date) >= date(?)
+                    LIMIT 1
+                  `).bind(level2Referrer.referrer_id, today, today).first()
+
+                  if (level2Active) {
+                    const level2Reward = Math.round(qkeyAmount * 0.10)
+
+                    await db.prepare(`
+                      UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+                    `).bind(level2Reward, level2Referrer.referrer_id).run()
+
+                    await db.prepare(`
+                      INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
+                      VALUES (?, ?, 2, ?, ?, ?)
+                    `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, today).run()
+
+                    await db.prepare(`
+                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                    `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%)`).run()
+                  }
+                }
               }
             }
           } catch (referralError) {
