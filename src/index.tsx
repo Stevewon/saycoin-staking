@@ -7978,6 +7978,7 @@ app.get('/admin/dashboard', (c) => {
                             <button onclick="exportDailyRewardsCSV()" class="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg text-xs sm:text-sm font-bold transition shadow"><i class="fas fa-file-excel mr-1"></i>일일배당 엑셀</button>
                             <button onclick="exportReferralRewardsCSV()" class="px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-xs sm:text-sm font-bold transition shadow"><i class="fas fa-file-excel mr-1"></i>직판/성과금 엑셀</button>
                             <button onclick="exportCSV('rewards')" class="px-3 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-xs sm:text-sm font-bold transition shadow"><i class="fas fa-file-excel mr-1"></i>회원별 합계 엑셀</button>
+                            <button onclick="rollbackDailyRewards()" class="px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs sm:text-sm font-bold transition shadow border-2 border-red-700"><i class="fas fa-undo mr-1"></i>휴일 배당 회수</button>
                         </div>
                     </div>
                     <!-- 배당 통계 -->
@@ -9136,6 +9137,33 @@ app.get('/admin/dashboard', (c) => {
                     link.click();
                     document.body.removeChild(link);
                 }).catch(function(e) { alert('직판/성과금 다운로드 실패'); });
+            }
+
+            // 휴일에 잘못 지급된 배당 회수 (본인 일일배당 + 1대/2대 매칭수당)
+            //   - daily_rewards / referral_rewards 행 삭제
+            //   - users.qkey_balance 차감
+            //   - transactions 에 회수 로그 INSERT
+            async function rollbackDailyRewards() {
+                var todayKst = new Date(Date.now() + 9*60*60*1000).toISOString().slice(0,10);
+                var dateStr = prompt('회수할 날짜를 입력하세요 (YYYY-MM-DD)\\n\\n예) 2026-05-01 (근로자의 날)\\n\\n해당 날짜의 본인 일일배당 + 1대/2대 매칭수당이 모두 회수되며,\\n각 회원의 QKEY 잔액에서 차감됩니다.', todayKst);
+                if (!dateStr) return;
+                if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(dateStr)) { alert('날짜 형식이 잘못되었습니다 (YYYY-MM-DD)'); return; }
+                if (!confirm('정말 ' + dateStr + ' 의 모든 일일배당 + 매칭수당을 회수하시겠습니까?\\n\\n⚠️ 이 작업은 되돌릴 수 없습니다.\\n각 회원의 QKEY 잔액에서 즉시 차감됩니다.')) return;
+                try {
+                    var res = await axios.post('/api/admin/rewards/rollback-daily', { date: dateStr });
+                    if (res.data && res.data.success) {
+                        alert('✅ 회수 완료\\n\\n' + (res.data.message || '') +
+                            '\\n\\n· 본인배당: ' + (res.data.dailyRolledBack || 0) + '건 / -' + Number(res.data.dailyQkeyTotal || 0).toLocaleString() + ' QKEY' +
+                            '\\n· 매칭수당: ' + (res.data.referralRolledBack || 0) + '건 / -' + Number(res.data.referralQkeyTotal || 0).toLocaleString() + ' QKEY' +
+                            '\\n· 합계: -' + Number(res.data.grandTotalQkey || 0).toLocaleString() + ' QKEY');
+                        try { if (typeof loadRewards === 'function') loadRewards(); } catch(e) {}
+                        try { if (typeof loadStatistics === 'function') loadStatistics(); } catch(e) {}
+                    } else {
+                        alert((res.data && res.data.error) || '회수 처리 실패');
+                    }
+                } catch(e) {
+                    alert((e.response && e.response.data && e.response.data.error) || '회수 처리 중 오류가 발생했습니다');
+                }
             }
 
             // ============================================
