@@ -3948,6 +3948,51 @@ app.post('/api/rewards/daily', async (c) => {
   }
 })
 
+// 어드민 진단: 특정 날짜의 daily_rewards / referral_rewards 행 조회 (디버깅용)
+app.get('/api/admin/diag/rewards', async (c) => {
+  try {
+    const db = c.env.DB
+    const date = c.req.query('date') || ''
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return c.json({ error: 'date=YYYY-MM-DD 필요' }, 400)
+    }
+    // reward_date 또는 paid_date 기준으로 조회
+    const dailyByReward = await db.prepare(
+      `SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+       FROM daily_rewards WHERE reward_date = ? ORDER BY id`
+    ).bind(date).all()
+    const dailyByPaid = await db.prepare(
+      `SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+       FROM daily_rewards WHERE paid_date = ? ORDER BY id`
+    ).bind(date).all()
+    const refByReward = await db.prepare(
+      `SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date, created_at
+       FROM referral_rewards WHERE reward_date = ? ORDER BY id`
+    ).bind(date).all()
+    const refByPaid = await db.prepare(
+      `SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date, created_at
+       FROM referral_rewards WHERE paid_date = ? ORDER BY id`
+    ).bind(date).all()
+    // 같은 (user, staking, reward_date) 중복 검출
+    const dupes = await db.prepare(
+      `SELECT user_id, staking_id, reward_date, COUNT(*) as cnt
+       FROM daily_rewards WHERE reward_date = ? OR paid_date = ?
+       GROUP BY user_id, staking_id, reward_date HAVING cnt > 1`
+    ).bind(date, date).all()
+    return c.json({
+      success: true,
+      date,
+      daily_by_reward_date: dailyByReward.results,
+      daily_by_paid_date: dailyByPaid.results,
+      referral_by_reward_date: refByReward.results,
+      referral_by_paid_date: refByPaid.results,
+      duplicates_daily: dupes.results
+    })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 특정 날짜의 일일 배당 + 1대/2대 매칭수당 전체 회수 (잘못 지급된 휴일 배당 롤백용)
 //   - daily_rewards 의 해당 reward_date 행 전부 삭제
 //   - users.qkey_balance 에서 해당 금액 차감
