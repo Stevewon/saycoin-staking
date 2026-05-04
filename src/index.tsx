@@ -5040,6 +5040,180 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
 //   - 옵션 A: 4/30 발생분 행 정리 후 cron 재트리거용
 //   - body: { rewardDate: 'YYYY-MM-DD', dryRun?: boolean }
 //   - transactions 테이블은 별도로 옵션 2에서 삭제 완료된 상태이므로 건드리지 않음
+// ============================================================
+// [신규 룰] KST 날짜 기준 당일 시작 = 당일 배당 자격 인정
+//   - 기존: date(?) >= date(s.start_date, '+1 day')  (start_date 다음날부터)
+//   - 신규: date(?, '+9 hours') >= date(s.start_date, '+9 hours')  (KST 같은 날도 자격)
+//   - 한국시간 기준 23:59:59 까지 가입·staking 시작은 당일분 배당 대상
+// ============================================================
+app.post('/api/admin/rewards/recalc-by-kst-date', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { accrualDate, paidDate, dryRun } = body || {}
+    if (!accrualDate || !paidDate) {
+      return c.json({ error: 'accrualDate / paidDate 필요 (예: "2026-04-30", "2026-05-04")' }, 400)
+    }
+
+    // paid_date 컬럼 보장
+    try { await db.prepare(`ALTER TABLE daily_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
+    try { await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
+
+    // ★ KST 날짜 기준 자격 staking 조회 (당일 시작 = 당일 자격)
+    //   - status = active
+    //   - end_date_kst >= accrualDate
+    //   - start_date_kst <= accrualDate  (당일 포함)
+    const eligibleStakings = await db.prepare(`
+      SELECT
+        s.user_id, s.id as staking_id, s.amount, s.period_days, s.period_months,
+        s.daily_rate, s.start_date, s.end_date, s.reset_at,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id AND reward_date = ?) as already_for_date
+      FROM staking s
+      WHERE s.status = 'active'
+        AND date(s.end_date, '+9 hours') >= date(?)
+        AND date(s.start_date, '+9 hours') <= date(?)
+    `).bind(accrualDate, accrualDate, accrualDate).all()
+
+    const USD_TO_QKEY = 150
+    const summary = {
+      accrualDate, paidDate, dryRun: !!dryRun,
+      eligible_staking_count: eligibleStakings.results.length,
+      already_paid_count: 0,
+      newly_added_daily: [] as any[],
+      newly_added_referral: [] as any[],
+      total_new_daily_qkey: 0,
+      total_new_referral_qkey: 0
+    }
+
+    for (const s of eligibleStakings.results) {
+      const periodDays = s.period_days || ((s.period_months as number) * 30)
+      if ((s.rewarded_count as number) >= periodDays) continue
+      if ((s.already_for_date as number) > 0) {
+        summary.already_paid_count++
+        continue
+      }
+      const dailyRate = s.daily_rate as number
+      const usdAmount = (s.amount as number) * dailyRate
+      const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
+
+      summary.newly_added_daily.push({
+        user_id: s.user_id, staking_id: s.staking_id, amount: s.amount,
+        daily_rate: dailyRate, qkey: qkeyAmount, start_date: s.start_date
+      })
+      summary.total_new_daily_qkey += qkeyAmount
+
+      if (!dryRun) {
+        // daily_rewards 행 신규 삽입 (reward_date=accrualDate, paid_date=paidDate)
+        await db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(s.user_id, s.staking_id, qkeyAmount, accrualDate, paidDate).run()
+
+        // 잔액 업데이트
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+          .bind(qkeyAmount, s.user_id).run()
+
+        // transactions 기록
+        const newCount = (s.rewarded_count as number) + 1
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+        `).bind(s.user_id, qkeyAmount,
+          `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
+        ).run()
+      }
+
+      // 매칭수당 (L1 20%, L2 10%) — 추천인이 accrualDate 시점 active 일 때만
+      try {
+        const l1ref = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(s.user_id).first()
+        if (l1ref && l1ref.referrer_id) {
+          const l1Active = await db.prepare(`
+            SELECT id FROM staking
+            WHERE user_id = ? AND status = 'active'
+              AND date(start_date, '+9 hours') <= date(?)
+              AND date(end_date, '+9 hours') >= date(?)
+            LIMIT 1
+          `).bind(l1ref.referrer_id, accrualDate, accrualDate).first()
+          if (l1Active) {
+            // 중복 체크
+            const dupL1 = await db.prepare(`
+              SELECT id FROM referral_rewards
+              WHERE referrer_id = ? AND referee_id = ? AND level = 1 AND reward_date = ?
+            `).bind(l1ref.referrer_id, s.user_id, accrualDate).first()
+            if (!dupL1) {
+              const l1Reward = Math.round(qkeyAmount * 0.20)
+              summary.newly_added_referral.push({
+                referrer_id: l1ref.referrer_id, referee_id: s.user_id, level: 1, qkey: l1Reward
+              })
+              summary.total_new_referral_qkey += l1Reward
+              if (!dryRun) {
+                await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+                  .bind(l1Reward, l1ref.referrer_id).run()
+                await db.prepare(`
+                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                  VALUES (?, ?, 1, ?, ?, ?, ?)
+                `).bind(l1ref.referrer_id, s.user_id, qkeyAmount, l1Reward, accrualDate, paidDate).run()
+                await db.prepare(`
+                  INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                  VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                `).bind(l1ref.referrer_id, l1Reward,
+                  `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
+                ).run()
+              }
+            }
+            // L2
+            const l2ref = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(l1ref.referrer_id).first()
+            if (l2ref && l2ref.referrer_id) {
+              const l2Active = await db.prepare(`
+                SELECT id FROM staking
+                WHERE user_id = ? AND status = 'active'
+                  AND date(start_date, '+9 hours') <= date(?)
+                  AND date(end_date, '+9 hours') >= date(?)
+                LIMIT 1
+              `).bind(l2ref.referrer_id, accrualDate, accrualDate).first()
+              if (l2Active) {
+                const dupL2 = await db.prepare(`
+                  SELECT id FROM referral_rewards
+                  WHERE referrer_id = ? AND referee_id = ? AND level = 2 AND reward_date = ?
+                `).bind(l2ref.referrer_id, s.user_id, accrualDate).first()
+                if (!dupL2) {
+                  const l2Reward = Math.round(qkeyAmount * 0.10)
+                  summary.newly_added_referral.push({
+                    referrer_id: l2ref.referrer_id, referee_id: s.user_id, level: 2, qkey: l2Reward
+                  })
+                  summary.total_new_referral_qkey += l2Reward
+                  if (!dryRun) {
+                    await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+                      .bind(l2Reward, l2ref.referrer_id).run()
+                    await db.prepare(`
+                      INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                      VALUES (?, ?, 2, ?, ?, ?, ?)
+                    `).bind(l2ref.referrer_id, s.user_id, qkeyAmount, l2Reward, accrualDate, paidDate).run()
+                    await db.prepare(`
+                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                    `).bind(l2ref.referrer_id, l2Reward,
+                      `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
+                    ).run()
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (refErr) {
+        console.error('referral recalc error:', refErr)
+      }
+    }
+
+    return c.json({ success: true, ...summary })
+  } catch (error: any) {
+    console.error('recalc-by-kst-date error:', error)
+    return c.json({ error: 'D1 error: ' + (error?.message || String(error)) }, 500)
+  }
+})
+
 app.post('/api/admin/rewards/cleanup-by-reward-date', async (c) => {
   try {
     const db = c.env.DB
