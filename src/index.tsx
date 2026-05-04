@@ -4273,6 +4273,100 @@ app.post('/api/admin/rewards/rollback-tx-range', async (c) => {
   }
 })
 
+// 어드민: 기간 내 사용자별 net 정합성 자동 보정
+//   - paid (daily_qkey + referral_reward) 합계 vs rollback 합계 비교
+//   - net > 0 (미회수): qkey_balance 추가 차감 + 음수 트랜잭션 INSERT
+//   - net < 0 (과회수): qkey_balance 복구 가산 + 양수 트랜잭션 INSERT
+app.post('/api/admin/rewards/reconcile-tx-range', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const fromDate = body && body.fromDate ? String(body.fromDate) : ''
+    const toDate = body && body.toDate ? String(body.toDate) : ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+      return c.json({ error: 'fromDate/toDate (YYYY-MM-DD) 필요' }, 400)
+    }
+
+    const paidRows = await db.prepare(
+      `SELECT user_id, COALESCE(SUM(amount), 0) as total
+       FROM transactions
+       WHERE date(created_at) BETWEEN ? AND ?
+         AND type IN ('daily_qkey','referral_reward')
+       GROUP BY user_id`
+    ).bind(fromDate, toDate).all()
+
+    const rolledRows = await db.prepare(
+      `SELECT user_id, COALESCE(SUM(amount), 0) as total
+       FROM transactions
+       WHERE date(created_at) BETWEEN ? AND ?
+         AND type IN ('daily_reward_rollback','referral_reward_rollback','rollback_restore')
+       GROUP BY user_id`
+    ).bind(fromDate, toDate).all()
+
+    const paidMap: Record<string, number> = {}
+    for (const r of (paidRows.results || [])) paidMap[String(r.user_id)] = Number(r.total) || 0
+    const rolledMap: Record<string, number> = {}
+    for (const r of (rolledRows.results || [])) rolledMap[String(r.user_id)] = Number(r.total) || 0
+
+    const allUids = new Set([...Object.keys(paidMap), ...Object.keys(rolledMap)])
+    const details: any[] = []
+    let underAdjustedCount = 0
+    let overAdjustedCount = 0
+    let totalUnderQkey = 0
+    let totalOverQkey = 0
+
+    for (const uid of allUids) {
+      const paid = paidMap[uid] || 0
+      const rolled = rolledMap[uid] || 0
+      const net = paid + rolled
+      if (net === 0) {
+        details.push({ user_id: Number(uid), paid, rolled, net, action: 'ok' })
+        continue
+      }
+      try {
+        if (net > 0) {
+          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(net, Number(uid)).run()
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'daily_reward_rollback', 'QKEY', ?, ?)
+          `).bind(Number(uid), -net, `[정합성 보정] ${fromDate}~${toDate} 잔여 미회수 차감 (-${net.toLocaleString()} QKEY)`).run()
+          underAdjustedCount++
+          totalUnderQkey += net
+          details.push({ user_id: Number(uid), paid, rolled, net, action: 'deducted', amount: net })
+        } else {
+          const restoreAmt = -net
+          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(restoreAmt, Number(uid)).run()
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'rollback_restore', 'QKEY', ?, ?)
+          `).bind(Number(uid), restoreAmt, `[정합성 보정] ${fromDate}~${toDate} 과회수 복구 (+${restoreAmt.toLocaleString()} QKEY)`).run()
+          overAdjustedCount++
+          totalOverQkey += restoreAmt
+          details.push({ user_id: Number(uid), paid, rolled, net, action: 'restored', amount: restoreAmt })
+        }
+      } catch (e) {
+        console.error('reconcile error for user', uid, e)
+        details.push({ user_id: Number(uid), paid, rolled, net, action: 'error', error: String(e) })
+      }
+    }
+
+    return c.json({
+      success: true,
+      fromDate,
+      toDate,
+      underAdjustedCount,
+      totalUnderQkey,
+      overAdjustedCount,
+      totalOverQkey,
+      netDelta: totalUnderQkey - totalOverQkey,
+      details
+    })
+  } catch (error) {
+    console.error('reconcile-tx-range error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 사용자별 보상 내역 조회
 app.get('/api/rewards/history/:userId', async (c) => {
   try {
