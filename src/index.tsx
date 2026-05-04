@@ -4367,12 +4367,14 @@ app.post('/api/admin/rewards/reconcile-tx-range', async (c) => {
   }
 })
 
-// 어드민: 휴일 잘못 지급된 양수 행 ↔ 음수 회수 행 1:1 페어링 삭제 (B-3 방식)
-//   - 5/1, 5/3 양수 행(+amount)을 동일 금액의 음수 회수 행(-amount)과 1:1 매칭하여 페어로 삭제
-//   - 매칭된 페어만 삭제 → 사용자 잔액 변화 0 보장 (잔액 검증 불필요, 페어 합 항상 0)
-//   - 매칭 안 된 음수 행은 description 만 "[잔액 보정]"으로 정리 (잔액 영향 0)
-//   - 제외 type: direct_referral (즉시 지급, 회수 없음)
-//   - dryRun=true 시 매칭 결과만 미리보기
+// 어드민: B-3 강화판 — 휴일 양수 행 100% 삭제 + 동일 금액 음수 매칭 삭제 + 잔여 음수 통합
+//   1) positiveDates 의 양수 행(daily_qkey, referral_reward)을 사용자별로 모두 삭제
+//   2) 사용자별 삭제된 양수 합계만큼, negativeDates 의 음수 회수 행에서 동일 금액으로 매칭하여 삭제
+//      - 동일 금액 매칭 우선 (1:1)
+//      - 동일 금액으로 못 채우면, 가장 큰 음수 행부터 부분 매칭 (전체 삭제 또는 일부 삭제 + 차액은 신규 보정 행)
+//   3) 페어 매칭 후 남은 음수 잔여분은 사용자당 단일 [잔액 보정] 행 1개로 통합 (description만 변경, 금액 합산)
+//   ★ direct_referral 은 type 필터에서 완전 제외 → 직접판매 수당은 절대 건드리지 않음
+//   ★ dryRun=true 시 미리보기만
 app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
   try {
     const db = c.env.DB
@@ -4409,7 +4411,7 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
       ORDER BY user_id, amount ASC, id ASC
     `).bind(...negativeDates).all()
 
-    // 3. 사용자별로 양수/음수 그룹화
+    // 3. 사용자별로 양수/음수 그룹화 (★ direct_referral 은 type 필터로 이미 제외됨)
     const posByUser: Record<number, any[]> = {}
     const negByUser: Record<number, any[]> = {}
     for (const r of (positives.results || []) as any[]) {
@@ -4423,105 +4425,189 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
       negByUser[u].push(r)
     }
 
-    // 4. 사용자별 1:1 페어 매칭 (동일 금액 우선, 없으면 미매칭으로 둠)
-    const pairsToDelete: { posId: number, negId: number, user_id: number, amount: number }[] = []
-    const orphanNegIds: number[] = []
-    const userSummary: any[] = []
+    // 4. B-3 강화판 — 사용자별 처리
+    //    (1) 양수 행 100% 삭제 대상 (5/1·5/3 흔적 완전 제거)
+    //    (2) 삭제될 양수 합계만큼 음수 행에서 차감 (동일 금액 우선 매칭, 부족하면 큰 음수부터 삭제)
+    //    (3) 잔여 음수 합산 = 사용자당 단일 [잔액 보정] 행 1개로 통합 (description 변경 + amount 합산)
+    //    ★ 잔액 변화 0 보장: 삭제되는 (양수합) = 삭제되는 (음수합 절댓값). 잔여 음수는 description만 통합, 금액 보존.
     const allUserIds = new Set<number>([...Object.keys(posByUser).map(Number), ...Object.keys(negByUser).map(Number)])
+    const userPlan: any[] = []   // 계획 수립용
+    const userSummary: any[] = []
 
     for (const uid of Array.from(allUserIds)) {
       const posList = (posByUser[uid] || []).slice()
       const negList = (negByUser[uid] || []).slice()
-      // 음수의 절댓값 = 양수 amount 와 매칭
+      const posSum = posList.reduce((s:number,p:any)=>s+Number(p.amount), 0)        // 양수 합 (삭제될 +)
+      const negSumAbs = negList.reduce((s:number,n:any)=>s+Math.abs(Number(n.amount)), 0)  // 음수 합 절댓값
+
+      // (a) 음수 행에서 posSum 만큼 매칭 삭제: 동일 금액 우선, 그 다음 큰 금액부터
+      const negSorted = negList.slice().sort((a:any,b:any)=> Math.abs(Number(b.amount)) - Math.abs(Number(a.amount)))
+      const negToDelete: any[] = []
+      const negToKeep: any[] = []
+      let remaining = posSum
+      const usedIds = new Set<number>()
+
+      // 1차: 정확히 일치하는 음수 행을 양수 행 각각에 대해 매칭 (가능한 만큼)
       const negByAmt: Record<string, any[]> = {}
-      for (const n of negList) {
+      for (const n of negSorted) {
         const k = String(Math.round(Math.abs(Number(n.amount))))
         if (!negByAmt[k]) negByAmt[k] = []
         negByAmt[k].push(n)
       }
-      const userPairs: any[] = []
-      const matchedNegIds = new Set<number>()
       for (const p of posList) {
         const k = String(Math.round(Number(p.amount)))
         const bucket = negByAmt[k] || []
         const n = bucket.shift()
-        if (n) {
-          userPairs.push({ posId: Number(p.id), negId: Number(n.id), amount: Number(p.amount) })
-          matchedNegIds.add(Number(n.id))
-          pairsToDelete.push({ posId: Number(p.id), negId: Number(n.id), user_id: uid, amount: Number(p.amount) })
+        if (n && !usedIds.has(Number(n.id))) {
+          usedIds.add(Number(n.id))
+          negToDelete.push(n)
+          remaining -= Math.abs(Number(n.amount))
         }
       }
-      // 매칭 안 된 음수 (orphan)
-      const orphans = negList.filter((n:any) => !matchedNegIds.has(Number(n.id)))
-      for (const o of orphans) orphanNegIds.push(Number(o.id))
-      // 매칭 안 된 양수 (드물지만 보고용)
-      const unmatchedPos = posList.filter((p:any) => !userPairs.find((up:any) => up.posId === Number(p.id)))
+      // 2차: remaining > 0 이면 큰 음수부터 추가로 매칭 (음수 행 절댓값이 remaining 이하인 것만 삭제)
+      if (remaining > 0.5) {
+        for (const n of negSorted) {
+          if (usedIds.has(Number(n.id))) continue
+          const absAmt = Math.abs(Number(n.amount))
+          if (absAmt <= remaining + 0.5) {
+            usedIds.add(Number(n.id))
+            negToDelete.push(n)
+            remaining -= absAmt
+            if (remaining <= 0.5) break
+          }
+        }
+      }
+      // 잔여 음수 = 삭제되지 않은 음수
+      for (const n of negSorted) {
+        if (!usedIds.has(Number(n.id))) negToKeep.push(n)
+      }
+      const negDeleteSumAbs = negToDelete.reduce((s:number,n:any)=>s+Math.abs(Number(n.amount)), 0)
+      const balanceDeltaForUser = posSum - negDeleteSumAbs  // 0 이어야 잔액 변화 없음
+      // 잔여 음수 통합 (description 통합 + 금액 합산하여 1행만 남기고 나머지는 삭제)
+      const orphanSum = negToKeep.reduce((s:number,n:any)=>s+Number(n.amount), 0) // 음수
+      const orphanIds = negToKeep.map((n:any)=>Number(n.id))
+      const consolidateMasterId = negToKeep.length > 0 ? Number(negToKeep[0].id) : null
+      const consolidateDeleteIds = negToKeep.length > 1 ? negToKeep.slice(1).map((n:any)=>Number(n.id)) : []
 
+      userPlan.push({
+        user_id: uid,
+        posIds: posList.map((p:any)=>Number(p.id)),
+        negDeleteIds: negToDelete.map((n:any)=>Number(n.id)),
+        consolidateMasterId,
+        consolidateDeleteIds,
+        orphanSum,
+        balanceDeltaForUser
+      })
       userSummary.push({
         user_id: uid,
         positive_count: posList.length,
+        positive_sum: posSum,
         negative_count: negList.length,
-        paired: userPairs.length,
-        unmatched_positive: unmatchedPos.length,
-        unmatched_negative: orphans.length,
-        paired_amount_sum: userPairs.reduce((s:number,x:any)=>s+x.amount, 0),
-        orphan_negative_sum: orphans.reduce((s:number,x:any)=>s+Number(x.amount), 0)
+        negative_sum_abs: negSumAbs,
+        deleted_positive_count: posList.length,
+        deleted_negative_count: negToDelete.length,
+        deleted_negative_sum_abs: negDeleteSumAbs,
+        balance_delta: balanceDeltaForUser,
+        orphan_consolidated_sum: orphanSum,
+        orphan_consolidated_count_deleted: consolidateDeleteIds.length,
+        orphan_master_id: consolidateMasterId
       })
     }
+
+    // 잔액 변화 0 검증 (전체 합)
+    const totalDelta = userSummary.reduce((s:number,u:any)=>s+u.balance_delta, 0)
+    const usersWithDelta = userSummary.filter((u:any)=>Math.abs(u.balance_delta) > 0.5).map((u:any)=>({user_id:u.user_id, delta:u.balance_delta}))
 
     if (dryRun) {
       return c.json({
         success: true,
         dryRun: true,
+        mode: 'B3-enhanced',
         positiveDates,
         negativeDates,
         totalPositiveRows: (positives.results || []).length,
         totalNegativeRows: (negatives.results || []).length,
-        totalPairs: pairsToDelete.length,
-        totalOrphanNegatives: orphanNegIds.length,
-        deletableRowCount: pairsToDelete.length * 2, // 페어당 2행
-        orphanRenameCount: renameOrphans ? orphanNegIds.length : 0,
         userCount: userSummary.length,
+        totalBalanceDelta: totalDelta,
+        usersWithBalanceDelta: usersWithDelta,
+        plannedPositiveDeletes: userPlan.reduce((s:number,p:any)=>s+p.posIds.length, 0),
+        plannedNegativeMatchedDeletes: userPlan.reduce((s:number,p:any)=>s+p.negDeleteIds.length, 0),
+        plannedConsolidationDeletes: userPlan.reduce((s:number,p:any)=>s+p.consolidateDeleteIds.length, 0),
+        plannedConsolidationMasters: userPlan.filter((p:any)=>p.consolidateMasterId !== null).length,
         perUserSummary: userSummary
       })
     }
 
-    // 5. 실제 삭제 (페어 단위 = 양수 + 음수)
-    let deleted = 0
-    const deleteIds: number[] = []
-    for (const p of pairsToDelete) { deleteIds.push(p.posId, p.negId) }
-    const CHUNK = 50
-    for (let i = 0; i < deleteIds.length; i += CHUNK) {
-      const chunk = deleteIds.slice(i, i + CHUNK)
-      const ph = chunk.map(() => '?').join(',')
-      const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...chunk).run()
-      deleted += (r.meta?.changes || 0)
+    // ★ 실삭제 전 마지막 안전장치: 잔액 변화가 0이 아니면 중단
+    if (Math.abs(totalDelta) > 0.5 || usersWithDelta.length > 0) {
+      return c.json({
+        success: false,
+        error: '잔액 변화 0 검증 실패 — 실삭제 중단됨',
+        totalBalanceDelta: totalDelta,
+        usersWithBalanceDelta: usersWithDelta,
+        perUserSummary: userSummary
+      }, 400)
     }
 
-    // 6. orphan 음수 행 description 만 보정 (금액/잔액 변화 0)
-    let renamed = 0
-    if (renameOrphans && orphanNegIds.length > 0) {
-      for (let i = 0; i < orphanNegIds.length; i += CHUNK) {
-        const chunk = orphanNegIds.slice(i, i + CHUNK)
-        const ph = chunk.map(() => '?').join(',')
-        const r = await db.prepare(`
+    // 5. 실삭제 수행
+    const CHUNK = 50
+    let deletedPositives = 0
+    let deletedNegMatched = 0
+    let consolidatedDeleted = 0
+    let consolidatedUpdated = 0
+
+    for (const plan of userPlan) {
+      // (a) 양수 행 삭제
+      if (plan.posIds.length > 0) {
+        for (let i = 0; i < plan.posIds.length; i += CHUNK) {
+          const chunk = plan.posIds.slice(i, i + CHUNK)
+          const ph = chunk.map(() => '?').join(',')
+          const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...chunk).run()
+          deletedPositives += (r.meta?.changes || 0)
+        }
+      }
+      // (b) 매칭된 음수 삭제
+      if (plan.negDeleteIds.length > 0) {
+        for (let i = 0; i < plan.negDeleteIds.length; i += CHUNK) {
+          const chunk = plan.negDeleteIds.slice(i, i + CHUNK)
+          const ph = chunk.map(() => '?').join(',')
+          const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...chunk).run()
+          deletedNegMatched += (r.meta?.changes || 0)
+        }
+      }
+      // (c) 잔여 음수 통합 — master 1행에 합산 amount + description 통합, 나머지 삭제
+      if (plan.consolidateMasterId !== null && renameOrphans) {
+        // master row update
+        const ru = await db.prepare(`
           UPDATE transactions
-          SET description = '[잔액 보정]'
-          WHERE id IN (${ph})
-        `).bind(...chunk).run()
-        renamed += (r.meta?.changes || 0)
+          SET amount = ?, description = '[잔액 보정] 휴일 회수 잔여분 통합'
+          WHERE id = ?
+        `).bind(plan.orphanSum, plan.consolidateMasterId).run()
+        consolidatedUpdated += (ru.meta?.changes || 0)
+        // delete others
+        if (plan.consolidateDeleteIds.length > 0) {
+          for (let i = 0; i < plan.consolidateDeleteIds.length; i += CHUNK) {
+            const chunk = plan.consolidateDeleteIds.slice(i, i + CHUNK)
+            const ph = chunk.map(() => '?').join(',')
+            const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...chunk).run()
+            consolidatedDeleted += (r.meta?.changes || 0)
+          }
+        }
       }
     }
 
     return c.json({
       success: true,
       dryRun: false,
+      mode: 'B3-enhanced',
       positiveDates,
       negativeDates,
-      totalPairs: pairsToDelete.length,
-      totalOrphanNegatives: orphanNegIds.length,
-      deletedRows: deleted,
-      renamedOrphans: renamed,
+      userCount: userSummary.length,
+      totalBalanceDelta: totalDelta,
+      deletedPositives,
+      deletedNegMatched,
+      consolidatedUpdated,
+      consolidatedDeleted,
       perUserSummary: userSummary
     })
   } catch (error) {
