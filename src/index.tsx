@@ -2024,13 +2024,13 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
       `).bind(staking.user_id).first()
 
       if (referrer && referrer.referrer_id) {
-        // 추천인 본인이 active 스테이킹을 보유하고 있는지(거치기간 내) 확인
+        // 추천인 본인이 active 스테이킹을 보유하고 있는지(거치기간 내) 확인 (KST 룰 적용)
         const referrerActive = await db.prepare(`
           SELECT id FROM staking
           WHERE user_id = ?
             AND status = 'active'
-            AND date(start_date) <= date('now')
-            AND date(end_date) >= date('now')
+            AND date(start_date, '+9 hours') <= date('now', '+9 hours')
+            AND date(end_date, '+9 hours') >= date('now', '+9 hours')
           LIMIT 1
         `).bind(referrer.referrer_id).first()
 
@@ -3760,8 +3760,11 @@ app.post('/api/rewards/daily', async (c) => {
     //   - 즉 cron은 reset_at 여부와 무관하게 일반 룰을 그대로 적용한다
     //   - 단, 리셋 스테이킹의 amount는 매출(직접판매) 통계에서만 별도 처리 (sales API에서 분리)
     // ★ 발생일(accrualDate) 기준으로 SELECT 조건 검사:
-    //   - end_date >= accrualDate (발생일이 거치기간 내)
-    //   - accrualDate >= start_date + 1 (승인일 익일부터)
+    //   - end_date_kst >= accrualDate (발생일이 거치기간 내)
+    //   - start_date_kst <= accrualDate (KST 같은 날 시작 = 당일 자격 인정)
+    // ★★ 사장님 룰 (2026-05-04 확정) ★★
+    //   - 한국시간(KST) 기준 23:59:59 이내 staking 시작 = 당일 가입 간주 = 당일 배당 자격
+    //   - 기존 "다음날부터" 룰 폐기 → KST 날짜 기준으로 비교
     const activeStakings = await db.prepare(`
       SELECT 
         s.user_id, 
@@ -3776,8 +3779,8 @@ app.post('/api/rewards/daily', async (c) => {
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count
       FROM staking s
       WHERE s.status = 'active' 
-        AND date(s.end_date) >= date(?)
-        AND date(?) >= date(s.start_date, '+1 day')
+        AND date(s.end_date, '+9 hours') >= date(?)
+        AND date(s.start_date, '+9 hours') <= date(?)
     `).bind(accrualDate, accrualDate).all()
 
     if (activeStakings.results.length === 0) {
@@ -3856,13 +3859,13 @@ app.post('/api/rewards/daily', async (c) => {
             `).bind(staking.user_id).first()
 
             if (level1Referrer && level1Referrer.referrer_id) {
-              // 발생일 기준 active 체크
+              // 발생일 기준 active 체크 (KST 룰 적용)
               const level1Active = await db.prepare(`
                 SELECT id FROM staking
                 WHERE user_id = ?
                   AND status = 'active'
-                  AND date(start_date) <= date(?)
-                  AND date(end_date) >= date(?)
+                  AND date(start_date, '+9 hours') <= date(?)
+                  AND date(end_date, '+9 hours') >= date(?)
                 LIMIT 1
               `).bind(level1Referrer.referrer_id, accrualDate, accrualDate).first()
 
@@ -3893,8 +3896,8 @@ app.post('/api/rewards/daily', async (c) => {
                     SELECT id FROM staking
                     WHERE user_id = ?
                       AND status = 'active'
-                      AND date(start_date) <= date(?)
-                      AND date(end_date) >= date(?)
+                      AND date(start_date, '+9 hours') <= date(?)
+                      AND date(end_date, '+9 hours') >= date(?)
                     LIMIT 1
                   `).bind(level2Referrer.referrer_id, accrualDate, accrualDate).first()
 
