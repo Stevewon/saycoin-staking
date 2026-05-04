@@ -9636,6 +9636,50 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- QKEY 잔액 임의 수정 모달 (숨김) -->
+                <div id="adjustBalanceModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-coins text-yellow-500 mr-2"></i>QKEY 잔액 임의 수정</h3>
+                            <button onclick="closeAdjustBalanceModal()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                        </div>
+                        <div class="space-y-4">
+                            <div class="bg-gray-50 rounded-lg p-3">
+                                <p class="text-xs text-gray-500 mb-1">대상 회원</p>
+                                <p class="text-sm font-bold text-gray-800" id="adjUserInfo">-</p>
+                                <p class="text-xs text-gray-600 mt-2">현재 잔액</p>
+                                <p class="text-lg font-bold text-yellow-600" id="adjCurrentBalance">- QKEY</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">수정 모드</label>
+                                <select id="adjMode" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-transparent" onchange="updateAdjPreview()">
+                                    <option value="delta">가산/차감 (delta) — 입력 금액을 현재 잔액에 +/- 함</option>
+                                    <option value="set">직접 설정 (set) — 입력 금액을 새 잔액으로 설정</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">금액 (QKEY)</label>
+                                <input type="number" id="adjAmount" placeholder="예: 10000 또는 -5000" oninput="updateAdjPreview()"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-transparent" />
+                                <p class="text-xs text-gray-500 mt-1">delta 모드: 양수=가산, 음수=차감 / set 모드: 새 잔액 값</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">사유 (description)</label>
+                                <input type="text" id="adjDescription" value="관리자 보정"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-transparent" />
+                            </div>
+                            <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                                <p class="text-xs text-yellow-700 font-bold mb-1"><i class="fas fa-eye mr-1"></i>적용 미리보기</p>
+                                <p class="text-sm text-gray-800" id="adjPreview">금액을 입력하면 미리보기가 표시됩니다</p>
+                            </div>
+                            <div class="flex gap-2 pt-2">
+                                <button onclick="closeAdjustBalanceModal()" class="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium">취소</button>
+                                <button onclick="submitAdjustBalance()" class="flex-1 px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg font-bold"><i class="fas fa-check mr-1"></i>적용</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 매출 현황 (숨김) -->
                 <div id="content-sales" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
@@ -10479,7 +10523,7 @@ app.get('/admin/dashboard', (c) => {
                                 </div>
                             </div>
 
-                            <div class="mt-3 sm:mt-4 pt-3 sm:pt-4 border-t flex justify-end gap-2">
+                            <div class="mt-3 sm:mt-4 pt-3 sm:pt-4 border-t flex justify-end gap-2 flex-wrap">
                                 <button onclick="showDownlineSales(\${u.id})" 
                                     class="px-3 sm:px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
                                     <i class="fas fa-sitemap mr-1 sm:mr-2"></i>\${I18N.t('admin.downline_sales')}
@@ -10487,6 +10531,10 @@ app.get('/admin/dashboard', (c) => {
                                 <button onclick="showUserDetail(\${u.id})" 
                                     class="px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
                                     <i class="fas fa-search mr-1 sm:mr-2"></i>\${I18N.t('admin.view_detail')}
+                                </button>
+                                <button onclick="openAdjustBalanceModal(\${u.id}, '\${esc(u.email)}', '\${esc(u.name)}', \${u.qkey_balance || 0})" 
+                                    class="px-3 sm:px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
+                                    <i class="fas fa-coins mr-1 sm:mr-2"></i>QKEY 잔액 수정
                                 </button>
                                 <button onclick="deleteUser(\${u.id}, '\${esc(u.name)}', '\${esc(u.email)}', \${u.staking_amount})" 
                                     class="px-3 sm:px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
@@ -10976,6 +11024,75 @@ app.get('/admin/dashboard', (c) => {
                     }
                 } catch (err) {
                     alert('코인 리셋 실패: ' + (err.response?.data?.error || err.message));
+                }
+            }
+
+            // ============================================
+            // QKEY 잔액 임의 수정 (관리자 보정)
+            // ============================================
+            let _adjCtx = { userId: 0, email: '', name: '', currentBalance: 0 };
+
+            function openAdjustBalanceModal(userId, email, name, currentBalance) {
+                _adjCtx = { userId: userId, email: email, name: name, currentBalance: Number(currentBalance) || 0 };
+                document.getElementById('adjUserInfo').textContent = '#' + userId + ' ' + name + ' (' + email + ')';
+                document.getElementById('adjCurrentBalance').textContent = (_adjCtx.currentBalance).toLocaleString() + ' QKEY';
+                document.getElementById('adjMode').value = 'delta';
+                document.getElementById('adjAmount').value = '';
+                document.getElementById('adjDescription').value = '관리자 보정';
+                document.getElementById('adjPreview').textContent = '금액을 입력하면 미리보기가 표시됩니다';
+                var m = document.getElementById('adjustBalanceModal');
+                m.classList.remove('hidden');
+                m.classList.add('flex');
+            }
+
+            function closeAdjustBalanceModal() {
+                var m = document.getElementById('adjustBalanceModal');
+                m.classList.add('hidden');
+                m.classList.remove('flex');
+            }
+
+            function updateAdjPreview() {
+                var mode = document.getElementById('adjMode').value;
+                var amt = Number(document.getElementById('adjAmount').value);
+                var preview = document.getElementById('adjPreview');
+                if (!amt && amt !== 0) { preview.textContent = '금액을 입력하면 미리보기가 표시됩니다'; return; }
+                var cur = _adjCtx.currentBalance;
+                var newBal, delta;
+                if (mode === 'set') { newBal = amt; delta = amt - cur; }
+                else { newBal = cur + amt; delta = amt; }
+                var sign = delta >= 0 ? '+' : '';
+                preview.innerHTML = '현재 ' + cur.toLocaleString() + ' QKEY → 변경 후 <span class="font-bold text-yellow-700">' + newBal.toLocaleString() + ' QKEY</span> (' + sign + delta.toLocaleString() + ')';
+            }
+
+            async function submitAdjustBalance() {
+                var mode = document.getElementById('adjMode').value;
+                var amtRaw = document.getElementById('adjAmount').value;
+                if (amtRaw === '' || amtRaw === null) { alert('금액을 입력해주세요'); return; }
+                var amt = Number(amtRaw);
+                if (isNaN(amt)) { alert('유효한 숫자를 입력해주세요'); return; }
+                var desc = (document.getElementById('adjDescription').value || '').trim() || '관리자 보정';
+                var cur = _adjCtx.currentBalance;
+                var newBal = (mode === 'set') ? amt : (cur + amt);
+                var delta = (mode === 'set') ? (amt - cur) : amt;
+                if (Math.abs(delta) < 0.0001) { alert('변경 사항이 없습니다'); return; }
+                var sign = delta >= 0 ? '+' : '';
+                if (!confirm('user #' + _adjCtx.userId + ' (' + _adjCtx.email + ')\\n\\n현재: ' + cur.toLocaleString() + ' QKEY\\n변경 후: ' + newBal.toLocaleString() + ' QKEY (' + sign + delta.toLocaleString() + ')\\n사유: ' + desc + '\\n\\n적용하시겠습니까?')) return;
+                try {
+                    var res = await axios.post('/api/admin/users/adjust-balance', {
+                        userId: _adjCtx.userId,
+                        amount: amt,
+                        description: desc,
+                        mode: mode
+                    });
+                    if (res.data.success) {
+                        alert('잔액 수정 완료\\n\\n이전: ' + (res.data.previousBalance || 0).toLocaleString() + ' QKEY\\n현재: ' + (res.data.newBalance || 0).toLocaleString() + ' QKEY\\nΔ: ' + ((res.data.delta || 0) >= 0 ? '+' : '') + (res.data.delta || 0).toLocaleString() + ' QKEY\\ntx ID: ' + res.data.txId);
+                        closeAdjustBalanceModal();
+                        loadUsers();
+                    } else {
+                        alert('실패: ' + (res.data.error || '원인 불명'));
+                    }
+                } catch (err) {
+                    alert('잔액 수정 실패: ' + (err.response?.data?.error || err.message));
                 }
             }
 
