@@ -4367,6 +4367,151 @@ app.post('/api/admin/rewards/reconcile-tx-range', async (c) => {
   }
 })
 
+// 어드민: 휴일 잘못 지급/회수 트랜잭션 흔적 완전 삭제 (5/1, 5/3 등)
+//   - 안전장치: 사용자별 net=0 인 경우에만 삭제 (잔액 변화 0 보장)
+//   - 대상 type: daily_qkey, referral_reward, daily_reward_rollback, referral_reward_rollback, rollback_restore
+//   - 제외 type: direct_referral (직접판매는 즉시 지급되어 회수 대상 아님)
+//   - dryRun=true 시 삭제하지 않고 영향 사용자/행 미리보기만 반환
+app.post('/api/admin/rewards/purge-tx-by-dates', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dates: string[] = Array.isArray(body?.dates) ? body.dates : []
+    const dryRun: boolean = body?.dryRun === true
+    const includeRollbackCreatedDates: string[] = Array.isArray(body?.rollbackCreatedDates) ? body.rollbackCreatedDates : []
+    if (dates.length === 0) return c.json({ error: 'dates 배열이 필요합니다 (예: ["2026-05-01","2026-05-03"])' }, 400)
+
+    // 대상 type
+    const TYPES = ['daily_qkey', 'referral_reward', 'daily_reward_rollback', 'referral_reward_rollback', 'rollback_restore']
+    const placeholders = TYPES.map(() => '?').join(',')
+
+    // 1. 양수 행: dates 의 created_at(KST date) 기준
+    //    SQLite: substr(datetime(created_at,'+9 hours'),1,10) = ?
+    const datePredicates = dates.map(() => `substr(datetime(created_at,'+9 hours'),1,10) = ?`).join(' OR ')
+
+    // 2. 회수/복구 행: rollbackCreatedDates 의 created_at 기준 (없으면 동일 dates 사용)
+    const rollbackDates = includeRollbackCreatedDates.length > 0 ? includeRollbackCreatedDates : dates
+    const rollbackDatePredicates = rollbackDates.map(() => `substr(datetime(created_at,'+9 hours'),1,10) = ?`).join(' OR ')
+
+    // 양수 후보
+    const positiveQuery = `
+      SELECT id, user_id, type, amount, description, created_at
+      FROM transactions
+      WHERE type IN (${placeholders})
+        AND coin_type = 'QKEY'
+        AND amount >= 0
+        AND (${datePredicates})
+    `
+    const positiveParams: any[] = [...TYPES, ...dates]
+    const positives = await db.prepare(positiveQuery).bind(...positiveParams).all()
+
+    // 음수(회수) + rollback_restore 후보
+    const negativeQuery = `
+      SELECT id, user_id, type, amount, description, created_at
+      FROM transactions
+      WHERE type IN ('daily_reward_rollback','referral_reward_rollback','rollback_restore')
+        AND coin_type = 'QKEY'
+        AND (
+          (${rollbackDatePredicates})
+          OR description LIKE '%2026-05-01%'
+          OR description LIKE '%2026-05-02%'
+          OR description LIKE '%2026-05-03%'
+          OR description LIKE '%5/1%'
+          OR description LIKE '%5/3%'
+        )
+    `
+    const negativeParams: any[] = [...rollbackDates]
+    const negatives = await db.prepare(negativeQuery).bind(...negativeParams).all()
+
+    // 사용자별 집계
+    const perUser: Record<number, { positives: any[], negatives: any[], posSum: number, negSum: number }> = {}
+    for (const r of (positives.results || []) as any[]) {
+      // direct_referral 제외 보장 (이미 type 필터로 제외되어 있음)
+      const uid = Number(r.user_id)
+      if (!perUser[uid]) perUser[uid] = { positives: [], negatives: [], posSum: 0, negSum: 0 }
+      perUser[uid].positives.push(r)
+      perUser[uid].posSum += Number(r.amount) || 0
+    }
+    for (const r of (negatives.results || []) as any[]) {
+      const uid = Number(r.user_id)
+      if (!perUser[uid]) perUser[uid] = { positives: [], negatives: [], posSum: 0, negSum: 0 }
+      perUser[uid].negatives.push(r)
+      perUser[uid].negSum += Number(r.amount) || 0
+    }
+
+    const summary: any[] = []
+    const eligibleIds: number[] = []
+    const skippedUsers: any[] = []
+    for (const uidStr of Object.keys(perUser)) {
+      const uid = Number(uidStr)
+      const u = perUser[uid]
+      const net = u.posSum + u.negSum // negSum already negative
+      const eligible = Math.abs(net) < 0.5
+      summary.push({
+        user_id: uid,
+        positive_count: u.positives.length,
+        positive_sum: u.posSum,
+        negative_count: u.negatives.length,
+        negative_sum: u.negSum,
+        net,
+        eligible
+      })
+      if (eligible) {
+        for (const p of u.positives) eligibleIds.push(Number(p.id))
+        for (const n of u.negatives) eligibleIds.push(Number(n.id))
+      } else {
+        skippedUsers.push({ user_id: uid, net, reason: 'net != 0' })
+      }
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        dates,
+        rollbackDates,
+        totalPositiveRows: (positives.results || []).length,
+        totalNegativeRows: (negatives.results || []).length,
+        eligibleUsers: summary.filter((s:any) => s.eligible).length,
+        skippedUsers: skippedUsers.length,
+        deletableRowCount: eligibleIds.length,
+        perUserSummary: summary,
+        skipped: skippedUsers
+      })
+    }
+
+    // 실제 삭제
+    let deleted = 0
+    if (eligibleIds.length > 0) {
+      // 청크로 나눠 IN 절 길이 제한 회피
+      const CHUNK = 50
+      for (let i = 0; i < eligibleIds.length; i += CHUNK) {
+        const chunk = eligibleIds.slice(i, i + CHUNK)
+        const ph = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...chunk).run()
+        deleted += (r.meta?.changes || 0)
+      }
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      dates,
+      rollbackDates,
+      totalPositiveRows: (positives.results || []).length,
+      totalNegativeRows: (negatives.results || []).length,
+      eligibleUsers: summary.filter((s:any) => s.eligible).length,
+      skippedUsers: skippedUsers.length,
+      deletedRowCount: deleted,
+      perUserSummary: summary,
+      skipped: skippedUsers
+    })
+  } catch (error) {
+    console.error('purge-tx-by-dates error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액 vs 거래내역 전체 합계 정합성 진단
 //   - users.qkey_balance vs SUM(transactions.amount WHERE coin_type='QKEY') 비교
 //   - 차이가 있는 사용자 모두 반환 (사용자단/어드민단 일치 여부 확인용)
