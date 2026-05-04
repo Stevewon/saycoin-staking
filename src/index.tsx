@@ -4166,6 +4166,113 @@ app.post('/api/admin/rewards/rollback-daily', async (c) => {
   }
 })
 
+// 어드민: transactions.created_at 기준 기간 회수 (휴일/주말에 잘못 찍힌 daily_qkey + referral_reward 회수)
+//   - direct_referral 은 즉시지급 정책이므로 회수 대상에서 제외
+//   - daily_rewards / referral_rewards 테이블 행은 reward_date 기준이라 별개로 두고,
+//     여기서는 transactions 행 자체를 음수 보전 + 잔액 차감만 처리한다.
+//   - 사용 예: { "fromDate": "2026-05-01", "toDate": "2026-05-03" }
+app.post('/api/admin/rewards/rollback-tx-range', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const fromDate = body && body.fromDate ? String(body.fromDate) : ''
+    const toDate = body && body.toDate ? String(body.toDate) : ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+      return c.json({ error: 'fromDate/toDate (YYYY-MM-DD) 필요' }, 400)
+    }
+
+    // 회수 대상: daily_qkey + referral_reward (direct_referral 제외)
+    // 단, 이미 회수 로그(daily_reward_rollback / referral_reward_rollback)가 있는 사용자/금액은
+    // 한 번 더 빼면 마이너스가 되므로, 같은 기간 회수 로그가 있으면 net 양수만 회수.
+    const rows = await db.prepare(
+      `SELECT id, user_id, type, amount, description, created_at
+       FROM transactions
+       WHERE date(created_at) BETWEEN ? AND ?
+         AND type IN ('daily_qkey','referral_reward')
+       ORDER BY id`
+    ).bind(fromDate, toDate).all()
+
+    // 같은 기간에 이미 발생한 롤백 합계 (사용자별)
+    const existingRollbacks = await db.prepare(
+      `SELECT user_id, SUM(amount) as rolled
+       FROM transactions
+       WHERE date(created_at) BETWEEN ? AND ?
+         AND type IN ('daily_reward_rollback','referral_reward_rollback')
+       GROUP BY user_id`
+    ).bind(fromDate, toDate).all()
+    const rolledMap: Record<string, number> = {}
+    for (const r of (existingRollbacks.results || [])) {
+      rolledMap[String(r.user_id)] = Number(r.rolled) || 0
+    }
+
+    // 회수해야 할 사용자별 amount 합계 (양수)
+    const toRollback: Record<string, { daily: number; ref: number; ids: number[] }> = {}
+    for (const r of (rows.results || [])) {
+      const uid = String(r.user_id)
+      if (!toRollback[uid]) toRollback[uid] = { daily: 0, ref: 0, ids: [] }
+      const amt = Number(r.amount) || 0
+      if (r.type === 'daily_qkey') toRollback[uid].daily += amt
+      else if (r.type === 'referral_reward') toRollback[uid].ref += amt
+      toRollback[uid].ids.push(Number(r.id))
+    }
+
+    let processedUsers = 0
+    let totalDailyQkey = 0
+    let totalRefQkey = 0
+    const details: any[] = []
+
+    for (const uid in toRollback) {
+      const d = toRollback[uid]
+      const grossPaid = d.daily + d.ref
+      const alreadyRolled = -1 * (rolledMap[uid] || 0) // 롤백은 음수로 저장되므로 부호 반전 (양수=이미 회수된 금액)
+      const netToRollback = Math.max(0, grossPaid - alreadyRolled)
+      if (netToRollback <= 0) {
+        details.push({ user_id: Number(uid), grossPaid, alreadyRolled, netToRollback, skipped: 'already_rolled' })
+        continue
+      }
+      // daily / ref 비율로 분배
+      const ratio = grossPaid > 0 ? d.daily / grossPaid : 0
+      const dailyPart = Math.round(netToRollback * ratio)
+      const refPart = netToRollback - dailyPart
+      try {
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(netToRollback, Number(uid)).run()
+        if (dailyPart > 0) {
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'daily_reward_rollback', 'QKEY', ?, ?)
+          `).bind(Number(uid), -dailyPart, `[휴일 회수] ${fromDate}~${toDate} 일일배당 회수 (-${dailyPart.toLocaleString()} QKEY)`).run()
+          totalDailyQkey += dailyPart
+        }
+        if (refPart > 0) {
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'referral_reward_rollback', 'QKEY', ?, ?)
+          `).bind(Number(uid), -refPart, `[휴일 회수] ${fromDate}~${toDate} 매칭수당 회수 (-${refPart.toLocaleString()} QKEY)`).run()
+          totalRefQkey += refPart
+        }
+        processedUsers++
+        details.push({ user_id: Number(uid), grossPaid, alreadyRolled, netToRollback, dailyPart, refPart })
+      } catch (e) {
+        console.error('rollback-tx-range error for user', uid, e)
+      }
+    }
+
+    return c.json({
+      success: true,
+      fromDate,
+      toDate,
+      processedUsers,
+      totalDailyQkey,
+      totalRefQkey,
+      grandTotalQkey: totalDailyQkey + totalRefQkey,
+      details
+    })
+  } catch (error) {
+    console.error('rollback-tx-range error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 사용자별 보상 내역 조회
 app.get('/api/rewards/history/:userId', async (c) => {
   try {
