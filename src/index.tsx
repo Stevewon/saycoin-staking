@@ -4478,8 +4478,8 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
         }
       }
 
-      // 2차: 그리디 — 남은 후보 중에서 |remaining + amount| 가 가장 작아지는 행을 반복 선택
-      //   remaining 이 0 에 수렴하도록
+      // 2차: 그리디 — 남은 후보 중에서 |remaining - amount| 가 가장 작아지는 행을 반복 선택
+      //   remaining 이 0 에 수렴하도록 (개선 없으면 즉시 종료)
       const epsilon = 0.5
       let safety = 0
       while (Math.abs(remaining) > epsilon && safety < 1000) {
@@ -4491,24 +4491,68 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
           if (usedIds.has(Number(c.id))) continue
           const after = remaining - Number(c.amount)
           const afterAbs = Math.abs(after)
-          // 더 좋아지는 경우만 채택 (수렴 보장)
           if (afterAbs < bestAfterAbs - epsilon) {
             bestAfterAbs = afterAbs
             bestIdx = i
           }
         }
-        if (bestIdx < 0) break // 더 개선할 수 없으면 종료
+        if (bestIdx < 0) break
         const c = candList[bestIdx]
         usedIds.add(Number(c.id))
         candToDelete.push(c)
         remaining -= Number(c.amount)
       }
 
-      // 잔여 후보 = 삭제되지 않은 후보
-      for (const c of candList) {
-        if (!usedIds.has(Number(c.id))) candToKeep.push(c)
+      // 3차 (A2안 핵심): 잔여가 여전히 0이 아니면 — 잔여 후보 중 amount 부호가 remaining 과 같은 행 1건을 찾아 분할
+      //   분할 split 행 1건 (amount = remaining) 을 신규 INSERT 후 즉시 삭제로 처리
+      //   원래 후보 행은 amount = (원래 amount - remaining) 으로 UPDATE → orphan(통합 대상)에 잔류
+      //   ※ remaining 부호와 동일한 부호의 후보 행이 있어야 분할 가능 (절댓값이 |remaining| 이상)
+      let splitPlan: any = null  // {srcId, srcOriginalAmount, srcNewAmount, splitAmount}
+      if (Math.abs(remaining) > epsilon) {
+        const need = remaining // 부호 포함 — 이만큼 더 삭제해야 변화 0
+        let bestSplitIdx = -1
+        let bestSplitAbsRemainder = Infinity
+        for (let i = 0; i < candList.length; i++) {
+          const c = candList[i]
+          if (usedIds.has(Number(c.id))) continue
+          const a = Number(c.amount)
+          // 분할 가능 조건: 부호가 같고, |a| > |need| (잔여가 남아야 통합 가능, 또는 같으면 분할 불필요였음)
+          if ((a > 0 && need > 0 && a > need + epsilon) || (a < 0 && need < 0 && a < need - epsilon)) {
+            const remainderAfter = a - need
+            const absRem = Math.abs(remainderAfter)
+            if (absRem < bestSplitAbsRemainder) {
+              bestSplitAbsRemainder = absRem
+              bestSplitIdx = i
+            }
+          }
+        }
+        if (bestSplitIdx >= 0) {
+          const src = candList[bestSplitIdx]
+          const srcAmt = Number(src.amount)
+          splitPlan = {
+            srcId: Number(src.id),
+            srcOriginalAmount: srcAmt,
+            srcNewAmount: srcAmt - need,   // 잔여로 남길 부분
+            splitAmount: need,             // 분할 후 즉시 삭제 처리할 가상 행 amount
+            srcType: String(src.type),
+            srcCreatedAt: String(src.created_at)
+          }
+          // src 행은 분할 후 잔여(orphan 통합 대상)에 들어감 — usedIds 에 넣지 않음
+          remaining = 0
+        }
       }
-      const candDeleteAmtSum = candToDelete.reduce((s:number,c:any)=>s+Number(c.amount), 0)
+
+      // 잔여 후보 = 삭제되지 않은 후보 (분할된 src 행도 잔여에 포함됨, amount 는 srcNewAmount 로 간주)
+      for (const c of candList) {
+        if (usedIds.has(Number(c.id))) continue
+        if (splitPlan && Number(c.id) === splitPlan.srcId) {
+          // 분할된 행 — 잔여에는 srcNewAmount 로 포함됨
+          candToKeep.push({ ...c, amount: splitPlan.srcNewAmount, _splitFrom: splitPlan.srcOriginalAmount })
+        } else {
+          candToKeep.push(c)
+        }
+      }
+      const candDeleteAmtSum = candToDelete.reduce((s:number,c:any)=>s+Number(c.amount), 0) + (splitPlan ? splitPlan.splitAmount : 0)
       // 잔액 변화 = -posSum - candDeleteAmtSum  →  0 이어야 안전
       const balanceDeltaForUser = -posSum - candDeleteAmtSum
       // 잔여 후보 통합 (description 통합 + 금액 합산하여 1행만 남기고 나머지는 삭제)
@@ -4520,6 +4564,7 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
         user_id: uid,
         posIds: posList.map((p:any)=>Number(p.id)),
         negDeleteIds: candToDelete.map((c:any)=>Number(c.id)),
+        splitPlan,
         consolidateMasterId,
         consolidateDeleteIds,
         orphanSum,
@@ -4534,6 +4579,8 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
         deleted_positive_count: posList.length,
         deleted_candidate_count: candToDelete.length,
         deleted_candidate_amount_sum: candDeleteAmtSum,
+        split_applied: splitPlan ? true : false,
+        split_amount: splitPlan ? splitPlan.splitAmount : 0,
         balance_delta: balanceDeltaForUser,
         orphan_consolidated_sum: orphanSum,
         orphan_consolidated_count_deleted: consolidateDeleteIds.length,
@@ -4549,7 +4596,7 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
       return c.json({
         success: true,
         dryRun: true,
-        mode: 'B3-enhanced',
+        mode: 'B3-A2',
         positiveDates,
         negativeDates,
         totalPositiveRows: (positives.results || []).length,
@@ -4561,6 +4608,7 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
         plannedNegativeMatchedDeletes: userPlan.reduce((s:number,p:any)=>s+p.negDeleteIds.length, 0),
         plannedConsolidationDeletes: userPlan.reduce((s:number,p:any)=>s+p.consolidateDeleteIds.length, 0),
         plannedConsolidationMasters: userPlan.filter((p:any)=>p.consolidateMasterId !== null).length,
+        plannedSplits: userPlan.filter((p:any)=>p.splitPlan).length,
         perUserSummary: userSummary
       })
     }
@@ -4582,6 +4630,7 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
     let deletedNegMatched = 0
     let consolidatedDeleted = 0
     let consolidatedUpdated = 0
+    let splitApplied = 0
 
     for (const plan of userPlan) {
       // (a) 양수 행 삭제
@@ -4593,7 +4642,7 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
           deletedPositives += (r.meta?.changes || 0)
         }
       }
-      // (b) 매칭된 음수 삭제
+      // (b) 매칭된 음수/복구 후보 삭제
       if (plan.negDeleteIds.length > 0) {
         for (let i = 0; i < plan.negDeleteIds.length; i += CHUNK) {
           const chunk = plan.negDeleteIds.slice(i, i + CHUNK)
@@ -4602,15 +4651,33 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
           deletedNegMatched += (r.meta?.changes || 0)
         }
       }
-      // (c) 잔여 음수 통합 — master 1행에 합산 amount + description 통합, 나머지 삭제
-      if (plan.consolidateMasterId !== null && renameOrphans) {
-        // master row update
+      // (b-2) 분할 적용: src 행을 srcNewAmount 로 UPDATE (분할된 splitAmount 만큼은 잔액 변화로 흡수됨)
+      //       이 행은 이후 (c) 통합 단계에서 master 가 되거나 통합으로 흡수됨
+      if (plan.splitPlan) {
+        const sp = plan.splitPlan
         const ru = await db.prepare(`
           UPDATE transactions
-          SET amount = ?, description = '[잔액 보정] 휴일 회수 잔여분 통합'
+          SET amount = ?, description = COALESCE(description,'') || ' [분할]'
           WHERE id = ?
-        `).bind(plan.orphanSum, plan.consolidateMasterId).run()
-        consolidatedUpdated += (ru.meta?.changes || 0)
+        `).bind(sp.srcNewAmount, sp.srcId).run()
+        splitApplied += (ru.meta?.changes || 0)
+      }
+      // (c) 잔여 후보 통합 — master 1행에 합산 amount + description 통합, 나머지 삭제
+      //     ★ orphanSum 은 splitPlan 의 srcNewAmount 가 이미 반영된 값 (계획 단계에서 candToKeep 에 srcNewAmount 로 push)
+      if (plan.consolidateMasterId !== null && renameOrphans) {
+        if (Math.abs(plan.orphanSum) > 0.5) {
+          // 통합 amount 가 0 이 아니면 master 행을 보정용으로 사용
+          const ru = await db.prepare(`
+            UPDATE transactions
+            SET amount = ?, description = '[잔액 보정] 휴일 회수 잔여분 통합'
+            WHERE id = ?
+          `).bind(plan.orphanSum, plan.consolidateMasterId).run()
+          consolidatedUpdated += (ru.meta?.changes || 0)
+        } else {
+          // 통합 amount 가 0 이면 master 까지 삭제 (사용자에게 0 행 표시 방지)
+          const r = await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(plan.consolidateMasterId).run()
+          consolidatedDeleted += (r.meta?.changes || 0)
+        }
         // delete others
         if (plan.consolidateDeleteIds.length > 0) {
           for (let i = 0; i < plan.consolidateDeleteIds.length; i += CHUNK) {
