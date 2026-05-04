@@ -5047,18 +5047,18 @@ app.post('/api/admin/rewards/cleanup-by-reward-date', async (c) => {
     const { rewardDate, dryRun } = body || {}
     if (!rewardDate) return c.json({ error: 'rewardDate 가 필요합니다 (예: "2026-04-30")' }, 400)
 
-    // 1. daily_rewards 영향 행 조회
+    // 1. daily_rewards 영향 행 조회 (실제 스키마: usdt_amount, staking_id)
     const dr = await db.prepare(
-      `SELECT id, user_id, staking_id, qkey_amount, reward_date, paid_date, created_at
+      `SELECT id, user_id, staking_id, usdt_amount, reward_date, created_at
        FROM daily_rewards WHERE reward_date = ?`
     ).bind(String(rewardDate)).all()
     const drRows = (dr.results || []) as any[]
 
-    // 2. referral_rewards 영향 행 조회
+    // 2. referral_rewards 영향 행 조회 (실제 스키마: referrer_id, referee_id, level, reward_amount)
     let rrRows: any[] = []
     try {
       const rr = await db.prepare(
-        `SELECT id, user_id, referee_id, level, qkey_amount, reward_date, paid_date, created_at
+        `SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, created_at
          FROM referral_rewards WHERE reward_date = ?`
       ).bind(String(rewardDate)).all()
       rrRows = (rr.results || []) as any[]
@@ -5072,13 +5072,13 @@ app.post('/api/admin/rewards/cleanup-by-reward-date', async (c) => {
       const u = Number(r.user_id)
       if (!byUser[u]) byUser[u] = { user_id: u, daily_count: 0, daily_amount: 0, ref_count: 0, ref_amount: 0 }
       byUser[u].daily_count++
-      byUser[u].daily_amount += Number(r.qkey_amount) || 0
+      byUser[u].daily_amount += Number(r.usdt_amount) || 0
     }
     for (const r of rrRows) {
-      const u = Number(r.user_id)
+      const u = Number(r.referrer_id)
       if (!byUser[u]) byUser[u] = { user_id: u, daily_count: 0, daily_amount: 0, ref_count: 0, ref_amount: 0 }
       byUser[u].ref_count++
-      byUser[u].ref_amount += Number(r.qkey_amount) || 0
+      byUser[u].ref_amount += Number(r.reward_amount) || 0
     }
     const userSummary = Object.values(byUser).sort((a:any,b:any)=>a.user_id-b.user_id)
 
@@ -5088,9 +5088,9 @@ app.post('/api/admin/rewards/cleanup-by-reward-date', async (c) => {
         dryRun: true,
         rewardDate,
         dailyRewardsCount: drRows.length,
-        dailyRewardsSum: drRows.reduce((s,r)=>s+(Number(r.qkey_amount)||0),0),
+        dailyRewardsSum: drRows.reduce((s,r)=>s+(Number(r.usdt_amount)||0),0),
         referralRewardsCount: rrRows.length,
-        referralRewardsSum: rrRows.reduce((s,r)=>s+(Number(r.qkey_amount)||0),0),
+        referralRewardsSum: rrRows.reduce((s,r)=>s+(Number(r.reward_amount)||0),0),
         affectedUserCount: userSummary.length,
         perUserSummary: userSummary
       })
