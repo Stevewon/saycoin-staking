@@ -4044,7 +4044,7 @@ app.get('/api/admin/diag/rewards', async (c) => {
       `SELECT id, user_id, type, coin_type, amount, description, created_at
        FROM transactions
        WHERE date(created_at) = ?
-         AND type IN ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback')
+         AND type IN ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback','rollback_restore')
        ORDER BY id`
     ).bind(date).all()
 
