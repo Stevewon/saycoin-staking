@@ -5236,6 +5236,45 @@ app.get('/api/admin/diag/full-audit', async (c) => {
   }
 })
 
+// 어드민: 특정 일자 마감(KST 23:59:59) 시점의 사용자별 잔액 (= 그 시점까지의 transactions amount 합)
+//   - query: ?date=YYYY-MM-DD  (KST 기준)
+//   - 4/30 당일 잔액 조회용
+app.get('/api/admin/diag/balance-as-of', async (c) => {
+  try {
+    const db = c.env.DB
+    const date = c.req.query('date') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD 필요 (KST)' }, 400)
+    // KST 23:59:59 = UTC 14:59:59 same day
+    const cutoffUtc = `${date} 14:59:59`
+    const users = await db.prepare(
+      `SELECT u.id, u.email,
+              COALESCE((SELECT SUM(t.amount) FROM transactions t
+                        WHERE t.user_id = u.id AND t.coin_type='QKEY'
+                              AND t.created_at <= ?), 0) as bal_as_of,
+              (SELECT COUNT(*) FROM transactions t
+                WHERE t.user_id = u.id AND t.coin_type='QKEY'
+                      AND t.created_at <= ?) as tx_count
+       FROM users u
+       ORDER BY u.id`
+    ).bind(cutoffUtc, cutoffUtc).all()
+    const out = (users.results || []).map((r: any) => ({
+      id: Number(r.id), email: r.email,
+      balance_as_of: Number(r.bal_as_of) || 0,
+      tx_count: Number(r.tx_count) || 0
+    }))
+    return c.json({
+      success: true,
+      date,
+      cutoff_utc: cutoffUtc,
+      total_users: out.length,
+      total_balance: out.reduce((s: number, r: any) => s + r.balance_as_of, 0),
+      results: out
+    })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액을 거래내역 합계로 강제 동기화 (사용자단=어드민단 일치 보장)
 //   - 옵션: { "userIds": [17,18] } 또는 빈 body로 전체
 app.post('/api/admin/diag/sync-balance-to-tx', async (c) => {
