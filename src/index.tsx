@@ -4399,14 +4399,20 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
       ORDER BY user_id, amount DESC, id ASC
     `).bind(...positiveDates).all()
 
-    // 2. 음수 후보: negativeDates KST 기준, *_rollback (음수)
+    // 2. 회수/복구 후보: negativeDates KST 기준
+    //    - daily_reward_rollback / referral_reward_rollback (음수) → 회수 행
+    //    - rollback_restore (양수) → 과회수 복구 행 (이것도 잔액 차감 매칭 후보로 사용)
+    //    잔액 변화 0 보장을 위해 양수+음수 모두 후보로 잡음.
+    //    "음수 매칭" 처리 시 절댓값 기준이 아니라 amount 그대로 사용:
+    //      양수 삭제로 줄어드는 잔액(posSum) = 회수(음수)+복구(양수) 합산해서 동일 부호로 상쇄해야 함
+    //    → 실제 의미: 양수합 만큼 "(-회수-복구)"의 합이 -posSum 이 되도록 매칭 삭제하면 잔액 변화 0
+    //    구현 단순화: 후보 행 amount 합 = -posSum 이 되도록 매칭하여 삭제
     const negDateClause = negativeDates.map(() => `substr(datetime(created_at,'+9 hours'),1,10) = ?`).join(' OR ')
     const negatives = await db.prepare(`
       SELECT id, user_id, type, amount, description, created_at
       FROM transactions
-      WHERE type IN ('daily_reward_rollback','referral_reward_rollback')
+      WHERE type IN ('daily_reward_rollback','referral_reward_rollback','rollback_restore')
         AND coin_type = 'QKEY'
-        AND amount < 0
         AND (${negDateClause})
       ORDER BY user_id, amount ASC, id ASC
     `).bind(...negativeDates).all()
@@ -4425,74 +4431,95 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
       negByUser[u].push(r)
     }
 
-    // 4. B-3 강화판 — 사용자별 처리
-    //    (1) 양수 행 100% 삭제 대상 (5/1·5/3 흔적 완전 제거)
-    //    (2) 삭제될 양수 합계만큼 음수 행에서 차감 (동일 금액 우선 매칭, 부족하면 큰 음수부터 삭제)
-    //    (3) 잔여 음수 합산 = 사용자당 단일 [잔액 보정] 행 1개로 통합 (description 변경 + amount 합산)
-    //    ★ 잔액 변화 0 보장: 삭제되는 (양수합) = 삭제되는 (음수합 절댓값). 잔여 음수는 description만 통합, 금액 보존.
+    // 4. B-3 강화판 (A안) — 사용자별 처리
+    //    (1) 양수 행(5/1·5/3 daily_qkey + referral_reward) 100% 삭제 대상
+    //    (2) 삭제로 줄어드는 잔액(posSum)을 5/4 회수/복구 후보 행들의 amount 합산으로 정확히 -posSum 만큼 매칭 삭제
+    //        - 후보 amount 합 = -posSum 이 되도록 (음수 회수 + 양수 복구 모두 사용)
+    //        - 그리디 알고리즘: |posSum + sumDeleted| 가 0 에 수렴하도록 반복 선택
+    //    (3) 잔여 후보(삭제 안 된 행)는 사용자당 단일 [잔액 보정] 행 1개로 통합 (description + amount 합산)
+    //    ★ 잔액 변화 0 보장: posSum + (삭제된 후보 amount 합) = 0
+    //    ★ direct_referral 절대 미손상 (type 필터 제외)
     const allUserIds = new Set<number>([...Object.keys(posByUser).map(Number), ...Object.keys(negByUser).map(Number)])
     const userPlan: any[] = []   // 계획 수립용
     const userSummary: any[] = []
 
     for (const uid of Array.from(allUserIds)) {
       const posList = (posByUser[uid] || []).slice()
-      const negList = (negByUser[uid] || []).slice()
+      const candList = (negByUser[uid] || []).slice() // 회수(-) + 복구(+) 후보
       const posSum = posList.reduce((s:number,p:any)=>s+Number(p.amount), 0)        // 양수 합 (삭제될 +)
-      const negSumAbs = negList.reduce((s:number,n:any)=>s+Math.abs(Number(n.amount)), 0)  // 음수 합 절댓값
+      const candSumRaw = candList.reduce((s:number,c:any)=>s+Number(c.amount), 0)   // 후보 amount 합 (음수+양수 그대로)
 
-      // (a) 음수 행에서 posSum 만큼 매칭 삭제: 동일 금액 우선, 그 다음 큰 금액부터
-      const negSorted = negList.slice().sort((a:any,b:any)=> Math.abs(Number(b.amount)) - Math.abs(Number(a.amount)))
-      const negToDelete: any[] = []
-      const negToKeep: any[] = []
-      let remaining = posSum
+      // 목표: 후보들 중에서 amount 합 = -posSum 이 되도록 부분집합을 골라 삭제
+      //   현재 잔액 영향: 양수 행 삭제로 -posSum, 후보 행 삭제로 -(amount 합)
+      //   잔액 변화 = -posSum - (삭제된 후보 amount 합) → 0 이려면 (삭제된 후보 amount 합) = -posSum
+      //   즉 sumDeletedCandidates 가 -posSum 이 되어야 함
+      const target = -posSum
+      const candToDelete: any[] = []
+      const candToKeep: any[] = []
       const usedIds = new Set<number>()
+      let remaining = target  // 남은 목표값 (점차 0 으로 수렴)
 
-      // 1차: 정확히 일치하는 음수 행을 양수 행 각각에 대해 매칭 (가능한 만큼)
-      const negByAmt: Record<string, any[]> = {}
-      for (const n of negSorted) {
-        const k = String(Math.round(Math.abs(Number(n.amount))))
-        if (!negByAmt[k]) negByAmt[k] = []
-        negByAmt[k].push(n)
+      // 1차: 정확 매칭 — 양수 행 각각에 대해 amount = -p.amount 인 후보 우선 (= 음수 회수 행 절댓값 동일)
+      const candByAmt: Record<string, any[]> = {}
+      for (const c of candList) {
+        const k = String(Math.round(Number(c.amount)))
+        if (!candByAmt[k]) candByAmt[k] = []
+        candByAmt[k].push(c)
       }
       for (const p of posList) {
-        const k = String(Math.round(Number(p.amount)))
-        const bucket = negByAmt[k] || []
-        const n = bucket.shift()
-        if (n && !usedIds.has(Number(n.id))) {
-          usedIds.add(Number(n.id))
-          negToDelete.push(n)
-          remaining -= Math.abs(Number(n.amount))
+        const need = -Number(p.amount)
+        const k = String(Math.round(need))
+        const bucket = candByAmt[k] || []
+        const c = bucket.shift()
+        if (c && !usedIds.has(Number(c.id))) {
+          usedIds.add(Number(c.id))
+          candToDelete.push(c)
+          remaining -= Number(c.amount)
         }
       }
-      // 2차: remaining > 0 이면 큰 음수부터 추가로 매칭 (음수 행 절댓값이 remaining 이하인 것만 삭제)
-      if (remaining > 0.5) {
-        for (const n of negSorted) {
-          if (usedIds.has(Number(n.id))) continue
-          const absAmt = Math.abs(Number(n.amount))
-          if (absAmt <= remaining + 0.5) {
-            usedIds.add(Number(n.id))
-            negToDelete.push(n)
-            remaining -= absAmt
-            if (remaining <= 0.5) break
+
+      // 2차: 그리디 — 남은 후보 중에서 |remaining + amount| 가 가장 작아지는 행을 반복 선택
+      //   remaining 이 0 에 수렴하도록
+      const epsilon = 0.5
+      let safety = 0
+      while (Math.abs(remaining) > epsilon && safety < 1000) {
+        safety++
+        let bestIdx = -1
+        let bestAfterAbs = Math.abs(remaining)
+        for (let i = 0; i < candList.length; i++) {
+          const c = candList[i]
+          if (usedIds.has(Number(c.id))) continue
+          const after = remaining - Number(c.amount)
+          const afterAbs = Math.abs(after)
+          // 더 좋아지는 경우만 채택 (수렴 보장)
+          if (afterAbs < bestAfterAbs - epsilon) {
+            bestAfterAbs = afterAbs
+            bestIdx = i
           }
         }
+        if (bestIdx < 0) break // 더 개선할 수 없으면 종료
+        const c = candList[bestIdx]
+        usedIds.add(Number(c.id))
+        candToDelete.push(c)
+        remaining -= Number(c.amount)
       }
-      // 잔여 음수 = 삭제되지 않은 음수
-      for (const n of negSorted) {
-        if (!usedIds.has(Number(n.id))) negToKeep.push(n)
+
+      // 잔여 후보 = 삭제되지 않은 후보
+      for (const c of candList) {
+        if (!usedIds.has(Number(c.id))) candToKeep.push(c)
       }
-      const negDeleteSumAbs = negToDelete.reduce((s:number,n:any)=>s+Math.abs(Number(n.amount)), 0)
-      const balanceDeltaForUser = posSum - negDeleteSumAbs  // 0 이어야 잔액 변화 없음
-      // 잔여 음수 통합 (description 통합 + 금액 합산하여 1행만 남기고 나머지는 삭제)
-      const orphanSum = negToKeep.reduce((s:number,n:any)=>s+Number(n.amount), 0) // 음수
-      const orphanIds = negToKeep.map((n:any)=>Number(n.id))
-      const consolidateMasterId = negToKeep.length > 0 ? Number(negToKeep[0].id) : null
-      const consolidateDeleteIds = negToKeep.length > 1 ? negToKeep.slice(1).map((n:any)=>Number(n.id)) : []
+      const candDeleteAmtSum = candToDelete.reduce((s:number,c:any)=>s+Number(c.amount), 0)
+      // 잔액 변화 = -posSum - candDeleteAmtSum  →  0 이어야 안전
+      const balanceDeltaForUser = -posSum - candDeleteAmtSum
+      // 잔여 후보 통합 (description 통합 + 금액 합산하여 1행만 남기고 나머지는 삭제)
+      const orphanSum = candToKeep.reduce((s:number,c:any)=>s+Number(c.amount), 0)
+      const consolidateMasterId = candToKeep.length > 0 ? Number(candToKeep[0].id) : null
+      const consolidateDeleteIds = candToKeep.length > 1 ? candToKeep.slice(1).map((c:any)=>Number(c.id)) : []
 
       userPlan.push({
         user_id: uid,
         posIds: posList.map((p:any)=>Number(p.id)),
-        negDeleteIds: negToDelete.map((n:any)=>Number(n.id)),
+        negDeleteIds: candToDelete.map((c:any)=>Number(c.id)),
         consolidateMasterId,
         consolidateDeleteIds,
         orphanSum,
@@ -4502,11 +4529,11 @@ app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
         user_id: uid,
         positive_count: posList.length,
         positive_sum: posSum,
-        negative_count: negList.length,
-        negative_sum_abs: negSumAbs,
+        candidate_count: candList.length,
+        candidate_sum_raw: candSumRaw,
         deleted_positive_count: posList.length,
-        deleted_negative_count: negToDelete.length,
-        deleted_negative_sum_abs: negDeleteSumAbs,
+        deleted_candidate_count: candToDelete.length,
+        deleted_candidate_amount_sum: candDeleteAmtSum,
         balance_delta: balanceDeltaForUser,
         orphan_consolidated_sum: orphanSum,
         orphan_consolidated_count_deleted: consolidateDeleteIds.length,
