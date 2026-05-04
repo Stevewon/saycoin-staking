@@ -5036,6 +5036,88 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
   }
 })
 
+// 어드민: daily_rewards / referral_rewards 테이블에서 특정 reward_date 행 삭제
+//   - 옵션 A: 4/30 발생분 행 정리 후 cron 재트리거용
+//   - body: { rewardDate: 'YYYY-MM-DD', dryRun?: boolean }
+//   - transactions 테이블은 별도로 옵션 2에서 삭제 완료된 상태이므로 건드리지 않음
+app.post('/api/admin/rewards/cleanup-by-reward-date', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { rewardDate, dryRun } = body || {}
+    if (!rewardDate) return c.json({ error: 'rewardDate 가 필요합니다 (예: "2026-04-30")' }, 400)
+
+    // 1. daily_rewards 영향 행 조회
+    const dr = await db.prepare(
+      `SELECT id, user_id, staking_id, qkey_amount, reward_date, paid_date, created_at
+       FROM daily_rewards WHERE reward_date = ?`
+    ).bind(String(rewardDate)).all()
+    const drRows = (dr.results || []) as any[]
+
+    // 2. referral_rewards 영향 행 조회
+    let rrRows: any[] = []
+    try {
+      const rr = await db.prepare(
+        `SELECT id, user_id, referee_id, level, qkey_amount, reward_date, paid_date, created_at
+         FROM referral_rewards WHERE reward_date = ?`
+      ).bind(String(rewardDate)).all()
+      rrRows = (rr.results || []) as any[]
+    } catch(e) {
+      // 테이블 없으면 무시
+    }
+
+    // 3. 사용자별 영향 집계
+    const byUser: Record<number, any> = {}
+    for (const r of drRows) {
+      const u = Number(r.user_id)
+      if (!byUser[u]) byUser[u] = { user_id: u, daily_count: 0, daily_amount: 0, ref_count: 0, ref_amount: 0 }
+      byUser[u].daily_count++
+      byUser[u].daily_amount += Number(r.qkey_amount) || 0
+    }
+    for (const r of rrRows) {
+      const u = Number(r.user_id)
+      if (!byUser[u]) byUser[u] = { user_id: u, daily_count: 0, daily_amount: 0, ref_count: 0, ref_amount: 0 }
+      byUser[u].ref_count++
+      byUser[u].ref_amount += Number(r.qkey_amount) || 0
+    }
+    const userSummary = Object.values(byUser).sort((a:any,b:any)=>a.user_id-b.user_id)
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        rewardDate,
+        dailyRewardsCount: drRows.length,
+        dailyRewardsSum: drRows.reduce((s,r)=>s+(Number(r.qkey_amount)||0),0),
+        referralRewardsCount: rrRows.length,
+        referralRewardsSum: rrRows.reduce((s,r)=>s+(Number(r.qkey_amount)||0),0),
+        affectedUserCount: userSummary.length,
+        perUserSummary: userSummary
+      })
+    }
+
+    // 4. 실삭제
+    const drDel = await db.prepare(`DELETE FROM daily_rewards WHERE reward_date = ?`).bind(String(rewardDate)).run()
+    let rrDel: any = { meta: { changes: 0 } }
+    try {
+      rrDel = await db.prepare(`DELETE FROM referral_rewards WHERE reward_date = ?`).bind(String(rewardDate)).run()
+    } catch(e) {}
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      rewardDate,
+      deletedDailyRewards: drDel.meta?.changes || 0,
+      deletedReferralRewards: rrDel.meta?.changes || 0,
+      affectedUserCount: userSummary.length,
+      perUserSummary: userSummary
+    })
+  } catch (error) {
+    console.error('cleanup-by-reward-date error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액 vs 거래내역 전체 합계 정합성 진단
 //   - users.qkey_balance vs SUM(transactions.amount WHERE coin_type='QKEY') 비교
 //   - 차이가 있는 사용자 모두 반환 (사용자단/어드민단 일치 여부 확인용)
