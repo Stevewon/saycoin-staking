@@ -4367,6 +4367,95 @@ app.post('/api/admin/rewards/reconcile-tx-range', async (c) => {
   }
 })
 
+// 어드민: 사용자별 잔액 vs 거래내역 전체 합계 정합성 진단
+//   - users.qkey_balance vs SUM(transactions.amount WHERE coin_type='QKEY') 비교
+//   - 차이가 있는 사용자 모두 반환 (사용자단/어드민단 일치 여부 확인용)
+app.get('/api/admin/diag/balance-vs-tx', async (c) => {
+  try {
+    const db = c.env.DB
+    const rows = await db.prepare(
+      `SELECT u.id, u.email, u.qkey_balance,
+              COALESCE((SELECT SUM(t.amount) FROM transactions t WHERE t.user_id = u.id AND t.coin_type='QKEY'), 0) as tx_sum,
+              (SELECT COUNT(*) FROM transactions t WHERE t.user_id = u.id AND t.coin_type='QKEY') as tx_count
+       FROM users u
+       ORDER BY u.id`
+    ).all()
+    const all: any[] = []
+    const mismatches: any[] = []
+    for (const r of (rows.results || [])) {
+      const bal = Number(r.qkey_balance) || 0
+      const sum = Number(r.tx_sum) || 0
+      const diff = bal - sum
+      const item = { id: r.id, email: r.email, balance: bal, tx_sum: sum, diff, tx_count: r.tx_count }
+      all.push(item)
+      if (Math.abs(diff) > 0.5) mismatches.push(item)
+    }
+    return c.json({
+      success: true,
+      total_users: all.length,
+      mismatch_count: mismatches.length,
+      mismatches,
+      total_diff: mismatches.reduce((s, m) => s + m.diff, 0)
+    })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// 어드민: 사용자별 잔액을 거래내역 합계로 강제 동기화 (사용자단=어드민단 일치 보장)
+//   - 옵션: { "userIds": [17,18] } 또는 빈 body로 전체
+app.post('/api/admin/diag/sync-balance-to-tx', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const userIds: number[] = (body && Array.isArray(body.userIds)) ? body.userIds.map((x: any) => Number(x)) : []
+    let rows
+    if (userIds.length > 0) {
+      const placeholders = userIds.map(() => '?').join(',')
+      rows = await db.prepare(
+        `SELECT u.id, u.qkey_balance,
+                COALESCE((SELECT SUM(t.amount) FROM transactions t WHERE t.user_id = u.id AND t.coin_type='QKEY'), 0) as tx_sum
+         FROM users u WHERE u.id IN (${placeholders})`
+      ).bind(...userIds).all()
+    } else {
+      rows = await db.prepare(
+        `SELECT u.id, u.qkey_balance,
+                COALESCE((SELECT SUM(t.amount) FROM transactions t WHERE t.user_id = u.id AND t.coin_type='QKEY'), 0) as tx_sum
+         FROM users u`
+      ).all()
+    }
+    const updated: any[] = []
+    let totalAdjustment = 0
+    for (const r of (rows.results || [])) {
+      const bal = Number(r.qkey_balance) || 0
+      const sum = Number(r.tx_sum) || 0
+      const diff = bal - sum
+      if (Math.abs(diff) <= 0.5) continue
+      try {
+        // 핵심 원칙: 어드민 잔액(bal) = 사용자 거래내역 SUM(sum) 이 일치해야 함
+        // 사용자가 본 거래내역의 SUM 이 진실 (사용자가 받은 보상 - 회수 = 진짜 받은 금액)
+        // 잔액 bal 이 sum 보다 크면 = 잔액에 잡혀있는 가상 금액 → 거래내역에 'balance_sync' 행을 추가하면
+        //                                       사용자 거래내역 SUM = bal 이 되고 잔액과 일치
+        // 잔액 bal 이 sum 보다 작으면 = 거래내역엔 있으나 잔액엔 차감 → 똑같이 보정 행 추가
+        const adjForTx = bal - sum  // tx 에 추가할 amount (양수면 +행, 음수면 -행)
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'balance_sync', 'QKEY', ?, ?)
+        `).bind(r.id, adjForTx, `[잔액 동기화] 사용자 거래내역 합계 보정 (tx_sum ${sum.toLocaleString()} → ${bal.toLocaleString()}, ${adjForTx >= 0 ? '+' : ''}${adjForTx.toLocaleString()})`).run()
+        // 잔액 변경 없음 — 거래내역 SUM 이 잔액과 일치하도록 행만 추가
+        updated.push({ id: r.id, balance: bal, old_tx_sum: sum, new_tx_sum: bal, adj_inserted: adjForTx })
+        totalAdjustment += adjForTx
+      } catch (e) {
+        console.error('sync-balance-to-tx error for user', r.id, e)
+      }
+    }
+    return c.json({ success: true, updatedCount: updated.length, totalAdjustment, updated })
+  } catch (error) {
+    console.error('sync-balance-to-tx error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 사용자별 보상 내역 조회
 app.get('/api/rewards/history/:userId', async (c) => {
   try {
