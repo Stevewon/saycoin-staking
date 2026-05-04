@@ -3948,6 +3948,64 @@ app.post('/api/rewards/daily', async (c) => {
   }
 })
 
+// 어드민 진단: 특정 날짜 + 특정 사용자의 transactions 조회 (중복지급 원인 파악용)
+app.get('/api/admin/diag/transactions', async (c) => {
+  try {
+    const db = c.env.DB
+    const date = c.req.query('date') || ''
+    const userId = c.req.query('userId') || ''
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return c.json({ error: 'date=YYYY-MM-DD 필요' }, 400)
+    }
+    let rows
+    if (userId) {
+      rows = await db.prepare(
+        `SELECT id, user_id, type, coin_type, amount, description, created_at
+         FROM transactions
+         WHERE user_id = ? AND date(created_at) = ?
+         ORDER BY id`
+      ).bind(userId, date).all()
+    } else {
+      rows = await db.prepare(
+        `SELECT id, user_id, type, coin_type, amount, description, created_at
+         FROM transactions
+         WHERE date(created_at) = ?
+         ORDER BY user_id, id`
+      ).bind(date).all()
+    }
+    // type 별 집계
+    const byType: Record<string, { count: number, total: number }> = {}
+    for (const r of (rows.results || [])) {
+      const t = String(r.type)
+      if (!byType[t]) byType[t] = { count: 0, total: 0 }
+      byType[t].count++
+      byType[t].total += Number(r.amount) || 0
+    }
+    // 같은 (user_id, type, description) 중복 검출
+    const dupes: any[] = []
+    const seen: Record<string, any[]> = {}
+    for (const r of (rows.results || [])) {
+      const key = `${r.user_id}|${r.type}|${r.description}`
+      if (!seen[key]) seen[key] = []
+      seen[key].push(r)
+    }
+    for (const k of Object.keys(seen)) {
+      if (seen[k].length > 1) dupes.push({ key: k, rows: seen[k] })
+    }
+    return c.json({
+      success: true,
+      date,
+      userId: userId || 'all',
+      total_rows: rows.results.length,
+      by_type: byType,
+      duplicates: dupes,
+      rows: rows.results
+    })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민 진단: 특정 날짜의 daily_rewards / referral_rewards 행 조회 (디버깅용)
 app.get('/api/admin/diag/rewards', async (c) => {
   try {
@@ -3979,6 +4037,41 @@ app.get('/api/admin/diag/rewards', async (c) => {
        FROM daily_rewards WHERE reward_date = ? OR paid_date = ?
        GROUP BY user_id, staking_id, reward_date HAVING cnt > 1`
     ).bind(date, date).all()
+
+    // transactions 테이블에서 해당 날짜에 발생한 보상 관련 행 전체 조회
+    // (date()는 SQLite에서 created_at의 날짜 부분 추출 → KST 저장 기준)
+    const txRewards = await db.prepare(
+      `SELECT id, user_id, type, coin_type, amount, description, created_at
+       FROM transactions
+       WHERE date(created_at) = ?
+         AND type IN ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback')
+       ORDER BY id`
+    ).bind(date).all()
+
+    // type별 집계
+    const txSummary = await db.prepare(
+      `SELECT type,
+              COUNT(*) as cnt,
+              COALESCE(SUM(amount), 0) as total_amount
+       FROM transactions
+       WHERE date(created_at) = ?
+         AND type IN ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback')
+       GROUP BY type`
+    ).bind(date).all()
+
+    // referral_reward 중 description에 Level 1 / Level 2 포함 여부별 분리 집계
+    const txReferralBreakdown = await db.prepare(
+      `SELECT
+         SUM(CASE WHEN description LIKE '%Level 1%' THEN 1 ELSE 0 END) as lvl1_cnt,
+         SUM(CASE WHEN description LIKE '%Level 1%' THEN amount ELSE 0 END) as lvl1_amount,
+         SUM(CASE WHEN description LIKE '%Level 2%' THEN 1 ELSE 0 END) as lvl2_cnt,
+         SUM(CASE WHEN description LIKE '%Level 2%' THEN amount ELSE 0 END) as lvl2_amount,
+         SUM(CASE WHEN description NOT LIKE '%Level 1%' AND description NOT LIKE '%Level 2%' THEN 1 ELSE 0 END) as other_cnt,
+         SUM(CASE WHEN description NOT LIKE '%Level 1%' AND description NOT LIKE '%Level 2%' THEN amount ELSE 0 END) as other_amount
+       FROM transactions
+       WHERE date(created_at) = ? AND type = 'referral_reward'`
+    ).bind(date).all()
+
     return c.json({
       success: true,
       date,
@@ -3986,7 +4079,10 @@ app.get('/api/admin/diag/rewards', async (c) => {
       daily_by_paid_date: dailyByPaid.results,
       referral_by_reward_date: refByReward.results,
       referral_by_paid_date: refByPaid.results,
-      duplicates_daily: dupes.results
+      duplicates_daily: dupes.results,
+      tx_rewards: txRewards.results,
+      tx_summary: txSummary.results,
+      tx_referral_breakdown: txReferralBreakdown.results
     })
   } catch (error) {
     return c.json({ error: String(error) }, 500)
