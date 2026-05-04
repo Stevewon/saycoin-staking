@@ -4986,6 +4986,56 @@ app.post('/api/admin/rewards/purge-after-date', async (c) => {
   }
 })
 
+// 어드민: 사용자 QKEY 잔액 임의 수정 + admin_adjustment 거래 자동 기록
+//   - body: { userId, amount, description?, mode? }
+//     amount: 양수면 가산, 음수면 차감 (mode='delta' 기본)
+//     mode='set' 사용 시 amount 를 잔액 그대로 세팅하고 차이값을 admin_adjustment 로 기록
+//   - description 미지정 시 '관리자 보정' 사용
+app.post('/api/admin/users/adjust-balance', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { userId, amount, description, mode } = body || {}
+    if (!userId || amount === undefined || amount === null) {
+      return c.json({ error: 'userId, amount 가 필요합니다' }, 400)
+    }
+    const uid = Number(userId)
+    const desc = String(description || '관리자 보정')
+    const cur = await db.prepare(`SELECT id, email, qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+    if (!cur) return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
+    const curBal = Number((cur as any).qkey_balance) || 0
+    let delta = 0
+    if (String(mode || 'delta') === 'set') {
+      delta = Number(amount) - curBal
+    } else {
+      delta = Number(amount)
+    }
+    if (Math.abs(delta) < 0.0001) {
+      return c.json({ success: true, message: '변경 사항 없음', currentBalance: curBal })
+    }
+    const newBal = curBal + delta
+    // 1) admin_adjustment 거래 기록
+    const ins = await db.prepare(
+      `INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'admin_adjustment', 'QKEY', ?, ?)`
+    ).bind(uid, delta, desc).run()
+    // 2) qkey_balance 업데이트
+    await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(newBal, uid).run()
+    return c.json({
+      success: true,
+      userId: uid,
+      email: (cur as any).email,
+      previousBalance: curBal,
+      newBalance: newBal,
+      delta,
+      txId: ins.meta?.last_row_id,
+      description: desc
+    })
+  } catch (error) {
+    console.error('adjust-balance error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액 vs 거래내역 전체 합계 정합성 진단
 //   - users.qkey_balance vs SUM(transactions.amount WHERE coin_type='QKEY') 비교
 //   - 차이가 있는 사용자 모두 반환 (사용자단/어드민단 일치 여부 확인용)
