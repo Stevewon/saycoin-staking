@@ -4591,7 +4591,8 @@ app.get('/api/referral-rewards/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
-    // 전체 보상 내역 (배당금 + 직접판매 + 매칭추천수당 + 누적)
+    // 전체 보상 내역 (배당금 + 직접판매 + 매칭추천수당 + 회수/복구 포함, 누적)
+    // ★ rollback/restore 타입도 포함시켜 사용자 화면이 어드민과 일치하도록 함
     const rewards = await db.prepare(`
       SELECT 
         t.id,
@@ -4606,15 +4607,18 @@ app.get('/api/referral-rewards/:userId', async (c) => {
           WHEN t.type = 'referral_reward' AND t.description LIKE '%Level 1%' THEN 'referral_level1'
           WHEN t.type = 'referral_reward' AND t.description LIKE '%Level 2%' THEN 'referral_level2'
           WHEN t.type = 'referral_reward' THEN 'referral_reward'
+          WHEN t.type = 'daily_reward_rollback' THEN 'daily_reward_rollback'
+          WHEN t.type = 'referral_reward_rollback' THEN 'referral_reward_rollback'
+          WHEN t.type = 'rollback_restore' THEN 'rollback_restore'
           ELSE t.type
         END as reward_category
       FROM transactions t
-      WHERE t.user_id = ? AND t.type IN ('daily_qkey', 'direct_referral', 'referral_reward')
+      WHERE t.user_id = ? AND t.type IN ('daily_qkey', 'direct_referral', 'referral_reward', 'daily_reward_rollback', 'referral_reward_rollback', 'rollback_restore')
       ORDER BY t.created_at DESC
-      LIMIT 200
+      LIMIT 300
     `).bind(userId).all()
 
-    // 카테고리별 통계 계산
+    // 카테고리별 통계 계산 (rollback 차감 포함하여 net 합계)
     const stats = await db.prepare(`
       SELECT 
         COALESCE(SUM(CASE WHEN type = 'daily_qkey' THEN amount ELSE 0 END), 0) as daily_total,
@@ -4625,24 +4629,38 @@ app.get('/api/referral-rewards/:userId', async (c) => {
         COALESCE(SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%Level 1%' THEN 1 ELSE 0 END), 0) as level1_count,
         COALESCE(SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%Level 2%' THEN amount ELSE 0 END), 0) as level2_total,
         COALESCE(SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%Level 2%' THEN 1 ELSE 0 END), 0) as level2_count,
+        COALESCE(SUM(CASE WHEN type = 'daily_reward_rollback' THEN amount ELSE 0 END), 0) as daily_rollback_total,
+        COALESCE(SUM(CASE WHEN type = 'referral_reward_rollback' THEN amount ELSE 0 END), 0) as ref_rollback_total,
+        COALESCE(SUM(CASE WHEN type = 'rollback_restore' THEN amount ELSE 0 END), 0) as rollback_restore_total,
         COALESCE(SUM(amount), 0) as grand_total,
         COUNT(*) as total_count
       FROM transactions
-      WHERE user_id = ? AND type IN ('daily_qkey', 'direct_referral', 'referral_reward')
+      WHERE user_id = ? AND type IN ('daily_qkey', 'direct_referral', 'referral_reward', 'daily_reward_rollback', 'referral_reward_rollback', 'rollback_restore')
     `).bind(userId).first()
 
+    // net = (paid) + (rollback) + (restore)  [rollback은 음수, restore는 양수]
+    const dailyRollback = stats?.daily_rollback_total || 0
+    const refRollback = stats?.ref_rollback_total || 0
+    const rollbackRestore = stats?.rollback_restore_total || 0
+    const dailyNet = (stats?.daily_total || 0) + dailyRollback // rollback은 이미 음수 저장
+    const refLevel1Net = stats?.level1_total || 0
+    const refLevel2Net = stats?.level2_total || 0
+    // 매칭(level1+level2)에 대한 회수는 ref_rollback_total로 별도 표기
     return c.json({
       success: true,
       rewards: rewards.results || [],
       stats: {
-        dailyTotal: stats?.daily_total || 0,
+        dailyTotal: dailyNet,
         dailyCount: stats?.daily_count || 0,
         directTotal: stats?.direct_total || 0,
         directCount: stats?.direct_count || 0,
-        level1Total: stats?.level1_total || 0,
-        level2Total: stats?.level2_total || 0,
+        level1Total: refLevel1Net,
+        level2Total: refLevel2Net,
         level1Count: stats?.level1_count || 0,
         level2Count: stats?.level2_count || 0,
+        dailyRollback: dailyRollback,
+        refRollback: refRollback,
+        rollbackRestore: rollbackRestore,
         grandTotal: stats?.grand_total || 0,
         totalCount: stats?.total_count || 0
       }
@@ -8407,6 +8425,8 @@ app.get('/dashboard', (c) => {
                                 var badgeClass = '';
                                 var badgeText = reward.reward_category || reward.type;
                                 var amountColor = '';
+                                var amountPrefix = '+';
+                                var amt = Number(reward.amount) || 0;
                                 
                                 if (reward.type === 'daily_qkey') {
                                     badgeClass = 'bg-green-100 text-green-700';
@@ -8426,8 +8446,24 @@ app.get('/dashboard', (c) => {
                                         badgeText = I18N.t('dash.reward_level2');
                                         amountColor = 'text-purple-600';
                                     }
+                                } else if (reward.type === 'daily_reward_rollback') {
+                                    badgeClass = 'bg-red-100 text-red-700';
+                                    badgeText = '배당금 회수';
+                                    amountColor = 'text-red-600';
+                                    amountPrefix = '';
+                                } else if (reward.type === 'referral_reward_rollback') {
+                                    badgeClass = 'bg-red-100 text-red-700';
+                                    badgeText = '성과금 회수';
+                                    amountColor = 'text-red-600';
+                                    amountPrefix = '';
+                                } else if (reward.type === 'rollback_restore') {
+                                    badgeClass = 'bg-teal-100 text-teal-700';
+                                    badgeText = '회수 복구';
+                                    amountColor = 'text-teal-600';
+                                    amountPrefix = '+';
                                 }
                                 
+                                var displayAmt = amt < 0 ? Math.round(amt).toLocaleString() : (amountPrefix + Math.round(amt).toLocaleString());
                                 return '<tr class="hover:bg-gray-50">' +
                                     '<td class="px-2 sm:px-4 py-2 text-xs text-gray-600 whitespace-nowrap">' + 
                                         new Date(reward.created_at).toLocaleDateString('ko-KR', { month: '2-digit', day: '2-digit' }) +
@@ -8435,8 +8471,8 @@ app.get('/dashboard', (c) => {
                                     '</td>' +
                                     '<td class="px-2 sm:px-4 py-2"><span class="px-2 py-0.5 ' + badgeClass + ' rounded text-xs font-medium whitespace-nowrap">' + badgeText + '</span></td>' +
                                     '<td class="px-2 sm:px-4 py-2 text-xs text-gray-700 truncate max-w-[120px]" title="' + (reward.description || '') + '">' + (reward.description || '-') + '</td>' +
-                                    '<td class="px-2 sm:px-4 py-2 text-right text-xs font-bold ' + amountColor + ' whitespace-nowrap">+' + 
-                                        Math.round(reward.amount).toLocaleString() + ' QKEY' +
+                                    '<td class="px-2 sm:px-4 py-2 text-right text-xs font-bold ' + amountColor + ' whitespace-nowrap">' + 
+                                        displayAmt + ' QKEY' +
                                     '</td>' +
                                 '</tr>';
                             }).join('');
