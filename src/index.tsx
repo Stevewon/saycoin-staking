@@ -4867,18 +4867,24 @@ app.post('/api/admin/rewards/purge-after-date', async (c) => {
   try {
     const db = c.env.DB
     const body = await c.req.json().catch(() => ({}))
-    const { cutoffDate, dryRun, coinType } = body || {}
+    const { cutoffDate, dryRun, coinType, excludeTypes } = body || {}
     if (!cutoffDate) return c.json({ error: 'cutoffDate 가 필요합니다 (예: "2026-04-30")' }, 400)
     const ct = String(coinType || 'QKEY')
+    // 옵션 2: 직판/스테이킹 보존 — excludeTypes 지정 시 해당 type 은 삭제 대상에서 제외
+    const excludeList: string[] = Array.isArray(excludeTypes) ? excludeTypes.map(String) : []
+    const excludeClause = excludeList.length > 0
+      ? ` AND type NOT IN (${excludeList.map(()=>'?').join(',')})`
+      : ''
 
-    // 1. 삭제 대상 조회 (KST 기준 cutoffDate 초과)
+    // 1. 삭제 대상 조회 (KST 기준 cutoffDate 초과, excludeTypes 제외)
     const targets = await db.prepare(`
       SELECT id, user_id, type, coin_type, amount, description, created_at
       FROM transactions
       WHERE coin_type = ?
         AND substr(datetime(created_at,'+9 hours'),1,10) > ?
+        ${excludeClause}
       ORDER BY user_id, created_at ASC
-    `).bind(ct, String(cutoffDate)).all()
+    `).bind(ct, String(cutoffDate), ...excludeList).all()
     const targetRows = (targets.results || []) as any[]
 
     // 2. 사용자별 영향 집계
