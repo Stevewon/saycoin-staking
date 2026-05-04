@@ -4855,6 +4855,131 @@ app.post('/api/admin/rewards/purge-tx-by-dates', async (c) => {
   }
 })
 
+// 어드민: 특정 컷오프(KST) 이후 거래 전부 삭제 + 잔액 재계산
+//   - 사장님 명령: 4/30까지만 남기고 5/1 이후 모든 보상/회수/복구/보정 행 삭제
+//   - 대상 type: 모든 type (daily_qkey, referral_reward, direct_referral,
+//                daily_reward_rollback, referral_reward_rollback, rollback_restore 포함)
+//   - 적용 컷오프: KST 기준 substr(datetime(created_at,'+9 hours'),1,10) > cutoffDate
+//   - 잔액 처리: 삭제 후 users.qkey_balance = SUM(remaining tx.amount WHERE coin_type='QKEY')
+//                (= 4/30까지의 정상 잔액으로 자동 복원)
+//   - dryRun=true 시 영향 범위만 미리보기 반환
+app.post('/api/admin/rewards/purge-after-date', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { cutoffDate, dryRun, coinType } = body || {}
+    if (!cutoffDate) return c.json({ error: 'cutoffDate 가 필요합니다 (예: "2026-04-30")' }, 400)
+    const ct = String(coinType || 'QKEY')
+
+    // 1. 삭제 대상 조회 (KST 기준 cutoffDate 초과)
+    const targets = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, created_at
+      FROM transactions
+      WHERE coin_type = ?
+        AND substr(datetime(created_at,'+9 hours'),1,10) > ?
+      ORDER BY user_id, created_at ASC
+    `).bind(ct, String(cutoffDate)).all()
+    const targetRows = (targets.results || []) as any[]
+
+    // 2. 사용자별 영향 집계
+    const byUser: Record<number, any> = {}
+    for (const r of targetRows) {
+      const u = Number(r.user_id)
+      if (!byUser[u]) byUser[u] = { user_id: u, count: 0, sum: 0, by_type: {} }
+      byUser[u].count++
+      byUser[u].sum += Number(r.amount) || 0
+      const t = String(r.type || '')
+      byUser[u].by_type[t] = (byUser[u].by_type[t] || 0) + 1
+    }
+
+    // 3. 사용자별 4/30까지 잔액 합계(보존되는 행 합)
+    const survived = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) as kept_sum, COUNT(*) as kept_count
+      FROM transactions
+      WHERE coin_type = ?
+        AND substr(datetime(created_at,'+9 hours'),1,10) <= ?
+      GROUP BY user_id
+    `).bind(ct, String(cutoffDate)).all()
+    const keptByUser: Record<number, any> = {}
+    for (const r of (survived.results || []) as any[]) {
+      keptByUser[Number(r.user_id)] = { kept_sum: Number(r.kept_sum) || 0, kept_count: Number(r.kept_count) || 0 }
+    }
+
+    // 4. 현재 사용자 잔액 + 새 잔액(=kept_sum) 비교
+    const userIds = Array.from(new Set([
+      ...Object.keys(byUser).map(Number),
+      ...Object.keys(keptByUser).map(Number)
+    ]))
+    const summary: any[] = []
+    for (const uid of userIds) {
+      const cur = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+      if (!cur) continue
+      const kept = keptByUser[uid] || { kept_sum: 0, kept_count: 0 }
+      const tgt = byUser[uid] || { count: 0, sum: 0, by_type: {} }
+      summary.push({
+        user_id: uid,
+        email: (cur as any).email,
+        name: (cur as any).name,
+        current_qkey_balance: Number((cur as any).qkey_balance) || 0,
+        new_qkey_balance: kept.kept_sum,                  // 삭제 후 잔액
+        balance_change: kept.kept_sum - (Number((cur as any).qkey_balance) || 0),
+        delete_count: tgt.count,
+        delete_sum: tgt.sum,
+        delete_by_type: tgt.by_type,
+        kept_count: kept.kept_count,
+        kept_sum: kept.kept_sum
+      })
+    }
+    summary.sort((a:any,b:any)=>a.user_id-b.user_id)
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        cutoffDate,
+        coinType: ct,
+        totalDeleteRows: targetRows.length,
+        totalDeleteSum: targetRows.reduce((s,r)=>s+(Number(r.amount)||0),0),
+        affectedUserCount: summary.length,
+        perUserSummary: summary
+      })
+    }
+
+    // 5. 실삭제 — 청크 단위 batch
+    const CHUNK = 100
+    let deleted = 0
+    const ids = targetRows.map(r => Number(r.id))
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const ch = ids.slice(i, i + CHUNK)
+      const ph = ch.map(()=>'?').join(',')
+      const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...ch).run()
+      deleted += (r.meta?.changes || 0)
+    }
+
+    // 6. 사용자 잔액 동기화 — 각 사용자 qkey_balance = kept_sum
+    let updatedUsers = 0
+    for (const s of summary) {
+      const r = await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`)
+        .bind(s.new_qkey_balance, s.user_id).run()
+      updatedUsers += (r.meta?.changes || 0)
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      cutoffDate,
+      coinType: ct,
+      deletedRows: deleted,
+      updatedUsers,
+      affectedUserCount: summary.length,
+      perUserSummary: summary
+    })
+  } catch (error) {
+    console.error('purge-after-date error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액 vs 거래내역 전체 합계 정합성 진단
 //   - users.qkey_balance vs SUM(transactions.amount WHERE coin_type='QKEY') 비교
 //   - 차이가 있는 사용자 모두 반환 (사용자단/어드민단 일치 여부 확인용)
