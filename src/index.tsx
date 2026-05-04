@@ -5153,6 +5153,89 @@ app.get('/api/admin/diag/balance-vs-tx', async (c) => {
   }
 })
 
+// 어드민: 47명 전수 — 사용자별 reward type 분류 합계 + balance + tx_sum 한방 진단
+//   - 사용자단 화면(referral-rewards stats)과 어드민단 잔액 비교를 한 번 호출로 수집
+app.get('/api/admin/diag/full-audit', async (c) => {
+  try {
+    const db = c.env.DB
+    const users = await db.prepare(
+      `SELECT id, email, qkey_balance FROM users ORDER BY id`
+    ).all()
+    const txByUser = await db.prepare(
+      `SELECT user_id, type,
+              COALESCE(SUM(amount),0) as sum_amt,
+              COUNT(*) as cnt
+       FROM transactions
+       WHERE coin_type='QKEY'
+       GROUP BY user_id, type`
+    ).all()
+    // user_id -> type -> {sum, cnt}
+    const m: Record<number, any> = {}
+    for (const r of (txByUser.results || []) as any[]) {
+      const uid = Number(r.user_id)
+      if (!m[uid]) m[uid] = {}
+      m[uid][String(r.type)] = { sum: Number(r.sum_amt) || 0, cnt: Number(r.cnt) || 0 }
+    }
+    const out: any[] = []
+    for (const u of (users.results || []) as any[]) {
+      const uid = Number(u.id)
+      const bal = Number(u.qkey_balance) || 0
+      const types = m[uid] || {}
+      const get = (t: string) => types[t]?.sum || 0
+      const getCnt = (t: string) => types[t]?.cnt || 0
+      const daily = get('daily_qkey')
+      const direct = get('direct_referral')
+      const ref = get('referral_reward')        // L1+L2 합산
+      const dRb = get('daily_reward_rollback')
+      const rRb = get('referral_reward_rollback')
+      const rs = get('rollback_restore')
+      const adj = get('admin_adjustment')
+      const stake = get('staking_reward')
+      const stakeBuy = get('staking_buy') + get('staking') + get('purchase_staking')  // 가능한 명칭들
+      const swap = get('swap') + get('qkey_swap') + get('qta_swap')
+      const sync = get('balance_sync')
+      // 그 외 known type 합계 외의 type 들
+      const knownTypes = new Set([
+        'daily_qkey','direct_referral','referral_reward',
+        'daily_reward_rollback','referral_reward_rollback','rollback_restore',
+        'admin_adjustment','staking_reward','staking_buy','staking','purchase_staking',
+        'swap','qkey_swap','qta_swap','balance_sync'
+      ])
+      let other = 0
+      const otherTypes: string[] = []
+      for (const k of Object.keys(types)) {
+        if (!knownTypes.has(k)) {
+          other += types[k].sum
+          otherTypes.push(`${k}:${types[k].sum}(${types[k].cnt})`)
+        }
+      }
+      const txSum = Object.values(types).reduce((s: number, v: any) => s + (v.sum || 0), 0)
+      const totalCnt = Object.values(types).reduce((s: number, v: any) => s + (v.cnt || 0), 0)
+      out.push({
+        id: uid, email: u.email,
+        balance: bal,
+        tx_sum: txSum,
+        balance_minus_tx: bal - txSum,
+        tx_count: totalCnt,
+        daily, direct, ref, dRb, rRb, rs, adj,
+        stake_reward: stake, stake_buy: stakeBuy, swap, sync, other,
+        other_types: otherTypes,
+        types: Object.keys(types).map(k => `${k}:${types[k].sum}(${types[k].cnt})`)
+      })
+    }
+    return c.json({
+      success: true,
+      total_users: out.length,
+      results: out,
+      mismatches: out.filter(r => Math.abs(r.balance_minus_tx) > 0.5),
+      total_balance: out.reduce((s, r) => s + r.balance, 0),
+      total_tx_sum: out.reduce((s, r) => s + r.tx_sum, 0)
+    })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액을 거래내역 합계로 강제 동기화 (사용자단=어드민단 일치 보장)
 //   - 옵션: { "userIds": [17,18] } 또는 빈 body로 전체
 app.post('/api/admin/diag/sync-balance-to-tx', async (c) => {
