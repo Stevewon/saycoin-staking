@@ -5058,6 +5058,88 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
 //   - 중복 지급 방지: 이미 staking.qx_reward > 0 AND qkey_reward > 0 이면 스킵
 //   - 중복 지급 방지: transactions 에 'three_set_supplement' type 로 기록 (이미 있으면 스킵)
 // ============================================================
+// ============================================================
+// [신규] 단일 staking 3종 보정 — staking_id 명시 지정
+//   - 사장님 지시: 5/4 진입자 중 정인숙(sela, staking_id=66) 만 보정
+//   - body: { stakingId, dryRun? }
+//   - 중복 방지: transactions(three_set_supplement) 같은 staking_id 이미 있으면 skip
+// ============================================================
+app.post('/api/admin/rewards/three-set-supplement-single', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { stakingId, dryRun } = body || {}
+    if (!stakingId) return c.json({ error: 'stakingId 가 필요합니다' }, 400)
+
+    const s: any = await db.prepare(`
+      SELECT s.id, s.user_id, s.amount, s.status, s.qta_reward, s.qx_reward, s.qkey_reward,
+             s.created_at, u.email, u.name, u.qx_balance, u.qkey_balance
+      FROM staking s LEFT JOIN users u ON s.user_id = u.id
+      WHERE s.id = ?
+    `).bind(stakingId).first()
+    if (!s) return c.json({ error: 'staking not found' }, 404)
+
+    const correctQx = (s.amount / 1000) * 10000
+    const correctQkey = (s.amount / 1000) * 5000
+    const qxDelta = correctQx - (s.qx_reward || 0)
+    const qkeyDelta = correctQkey - (s.qkey_reward || 0)
+
+    // 중복 방지
+    const dup = await db.prepare(`
+      SELECT id FROM transactions
+      WHERE user_id = ? AND type = 'three_set_supplement' AND description LIKE ?
+      LIMIT 1
+    `).bind(s.user_id, `%staking_id=${s.id}%`).first()
+
+    const result: any = {
+      stakingId: s.id, userId: s.user_id, email: s.email, name: s.name,
+      amount: s.amount, status: s.status,
+      before: { qx_reward: s.qx_reward || 0, qkey_reward: s.qkey_reward || 0,
+                qx_balance: s.qx_balance || 0, qkey_balance: s.qkey_balance || 0 },
+      delta: { qx: qxDelta, qkey: qkeyDelta },
+      duplicate: !!dup,
+      dryRun: !!dryRun
+    }
+
+    if (dup) {
+      result.skipped = 'transactions(three_set_supplement) already exists for this staking_id'
+      return c.json({ success: true, ...result })
+    }
+
+    if (!dryRun) {
+      // staking 행 정정
+      await db.prepare(`UPDATE staking SET qx_reward = ?, qkey_reward = ? WHERE id = ?`)
+        .bind(correctQx, correctQkey, s.id).run()
+
+      // status=active 만 잔액 즉시 +
+      if (s.status === 'active') {
+        if (qxDelta > 0) {
+          await db.prepare(`UPDATE users SET qx_balance = COALESCE(qx_balance,0) + ? WHERE id = ?`)
+            .bind(qxDelta, s.user_id).run()
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'three_set_supplement', 'QX', ?, ?)
+          `).bind(s.user_id, qxDelta,
+            `3종 보정 QX (staking_id=${s.id}, amount=$${s.amount}, 사장님 지시)`).run()
+        }
+        if (qkeyDelta > 0) {
+          await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`)
+            .bind(qkeyDelta, s.user_id).run()
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'three_set_supplement', 'QKEY', ?, ?)
+          `).bind(s.user_id, qkeyDelta,
+            `3종 보정 QKEY (staking_id=${s.id}, amount=$${s.amount}, 사장님 지시)`).run()
+        }
+      }
+    }
+    return c.json({ success: true, ...result })
+  } catch (error: any) {
+    console.error('three-set-supplement-single error:', error)
+    return c.json({ error: 'D1 error: ' + (error?.message || String(error)) }, 500)
+  }
+})
+
 app.post('/api/admin/rewards/three-set-supplement', async (c) => {
   try {
     const db = c.env.DB
