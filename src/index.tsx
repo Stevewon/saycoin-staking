@@ -5023,6 +5023,135 @@ app.get('/api/admin/shop/export/orders', async (c) => {
 })
 
 // ============================================
+// Shop Inquiries (쇼핑몰 문의)
+// ============================================
+
+async function ensureInquiriesTable(db: any) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS shop_inquiries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    order_id INTEGER DEFAULT NULL,
+    category TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    admin_reply TEXT DEFAULT '',
+    replied_at DATETIME DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`).run()
+}
+
+// 사용자: 문의 등록
+app.post('/api/shop/inquiry', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureInquiriesTable(db)
+    const body = await c.req.json().catch(() => ({}))
+    const { userId, orderId, category, title, content } = body || {}
+    if (!userId) return c.json({ error: '사용자 정보가 필요합니다' }, 400)
+    if (!category || !['shipping','refund','other'].includes(String(category))) {
+      return c.json({ error: '문의 유형을 선택해주세요 (배송/환불/기타)' }, 400)
+    }
+    if (!title || String(title).trim().length === 0) return c.json({ error: '제목을 입력해주세요' }, 400)
+    if (!content || String(content).trim().length === 0) return c.json({ error: '문의 내용을 입력해주세요' }, 400)
+    const r = await db.prepare(
+      `INSERT INTO shop_inquiries (user_id, order_id, category, title, content) VALUES (?, ?, ?, ?, ?)`
+    ).bind(Number(userId), orderId ? Number(orderId) : null, String(category), String(title).trim(), String(content).trim()).run()
+    return c.json({ success: true, id: r.meta?.last_row_id, message: '문의가 등록되었습니다' })
+  } catch (error) {
+    console.error('inquiry create error:', error)
+    return c.json({ error: '문의 등록 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 사용자: 본인 문의 목록 (본인만 조회 가능)
+app.get('/api/shop/inquiries/:userId', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureInquiriesTable(db)
+    const userId = c.req.param('userId')
+    if (!userId) return c.json({ error: '사용자 정보가 필요합니다' }, 400)
+    const list = await db.prepare(
+      `SELECT id, user_id, order_id, category, title, content, status, admin_reply, replied_at, created_at
+       FROM shop_inquiries WHERE user_id = ? ORDER BY created_at DESC`
+    ).bind(Number(userId)).all()
+    return c.json({ success: true, inquiries: list.results })
+  } catch (error) {
+    console.error('inquiry list error:', error)
+    return c.json({ error: '문의 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 사용자: 본인 문의 단건 (본인 소유 검증)
+app.get('/api/shop/inquiry/:id', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureInquiriesTable(db)
+    const id = c.req.param('id')
+    const userId = c.req.query('userId')
+    if (!userId) return c.json({ error: '사용자 정보가 필요합니다' }, 400)
+    const row = await db.prepare(
+      `SELECT id, user_id, order_id, category, title, content, status, admin_reply, replied_at, created_at
+       FROM shop_inquiries WHERE id = ? AND user_id = ?`
+    ).bind(Number(id), Number(userId)).first()
+    if (!row) return c.json({ error: '문의를 찾을 수 없습니다' }, 404)
+    return c.json({ success: true, inquiry: row })
+  } catch (error) {
+    return c.json({ error: '문의 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 어드민: 모든 문의 목록 (어드민 토큰 미들웨어가 /api/admin/* 자동 보호)
+app.get('/api/admin/shop/inquiries', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureInquiriesTable(db)
+    const list = await db.prepare(
+      `SELECT i.id, i.user_id, u.name as user_name, u.email as user_email, u.phone as user_phone,
+              i.order_id, i.category, i.title, i.content, i.status, i.admin_reply, i.replied_at, i.created_at
+       FROM shop_inquiries i LEFT JOIN users u ON i.user_id = u.id
+       ORDER BY i.created_at DESC`
+    ).all()
+    return c.json({ success: true, inquiries: list.results })
+  } catch (error) {
+    console.error('admin inquiry list error:', error)
+    return c.json({ error: '문의 조회 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 어드민: 문의 답변 (pending → answered)
+app.post('/api/admin/shop/inquiry/:id/reply', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureInquiriesTable(db)
+    const id = c.req.param('id')
+    const body = await c.req.json().catch(() => ({}))
+    const { reply } = body || {}
+    if (!reply || String(reply).trim().length === 0) return c.json({ error: '답변 내용을 입력해주세요' }, 400)
+    await db.prepare(
+      `UPDATE shop_inquiries SET admin_reply = ?, replied_at = CURRENT_TIMESTAMP, status = 'answered' WHERE id = ?`
+    ).bind(String(reply).trim(), Number(id)).run()
+    return c.json({ success: true, message: '답변이 등록되었습니다' })
+  } catch (error) {
+    console.error('admin inquiry reply error:', error)
+    return c.json({ error: '답변 등록 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// 어드민: 문의 삭제
+app.delete('/api/admin/shop/inquiry/:id', async (c) => {
+  try {
+    const db = c.env.DB
+    await ensureInquiriesTable(db)
+    const id = c.req.param('id')
+    await db.prepare(`DELETE FROM shop_inquiries WHERE id = ?`).bind(Number(id)).run()
+    return c.json({ success: true, message: '문의가 삭제되었습니다' })
+  } catch (error) {
+    return c.json({ error: '삭제 중 오류가 발생했습니다' }, 500)
+  }
+})
+
+// ============================================
 // Notices (공지사항)
 // ============================================
 
@@ -6349,12 +6478,70 @@ app.get('/dashboard', (c) => {
                     <div id="shopPanel-orders" class="hidden">
                         <div class="flex items-center justify-between mb-3">
                             <h3 class="font-bold text-gray-700 text-sm"><i class="fas fa-receipt mr-1 text-pink-500"></i>내 구매 내역</h3>
-                            <button onclick="loadMyOrders()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                            <div class="flex items-center gap-2">
+                                <button onclick="openInquiryModal()" class="px-3 py-1 bg-blue-50 hover:bg-blue-100 rounded text-xs font-medium text-blue-700 border border-blue-200"><i class="fas fa-comment-dots mr-1"></i>문의하기</button>
+                                <button onclick="loadMyInquiries()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-clipboard-list mr-1"></i>내 문의내역</button>
+                                <button onclick="loadMyOrders()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                            </div>
                         </div>
-                        <p class="text-xs text-gray-500 mb-3"><i class="fas fa-info-circle mr-1"></i>구매한 상품의 결제·배송 상태를 실시간으로 확인할 수 있습니다.</p>
+                        <p class="text-xs text-gray-500 mb-3"><i class="fas fa-info-circle mr-1"></i>구매한 상품의 결제·배송 상태를 실시간으로 확인할 수 있습니다. 문의 내용은 본인과 쇼핑몰 관리자만 볼 수 있습니다.</p>
                         <div id="shopMyOrders" class="space-y-2 max-h-[70vh] overflow-y-auto">
                             <p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-shopping-bag text-3xl text-gray-200 mb-2 block"></i>아직 구매 내역이 없습니다</p>
                         </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 쇼핑몰 문의 모달 (등록) -->
+            <div id="inquiryModal" class="fixed inset-0 bg-black/50 z-[100] hidden items-center justify-center p-4">
+                <div class="bg-white rounded-xl shadow-2xl max-w-md w-full p-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-comment-dots text-blue-600 mr-2"></i>쇼핑몰 문의하기</h3>
+                        <button onclick="closeInquiryModal()" class="text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
+                    </div>
+                    <div class="space-y-3">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700 mb-1">문의 유형 <span class="text-red-500">*</span></label>
+                            <select id="inquiryCategory" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+                                <option value="">선택해주세요</option>
+                                <option value="shipping">배송 문의</option>
+                                <option value="refund">환불 문의</option>
+                                <option value="other">기타 문의</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700 mb-1">관련 주문 (선택)</label>
+                            <select id="inquiryOrderId" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+                                <option value="">없음</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700 mb-1">제목 <span class="text-red-500">*</span></label>
+                            <input id="inquiryTitle" type="text" maxlength="100" placeholder="문의 제목" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700 mb-1">내용 <span class="text-red-500">*</span></label>
+                            <textarea id="inquiryContent" rows="5" maxlength="2000" placeholder="문의 내용을 자세히 적어주세요" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
+                        </div>
+                        <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i>문의 내용은 본인과 쇼핑몰 관리자만 열람 가능합니다.</p>
+                    </div>
+                    <div class="flex gap-2 mt-4">
+                        <button onclick="closeInquiryModal()" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium text-gray-700">취소</button>
+                        <button onclick="submitInquiry()" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-bold"><i class="fas fa-paper-plane mr-1"></i>문의 등록</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 쇼핑몰 문의 내역 모달 -->
+            <div id="myInquiriesModal" class="fixed inset-0 bg-black/50 z-[100] hidden items-center justify-center p-4">
+                <div class="bg-white rounded-xl shadow-2xl max-w-2xl w-full p-5 max-h-[85vh] flex flex-col">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clipboard-list text-blue-600 mr-2"></i>내 문의 내역</h3>
+                        <button onclick="closeMyInquiriesModal()" class="text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
+                    </div>
+                    <p class="text-[11px] text-gray-500 mb-3"><i class="fas fa-lock mr-1"></i>본인이 작성한 문의만 표시됩니다.</p>
+                    <div id="myInquiriesList" class="space-y-2 overflow-y-auto flex-1">
+                        <p class="text-center text-gray-400 text-sm py-8">불러오는 중...</p>
                     </div>
                 </div>
             </div>
@@ -6964,6 +7151,121 @@ app.get('/dashboard', (c) => {
                 } catch(e) {
                     alert((e.response && e.response.data && e.response.data.error) || '취소 처리 중 오류가 발생했습니다');
                 }
+            }
+
+            // ========== 쇼핑몰 문의 (사용자) ==========
+            function openInquiryModal() {
+                if (!currentUser || !currentUser.id) { alert('로그인이 필요합니다'); return; }
+                // 폼 초기화
+                document.getElementById('inquiryCategory').value = '';
+                document.getElementById('inquiryTitle').value = '';
+                document.getElementById('inquiryContent').value = '';
+                // 주문 목록 옵션 채우기
+                var sel = document.getElementById('inquiryOrderId');
+                sel.innerHTML = '<option value="">없음</option>';
+                (async function() {
+                    try {
+                        var res = await axios.get('/api/shop/orders/' + currentUser.id);
+                        if (res.data.success && Array.isArray(res.data.orders)) {
+                            res.data.orders.slice(0, 30).forEach(function(o) {
+                                var opt = document.createElement('option');
+                                opt.value = o.id;
+                                opt.textContent = '#' + o.id + ' - ' + (o.product_name || '') + ' x' + o.quantity;
+                                sel.appendChild(opt);
+                            });
+                        }
+                    } catch(e) {}
+                })();
+                var m = document.getElementById('inquiryModal');
+                m.classList.remove('hidden');
+                m.classList.add('flex');
+            }
+
+            function closeInquiryModal() {
+                var m = document.getElementById('inquiryModal');
+                m.classList.add('hidden');
+                m.classList.remove('flex');
+            }
+
+            async function submitInquiry() {
+                if (!currentUser || !currentUser.id) { alert('로그인이 필요합니다'); return; }
+                var category = document.getElementById('inquiryCategory').value;
+                var title = document.getElementById('inquiryTitle').value.trim();
+                var content = document.getElementById('inquiryContent').value.trim();
+                var orderId = document.getElementById('inquiryOrderId').value;
+                if (!category) { alert('문의 유형(배송/환불/기타)을 선택해주세요'); return; }
+                if (!title) { alert('제목을 입력해주세요'); return; }
+                if (!content) { alert('문의 내용을 입력해주세요'); return; }
+                try {
+                    var res = await axios.post('/api/shop/inquiry', {
+                        userId: currentUser.id,
+                        orderId: orderId ? Number(orderId) : null,
+                        category: category,
+                        title: title,
+                        content: content
+                    });
+                    if (res.data.success) {
+                        alert('문의가 등록되었습니다');
+                        closeInquiryModal();
+                        loadMyInquiries();
+                    } else {
+                        alert(res.data.error || '문의 등록 실패');
+                    }
+                } catch(e) {
+                    alert((e.response && e.response.data && e.response.data.error) || '문의 등록 중 오류가 발생했습니다');
+                }
+            }
+
+            async function loadMyInquiries() {
+                if (!currentUser || !currentUser.id) { alert('로그인이 필요합니다'); return; }
+                var m = document.getElementById('myInquiriesModal');
+                m.classList.remove('hidden');
+                m.classList.add('flex');
+                var listEl = document.getElementById('myInquiriesList');
+                listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-8">불러오는 중...</p>';
+                try {
+                    var res = await axios.get('/api/shop/inquiries/' + currentUser.id);
+                    if (!res.data.success) { listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-8">조회 실패</p>'; return; }
+                    var items = res.data.inquiries || [];
+                    if (items.length === 0) {
+                        listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-inbox text-3xl text-gray-200 mb-2 block"></i>등록된 문의가 없습니다</p>';
+                        return;
+                    }
+                    var catLabel = { shipping:'배송', refund:'환불', other:'기타' };
+                    var catColor = { shipping:'blue', refund:'orange', other:'gray' };
+                    listEl.innerHTML = items.map(function(it) {
+                        var date = new Date(it.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
+                        var color = catColor[it.category] || 'gray';
+                        var statusBadge = it.status === 'answered'
+                            ? '<span class="text-[11px] px-2 py-0.5 bg-green-100 text-green-700 rounded-full">답변완료</span>'
+                            : '<span class="text-[11px] px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">답변대기</span>';
+                        var replyBlock = it.admin_reply
+                            ? '<div class="mt-2 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800"><p class="font-bold mb-1"><i class="fas fa-reply mr-1"></i>관리자 답변</p><p class="whitespace-pre-wrap">' + escapeHtml(it.admin_reply) + '</p>' + (it.replied_at ? '<p class="text-[10px] text-blue-500 mt-1">' + new Date(it.replied_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) + '</p>' : '') + '</div>'
+                            : '';
+                        var orderTag = it.order_id ? '<span class="text-[11px] text-gray-500 ml-2">주문 #' + it.order_id + '</span>' : '';
+                        return '<div class="bg-gray-50 rounded-lg p-3 border border-gray-200">' +
+                            '<div class="flex items-center justify-between mb-1">' +
+                                '<div class="flex items-center gap-2">' +
+                                    '<span class="text-[11px] px-2 py-0.5 bg-' + color + '-100 text-' + color + '-700 rounded-full">' + (catLabel[it.category]||it.category) + '</span>' +
+                                    statusBadge +
+                                    orderTag +
+                                '</div>' +
+                                '<span class="text-[11px] text-gray-400">' + date + '</span>' +
+                            '</div>' +
+                            '<p class="text-sm font-bold text-gray-800">' + escapeHtml(it.title) + '</p>' +
+                            '<p class="text-xs text-gray-600 mt-1 whitespace-pre-wrap">' + escapeHtml(it.content) + '</p>' +
+                            replyBlock +
+                        '</div>';
+                    }).join('');
+                } catch(e) {
+                    listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-8">조회 중 오류가 발생했습니다</p>';
+                }
+            }
+
+            function closeMyInquiriesModal() {
+                var m = document.getElementById('myInquiriesModal');
+                m.classList.add('hidden');
+                m.classList.remove('flex');
             }
 
             async function buyProduct(productId, productName, priceQkey) {
@@ -9016,6 +9318,31 @@ app.get('/admin/dashboard', (c) => {
                             </table>
                         </div>
                     </div>
+
+                    <!-- 쇼핑몰 문의 관리 (쇼핑몰 관리자 전용) -->
+                    <div class="mt-6 border-t pt-6">
+                        <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                            <h3 class="font-bold text-gray-700"><i class="fas fa-comment-dots mr-1 text-blue-600"></i>쇼핑몰 문의 관리 <span id="adminInquiryCount" class="text-xs text-gray-500 font-normal ml-1"></span></h3>
+                            <div class="flex gap-2 flex-wrap">
+                                <select id="adminInquiryFilterStatus" onchange="renderAdminInquiries()" class="text-xs border rounded px-2 py-1 bg-white">
+                                    <option value="">전체 상태</option>
+                                    <option value="pending">답변대기</option>
+                                    <option value="answered">답변완료</option>
+                                </select>
+                                <select id="adminInquiryFilterCategory" onchange="renderAdminInquiries()" class="text-xs border rounded px-2 py-1 bg-white">
+                                    <option value="">전체 유형</option>
+                                    <option value="shipping">배송</option>
+                                    <option value="refund">환불</option>
+                                    <option value="other">기타</option>
+                                </select>
+                                <button onclick="loadAdminInquiries()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-xs font-medium"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                            </div>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-3"><i class="fas fa-lock mr-1"></i>쇼핑몰 관리자만 열람 가능합니다. 사용자 본인과 본 페이지 외에는 노출되지 않습니다.</p>
+                        <div id="adminInquiryList" class="space-y-2">
+                            <p class="text-center py-6 text-gray-400 text-sm">로딩 중...</p>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- 산하매출 모달 -->
@@ -9162,7 +9489,7 @@ app.get('/admin/dashboard', (c) => {
                 else if (tab === 'sales') loadSalesStatus();
                 else if (tab === 'swaps') loadSwaps();
                 else if (tab === 'memberRewards') loadMemberRewards();
-                else if (tab === 'shop') { loadAdminShopProducts(); loadAdminShopOrders(); }
+                else if (tab === 'shop') { loadAdminShopProducts(); loadAdminShopOrders(); loadAdminInquiries(); }
                 else if (tab === 'notices') loadAdminNotices();
             }
 
@@ -11279,6 +11606,110 @@ app.get('/admin/dashboard', (c) => {
                         if (currentTab === 'shop') loadAdminShopOrders();
                         else clearInterval(shopOrderRefreshTimer);
                     }, 10000);
+                }
+            }
+
+            // ================== 어드민: 쇼핑몰 문의 관리 ==================
+            var _adminInquiriesCache = [];
+            var shopInquiryRefreshTimer = null;
+
+            async function loadAdminInquiries() {
+                try {
+                    var res = await axios.get('/api/admin/shop/inquiries');
+                    if (!res.data.success) return;
+                    _adminInquiriesCache = res.data.inquiries || [];
+                    renderAdminInquiries();
+                } catch(e) {
+                    console.error('Admin inquiries load error:', e);
+                    var el = document.getElementById('adminInquiryList');
+                    if (el) el.innerHTML = '<p class="text-center py-6 text-red-400 text-sm">조회 중 오류가 발생했습니다</p>';
+                }
+                if (shopInquiryRefreshTimer) clearInterval(shopInquiryRefreshTimer);
+                if (currentTab === 'shop') {
+                    shopInquiryRefreshTimer = setInterval(function() {
+                        if (currentTab === 'shop') loadAdminInquiries();
+                        else clearInterval(shopInquiryRefreshTimer);
+                    }, 30000);
+                }
+            }
+
+            function renderAdminInquiries() {
+                var el = document.getElementById('adminInquiryList');
+                var countEl = document.getElementById('adminInquiryCount');
+                if (!el) return;
+                var fStatus = (document.getElementById('adminInquiryFilterStatus') || {}).value || '';
+                var fCat = (document.getElementById('adminInquiryFilterCategory') || {}).value || '';
+                var items = (_adminInquiriesCache || []).filter(function(it) {
+                    if (fStatus && it.status !== fStatus) return false;
+                    if (fCat && it.category !== fCat) return false;
+                    return true;
+                });
+                if (countEl) countEl.textContent = '(' + items.length + '건)';
+                if (items.length === 0) {
+                    el.innerHTML = '<p class="text-center py-6 text-gray-400 text-sm"><i class="fas fa-inbox text-2xl text-gray-200 mb-1 block"></i>조회된 문의가 없습니다</p>';
+                    return;
+                }
+                var catLabel = { shipping:'배송', refund:'환불', other:'기타' };
+                var catColor = { shipping:'blue', refund:'orange', other:'gray' };
+                el.innerHTML = items.map(function(it) {
+                    var date = new Date(it.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
+                    var color = catColor[it.category] || 'gray';
+                    var statusBadge = it.status === 'answered'
+                        ? '<span class="text-[11px] px-2 py-0.5 bg-green-100 text-green-700 rounded-full">답변완료</span>'
+                        : '<span class="text-[11px] px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">답변대기</span>';
+                    var orderTag = it.order_id ? '<span class="text-[11px] text-gray-500 ml-1">주문 #' + it.order_id + '</span>' : '';
+                    var replyBlock = it.admin_reply
+                        ? '<div class="mt-2 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800"><p class="font-bold mb-1"><i class="fas fa-reply mr-1"></i>관리자 답변</p><p class="whitespace-pre-wrap">' + escapeHtml(it.admin_reply) + '</p>' + (it.replied_at ? '<p class="text-[10px] text-blue-500 mt-1">' + new Date(it.replied_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) + '</p>' : '') + '</div>'
+                        : '';
+                    return '<div class="bg-white border border-gray-200 rounded-lg p-3">' +
+                        '<div class="flex items-center justify-between mb-2 flex-wrap gap-1">' +
+                            '<div class="flex items-center gap-2 flex-wrap">' +
+                                '<span class="text-[11px] px-2 py-0.5 bg-' + color + '-100 text-' + color + '-700 rounded-full">' + (catLabel[it.category]||it.category) + '</span>' +
+                                statusBadge +
+                                '<span class="text-xs text-gray-700 font-medium">' + escapeHtml(it.user_name || '') + '</span>' +
+                                '<span class="text-[11px] text-gray-400">' + escapeHtml(it.user_email || '') + '</span>' +
+                                orderTag +
+                            '</div>' +
+                            '<span class="text-[11px] text-gray-400">' + date + '</span>' +
+                        '</div>' +
+                        '<p class="text-sm font-bold text-gray-800">' + escapeHtml(it.title) + '</p>' +
+                        '<p class="text-xs text-gray-600 mt-1 whitespace-pre-wrap">' + escapeHtml(it.content) + '</p>' +
+                        replyBlock +
+                        '<div class="mt-2 flex gap-2">' +
+                            '<button onclick="adminReplyInquiry(' + it.id + ')" class="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-bold"><i class="fas fa-reply mr-1"></i>' + (it.admin_reply ? '답변 수정' : '답변 작성') + '</button>' +
+                            '<button onclick="adminDeleteInquiry(' + it.id + ')" class="px-3 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded text-xs font-bold border border-red-200"><i class="fas fa-trash mr-1"></i>삭제</button>' +
+                        '</div>' +
+                    '</div>';
+                }).join('');
+            }
+
+            async function adminReplyInquiry(id) {
+                var existing = (_adminInquiriesCache || []).find(function(x){return x.id===id;});
+                var prev = existing && existing.admin_reply ? existing.admin_reply : '';
+                var reply = prompt('답변 내용을 입력하세요:', prev);
+                if (reply === null) return;
+                reply = String(reply).trim();
+                if (!reply) { alert('답변 내용을 입력해주세요'); return; }
+                try {
+                    var res = await axios.post('/api/admin/shop/inquiry/' + id + '/reply', { reply: reply });
+                    if (res.data.success) {
+                        alert('답변이 등록되었습니다');
+                        loadAdminInquiries();
+                    } else {
+                        alert(res.data.error || '답변 등록 실패');
+                    }
+                } catch(e) {
+                    alert((e.response && e.response.data && e.response.data.error) || '답변 등록 중 오류가 발생했습니다');
+                }
+            }
+
+            async function adminDeleteInquiry(id) {
+                if (!confirm('이 문의를 삭제하시겠습니까?')) return;
+                try {
+                    await axios.delete('/api/admin/shop/inquiry/' + id);
+                    loadAdminInquiries();
+                } catch(e) {
+                    alert('삭제 중 오류가 발생했습니다');
                 }
             }
 
