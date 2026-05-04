@@ -1833,9 +1833,9 @@ app.post('/api/staking/create', async (c) => {
     const db = c.env.DB
 
     // 코인 지급 수량 계산 (날짜 기반 정책)
-    // ~5/3: QTA 75,000 / QX 10,000 / QKEY 5,000 per $1,000
-    // 5/4~: QTA 75,000 only (QX·QKEY 즉시지급 없음, 일일배당 QKEY만 유지)
-    const PHASE2_DATE = new Date('2026-05-04T00:00:00+09:00') // KST 기준 5월 4일
+    // ~5/10: QTA 75,000 / QX 10,000 / QKEY 5,000 per $1,000 (사장님 지시 2026-05-04 연장)
+    // 5/11~: QTA 75,000 only (QX·QKEY 즉시지급 없음, 일일배당 QKEY만 유지)
+    const PHASE2_DATE = new Date('2026-05-11T00:00:00+09:00') // KST 기준 5월 11일 00:00 (5/10 23:59:59 까지 3종 지급)
     const now = new Date()
     const isPhase2 = now >= PHASE2_DATE
 
@@ -5049,6 +5049,121 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
 //   - 신규: date(?, '+9 hours') >= date(s.start_date, '+9 hours')  (KST 같은 날도 자격)
 //   - 한국시간 기준 23:59:59 까지 가입·staking 시작은 당일분 배당 대상
 // ============================================================
+// ============================================================
+// [신규] 3종 코인 세트 (QTA + QX + QKEY) 누락 보정 — 5/4~5/10 진입자
+//   - 사장님 지시 2026-05-04: 컷오프를 5/3 → 5/10 KST 23:59:59 로 연장
+//   - 5/4 이후 진입한 staking 중 qx_reward=0 OR qkey_reward=0 인 행 추적
+//   - staking.qx_reward, qkey_reward 값을 amount/1000 * 10000, *5000 으로 정정
+//   - 사용자 잔액 보정 (qx_balance, qkey_balance 차이만큼 +)
+//   - 중복 지급 방지: 이미 staking.qx_reward > 0 AND qkey_reward > 0 이면 스킵
+//   - 중복 지급 방지: transactions 에 'three_set_supplement' type 로 기록 (이미 있으면 스킵)
+// ============================================================
+app.post('/api/admin/rewards/three-set-supplement', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { fromDate, toDate, dryRun } = body || {}
+    const fd = fromDate || '2026-05-04'
+    const td = toDate || '2026-05-10'
+
+    // 대상 staking 조회: created_at KST 가 fromDate~toDate 범위 + status active 또는 pending
+    //   + qx_reward 또는 qkey_reward 가 0 인 행 (Phase2 룰로 잘못 0 저장된 케이스)
+    const targets = await db.prepare(`
+      SELECT 
+        s.id, s.user_id, s.amount, s.status, s.qta_reward, s.qx_reward, s.qkey_reward,
+        s.start_date, s.created_at,
+        u.email, u.name, u.qta_balance, u.qx_balance, u.qkey_balance
+      FROM staking s
+      LEFT JOIN users u ON s.user_id = u.id
+      WHERE s.status IN ('active','pending')
+        AND date(s.created_at, '+9 hours') >= date(?)
+        AND date(s.created_at, '+9 hours') <= date(?)
+        AND ((COALESCE(s.qx_reward,0) = 0) OR (COALESCE(s.qkey_reward,0) = 0))
+    `).bind(fd, td).all()
+
+    const summary = {
+      fromDate: fd, toDate: td, dryRun: !!dryRun,
+      candidate_count: targets.results.length,
+      processed: [] as any[],
+      skipped_duplicate: [] as any[],
+      total_qx_added: 0,
+      total_qkey_added: 0
+    }
+
+    for (const s of targets.results) {
+      const correctQx = ((s.amount as number) / 1000) * 10000
+      const correctQkey = ((s.amount as number) / 1000) * 5000
+      const currentQx = (s.qx_reward as number) || 0
+      const currentQkey = (s.qkey_reward as number) || 0
+      const qxDelta = correctQx - currentQx
+      const qkeyDelta = correctQkey - currentQkey
+
+      // 중복 방지: transactions 에 같은 staking_id 로 'three_set_supplement' 가 이미 있으면 스킵
+      const dupCheck = await db.prepare(`
+        SELECT id FROM transactions 
+        WHERE user_id = ? AND type = 'three_set_supplement' 
+          AND description LIKE ?
+        LIMIT 1
+      `).bind(s.user_id, `%staking_id=${s.id}%`).first()
+
+      if (dupCheck) {
+        summary.skipped_duplicate.push({
+          staking_id: s.id, user_id: s.user_id, email: s.email,
+          reason: 'transactions(three_set_supplement) already exists'
+        })
+        continue
+      }
+
+      summary.processed.push({
+        staking_id: s.id, user_id: s.user_id, email: s.email, name: s.name,
+        amount: s.amount, status: s.status,
+        before: { qx_reward: currentQx, qkey_reward: currentQkey },
+        after: { qx_reward: correctQx, qkey_reward: correctQkey },
+        delta: { qx: qxDelta, qkey: qkeyDelta },
+        created_at: s.created_at
+      })
+      summary.total_qx_added += qxDelta
+      summary.total_qkey_added += qkeyDelta
+
+      if (!dryRun) {
+        // 1. staking 행의 qx_reward, qkey_reward 업데이트
+        await db.prepare(`
+          UPDATE staking SET qx_reward = ?, qkey_reward = ? WHERE id = ?
+        `).bind(correctQx, correctQkey, s.id).run()
+
+        // 2. status='active' 인 경우만 즉시 잔액 추가 (pending 은 승인 시 지급되므로 staking 행만 정정)
+        if (s.status === 'active' && (qxDelta > 0 || qkeyDelta > 0)) {
+          if (qxDelta > 0) {
+            await db.prepare(`UPDATE users SET qx_balance = COALESCE(qx_balance,0) + ? WHERE id = ?`)
+              .bind(qxDelta, s.user_id).run()
+            await db.prepare(`
+              INSERT INTO transactions (user_id, type, coin_type, amount, description)
+              VALUES (?, 'three_set_supplement', 'QX', ?, ?)
+            `).bind(s.user_id, qxDelta,
+              `3종 보정 QX (staking_id=${s.id}, amount=$${s.amount}, 5/4-5/10 진입자 누락분)`
+            ).run()
+          }
+          if (qkeyDelta > 0) {
+            await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`)
+              .bind(qkeyDelta, s.user_id).run()
+            await db.prepare(`
+              INSERT INTO transactions (user_id, type, coin_type, amount, description)
+              VALUES (?, 'three_set_supplement', 'QKEY', ?, ?)
+            `).bind(s.user_id, qkeyDelta,
+              `3종 보정 QKEY (staking_id=${s.id}, amount=$${s.amount}, 5/4-5/10 진입자 누락분)`
+            ).run()
+          }
+        }
+      }
+    }
+
+    return c.json({ success: true, ...summary })
+  } catch (error: any) {
+    console.error('three-set-supplement error:', error)
+    return c.json({ error: 'D1 error: ' + (error?.message || String(error)) }, 500)
+  }
+})
+
 app.post('/api/admin/rewards/recalc-by-kst-date', async (c) => {
   try {
     const db = c.env.DB
