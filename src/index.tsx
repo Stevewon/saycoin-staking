@@ -4367,6 +4367,169 @@ app.post('/api/admin/rewards/reconcile-tx-range', async (c) => {
   }
 })
 
+// 어드민: 휴일 잘못 지급된 양수 행 ↔ 음수 회수 행 1:1 페어링 삭제 (B-3 방식)
+//   - 5/1, 5/3 양수 행(+amount)을 동일 금액의 음수 회수 행(-amount)과 1:1 매칭하여 페어로 삭제
+//   - 매칭된 페어만 삭제 → 사용자 잔액 변화 0 보장 (잔액 검증 불필요, 페어 합 항상 0)
+//   - 매칭 안 된 음수 행은 description 만 "[잔액 보정]"으로 정리 (잔액 영향 0)
+//   - 제외 type: direct_referral (즉시 지급, 회수 없음)
+//   - dryRun=true 시 매칭 결과만 미리보기
+app.post('/api/admin/rewards/pair-purge-tx', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const positiveDates: string[] = Array.isArray(body?.positiveDates) ? body.positiveDates : []
+    const negativeDates: string[] = Array.isArray(body?.negativeDates) ? body.negativeDates : []
+    const dryRun: boolean = body?.dryRun === true
+    const renameOrphans: boolean = body?.renameOrphans !== false // 기본 true
+    if (positiveDates.length === 0 || negativeDates.length === 0) {
+      return c.json({ error: 'positiveDates, negativeDates 배열이 모두 필요합니다' }, 400)
+    }
+
+    // 1. 양수 후보: positiveDates KST 기준, daily_qkey + referral_reward (양수만)
+    const posDateClause = positiveDates.map(() => `substr(datetime(created_at,'+9 hours'),1,10) = ?`).join(' OR ')
+    const positives = await db.prepare(`
+      SELECT id, user_id, type, amount, description, created_at
+      FROM transactions
+      WHERE type IN ('daily_qkey','referral_reward')
+        AND coin_type = 'QKEY'
+        AND amount > 0
+        AND (${posDateClause})
+      ORDER BY user_id, amount DESC, id ASC
+    `).bind(...positiveDates).all()
+
+    // 2. 음수 후보: negativeDates KST 기준, *_rollback (음수)
+    const negDateClause = negativeDates.map(() => `substr(datetime(created_at,'+9 hours'),1,10) = ?`).join(' OR ')
+    const negatives = await db.prepare(`
+      SELECT id, user_id, type, amount, description, created_at
+      FROM transactions
+      WHERE type IN ('daily_reward_rollback','referral_reward_rollback')
+        AND coin_type = 'QKEY'
+        AND amount < 0
+        AND (${negDateClause})
+      ORDER BY user_id, amount ASC, id ASC
+    `).bind(...negativeDates).all()
+
+    // 3. 사용자별로 양수/음수 그룹화
+    const posByUser: Record<number, any[]> = {}
+    const negByUser: Record<number, any[]> = {}
+    for (const r of (positives.results || []) as any[]) {
+      const u = Number(r.user_id)
+      if (!posByUser[u]) posByUser[u] = []
+      posByUser[u].push(r)
+    }
+    for (const r of (negatives.results || []) as any[]) {
+      const u = Number(r.user_id)
+      if (!negByUser[u]) negByUser[u] = []
+      negByUser[u].push(r)
+    }
+
+    // 4. 사용자별 1:1 페어 매칭 (동일 금액 우선, 없으면 미매칭으로 둠)
+    const pairsToDelete: { posId: number, negId: number, user_id: number, amount: number }[] = []
+    const orphanNegIds: number[] = []
+    const userSummary: any[] = []
+    const allUserIds = new Set<number>([...Object.keys(posByUser).map(Number), ...Object.keys(negByUser).map(Number)])
+
+    for (const uid of Array.from(allUserIds)) {
+      const posList = (posByUser[uid] || []).slice()
+      const negList = (negByUser[uid] || []).slice()
+      // 음수의 절댓값 = 양수 amount 와 매칭
+      const negByAmt: Record<string, any[]> = {}
+      for (const n of negList) {
+        const k = String(Math.round(Math.abs(Number(n.amount))))
+        if (!negByAmt[k]) negByAmt[k] = []
+        negByAmt[k].push(n)
+      }
+      const userPairs: any[] = []
+      const matchedNegIds = new Set<number>()
+      for (const p of posList) {
+        const k = String(Math.round(Number(p.amount)))
+        const bucket = negByAmt[k] || []
+        const n = bucket.shift()
+        if (n) {
+          userPairs.push({ posId: Number(p.id), negId: Number(n.id), amount: Number(p.amount) })
+          matchedNegIds.add(Number(n.id))
+          pairsToDelete.push({ posId: Number(p.id), negId: Number(n.id), user_id: uid, amount: Number(p.amount) })
+        }
+      }
+      // 매칭 안 된 음수 (orphan)
+      const orphans = negList.filter((n:any) => !matchedNegIds.has(Number(n.id)))
+      for (const o of orphans) orphanNegIds.push(Number(o.id))
+      // 매칭 안 된 양수 (드물지만 보고용)
+      const unmatchedPos = posList.filter((p:any) => !userPairs.find((up:any) => up.posId === Number(p.id)))
+
+      userSummary.push({
+        user_id: uid,
+        positive_count: posList.length,
+        negative_count: negList.length,
+        paired: userPairs.length,
+        unmatched_positive: unmatchedPos.length,
+        unmatched_negative: orphans.length,
+        paired_amount_sum: userPairs.reduce((s:number,x:any)=>s+x.amount, 0),
+        orphan_negative_sum: orphans.reduce((s:number,x:any)=>s+Number(x.amount), 0)
+      })
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        positiveDates,
+        negativeDates,
+        totalPositiveRows: (positives.results || []).length,
+        totalNegativeRows: (negatives.results || []).length,
+        totalPairs: pairsToDelete.length,
+        totalOrphanNegatives: orphanNegIds.length,
+        deletableRowCount: pairsToDelete.length * 2, // 페어당 2행
+        orphanRenameCount: renameOrphans ? orphanNegIds.length : 0,
+        userCount: userSummary.length,
+        perUserSummary: userSummary
+      })
+    }
+
+    // 5. 실제 삭제 (페어 단위 = 양수 + 음수)
+    let deleted = 0
+    const deleteIds: number[] = []
+    for (const p of pairsToDelete) { deleteIds.push(p.posId, p.negId) }
+    const CHUNK = 50
+    for (let i = 0; i < deleteIds.length; i += CHUNK) {
+      const chunk = deleteIds.slice(i, i + CHUNK)
+      const ph = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...chunk).run()
+      deleted += (r.meta?.changes || 0)
+    }
+
+    // 6. orphan 음수 행 description 만 보정 (금액/잔액 변화 0)
+    let renamed = 0
+    if (renameOrphans && orphanNegIds.length > 0) {
+      for (let i = 0; i < orphanNegIds.length; i += CHUNK) {
+        const chunk = orphanNegIds.slice(i, i + CHUNK)
+        const ph = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`
+          UPDATE transactions
+          SET description = '[잔액 보정]'
+          WHERE id IN (${ph})
+        `).bind(...chunk).run()
+        renamed += (r.meta?.changes || 0)
+      }
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      positiveDates,
+      negativeDates,
+      totalPairs: pairsToDelete.length,
+      totalOrphanNegatives: orphanNegIds.length,
+      deletedRows: deleted,
+      renamedOrphans: renamed,
+      perUserSummary: userSummary
+    })
+  } catch (error) {
+    console.error('pair-purge-tx error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 휴일 잘못 지급/회수 트랜잭션 흔적 완전 삭제 (5/1, 5/3 등)
 //   - 안전장치: 사용자별 net=0 인 경우에만 삭제 (잔액 변화 0 보장)
 //   - 대상 type: daily_qkey, referral_reward, daily_reward_rollback, referral_reward_rollback, rollback_restore
