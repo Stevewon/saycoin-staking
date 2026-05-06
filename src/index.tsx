@@ -7059,8 +7059,15 @@ app.get('/', (c) => {
                         </div>
                         <div class="mb-4 sm:mb-6">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="login.password">비밀번호</label>
-                            <input type="password" id="loginPassword" required
-                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                            <div class="relative">
+                                <input type="password" id="loginPassword" required
+                                    class="w-full px-3 py-2 sm:px-4 sm:py-3 pr-10 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                                <button type="button" onclick="togglePasswordVisibility('loginPassword', this)"
+                                    class="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 text-gray-400 hover:text-purple-600 focus:outline-none"
+                                    aria-label="비밀번호 표시/숨김" tabindex="-1">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                            </div>
                         </div>
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-2 sm:py-3 rounded-lg font-bold hover:bg-purple-700 transition text-sm sm:text-base" data-i18n="common.login">
@@ -7098,21 +7105,35 @@ app.get('/', (c) => {
                         </div>
                         <div class="mb-3 sm:mb-4">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.password">비밀번호</label>
-                            <input type="password" id="registerPassword" required
-                                minlength="4"
-                                data-i18n-placeholder="register.password_input"
-                                placeholder="비밀번호 입력"
-                                autocomplete="new-password"
-                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                            <div class="relative">
+                                <input type="password" id="registerPassword" required
+                                    minlength="4"
+                                    data-i18n-placeholder="register.password_input"
+                                    placeholder="비밀번호 입력"
+                                    autocomplete="new-password"
+                                    class="w-full px-3 py-2 sm:px-4 sm:py-3 pr-10 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                                <button type="button" onclick="togglePasswordVisibility('registerPassword', this)"
+                                    class="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 text-gray-400 hover:text-purple-600 focus:outline-none"
+                                    aria-label="비밀번호 표시/숨김" tabindex="-1">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                            </div>
                         </div>
                         <div class="mb-3 sm:mb-4">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.password_confirm">비밀번호 확인</label>
-                            <input type="password" id="registerPasswordConfirm" required
-                                minlength="4"
-                                data-i18n-placeholder="register.password_reinput"
-                                placeholder="비밀번호 재입력"
-                                autocomplete="new-password"
-                                class="w-full px-3 py-2 sm:px-4 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                            <div class="relative">
+                                <input type="password" id="registerPasswordConfirm" required
+                                    minlength="4"
+                                    data-i18n-placeholder="register.password_reinput"
+                                    placeholder="비밀번호 재입력"
+                                    autocomplete="new-password"
+                                    class="w-full px-3 py-2 sm:px-4 sm:py-3 pr-10 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                                <button type="button" onclick="togglePasswordVisibility('registerPasswordConfirm', this)"
+                                    class="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 text-gray-400 hover:text-purple-600 focus:outline-none"
+                                    aria-label="비밀번호 표시/숨김" tabindex="-1">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                            </div>
                         </div>
                         <div class="mb-3 sm:mb-4">
                             <label class="block text-gray-700 text-sm font-bold mb-2" data-i18n="register.phone">전화번호</label>
@@ -7238,6 +7259,20 @@ app.get('/', (c) => {
         <script src="/static/axios.min.js"></script>
         <script src="/static/i18n.js?v=20260427c"></script>
         <script>
+            // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
+            function togglePasswordVisibility(inputId, btn) {
+                const input = document.getElementById(inputId);
+                if (!input) return;
+                const icon = btn ? btn.querySelector('i') : null;
+                if (input.type === 'password') {
+                    input.type = 'text';
+                    if (icon) { icon.classList.remove('fa-eye'); icon.classList.add('fa-eye-slash'); }
+                } else {
+                    input.type = 'password';
+                    if (icon) { icon.classList.remove('fa-eye-slash'); icon.classList.add('fa-eye'); }
+                }
+            }
+
             function showRegister() {
                 document.getElementById('loginForm').classList.add('hidden');
                 document.getElementById('registerForm').classList.remove('hidden');
@@ -10397,6 +10432,21 @@ app.get('/admin/dashboard', (c) => {
                             </button>
                         </div>
                     </div>
+                    <!-- 회원 검색 -->
+                    <div class="mb-3 sm:mb-4 flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+                        <div class="relative flex-1">
+                            <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm"></i>
+                            <input type="text" id="usersSearchInput" 
+                                placeholder="이름 / 아이디 / 전화번호 / 지갑주소 / 추천인코드로 검색"
+                                oninput="filterUsersList(this.value)"
+                                class="w-full pl-10 pr-10 py-2 sm:py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 text-sm sm:text-base">
+                            <button type="button" onclick="clearUsersSearch()" 
+                                class="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 text-gray-400 hover:text-gray-700 text-sm" title="검색어 지우기">
+                                <i class="fas fa-times-circle"></i>
+                            </button>
+                        </div>
+                        <div id="usersSearchCount" class="text-xs sm:text-sm text-gray-600 whitespace-nowrap px-2"></div>
+                    </div>
                     <div id="usersList" class="space-y-4">
                         <p class="text-center text-gray-500 py-8" data-i18n="admin.loading">로딩 중...</p>
                     </div>
@@ -11367,19 +11417,78 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // 사용자 목록 캐시 (검색 필터링용)
+            let __allUsersCache = [];
+
+            // 사용자 카드 HTML 생성 (검색 필터링 결과 렌더링에 재사용)
+            function renderUsersCards(users) {
+                const listEl = document.getElementById('usersList');
+                if (!listEl) return;
+                if (!users || users.length === 0) {
+                    listEl.innerHTML = '<p class="text-center text-gray-500 py-8">' + I18N.t('admin.no_users') + '</p>';
+                    return;
+                }
+                listEl.innerHTML = users.map(u => __renderUserCardHtml(u)).join('');
+            }
+
+            // 회원 검색 (이름/아이디/전화번호/지갑/추천인코드)
+            function filterUsersList(query) {
+                const q = (query || '').trim().toLowerCase();
+                const countEl = document.getElementById('usersSearchCount');
+                if (!__allUsersCache || __allUsersCache.length === 0) {
+                    if (countEl) countEl.textContent = '';
+                    return;
+                }
+                if (!q) {
+                    renderUsersCards(__allUsersCache);
+                    if (countEl) countEl.textContent = '전체 ' + __allUsersCache.length + '명';
+                    return;
+                }
+                const filtered = __allUsersCache.filter(u => {
+                    const fields = [
+                        u.email, u.name, u.phone,
+                        u.wallet_address, u.usdt_wallet_address,
+                        u.referral_code, u.country
+                    ];
+                    return fields.some(f => f && String(f).toLowerCase().includes(q));
+                });
+                renderUsersCards(filtered);
+                if (countEl) countEl.textContent = '검색결과 ' + filtered.length + '명 / 전체 ' + __allUsersCache.length + '명';
+            }
+
+            // 검색어 지우기
+            function clearUsersSearch() {
+                const input = document.getElementById('usersSearchInput');
+                if (input) input.value = '';
+                filterUsersList('');
+            }
+
             // 사용자 목록 로드
             async function loadUsers() {
                 try {
                     const response = await axios.get('/api/admin/users');
                     const users = response.data.users || [];
-                    const listEl = document.getElementById('usersList');
+                    __allUsersCache = users;
 
-                    if (users.length === 0) {
-                        listEl.innerHTML = '<p class="text-center text-gray-500 py-8">' + I18N.t('admin.no_users') + '</p>';
-                        return;
+                    const countEl = document.getElementById('usersSearchCount');
+                    if (countEl) countEl.textContent = '전체 ' + users.length + '명';
+
+                    // 기존 검색어가 있으면 검색 결과 유지, 없으면 전체 표시
+                    const searchInput = document.getElementById('usersSearchInput');
+                    const currentQuery = searchInput ? searchInput.value : '';
+                    if (currentQuery && currentQuery.trim()) {
+                        filterUsersList(currentQuery);
+                    } else {
+                        renderUsersCards(users);
                     }
+                } catch (error) {
+                    console.error('Users list load failed:', error);
+                }
+            }
 
-                    listEl.innerHTML = users.map(u => \`
+            // 회원 카드 HTML 생성 (단일 사용자)
+            function __renderUserCardHtml(u) {
+                return \`
                         <div class="border border-gray-200 rounded-lg p-6">
                             <div class="flex justify-between items-start">
                                 <div class="flex-1">
@@ -11455,10 +11564,7 @@ app.get('/admin/dashboard', (c) => {
                                 </button>
                             </div>
                         </div>
-                    \`).join('');
-                } catch (error) {
-                    console.error('Users list load failed:', error);
-                }
+                    \`;
             }
 
             // 가입 현황 로드
