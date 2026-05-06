@@ -3725,6 +3725,53 @@ function getPrevBusinessDayKst(today: Date): { dateStr: string, daysBack: number
   return { dateStr: kstDateStr(new Date(today.getTime() - 24 * 60 * 60 * 1000)), daysBack: 1 }
 }
 
+// ★★ B 보강 (2026-05-06 확정) ★★
+// 사장님 룰 (재확정):
+//  1) 휴일/공휴일 매출도 직판수당은 즉시 지급 (이미 staking-approve 에서 처리)
+//  2) 휴일/공휴일 staking 의 일일배당(본인+위/아래 매칭)은 "그 다음 첫 평일" 에 무조건 발생
+//  3) 휴일/공휴일에 위·아래 매출이 전혀 없으면 일일배당 자체 0원 (기존 룰)
+//
+// "한 staking 에 대해 cron 이 채워야 할 reward_date 목록" 을 반환:
+//  - lastRewardDate: 그 staking 의 daily_rewards 테이블 내 마지막 reward_date (없으면 NULL)
+//  - startDateKst   : staking.start_date 의 KST 날짜 (YYYY-MM-DD)
+//  - todayKst       : 오늘 KST 날짜 (cron 실행일, 평일임이 보장됨)
+// 룰:
+//  A. lastRewardDate 가 있으면 → "lastRewardDate 다음 영업일 ~ todayKst" 사이의 모든 영업일
+//     (todayKst 포함; 오늘이 평일이므로 오늘분도 포함)
+//  B. lastRewardDate 가 없으면 (첫 지급) → "startDateKst ~ todayKst" 사이 영업일 중
+//     startDateKst 가 평일이면 그 평일 포함, 휴일이면 그 다음 첫 평일부터 todayKst 까지
+//     → 단순히 "max(startDateKst, todayKst 까지) 영업일 전부"
+//  안전 제한: 최대 30일 (연휴+버퍼)
+function getStakingAccrualDatesKst(
+  lastRewardDate: string | null,
+  startDateKst: string,
+  todayKst: string
+): string[] {
+  // 시작점: lastRewardDate 가 있으면 그 다음날, 없으면 startDateKst 부터
+  let cursorStr: string
+  if (lastRewardDate && /^\d{4}-\d{2}-\d{2}$/.test(lastRewardDate)) {
+    const d = new Date(lastRewardDate + 'T00:00:00Z')
+    cursorStr = new Date(d.getTime() + 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+  } else {
+    cursorStr = startDateKst
+  }
+  // 끝점: todayKst (포함)
+  const endDate = new Date(todayKst + 'T00:00:00Z')
+  let cursor = new Date(cursorStr + 'T00:00:00Z')
+  const result: string[] = []
+  let safety = 0
+  while (cursor.getTime() <= endDate.getTime() && safety < 30) {
+    const dateStr = cursor.toISOString().split('T')[0]
+    // KST 영업일 판정: cursor 는 KST 00:00 의 UTC 표현 → 실제 UTC 시각은 -9h
+    const checkDate = new Date(cursor.getTime() - 9 * 60 * 60 * 1000)
+    const { isBusinessDay } = isKoreanBusinessDay(checkDate)
+    if (isBusinessDay) result.push(dateStr)
+    cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000)
+    safety++
+  }
+  return result
+}
+
 // 출금 신청 창 체크
 // 룰: 매주 금요일 10:00~14:00 KST. 공휴일 여부 무관. 실제 지급 처리는 관리자가 수동으로 진행.
 function isWithdrawalWindowOpen(d: Date): boolean {
@@ -3758,35 +3805,25 @@ app.post('/api/rewards/daily', async (c) => {
       })
     }
 
-    // ★★ 발생일/지급일 분리 정책 (2026-05-01 확정) ★★
-    //   - 영업일에 발생한 배당은 "다음 영업일"에 지급된다.
-    //   - 예) 금요일 발생분 → 월요일 지급
-    //   - 예) 4/30(목) 발생분 → 5/1~3 휴일 → 5/4(월) 지급
-    //   - 예) 5/4(월) 발생분 → 5/5(어린이날) 휴일 → 5/6(수) 지급
-    //   - 발생일 = 직전 영업일(reward_date), 지급일 = 오늘(paid_date)
-    //   - daily_rewards / referral_rewards 의 reward_date 는 "발생일"을 기록 (잔액 반영은 오늘)
-    const { dateStr: accrualDate, daysBack } = getPrevBusinessDayKst(now)
+    // ★★ B 보강 (2026-05-06 확정) — 사장님 최종 룰 ★★
+    //   1) 휴일/공휴일 매출도 직판수당은 즉시 지급 (staking-approve 단계)
+    //   2) 휴일/공휴일 staking 의 일일배당(본인+위/아래 매칭)은 그 다음 첫 평일에 무조건 발생
+    //   3) 휴일/공휴일에 위·아래 매출이 전혀 없으면 일일배당 0원 (cron 자체 미실행)
+    //
+    //   변경점: 기존엔 "직전 1영업일분" 만 처리 → 이제는 staking 별로
+    //   "마지막 reward_date 다음 영업일 ~ 오늘" 의 모든 누락 평일을 일괄 처리.
+    //   휴일에 시작한 staking 의 reward_date 는 자동으로 "그 다음 첫 평일" 부터 채워짐.
 
     // paid_date 컬럼 보장 (없으면 추가)
     try { await db.prepare(`ALTER TABLE daily_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
     try { await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
 
-    // 활성 투자 조회 (승인일 익일부터 거치기간 종료일까지)
-    // ★★ 룰 (재확정 2026-04-30) ★★
-    //   - 리셋은 [잔액(QTA/QX/QKEY)을 0으로 만드는 일회성 이벤트]일 뿐
-    //   - 리셋된 스테이킹도 그 다음날부터 본인 데일리 배당 + Level 1 + Level 2 매칭수당 모두 정상 지급
-    //   - 즉 cron은 reset_at 여부와 무관하게 일반 룰을 그대로 적용한다
-    //   - 단, 리셋 스테이킹의 amount는 매출(직접판매) 통계에서만 별도 처리 (sales API에서 분리)
-    // ★ 발생일(accrualDate) 기준으로 SELECT 조건 검사:
-    //   - end_date_kst >= accrualDate (발생일이 거치기간 내)
-    //   - start_date_kst <= accrualDate (KST 같은 날 시작 = 당일 자격 인정)
-    // ★★ 사장님 룰 (2026-05-04 확정) ★★
-    //   - 한국시간(KST) 기준 23:59:59 이내 staking 시작 = 당일 가입 간주 = 당일 배당 자격
-    //   - 기존 "다음날부터" 룰 폐기 → KST 날짜 기준으로 비교
+    // 활성 투자 조회 (오늘까지 시작했고 거치기간 종료일이 오늘 이상인 모든 staking)
+    // ★ 누락 보강을 위해 staking.start_date 가 오늘(today) 이전이면 모두 후보 — 휴일 가입자도 포함
     const activeStakings = await db.prepare(`
-      SELECT 
-        s.user_id, 
-        s.id as staking_id, 
+      SELECT
+        s.user_id,
+        s.id as staking_id,
         s.amount,
         s.period_days,
         s.period_months,
@@ -3794,24 +3831,27 @@ app.post('/api/rewards/daily', async (c) => {
         s.start_date,
         s.end_date,
         s.reset_at,
-        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count
+        date(s.start_date, '+9 hours') as start_date_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
       FROM staking s
-      WHERE s.status = 'active' 
+      WHERE s.status = 'active'
         AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
-    `).bind(accrualDate, accrualDate).all()
+    `).bind(today, today).all()
 
     if (activeStakings.results.length === 0) {
-      return c.json({ 
-        success: true, 
+      return c.json({
+        success: true,
         message: t(c, 'rewards.no_active'),
-        rewarded: 0 
+        rewarded: 0
       })
     }
 
     let rewardedCount = 0
     let totalQkeyRewarded = 0
     let skippedCount = 0
+    let processedDates: { staking_id: any, dates: string[] }[] = []
 
     // 환율: 1 USD = 1,500 KRW, 1 QKEY = 10 KRW → 1 USD = 150 QKEY
     const USD_TO_QKEY = 150
@@ -3819,44 +3859,55 @@ app.post('/api/rewards/daily', async (c) => {
     for (const staking of activeStakings.results) {
       try {
         const periodDays = staking.period_days || (staking.period_months * 30)
-        
-        // 총 지급 횟수 제한: 거치기간 일수
-        if (staking.rewarded_count >= periodDays) {
-          skippedCount++
-          continue
+
+        // 이 staking 에 대해 채워야 할 reward_date 목록 산출
+        // - lastRewardDate 가 있으면 그 다음 영업일 ~ today
+        // - 없으면 startDateKst ~ today (휴일이면 자동 skip 되어 첫 평일부터)
+        const accrualDates = getStakingAccrualDatesKst(
+          (staking.last_reward_date as string) || null,
+          staking.start_date_kst as string,
+          today
+        )
+
+        if (accrualDates.length === 0) {
+          continue // 처리할 평일 없음
         }
 
-        // 발생일(accrualDate) 기준 중복 체크 — 같은 발생일분이 이미 지급되었으면 스킵
-        const todayRewards = await db.prepare(`
-          SELECT COUNT(*) as count FROM daily_rewards
-          WHERE user_id = ? AND staking_id = ? AND reward_date = ?
-        `).bind(staking.user_id, staking.staking_id, accrualDate).first()
+        const stakingProcessed: string[] = []
 
-        if (todayRewards.count === 0) {
+        for (const accrualDate of accrualDates) {
+          // 거치기간 일수 초과 시 종료
+          const currentRewardedCount = staking.rewarded_count + stakingProcessed.length
+          if (currentRewardedCount >= periodDays) {
+            skippedCount++
+            break
+          }
+
+          // 중복 방지 — 같은 (user, staking, reward_date) 가 이미 있으면 skip
+          const exists = await db.prepare(`
+            SELECT COUNT(*) as count FROM daily_rewards
+            WHERE user_id = ? AND staking_id = ? AND reward_date = ?
+          `).bind(staking.user_id, staking.staking_id, accrualDate).first()
+          if (exists.count > 0) continue
+
           // 금액별 차등 배당률 적용
           const dailyRate = staking.daily_rate || getDailyRate(staking.amount)
           const usdAmount = staking.amount * dailyRate
-          // USD를 QKEY로 변환 (1 USD = 150 QKEY)
           const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
 
-          // ★ 리셋 여부와 무관하게 일반 룰 그대로 적용 ★
-          //   리셋은 잔액 0으로 초기화한 일회성 이벤트일 뿐, 그 다음날부터는 정상 누적
-
           // [본인 배당 지급]
-          //   reward_date = accrualDate (발생일, 직전 영업일)
-          //   paid_date   = today        (지급일, 오늘)
-          //   잔액 가산은 오늘 일어남 — transactions 도 오늘 시각으로 자동 기록
+          //   reward_date = accrualDate (해당 평일)
+          //   paid_date   = today       (오늘 cron 실행일)
           await db.prepare(`
             INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
             VALUES (?, ?, ?, ?, ?)
           `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, today).run()
 
-          // 사용자 QKEY 잔액 업데이트
           await db.prepare(`
             UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
           `).bind(qkeyAmount, staking.user_id).run()
 
-          const newCount = staking.rewarded_count + 1
+          const newCount = currentRewardedCount + 1
           await db.prepare(`
             INSERT INTO transactions (user_id, type, coin_type, amount, description)
             VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
@@ -3864,20 +3915,15 @@ app.post('/api/rewards/daily', async (c) => {
 
           rewardedCount++
           totalQkeyRewarded += qkeyAmount
+          stakingProcessed.push(accrualDate)
 
-          // 매칭추천수당 지급 (QKEY)
-          // ★★ 정책 ★★
-          //   1) 추천인 본인이 스테이킹 active 상태(거치기간 내)에서만 지급
-          //   2) 활성체크 기준일은 "발생일(accrualDate)" — 그날 추천인도 active 였어야 함
-          //   3) reward_date = accrualDate, paid_date = today 로 분리 기록
+          // 매칭추천수당 (L1 20%, L2 10%) — 추천인이 accrualDate 시점 active 일 때만
           try {
-            // 1대 매칭추천수당 (20%) — 추천인 본인 스테이킹 활성 체크
             const level1Referrer = await db.prepare(`
               SELECT referrer_id FROM users WHERE id = ?
             `).bind(staking.user_id).first()
 
             if (level1Referrer && level1Referrer.referrer_id) {
-              // 발생일 기준 active 체크 (KST 룰 적용)
               const level1Active = await db.prepare(`
                 SELECT id FROM staking
                 WHERE user_id = ?
@@ -3888,23 +3934,30 @@ app.post('/api/rewards/daily', async (c) => {
               `).bind(level1Referrer.referrer_id, accrualDate, accrualDate).first()
 
               if (level1Active) {
-                const level1Reward = Math.round(qkeyAmount * 0.20)
+                // 1대 중복 체크
+                const l1Exists = await db.prepare(`
+                  SELECT COUNT(*) as count FROM referral_rewards
+                  WHERE referrer_id = ? AND referee_id = ? AND level = 1 AND reward_date = ?
+                `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate).first()
 
-                await db.prepare(`
-                  UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-                `).bind(level1Reward, level1Referrer.referrer_id).run()
+                if (l1Exists.count === 0) {
+                  const level1Reward = Math.round(qkeyAmount * 0.20)
+                  await db.prepare(`
+                    UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+                  `).bind(level1Reward, level1Referrer.referrer_id).run()
 
-                await db.prepare(`
-                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                  VALUES (?, ?, 1, ?, ?, ?, ?)
-                `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today).run()
+                  await db.prepare(`
+                    INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                    VALUES (?, ?, 1, ?, ?, ?, ?)
+                  `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today).run()
 
-                await db.prepare(`
-                  INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                  VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${today})`).run()
+                  await db.prepare(`
+                    INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                    VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                  `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${today})`).run()
+                }
 
-                // 2대 매칭추천수당 (10%) — 2대 추천인 본인 스테이킹 활성 체크
+                // 2대 매칭추천수당 (10%)
                 const level2Referrer = await db.prepare(`
                   SELECT referrer_id FROM users WHERE id = ?
                 `).bind(level1Referrer.referrer_id).first()
@@ -3920,48 +3973,57 @@ app.post('/api/rewards/daily', async (c) => {
                   `).bind(level2Referrer.referrer_id, accrualDate, accrualDate).first()
 
                   if (level2Active) {
-                    const level2Reward = Math.round(qkeyAmount * 0.10)
+                    const l2Exists = await db.prepare(`
+                      SELECT COUNT(*) as count FROM referral_rewards
+                      WHERE referrer_id = ? AND referee_id = ? AND level = 2 AND reward_date = ?
+                    `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate).first()
 
-                    await db.prepare(`
-                      UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-                    `).bind(level2Reward, level2Referrer.referrer_id).run()
+                    if (l2Exists.count === 0) {
+                      const level2Reward = Math.round(qkeyAmount * 0.10)
+                      await db.prepare(`
+                        UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+                      `).bind(level2Reward, level2Referrer.referrer_id).run()
 
-                    await db.prepare(`
-                      INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                      VALUES (?, ?, 2, ?, ?, ?, ?)
-                    `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today).run()
+                      await db.prepare(`
+                        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                        VALUES (?, ?, 2, ?, ?, ?, ?)
+                      `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today).run()
 
-                    await db.prepare(`
-                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                    `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${today})`).run()
+                      await db.prepare(`
+                        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                        VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                      `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${today})`).run()
+                    }
                   }
                 }
               }
             }
           } catch (referralError) {
-            console.error(`매칭추천수당 처리 오류 (user ${staking.user_id}):`, referralError)
+            console.error(`매칭추천수당 처리 오류 (user ${staking.user_id}, accrual ${accrualDate}):`, referralError)
           }
+        }
+
+        if (stakingProcessed.length > 0) {
+          processedDates.push({ staking_id: staking.staking_id, dates: stakingProcessed })
         }
       } catch (err) {
         console.error(`보상 지급 오류 (user ${staking.user_id}):`, err)
       }
     }
 
-    let message = `[발생일 ${accrualDate} → 지급일 ${today}] ${rewardedCount} rewarded (${totalQkeyRewarded.toLocaleString()} QKEY)`
+    let message = `[지급일 ${today}] ${rewardedCount} rewarded across ${processedDates.length} stakings (${totalQkeyRewarded.toLocaleString()} QKEY)`
     if (skippedCount > 0) {
       message += ` | ${skippedCount} completed`
     }
 
-    return c.json({ 
-      success: true, 
+    return c.json({
+      success: true,
       message: message,
-      accrualDate,
       paidDate: today,
-      daysBack,
       rewarded: rewardedCount,
       totalQkey: totalQkeyRewarded,
-      skipped: skippedCount
+      skipped: skippedCount,
+      processedDates: processedDates
     })
   } catch (error) {
     console.error('Daily reward error:', error)
