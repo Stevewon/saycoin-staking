@@ -5492,6 +5492,57 @@ app.post('/api/admin/rewards/cleanup-by-reward-date', async (c) => {
   }
 })
 
+// 어드민: referral_rewards 의 paid_date 를 일괄 갱신 (사용자단 화면 동기화용)
+//   - body: { rewardDate: 'YYYY-MM-DD', paidDate?: 'YYYY-MM-DD'(default=오늘 KST), dryRun?: boolean }
+//   - 효과: 해당 reward_date 의 referral_rewards 모든 행에 paid_date 를 지정해 사용자단에서도 정상 표시되도록 함
+//   - transactions/잔액은 이미 발생 시점에 처리되어 있으므로 추가 변동 없음 (중복 지급 방지)
+app.post('/api/admin/rewards/set-referral-paid-date', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { rewardDate, paidDate, dryRun } = body || {}
+    if (!rewardDate) return c.json({ error: 'rewardDate 가 필요합니다 (예: "2026-05-05")' }, 400)
+
+    const finalPaid = paidDate || new Date(Date.now() + 9*60*60*1000).toISOString().slice(0,10)
+
+    const before = await db.prepare(
+      `SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date, created_at
+       FROM referral_rewards WHERE reward_date = ? ORDER BY id`
+    ).bind(String(rewardDate)).all()
+    const rows = (before.results || []) as any[]
+    const nullRows = rows.filter((r:any)=> r.paid_date == null || r.paid_date === '')
+
+    if (dryRun) {
+      return c.json({
+        success: true, dryRun: true, rewardDate, paidDate: finalPaid,
+        totalRows: rows.length, nullPaidRows: nullRows.length,
+        targets: nullRows.map((r:any)=>({ id:r.id, referrer:r.referrer_id, referee:r.referee_id, amount:r.reward_amount, paid_date:r.paid_date }))
+      })
+    }
+
+    let updated = 0
+    for (const r of nullRows) {
+      const u = await db.prepare(
+        `UPDATE referral_rewards SET paid_date = ? WHERE id = ? AND (paid_date IS NULL OR paid_date = '')`
+      ).bind(finalPaid, r.id).run()
+      updated += (u.meta?.changes || 0)
+    }
+
+    const after = await db.prepare(
+      `SELECT id, referrer_id, referee_id, reward_amount, reward_date, paid_date FROM referral_rewards WHERE reward_date = ? ORDER BY id`
+    ).bind(String(rewardDate)).all()
+
+    return c.json({
+      success: true, dryRun: false, rewardDate, paidDate: finalPaid,
+      totalRows: rows.length, nullBefore: nullRows.length, updatedCount: updated,
+      after: after.results || []
+    })
+  } catch (error) {
+    console.error('set-referral-paid-date error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액 vs 거래내역 전체 합계 정합성 진단
 //   - users.qkey_balance vs SUM(transactions.amount WHERE coin_type='QKEY') 비교
 //   - 차이가 있는 사용자 모두 반환 (사용자단/어드민단 일치 여부 확인용)
