@@ -2800,6 +2800,22 @@ app.get('/api/admin/user/:userId', async (c) => {
       SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50
     `).bind(userId).all()
 
+    // 직판수당(매출수당) 내역 — referrer_id 기준으로 본인이 받은 referral_rewards 표시
+    let referralRewards: any[] = []
+    try {
+      const rr = await db.prepare(`
+        SELECT r.id, r.referrer_id, r.referee_id, r.level, r.reward_amount,
+               r.reward_date, r.paid_date, r.created_at,
+               u.email as referee_email, u.name as referee_name
+        FROM referral_rewards r
+        LEFT JOIN users u ON r.referee_id = u.id
+        WHERE r.referrer_id = ?
+        ORDER BY r.created_at DESC
+        LIMIT 100
+      `).bind(userId).all()
+      referralRewards = (rr.results || []) as any[]
+    } catch(e) { /* 테이블 없으면 무시 */ }
+
     // 추천인 정보
     let referrer = null
     if (user.referrer_id) {
@@ -2818,6 +2834,7 @@ app.get('/api/admin/user/:userId', async (c) => {
       user,
       stakings: stakings.results,
       rewards: rewards.results,
+      referral_rewards: referralRewards,
       withdrawals: withdrawals.results,
       transactions: transactions.results,
       referrer,
