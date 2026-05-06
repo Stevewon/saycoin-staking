@@ -5674,6 +5674,159 @@ app.post('/api/admin/rewards/set-daily-paid-date', async (c) => {
   }
 })
 
+// ★★ 어드민 통합 수동 보정 엔드포인트 (2026-05-06 신설) ★★
+// 사용처: 평일 KST 07:00 자동 cron 후 사장님이 임의 수정 필요 시 사용
+//
+// action 종류:
+//  1) "update_amount"  — 특정 daily_rewards 또는 referral_rewards 행의 금액 수정 (잔액 자동 동기화)
+//     body: { action:"update_amount", table:"daily_rewards"|"referral_rewards", id:N, newAmount:N, reason:"..." }
+//
+//  2) "delete_reward"  — 특정 reward 행 삭제 + 잔액 차감 + 매칭 transaction 삭제
+//     body: { action:"delete_reward", table:"daily_rewards"|"referral_rewards", id:N, reason:"..." }
+//
+//  3) "manual_insert"  — 누락된 reward 수동 발행 (본인 daily 또는 매칭 L1/L2)
+//     body: { action:"manual_insert", type:"daily"|"l1"|"l2",
+//             userId:N, stakingId:N, refereeId:N(매칭일때),
+//             amount:N, rewardDate:"YYYY-MM-DD", paidDate:"YYYY-MM-DD", reason:"..." }
+//
+// 모든 action 은 dryRun 지원 (기본 false). 실행 시 transactions 테이블도 자동 동기화.
+app.post('/api/admin/rewards/manual-adjust', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { action, dryRun = false, reason = '' } = body || {}
+    if (!action) return c.json({ error: 'action 이 필요합니다 (update_amount | delete_reward | manual_insert)' }, 400)
+
+    const today = new Date(Date.now() + 9*60*60*1000).toISOString().slice(0,10)
+
+    // === ACTION 1: update_amount ===
+    if (action === 'update_amount') {
+      const { table, id, newAmount } = body
+      if (!table || !id || newAmount == null) return c.json({ error: 'table, id, newAmount 필요' }, 400)
+      if (!['daily_rewards','referral_rewards'].includes(table)) return c.json({ error: 'table 은 daily_rewards 또는 referral_rewards' }, 400)
+
+      const amountCol = table === 'daily_rewards' ? 'usdt_amount' : 'reward_amount'
+      const userCol = table === 'daily_rewards' ? 'user_id' : 'referrer_id'
+      const before = await db.prepare(
+        `SELECT * FROM ${table} WHERE id = ?`
+      ).bind(id).first()
+      if (!before) return c.json({ error: `${table}#${id} not found` }, 404)
+
+      const oldAmount = (before as any)[amountCol] || 0
+      const userId = (before as any)[userCol]
+      const diff = newAmount - oldAmount
+
+      if (dryRun) {
+        return c.json({ success: true, dryRun: true, action, table, id, oldAmount, newAmount, diff, userId, reason })
+      }
+
+      // reward 행 금액 수정
+      await db.prepare(`UPDATE ${table} SET ${amountCol} = ? WHERE id = ?`).bind(newAmount, id).run()
+      // 사용자 잔액 보정
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(diff, userId).run()
+      // 보정 transaction 삽입 (감사 추적)
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'admin_adjust', 'QKEY', ?, ?)
+      `).bind(userId, diff, `Admin reward adjust ${table}#${id}: ${oldAmount} -> ${newAmount} (diff ${diff>=0?'+':''}${diff}) reason=${reason}`).run()
+
+      return c.json({ success: true, action, table, id, oldAmount, newAmount, diff, userId, reason })
+    }
+
+    // === ACTION 2: delete_reward ===
+    if (action === 'delete_reward') {
+      const { table, id } = body
+      if (!table || !id) return c.json({ error: 'table, id 필요' }, 400)
+      if (!['daily_rewards','referral_rewards'].includes(table)) return c.json({ error: 'table 잘못됨' }, 400)
+
+      const amountCol = table === 'daily_rewards' ? 'usdt_amount' : 'reward_amount'
+      const userCol = table === 'daily_rewards' ? 'user_id' : 'referrer_id'
+      const row = await db.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first()
+      if (!row) return c.json({ error: `${table}#${id} not found` }, 404)
+      const amount = (row as any)[amountCol] || 0
+      const userId = (row as any)[userCol]
+
+      if (dryRun) {
+        return c.json({ success: true, dryRun: true, action, table, id, amount, userId, reason })
+      }
+
+      await db.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id).run()
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, userId).run()
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'admin_adjust', 'QKEY', ?, ?)
+      `).bind(userId, -amount, `Admin reward delete ${table}#${id}: -${amount} QKEY reason=${reason}`).run()
+
+      return c.json({ success: true, action, table, id, deletedAmount: amount, userId, reason })
+    }
+
+    // === ACTION 3: manual_insert ===
+    if (action === 'manual_insert') {
+      const { type, userId, stakingId, refereeId, amount, rewardDate, paidDate } = body
+      if (!type || !userId || amount == null || !rewardDate) {
+        return c.json({ error: 'type(daily|l1|l2), userId, amount, rewardDate 필요' }, 400)
+      }
+      const finalPaid = paidDate || today
+
+      if (dryRun) {
+        return c.json({ success: true, dryRun: true, action, type, userId, stakingId, refereeId, amount, rewardDate, paidDate: finalPaid, reason })
+      }
+
+      let insertedId: any = null
+
+      if (type === 'daily') {
+        if (!stakingId) return c.json({ error: 'daily 는 stakingId 필요' }, 400)
+        // 중복 체크
+        const dup = await db.prepare(
+          `SELECT id FROM daily_rewards WHERE user_id = ? AND staking_id = ? AND reward_date = ?`
+        ).bind(userId, stakingId, rewardDate).first()
+        if (dup) return c.json({ error: `daily_rewards already exists (id=${(dup as any).id})` }, 409)
+
+        const r = await db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(userId, stakingId, amount, rewardDate, finalPaid).run()
+        insertedId = r.meta?.last_row_id
+
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(amount, userId).run()
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+        `).bind(userId, amount, `Daily reward ${amount.toLocaleString()} QKEY (manual insert by admin, accrued ${rewardDate} paid ${finalPaid}) reason=${reason}`).run()
+
+      } else if (type === 'l1' || type === 'l2') {
+        if (!refereeId) return c.json({ error: 'l1/l2 는 refereeId 필요' }, 400)
+        const level = type === 'l1' ? 1 : 2
+        const dup = await db.prepare(
+          `SELECT id FROM referral_rewards WHERE referrer_id = ? AND referee_id = ? AND level = ? AND reward_date = ?`
+        ).bind(userId, refereeId, level, rewardDate).first()
+        if (dup) return c.json({ error: `referral_rewards already exists (id=${(dup as any).id})` }, 409)
+
+        const r = await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, 0, ?, ?, ?)
+        `).bind(userId, refereeId, level, amount, rewardDate, finalPaid).run()
+        insertedId = r.meta?.last_row_id
+
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(amount, userId).run()
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+        `).bind(userId, amount, `Level ${level} referral bonus ${amount.toLocaleString()} QKEY (manual insert by admin, accrued ${rewardDate} paid ${finalPaid}) reason=${reason}`).run()
+      } else {
+        return c.json({ error: 'type 은 daily|l1|l2' }, 400)
+      }
+
+      return c.json({ success: true, action, type, insertedId, userId, stakingId, refereeId, amount, rewardDate, paidDate: finalPaid, reason })
+    }
+
+    return c.json({ error: 'unknown action' }, 400)
+  } catch (error) {
+    console.error('manual-adjust error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민: 사용자별 잔액 vs 거래내역 전체 합계 정합성 진단
 //   - users.qkey_balance vs SUM(transactions.amount WHERE coin_type='QKEY') 비교
 //   - 차이가 있는 사용자 모두 반환 (사용자단/어드민단 일치 여부 확인용)
