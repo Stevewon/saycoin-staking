@@ -5078,13 +5078,17 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
   try {
     const db = c.env.DB
     const body = await c.req.json().catch(() => ({}))
-    const { userId, amount, description, mode } = body || {}
+    const { userId, amount, description, mode, reason } = body || {}
     if (!userId || amount === undefined || amount === null) {
       return c.json({ error: 'userId, amount 가 필요합니다' }, 400)
     }
+    // ★ 사장님 룰 (2026-05-06 확정): 어드민 잔액 수정 시 사유(reason) 필수
+    const reasonRaw = String(reason || description || '').trim()
+    if (!reasonRaw || reasonRaw === '관리자 보정') {
+      return c.json({ error: '수정 사유(reason)를 구체적으로 입력해주세요. 사유 없이는 잔액을 변경할 수 없습니다.' }, 400)
+    }
     const uid = Number(userId)
-    const desc = String(description || '관리자 보정')
-    const cur = await db.prepare(`SELECT id, email, qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+    const cur = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(uid).first()
     if (!cur) return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
     const curBal = Number((cur as any).qkey_balance) || 0
     let delta = 0
@@ -5097,21 +5101,31 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
       return c.json({ success: true, message: '변경 사항 없음', currentBalance: curBal })
     }
     const newBal = curBal + delta
-    // 1) admin_adjustment 거래 기록
+    // 풍부한 description 생성 (사용자/어드민 양측에 명확히 표시)
+    //   형식: [어드민 수정] ▲증액 +500 QKEY (이전 2,000 → 이후 2,500) | 사유: <reason>
+    //   또는: [어드민 수정] ▼차감 -300 QKEY (이전 2,000 → 이후 1,700) | 사유: <reason>
+    const fmt = (n: number) => Math.round(n).toLocaleString('ko-KR')
+    const arrow = delta >= 0 ? '▲증액' : '▼차감'
+    const sign = delta >= 0 ? '+' : ''
+    const richDesc = `[어드민 수정] ${arrow} ${sign}${fmt(delta)} QKEY (이전 ${fmt(curBal)} → 이후 ${fmt(newBal)}) | 사유: ${reasonRaw}`
+    // 1) admin_adjustment 거래 기록 (description 에 사유+변동량 모두 포함)
     const ins = await db.prepare(
       `INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'admin_adjustment', 'QKEY', ?, ?)`
-    ).bind(uid, delta, desc).run()
-    // 2) qkey_balance 업데이트
+    ).bind(uid, delta, richDesc).run()
+    // 2) qkey_balance 업데이트 (기존 로직 유지 — 신규 set/update 코드 추가 없음)
     await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(newBal, uid).run()
     return c.json({
       success: true,
       userId: uid,
       email: (cur as any).email,
+      name: (cur as any).name,
       previousBalance: curBal,
       newBalance: newBal,
       delta,
+      direction: delta >= 0 ? 'increase' : 'decrease',
       txId: ins.meta?.last_row_id,
-      description: desc
+      reason: reasonRaw,
+      description: richDesc
     })
   } catch (error) {
     console.error('adjust-balance error:', error)
@@ -6173,8 +6187,9 @@ app.get('/api/referral-rewards/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
-    // 전체 보상 내역 (배당금 + 직접판매 + 매칭추천수당 + 회수/복구 포함, 누적)
-    // ★ rollback/restore 타입도 포함시켜 사용자 화면이 어드민과 일치하도록 함
+    // 전체 보상 내역 (배당금 + 직접판매 + 매칭추천수당 + 회수/복구 + 어드민 보정 포함, 누적)
+    // ★ rollback/restore/admin_adjustment 타입도 포함시켜 사용자 화면이 어드민과 일치하도록 함
+    // ★ 사장님 룰 (2026-05-06): 어드민 잔액 수정 내역(admin_adjustment) 도 사용자측에 명시 노출
     const rewards = await db.prepare(`
       SELECT 
         t.id,
@@ -6192,10 +6207,12 @@ app.get('/api/referral-rewards/:userId', async (c) => {
           WHEN t.type = 'daily_reward_rollback' THEN 'daily_reward_rollback'
           WHEN t.type = 'referral_reward_rollback' THEN 'referral_reward_rollback'
           WHEN t.type = 'rollback_restore' THEN 'rollback_restore'
+          WHEN t.type = 'admin_adjustment' AND t.amount >= 0 THEN 'admin_adjustment_increase'
+          WHEN t.type = 'admin_adjustment' AND t.amount < 0 THEN 'admin_adjustment_decrease'
           ELSE t.type
         END as reward_category
       FROM transactions t
-      WHERE t.user_id = ? AND t.type IN ('daily_qkey', 'direct_referral', 'referral_reward', 'daily_reward_rollback', 'referral_reward_rollback', 'rollback_restore')
+      WHERE t.user_id = ? AND t.type IN ('daily_qkey', 'direct_referral', 'referral_reward', 'daily_reward_rollback', 'referral_reward_rollback', 'rollback_restore', 'admin_adjustment')
       ORDER BY t.created_at DESC
       LIMIT 300
     `).bind(userId).all()
@@ -10078,6 +10095,19 @@ app.get('/dashboard', (c) => {
                                     badgeText = '회수 복구';
                                     amountColor = 'text-teal-600';
                                     amountPrefix = '+';
+                                } else if (reward.type === 'admin_adjustment') {
+                                    // ★ 어드민 잔액 보정 내역 (description 에 사유+변동량 포함)
+                                    if (amt >= 0) {
+                                        badgeClass = 'bg-emerald-100 text-emerald-700 border border-emerald-300';
+                                        badgeText = '▲ 어드민 증액';
+                                        amountColor = 'text-emerald-700 font-extrabold';
+                                        amountPrefix = '+';
+                                    } else {
+                                        badgeClass = 'bg-rose-100 text-rose-700 border border-rose-300';
+                                        badgeText = '▼ 어드민 차감';
+                                        amountColor = 'text-rose-700 font-extrabold';
+                                        amountPrefix = '';
+                                    }
                                 }
                                 
                                 var displayAmt = amt < 0 ? Math.round(amt).toLocaleString() : (amountPrefix + Math.round(amt).toLocaleString());
@@ -10627,13 +10657,19 @@ app.get('/admin/dashboard', (c) => {
                                 <p class="text-xs text-gray-500 mt-1">delta 모드: 양수=가산, 음수=차감 / set 모드: 새 잔액 값</p>
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">사유 (description)</label>
-                                <input type="text" id="adjDescription" value="관리자 보정"
-                                    class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-transparent" />
+                                <label class="block text-sm font-medium text-gray-700 mb-1">
+                                    수정 사유 <span class="text-red-500 font-bold">*</span> 
+                                    <span class="text-xs text-gray-500 font-normal">(필수 — 사용자측 보상 내역에 노출됨)</span>
+                                </label>
+                                <textarea id="adjDescription" rows="2"
+                                    placeholder="예: 5/5 휴일 매출 누락분 수동 입금 / 잘못 입금된 배당 회수 등 — 구체적으로 기재하세요"
+                                    class="w-full px-3 py-2 border-2 border-red-200 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-yellow-500 text-sm resize-none"></textarea>
+                                <p class="text-xs text-red-600 mt-1"><i class="fas fa-exclamation-triangle mr-1"></i>사유는 사용자측 "수당 보상 내역" 화면에 그대로 표시됩니다. 명확한 사유를 입력하세요.</p>
                             </div>
                             <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
                                 <p class="text-xs text-yellow-700 font-bold mb-1"><i class="fas fa-eye mr-1"></i>적용 미리보기</p>
                                 <p class="text-sm text-gray-800" id="adjPreview">금액을 입력하면 미리보기가 표시됩니다</p>
+                                <p class="text-xs text-gray-600 mt-2" id="adjDescPreview"></p>
                             </div>
                             <div class="flex gap-2 pt-2">
                                 <button onclick="closeAdjustBalanceModal()" class="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium">취소</button>
@@ -12057,8 +12093,10 @@ app.get('/admin/dashboard', (c) => {
                 document.getElementById('adjCurrentBalance').textContent = (_adjCtx.currentBalance).toLocaleString() + ' QKEY';
                 document.getElementById('adjMode').value = 'delta';
                 document.getElementById('adjAmount').value = '';
-                document.getElementById('adjDescription').value = '관리자 보정';
+                document.getElementById('adjDescription').value = '';
                 document.getElementById('adjPreview').textContent = '금액을 입력하면 미리보기가 표시됩니다';
+                var dp = document.getElementById('adjDescPreview');
+                if (dp) dp.textContent = '';
                 var m = document.getElementById('adjustBalanceModal');
                 m.classList.remove('hidden');
                 m.classList.add('flex');
@@ -12074,13 +12112,34 @@ app.get('/admin/dashboard', (c) => {
                 var mode = document.getElementById('adjMode').value;
                 var amt = Number(document.getElementById('adjAmount').value);
                 var preview = document.getElementById('adjPreview');
-                if (!amt && amt !== 0) { preview.textContent = '금액을 입력하면 미리보기가 표시됩니다'; return; }
+                var descPreview = document.getElementById('adjDescPreview');
+                if (!amt && amt !== 0) { 
+                    preview.textContent = '금액을 입력하면 미리보기가 표시됩니다'; 
+                    if (descPreview) descPreview.textContent = '';
+                    return; 
+                }
                 var cur = _adjCtx.currentBalance;
                 var newBal, delta;
                 if (mode === 'set') { newBal = amt; delta = amt - cur; }
                 else { newBal = cur + amt; delta = amt; }
                 var sign = delta >= 0 ? '+' : '';
-                preview.innerHTML = '현재 ' + cur.toLocaleString() + ' QKEY → 변경 후 <span class="font-bold text-yellow-700">' + newBal.toLocaleString() + ' QKEY</span> (' + sign + delta.toLocaleString() + ')';
+                var arrow = delta >= 0 ? '▲증액' : '▼차감';
+                var deltaColor = delta >= 0 ? 'text-emerald-700' : 'text-rose-700';
+                var deltaBg = delta >= 0 ? 'bg-emerald-50' : 'bg-rose-50';
+                preview.innerHTML = 
+                    '<div class="' + deltaBg + ' rounded p-2 mb-1">' +
+                    '<span class="font-bold ' + deltaColor + '">' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' QKEY</span>' +
+                    '</div>' +
+                    '이전 ' + cur.toLocaleString() + ' QKEY → 이후 <span class="font-bold text-yellow-700">' + newBal.toLocaleString() + ' QKEY</span>';
+                // 사용자측에 표시될 description 미리보기
+                var reason = (document.getElementById('adjDescription').value || '').trim();
+                if (descPreview) {
+                    if (reason) {
+                        descPreview.innerHTML = '<span class="text-gray-500">사용자 화면 표시:</span> <span class="font-mono text-gray-700">[어드민 수정] ' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' QKEY (이전 ' + cur.toLocaleString() + ' → 이후 ' + newBal.toLocaleString() + ') | 사유: ' + reason + '</span>';
+                    } else {
+                        descPreview.innerHTML = '<span class="text-red-500">⚠️ 사유를 입력하면 사용자측 표시 형식이 미리보기됩니다</span>';
+                    }
+                }
             }
 
             async function submitAdjustBalance() {
@@ -12089,22 +12148,49 @@ app.get('/admin/dashboard', (c) => {
                 if (amtRaw === '' || amtRaw === null) { alert('금액을 입력해주세요'); return; }
                 var amt = Number(amtRaw);
                 if (isNaN(amt)) { alert('유효한 숫자를 입력해주세요'); return; }
-                var desc = (document.getElementById('adjDescription').value || '').trim() || '관리자 보정';
+                var reason = (document.getElementById('adjDescription').value || '').trim();
+                if (!reason || reason === '관리자 보정' || reason.length < 3) {
+                    alert('⚠️ 수정 사유를 구체적으로 입력해주세요 (최소 3자 이상).\\n\\n사유는 사용자측 보상 내역에 그대로 노출됩니다.');
+                    document.getElementById('adjDescription').focus();
+                    return;
+                }
                 var cur = _adjCtx.currentBalance;
                 var newBal = (mode === 'set') ? amt : (cur + amt);
                 var delta = (mode === 'set') ? (amt - cur) : amt;
                 if (Math.abs(delta) < 0.0001) { alert('변경 사항이 없습니다'); return; }
                 var sign = delta >= 0 ? '+' : '';
-                if (!confirm('user #' + _adjCtx.userId + ' (' + _adjCtx.email + ')\\n\\n현재: ' + cur.toLocaleString() + ' QKEY\\n변경 후: ' + newBal.toLocaleString() + ' QKEY (' + sign + delta.toLocaleString() + ')\\n사유: ' + desc + '\\n\\n적용하시겠습니까?')) return;
+                var arrow = delta >= 0 ? '▲증액' : '▼차감';
+                if (!confirm(
+                    '★ QKEY 잔액 수정 확인 ★\\n\\n' +
+                    '회원: #' + _adjCtx.userId + ' ' + _adjCtx.name + ' (' + _adjCtx.email + ')\\n' +
+                    '─────────────────────────\\n' +
+                    arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' QKEY\\n' +
+                    '이전 잔액: ' + cur.toLocaleString() + ' QKEY\\n' +
+                    '이후 잔액: ' + newBal.toLocaleString() + ' QKEY\\n' +
+                    '─────────────────────────\\n' +
+                    '사유: ' + reason + '\\n\\n' +
+                    '※ 이 내역은 사용자측 "수당 보상 내역" 에 그대로 표시됩니다.\\n\\n' +
+                    '적용하시겠습니까?'
+                )) return;
                 try {
                     var res = await axios.post('/api/admin/users/adjust-balance', {
                         userId: _adjCtx.userId,
                         amount: amt,
-                        description: desc,
+                        reason: reason,
+                        description: reason,
                         mode: mode
                     });
                     if (res.data.success) {
-                        alert('잔액 수정 완료\\n\\n이전: ' + (res.data.previousBalance || 0).toLocaleString() + ' QKEY\\n현재: ' + (res.data.newBalance || 0).toLocaleString() + ' QKEY\\nΔ: ' + ((res.data.delta || 0) >= 0 ? '+' : '') + (res.data.delta || 0).toLocaleString() + ' QKEY\\ntx ID: ' + res.data.txId);
+                        var d = res.data.delta || 0;
+                        var resArrow = d >= 0 ? '▲증액' : '▼차감';
+                        alert(
+                            '✅ 잔액 수정 완료\\n\\n' +
+                            resArrow + ' ' + (d >= 0 ? '+' : '') + Math.abs(d).toLocaleString() + ' QKEY\\n' +
+                            '이전: ' + (res.data.previousBalance || 0).toLocaleString() + ' QKEY\\n' +
+                            '이후: ' + (res.data.newBalance || 0).toLocaleString() + ' QKEY\\n' +
+                            '사유: ' + (res.data.reason || reason) + '\\n' +
+                            'tx ID: ' + res.data.txId
+                        );
                         closeAdjustBalanceModal();
                         loadUsers();
                     } else {
@@ -12114,6 +12200,15 @@ app.get('/admin/dashboard', (c) => {
                     alert('잔액 수정 실패: ' + (err.response?.data?.error || err.message));
                 }
             }
+
+            // 사유 입력 시에도 미리보기 업데이트되도록 이벤트 위임 (DOMContentLoaded 후)
+            document.addEventListener('DOMContentLoaded', function() {
+                var d = document.getElementById('adjDescription');
+                if (d && !d.__bound) {
+                    d.addEventListener('input', updateAdjPreview);
+                    d.__bound = true;
+                }
+            });
 
             // 사용자 강제 탈퇴
             async function deleteUser(userId, userName, userEmail, stakingAmount) {
