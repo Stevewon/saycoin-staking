@@ -2048,9 +2048,10 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
             VALUES (?, 'direct_referral', 'QKEY', ?, ?)
           `).bind(referrer.referrer_id, directBonusQkey, `Direct referral bonus ($${staking.amount.toLocaleString()} x 10% = ${directBonusQkey.toLocaleString()} QKEY)`).run()
 
+          // 직접판매수당은 매출 발생 즉시 지급(공휴일 무관) → reward_date / paid_date 모두 오늘 KST
           await db.prepare(`
-            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date)
-            VALUES (?, ?, 0, ?, ?, date('now'))
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+            VALUES (?, ?, 0, ?, ?, date('now', '+9 hours'), date('now', '+9 hours'))
           `).bind(referrer.referrer_id, staking.user_id, staking.amount, directBonusQkey).run()
         } else {
           console.log(`[직접추천수당 스킵] 추천인 #${referrer.referrer_id} 본인 스테이킹 미완료 (referee #${staking.user_id})`)
