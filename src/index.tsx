@@ -10111,14 +10111,44 @@ app.get('/dashboard', (c) => {
                                 }
                                 
                                 var displayAmt = amt < 0 ? Math.round(amt).toLocaleString() : (amountPrefix + Math.round(amt).toLocaleString());
+
+                                // ★ 어드민 보정(admin_adjustment) 행은 description 을 풀 노출 + 사유/변동량/이전·이후 잔액 강조
+                                var detailsHtml = '';
+                                if (reward.type === 'admin_adjustment') {
+                                    var rawDesc = String(reward.description || '');
+                                    // description 포맷: "[어드민 수정] ▲증액 +500 QKEY (이전 2,000 → 이후 2,500) | 사유: <reason>"
+                                    var deltaMatch = rawDesc.match(/(▲증액|▼차감)\s*([+\-]?[\d,\.]+)\s*QKEY/);
+                                    var prevAfterMatch = rawDesc.match(/이전\s*([\d,\.\-]+)\s*[→→]\s*이후\s*([\d,\.\-]+)/);
+                                    var reasonMatch = rawDesc.match(/사유\s*[:：]\s*(.+?)\s*$/);
+                                    var deltaTxt = deltaMatch ? (deltaMatch[1] + ' ' + deltaMatch[2] + ' QKEY') : '';
+                                    var prevTxt = prevAfterMatch ? prevAfterMatch[1] : '';
+                                    var afterTxt = prevAfterMatch ? prevAfterMatch[2] : '';
+                                    var reasonTxt = reasonMatch ? reasonMatch[1] : '';
+                                    var deltaColor = amt >= 0 ? 'text-emerald-700' : 'text-rose-700';
+                                    detailsHtml =
+                                        '<div class="space-y-1">' +
+                                            (deltaTxt ? '<div class="text-xs font-extrabold ' + deltaColor + '">변동: ' + deltaTxt + '</div>' : '') +
+                                            (prevTxt && afterTxt ? '<div class="text-[11px] text-gray-700">이전 <span class="font-semibold">' + prevTxt + '</span> → 이후 <span class="font-semibold">' + afterTxt + '</span></div>' : '') +
+                                            (reasonTxt ? '<div class="text-[11px] text-gray-800 bg-yellow-50 border border-yellow-200 rounded px-1.5 py-0.5 break-words"><span class="font-semibold">사유:</span> ' + reasonTxt + '</div>' : '') +
+                                            (!deltaTxt && !reasonTxt ? '<div class="text-xs text-gray-700 break-words">' + rawDesc + '</div>' : '') +
+                                        '</div>';
+                                } else {
+                                    detailsHtml = '<div class="text-xs text-gray-700 break-words" title="' + (reward.description || '') + '">' + (reward.description || '-') + '</div>';
+                                }
+
+                                // 어드민 보정은 내용 칸 잘림 금지(전체 노출). 그 외는 모바일 가독성 유지.
+                                var detailsTdClass = (reward.type === 'admin_adjustment')
+                                    ? 'px-2 sm:px-4 py-2 text-xs text-gray-700 align-top min-w-[180px] max-w-[260px] whitespace-normal break-words'
+                                    : 'px-2 sm:px-4 py-2 text-xs text-gray-700 align-top max-w-[180px] whitespace-normal break-words';
+
                                 return '<tr class="hover:bg-gray-50">' +
-                                    '<td class="px-2 sm:px-4 py-2 text-xs text-gray-600 whitespace-nowrap">' + 
+                                    '<td class="px-2 sm:px-4 py-2 text-xs text-gray-600 whitespace-nowrap align-top">' +
                                         new Date(reward.created_at).toLocaleDateString('ko-KR', { month: '2-digit', day: '2-digit' }) +
                                         ' ' + new Date(reward.created_at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) +
                                     '</td>' +
-                                    '<td class="px-2 sm:px-4 py-2"><span class="px-2 py-0.5 ' + badgeClass + ' rounded text-xs font-medium whitespace-nowrap">' + badgeText + '</span></td>' +
-                                    '<td class="px-2 sm:px-4 py-2 text-xs text-gray-700 truncate max-w-[120px]" title="' + (reward.description || '') + '">' + (reward.description || '-') + '</td>' +
-                                    '<td class="px-2 sm:px-4 py-2 text-right text-xs font-bold ' + amountColor + ' whitespace-nowrap">' + 
+                                    '<td class="px-2 sm:px-4 py-2 align-top"><span class="inline-block px-2 py-0.5 ' + badgeClass + ' rounded text-xs font-medium whitespace-nowrap">' + badgeText + '</span></td>' +
+                                    '<td class="' + detailsTdClass + '">' + detailsHtml + '</td>' +
+                                    '<td class="px-2 sm:px-4 py-2 text-right text-xs font-bold ' + amountColor + ' whitespace-nowrap align-top">' +
                                         displayAmt + ' QKEY' +
                                     '</td>' +
                                 '</tr>';
