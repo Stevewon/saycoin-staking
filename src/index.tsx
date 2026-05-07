@@ -7425,6 +7425,11 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
     const rrDelete = Array.isArray(body.rr_delete) ? body.rr_delete : []
     const txDelete = Array.isArray(body.tx_delete) ? body.tx_delete : []
     const drDelete = Array.isArray(body.dr_delete) ? body.dr_delete : []
+    // direct_inserts: [{user_id, referee_id, stake_id, amount, kst_date, description}]
+    //   - transactions(type=direct_referral) INSERT + qkey_balance += amount
+    //   - 정책: 직접판매수당 = 하부 스테이크 원금 × 10% × 150 (USDT→QKEY 환산)
+    //   - 중복 가드: 동일 (user_id + referee_id + stake_id) direct_referral 이미 존재 시 skip
+    const directInserts = Array.isArray(body.direct_inserts) ? body.direct_inserts : []
     const reason = String(body.reason || 'rollback-and-update-inplace-2026-05-07')
 
     // === 검증 (dryRun 계획 수립) ===
@@ -7475,6 +7480,9 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
     const drDeleteTotal = drDelete.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
     const totalDeleteAmount = rrDeleteTotal + txDeleteTotal + drDeleteTotal
 
+    // 직접판매수당 INSERT 계획 합계
+    const directInsertTotal = directInserts.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
+
     if (dryRun) {
       return c.json({
         success: true, dryRun: true,
@@ -7487,8 +7495,10 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
         plan_tx_updates, plan_tx_inserts,
         plan_rr_updates, plan_rr_inserts,
         plan_dr_updates, plan_dr_inserts,
+        plan_direct_inserts: directInserts.length,
+        plan_direct_inserts_total: directInsertTotal,
         plan_balance_delta_from_updates: plan_balance_delta,
-        net_balance_change: plan_balance_delta - rollbackTotal - totalDeleteAmount,
+        net_balance_change: plan_balance_delta - rollbackTotal - totalDeleteAmount + directInsertTotal,
         entries: planEntries
       })
     }
@@ -7577,6 +7587,41 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
       }
       await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, userId).run()
       totalDrDeletedAmount += amount
+    }
+
+    // === STEP A5: 직접판매수당 INSERT (transactions(type=direct_referral) + qkey_balance +amount) ===
+    //   - 정책: 하부 스테이크 원금 × 10% × 150 (USDT→QKEY 환산)
+    //   - 원래 자리(스테이크 KST 일자)에 created_at 으로 박힘
+    //   - 중복 가드: 동일 (user_id + amount + description) direct_referral 행 존재 시 skip
+    let directInserted = 0
+    let totalDirectInsertedAmount = 0
+    const directInsertResults: any[] = []
+    for (const r of directInserts) {
+      const userId = Number(r.user_id)
+      const refereeId = Number(r.referee_id || 0)
+      const stakeId = Number(r.stake_id || 0)
+      const amount = Number(r.amount || 0)
+      const kstD = String(r.kst_date || kstDate)
+      const desc = String(r.description || `Direct sales bonus (referee=${refereeId} stake=${stakeId} x 10%, paid ${kstD})`)
+      if (!Number.isFinite(userId) || !Number.isFinite(amount) || amount <= 0) {
+        directInsertResults.push({ user_id: userId, referee_id: refereeId, stake_id: stakeId, status: 'skip-invalid' })
+        continue
+      }
+      // 중복 가드: 동일 user_id + amount + description (stake_id 식별자 기반)
+      const existsTx = await db.prepare(`SELECT id FROM transactions WHERE user_id = ? AND type = 'direct_referral' AND amount = ? AND description = ? LIMIT 1`).bind(userId, amount, desc).first() as any
+      if (existsTx) {
+        directInsertResults.push({ user_id: userId, referee_id: refereeId, stake_id: stakeId, status: 'skip-duplicate', existing_tx_id: existsTx.id })
+        continue
+      }
+      // KST 일자(YYYY-MM-DD) → UTC created_at (KST 12:00 = UTC 03:00 → 시각은 정오 기준으로 박음)
+      // 단, KST 12:00 = UTC 03:00 (KST = UTC+9) 이므로 created_at = `${kstD} 03:00:00`
+      const createdAt = `${kstD} 03:00:00`
+      const insertRes = await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, created_at) VALUES (?, 'direct_referral', 'QKEY', ?, ?, ?)`).bind(userId, amount, desc, createdAt).run()
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(amount, userId).run()
+      directInserted += 1
+      totalDirectInsertedAmount += amount
+      const newTxId = (insertRes as any)?.meta?.last_row_id || null
+      directInsertResults.push({ user_id: userId, referee_id: refereeId, stake_id: stakeId, amount, kst_date: kstD, tx_id: newTxId, status: 'inserted' })
     }
 
     // === STEP B: IN-PLACE UPDATE (기존 행 amount → 정책 정확값) ===
@@ -7725,9 +7770,10 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
       stepA2_rr_delete: { rr_deleted: rrDeleted, matched_tx_deleted: rrDelTxDeleted, balance_revert: -totalRrDeletedAmount },
       stepA3_tx_delete: { tx_deleted: txDeleted, balance_revert: -totalTxDeletedAmount },
       stepA4_dr_delete: { dr_deleted: drDeleted, matched_tx_deleted: drDelTxDeleted, balance_revert: -totalDrDeletedAmount },
+      stepA5_direct_inserts: { direct_inserted: directInserted, balance_added: totalDirectInsertedAmount, results: directInsertResults },
       stepB: { tx_updated: txUpdated, rr_updated: rrUpdated, dr_updated: drUpdated, tx_inserted: txInserted, rr_inserted: rrInserted, dr_inserted: drInserted },
       stepC: { total_balance_delta: totalBalanceDelta },
-      net_balance_change: totalBalanceDelta - revertedBalance - totalRrDeletedAmount - totalTxDeletedAmount - totalDrDeletedAmount,
+      net_balance_change: totalBalanceDelta - revertedBalance - totalRrDeletedAmount - totalTxDeletedAmount - totalDrDeletedAmount + totalDirectInsertedAmount,
       results: updResults
     })
   } catch (error) {
