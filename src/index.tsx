@@ -3944,10 +3944,20 @@ app.post('/api/rewards/daily', async (c) => {
           `).bind(qkeyAmount, staking.user_id).run()
 
           const newCount = currentRewardedCount + 1
-          await db.prepare(`
-            INSERT INTO transactions (user_id, type, coin_type, amount, description)
-            VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-          `).bind(staking.user_id, qkeyAmount, `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, accrued ${accrualDate} paid ${today})`).run()
+          // EXISTS 가드 — (user, type='daily_qkey', amount, KST date) 중복 INSERT 차단
+          const dqExists2 = await db.prepare(`
+            SELECT id FROM transactions
+            WHERE user_id = ? AND type = 'daily_qkey' AND coin_type = 'QKEY'
+              AND amount = ?
+              AND date(created_at, '+9 hours') = ?
+            LIMIT 1
+          `).bind(staking.user_id, qkeyAmount, today).first()
+          if (!dqExists2) {
+            await db.prepare(`
+              INSERT INTO transactions (user_id, type, coin_type, amount, description)
+              VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+            `).bind(staking.user_id, qkeyAmount, `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, accrued ${accrualDate} paid ${today})`).run()
+          }
 
           rewardedCount++
           totalQkeyRewarded += qkeyAmount
@@ -3987,10 +3997,20 @@ app.post('/api/rewards/daily', async (c) => {
                     VALUES (?, ?, 1, ?, ?, ?, ?)
                   `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today).run()
 
-                  await db.prepare(`
-                    INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                    VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                  `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${today})`).run()
+                  // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                  const l1TxExists2 = await db.prepare(`
+                    SELECT id FROM transactions
+                    WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                      AND amount = ?
+                      AND date(created_at, '+9 hours') = ?
+                    LIMIT 1
+                  `).bind(level1Referrer.referrer_id, level1Reward, today).first()
+                  if (!l1TxExists2) {
+                    await db.prepare(`
+                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                    `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${today})`).run()
+                  }
                 }
 
                 // 2대 매칭추천수당 (10%)
@@ -4025,10 +4045,20 @@ app.post('/api/rewards/daily', async (c) => {
                         VALUES (?, ?, 2, ?, ?, ?, ?)
                       `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today).run()
 
-                      await db.prepare(`
-                        INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                        VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                      `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${today})`).run()
+                      // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                      const l2TxExists2 = await db.prepare(`
+                        SELECT id FROM transactions
+                        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                          AND amount = ?
+                          AND date(created_at, '+9 hours') = ?
+                        LIMIT 1
+                      `).bind(level2Referrer.referrer_id, level2Reward, today).first()
+                      if (!l2TxExists2) {
+                        await db.prepare(`
+                          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                          VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                        `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${today})`).run()
+                      }
                     }
                   }
                 }
@@ -4314,13 +4344,22 @@ app.post('/api/admin/rewards/check-missing-by-kst', async (c) => {
       await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
         .bind(qkeyAmount, s.user_id).run()
 
-      // 3) 거래내역 기록
+      // 3) 거래내역 기록 — EXISTS 가드 (user_id, type='daily_qkey', amount, KST date) 중복 INSERT 차단
       const newCount = Number(s.total_paid_count) + 1
-      await db.prepare(`
-        INSERT INTO transactions (user_id, type, coin_type, amount, description)
-        VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-      `).bind(s.user_id, qkeyAmount,
-        `[KST 24h 보충] Daily ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+      const dqExists = await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = 'daily_qkey' AND coin_type = 'QKEY'
+          AND amount = ?
+          AND date(created_at, '+9 hours') = ?
+        LIMIT 1
+      `).bind(s.user_id, qkeyAmount, paidDate).first()
+      if (!dqExists) {
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+        `).bind(s.user_id, qkeyAmount,
+          `[KST 24h 보충] Daily ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+      }
 
       inserted++
       totalQkey += qkeyAmount
@@ -4349,11 +4388,21 @@ app.post('/api/admin/rewards/check-missing-by-kst', async (c) => {
                 INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
                 VALUES (?, ?, 1, ?, ?, ?, ?)
               `).bind(lvl1.referrer_id, s.user_id, qkeyAmount, l1Reward, targetDate, paidDate).run()
-              await db.prepare(`
-                INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-              `).bind(lvl1.referrer_id, l1Reward,
-                `[KST 24h 보충] Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+              // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+              const l1TxExists = await db.prepare(`
+                SELECT id FROM transactions
+                WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                  AND amount = ?
+                  AND date(created_at, '+9 hours') = ?
+                LIMIT 1
+              `).bind(lvl1.referrer_id, l1Reward, paidDate).first()
+              if (!l1TxExists) {
+                await db.prepare(`
+                  INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                  VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                `).bind(lvl1.referrer_id, l1Reward,
+                  `[KST 24h 보충] Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+              }
 
               // 5) L2 매칭 (10%)
               const lvl2 = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(lvl1.referrer_id).first() as any
@@ -4377,11 +4426,21 @@ app.post('/api/admin/rewards/check-missing-by-kst', async (c) => {
                       INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
                       VALUES (?, ?, 2, ?, ?, ?, ?)
                     `).bind(lvl2.referrer_id, s.user_id, qkeyAmount, l2Reward, targetDate, paidDate).run()
-                    await db.prepare(`
-                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                    `).bind(lvl2.referrer_id, l2Reward,
-                      `[KST 24h 보충] Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+                    // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                    const l2TxExists = await db.prepare(`
+                      SELECT id FROM transactions
+                      WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                        AND amount = ?
+                        AND date(created_at, '+9 hours') = ?
+                      LIMIT 1
+                    `).bind(lvl2.referrer_id, l2Reward, paidDate).first()
+                    if (!l2TxExists) {
+                      await db.prepare(`
+                        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                        VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                      `).bind(lvl2.referrer_id, l2Reward,
+                        `[KST 24h 보충] Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+                    }
                   }
                 }
               }
@@ -5769,14 +5828,23 @@ app.post('/api/admin/rewards/recalc-by-kst-date', async (c) => {
         await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
           .bind(qkeyAmount, s.user_id).run()
 
-        // transactions 기록
+        // transactions 기록 — EXISTS 가드 (user, type='daily_qkey', amount, KST date) 중복 INSERT 차단
         const newCount = (s.rewarded_count as number) + 1
-        await db.prepare(`
-          INSERT INTO transactions (user_id, type, coin_type, amount, description)
-          VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-        `).bind(s.user_id, qkeyAmount,
-          `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
-        ).run()
+        const dqExists3 = await db.prepare(`
+          SELECT id FROM transactions
+          WHERE user_id = ? AND type = 'daily_qkey' AND coin_type = 'QKEY'
+            AND amount = ?
+            AND date(created_at, '+9 hours') = ?
+          LIMIT 1
+        `).bind(s.user_id, qkeyAmount, paidDate).first()
+        if (!dqExists3) {
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+          `).bind(s.user_id, qkeyAmount,
+            `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
+          ).run()
+        }
       }
 
       // 매칭수당 (L1 20%, L2 10%) — 추천인이 accrualDate 시점 active 일 때만
@@ -5809,12 +5877,22 @@ app.post('/api/admin/rewards/recalc-by-kst-date', async (c) => {
                   INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
                   VALUES (?, ?, 1, ?, ?, ?, ?)
                 `).bind(l1ref.referrer_id, s.user_id, qkeyAmount, l1Reward, accrualDate, paidDate).run()
-                await db.prepare(`
-                  INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                  VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                `).bind(l1ref.referrer_id, l1Reward,
-                  `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
-                ).run()
+                // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                const l1TxExists3 = await db.prepare(`
+                  SELECT id FROM transactions
+                  WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                    AND amount = ?
+                    AND date(created_at, '+9 hours') = ?
+                  LIMIT 1
+                `).bind(l1ref.referrer_id, l1Reward, paidDate).first()
+                if (!l1TxExists3) {
+                  await db.prepare(`
+                    INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                    VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                  `).bind(l1ref.referrer_id, l1Reward,
+                    `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
+                  ).run()
+                }
               }
             }
             // L2
@@ -5845,12 +5923,22 @@ app.post('/api/admin/rewards/recalc-by-kst-date', async (c) => {
                       INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
                       VALUES (?, ?, 2, ?, ?, ?, ?)
                     `).bind(l2ref.referrer_id, s.user_id, qkeyAmount, l2Reward, accrualDate, paidDate).run()
-                    await db.prepare(`
-                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                    `).bind(l2ref.referrer_id, l2Reward,
-                      `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
-                    ).run()
+                    // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                    const l2TxExists3 = await db.prepare(`
+                      SELECT id FROM transactions
+                      WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                        AND amount = ?
+                        AND date(created_at, '+9 hours') = ?
+                      LIMIT 1
+                    `).bind(l2ref.referrer_id, l2Reward, paidDate).first()
+                    if (!l2TxExists3) {
+                      await db.prepare(`
+                        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                        VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                      `).bind(l2ref.referrer_id, l2Reward,
+                        `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${paidDate}) [KST-rule recalc]`
+                      ).run()
+                    }
                   }
                 }
               }
