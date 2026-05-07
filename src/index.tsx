@@ -6620,6 +6620,114 @@ app.post('/api/admin/diag/purge-tx-duplicates', async (c) => {
   }
 })
 
+// 진짜 중복 정리 — (user_id, type, coin_type, amount) 키 (description 무시)
+// description 의 accrued 일자 표기만 다른 동일 보상 cron 다중 INSERT 잡기 위함
+app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body.dryRun !== false
+    const fromDate = body.fromDate ? String(body.fromDate) : '2026-04-01'
+    const toDate = body.toDate ? String(body.toDate) : '2099-12-31'
+    // KST 같은 일자 내 (user_id, type, amount) 중복만 잡음 — 다른 일자의 정상 보상은 보호
+    const sql = `
+      SELECT id, user_id, type, coin_type, amount, description, created_at,
+             date(datetime(created_at, '+9 hours')) AS kst_date
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND type IN ('referral_reward','daily_qkey','direct_referral')
+        AND date(datetime(created_at, '+9 hours')) BETWEEN ? AND ?
+      ORDER BY user_id, type, amount, kst_date, id
+    `
+    const rows = await db.prepare(sql).bind(fromDate, toDate).all()
+    const allRows = (rows.results || []) as any[]
+
+    const groups: Record<string, any[]> = {}
+    for (const r of allRows) {
+      const key = `${r.user_id}|${r.type}|${r.coin_type}|${r.amount}|${r.kst_date}`
+      if (!groups[key]) groups[key] = []
+      groups[key].push(r)
+    }
+
+    const duplicateGroups: any[] = []
+    let totalDuplicateRows = 0
+    let totalDuplicateAmount = 0
+    const balanceDeltaByUser: Record<number, number> = {}
+    for (const key in groups) {
+      const grp = groups[key]
+      if (grp.length < 2) continue
+      // id 가장 작은 것 KEEP (최초 정상 INSERT)
+      const keepRow = grp.reduce((a: any, b: any) => (b.id < a.id ? b : a))
+      const removeRows = grp.filter((r: any) => r.id !== keepRow.id)
+      const removeAmount = removeRows.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
+      totalDuplicateRows += removeRows.length
+      totalDuplicateAmount += removeAmount
+      for (const r of removeRows) {
+        balanceDeltaByUser[r.user_id] = (balanceDeltaByUser[r.user_id] || 0) + Number(r.amount || 0)
+      }
+      duplicateGroups.push({
+        key,
+        user_id: grp[0].user_id,
+        type: grp[0].type,
+        amount: grp[0].amount,
+        kst_date: grp[0].kst_date,
+        rows_total: grp.length,
+        keep_row_id: keepRow.id,
+        remove_rows: removeRows.map((r: any) => ({ id: r.id, created_at: r.created_at, description: r.description })),
+        remove_amount: removeAmount
+      })
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true, dryRun: true, scope: { fromDate, toDate },
+        analyzed_rows: allRows.length,
+        duplicate_groups: duplicateGroups.length,
+        rows_to_remove: totalDuplicateRows,
+        amount_to_subtract: totalDuplicateAmount,
+        affected_users: Object.keys(balanceDeltaByUser).length,
+        balance_delta_by_user: balanceDeltaByUser,
+        groups: duplicateGroups
+      })
+    }
+
+    let deletedCount = 0
+    let balanceSubtracted = 0
+    const auditLogs: any[] = []
+    for (const grp of duplicateGroups) {
+      for (const r of grp.remove_rows) {
+        const del = await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(r.id).run()
+        const removed = (del.meta?.changes || 0)
+        deletedCount += removed
+        if (removed > 0) {
+          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`)
+            .bind(Number(grp.amount || 0), grp.user_id).run()
+          balanceSubtracted += Number(grp.amount || 0)
+          const desc = `[중복v2 정리] tx_id=${r.id} type=${grp.type} amount=-${grp.amount} kst=${grp.kst_date} keep=${grp.keep_row_id}`
+          const ins = await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, '_purge_internal', 'QKEY', ?, ?)
+          `).bind(grp.user_id, -Number(grp.amount || 0), desc).run()
+          auditLogs.push({ user_id: grp.user_id, deleted_id: r.id, audit_id: (ins.meta as any)?.last_row_id, amount: grp.amount })
+        }
+      }
+    }
+
+    return c.json({
+      success: true, dryRun: false, scope: { fromDate, toDate },
+      duplicate_groups: duplicateGroups.length,
+      deleted_rows: deletedCount,
+      balance_subtracted: balanceSubtracted,
+      audit_logs_count: auditLogs.length,
+      affected_users: Object.keys(balanceDeltaByUser).length,
+      balance_delta_by_user: balanceDeltaByUser
+    })
+  } catch (error) {
+    console.error('purge-tx-duplicates-v2 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 사용자별 보상 내역 조회
 app.get('/api/rewards/history/:userId', async (c) => {
   try {
