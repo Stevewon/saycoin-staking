@@ -6153,6 +6153,227 @@ app.post('/api/admin/rewards/set-daily-paid-date', async (c) => {
 //             amount:N, rewardDate:"YYYY-MM-DD", paidDate:"YYYY-MM-DD", reason:"..." }
 //
 // 모든 action 은 dryRun 지원 (기본 false). 실행 시 transactions 테이블도 자동 동기화.
+
+// ===========================================================================
+// 사장님 GO (2026-05-07): 1·2단계 보충 전용 엔드포인트
+//   1단계: 5/7 accrued daily_qkey 누락 16명 보충 + 파생 매칭(1대 20% / 2대 10%) 자동 INSERT
+//   2단계: 5/6 accrued (manual insert) → 5/7 paid 분의 referral 누락 26건 보충
+//   3단계(balance_sync 차감)는 별도 GO 받은 후 진행 — 본 엔드포인트 미포함
+//
+// 룰:
+//   - dryRun=true: 영향 명세만 반환, INSERT/UPDATE 없음
+//   - dryRun=false: D1 트랜잭션으로 INSERT + qkey_balance 가산
+//   - 동일 (user, type, amount, KST date) 중복 방지를 위해 EXISTS 가드 적용
+//   - description 에 [audit-fill 2026-05-07] 마커로 식별 가능하게 기록
+// ===========================================================================
+app.post('/api/admin/rewards/repair-2026-05-07', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body?.dryRun !== false  // 기본 dry-run (안전)
+    const PAID = '2026-05-07'
+    const ACCR_57 = '2026-05-07'
+    const ACCR_56 = '2026-05-06'
+    const USD_TO_QKEY = 150
+    const MARKER = '[audit-fill 2026-05-07]'
+
+    // === 1단계 데이터: 5/7 daily 누락 16명 (uid, sid, amount, rate) ===
+    const stage1: Array<{uid:number, sid:number, amount:number, rate:number}> = [
+      { uid: 2,  sid: 1,  amount: 10000, rate: 0.01  },
+      { uid: 64, sid: 76, amount: 15000, rate: 0.01  },
+      { uid: 68, sid: 81, amount: 1000,  rate: 0.005 },
+      { uid: 69, sid: 80, amount: 2000,  rate: 0.005 },
+      { uid: 70, sid: 82, amount: 7000,  rate: 0.007 },
+      { uid: 71, sid: 87, amount: 1000,  rate: 0.005 },
+      { uid: 72, sid: 78, amount: 2000,  rate: 0.005 },
+      { uid: 75, sid: 86, amount: 2000,  rate: 0.005 },
+      { uid: 77, sid: 75, amount: 5000,  rate: 0.007 },
+      { uid: 78, sid: 85, amount: 1000,  rate: 0.005 },
+      { uid: 79, sid: 83, amount: 1000,  rate: 0.005 },
+      { uid: 80, sid: 79, amount: 5000,  rate: 0.007 },
+      { uid: 83, sid: 88, amount: 1000,  rate: 0.005 },
+      { uid: 84, sid: 89, amount: 10000, rate: 0.01  },
+      { uid: 85, sid: 90, amount: 1000,  rate: 0.005 },
+      { uid: 86, sid: 91, amount: 6000,  rate: 0.007 },
+    ]
+
+    // === 2단계 데이터: 5/6 accrued (paid 5/7) referral 누락 26건 ===
+    // src_uid: 누구의 daily 가 source 인지 / l1: 1대 referrer / l2: 2대 referrer / src_amt: 그 daily 금액
+    const stage2: Array<{src_uid:number, src_amt:number, l1:number, l2:number}> = [
+      { src_uid: 68, src_amt: 750,   l1: 65, l2: 2  },
+      { src_uid: 69, src_amt: 1500,  l1: 68, l2: 65 },
+      { src_uid: 70, src_amt: 7350,  l1: 69, l2: 68 },
+      { src_uid: 71, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 72, src_amt: 1500,  l1: 70, l2: 69 },
+      { src_uid: 75, src_amt: 1500,  l1: 70, l2: 69 },
+      { src_uid: 78, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 79, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 80, src_amt: 5250,  l1: 70, l2: 69 },
+      { src_uid: 83, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 84, src_amt: 15000, l1: 76, l2: 45 },
+      { src_uid: 85, src_amt: 750,   l1: 41, l2: 2  },
+      { src_uid: 86, src_amt: 6300,  l1: 84, l2: 76 },
+    ]
+
+    // 1단계 파생 매칭 데이터: 5/7 accrued daily 의 1대(20%) / 2대(10%)
+    // (referrer 트리는 사전 분석된 결과)
+    const stage1Match: Array<{src_uid:number, src_amt:number, l1:number|null, l2:number|null}> = [
+      { src_uid: 2,  src_amt: 15000, l1: 1,  l2: null }, // qtangel(1) referrer 없음
+      { src_uid: 64, src_amt: 22500, l1: null, l2: null },
+      { src_uid: 68, src_amt: 750,   l1: 65, l2: 2  },
+      { src_uid: 69, src_amt: 1500,  l1: 68, l2: 65 },
+      { src_uid: 70, src_amt: 7350,  l1: 69, l2: 68 },
+      { src_uid: 71, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 72, src_amt: 1500,  l1: 70, l2: 69 },
+      { src_uid: 75, src_amt: 1500,  l1: 70, l2: 69 },
+      { src_uid: 77, src_amt: 5250,  l1: 2,  l2: 1  },
+      { src_uid: 78, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 79, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 80, src_amt: 5250,  l1: 70, l2: 69 },
+      { src_uid: 83, src_amt: 750,   l1: 70, l2: 69 },
+      { src_uid: 84, src_amt: 15000, l1: 76, l2: 45 },
+      { src_uid: 85, src_amt: 750,   l1: 41, l2: 2  },
+      { src_uid: 86, src_amt: 6300,  l1: 84, l2: 76 },
+    ]
+
+    // EXISTS 가드: (user_id, type, coin_type, amount, KST date)
+    async function existsTx(uid:number, type:string, amt:number, kstDate:string) {
+      const r = await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = ? AND coin_type = 'QKEY'
+          AND amount = ? AND date(created_at, '+9 hours') = ?
+        LIMIT 1
+      `).bind(uid, type, amt, kstDate).first()
+      return !!r
+    }
+
+    const plan: any[] = []
+    let totalAdd = 0
+
+    // 1단계 plan 생성
+    for (const s of stage1) {
+      const qkey = Math.round(s.amount * s.rate * USD_TO_QKEY)
+      const exists = await existsTx(s.uid, 'daily_qkey', qkey, PAID)
+      plan.push({ stage: 1, kind: 'daily', uid: s.uid, sid: s.sid, qkey, exists })
+      if (!exists) totalAdd += qkey
+    }
+    // 1단계 파생 매칭 plan
+    for (const m of stage1Match) {
+      if (m.l1) {
+        const l1Amt = Math.round(m.src_amt * 0.20)
+        const ex = await existsTx(m.l1, 'referral_reward', l1Amt, PAID)
+        plan.push({ stage: 1, kind: 'l1_match', referrer: m.l1, src_uid: m.src_uid, src_amt: m.src_amt, qkey: l1Amt, accrued: ACCR_57, exists: ex })
+        if (!ex) totalAdd += l1Amt
+      }
+      if (m.l2) {
+        const l2Amt = Math.round(m.src_amt * 0.10)
+        const ex = await existsTx(m.l2, 'referral_reward', l2Amt, PAID)
+        plan.push({ stage: 1, kind: 'l2_match', referrer: m.l2, src_uid: m.src_uid, src_amt: m.src_amt, qkey: l2Amt, accrued: ACCR_57, exists: ex })
+        if (!ex) totalAdd += l2Amt
+      }
+    }
+    // 2단계 plan
+    for (const s of stage2) {
+      const l1Amt = Math.round(s.src_amt * 0.20)
+      const l2Amt = Math.round(s.src_amt * 0.10)
+      const ex1 = await existsTx(s.l1, 'referral_reward', l1Amt, PAID)
+      const ex2 = await existsTx(s.l2, 'referral_reward', l2Amt, PAID)
+      plan.push({ stage: 2, kind: 'l1_match', referrer: s.l1, src_uid: s.src_uid, src_amt: s.src_amt, qkey: l1Amt, accrued: ACCR_56, exists: ex1 })
+      plan.push({ stage: 2, kind: 'l2_match', referrer: s.l2, src_uid: s.src_uid, src_amt: s.src_amt, qkey: l2Amt, accrued: ACCR_56, exists: ex2 })
+      if (!ex1) totalAdd += l1Amt
+      if (!ex2) totalAdd += l2Amt
+    }
+
+    if (dryRun) {
+      const insertPlan = plan.filter(p => !p.exists)
+      const skipPlan = plan.filter(p => p.exists)
+      // 사용자별 가산 합계
+      const balanceDelta: Record<string, number> = {}
+      for (const p of insertPlan) {
+        const target = p.kind === 'daily' ? p.uid : p.referrer
+        if (!target) continue
+        balanceDelta[String(target)] = (balanceDelta[String(target)] || 0) + p.qkey
+      }
+      return c.json({
+        success: true,
+        dryRun: true,
+        plan_total: plan.length,
+        will_insert: insertPlan.length,
+        will_skip: skipPlan.length,
+        total_qkey_to_add: totalAdd,
+        balance_delta_by_user: balanceDelta,
+        details: plan
+      })
+    }
+
+    // === 실제 실행 ===
+    let inserted = 0
+    let skipped = 0
+    const auditIds: number[] = []
+
+    for (const p of plan) {
+      if (p.exists) { skipped++; continue }
+
+      if (p.stage === 1 && p.kind === 'daily') {
+        // 1) daily_rewards INSERT (qkey 단위로 usdt_amount 컬럼 사용 — 기존 스키마 그대로)
+        await db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(p.uid, p.sid, p.qkey, ACCR_57, PAID).run()
+
+        // 2) qkey_balance 가산
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+          .bind(p.qkey, p.uid).run()
+
+        // 3) transactions audit
+        const r:any = await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+        `).bind(p.uid, p.qkey,
+          `Daily reward ${p.qkey.toLocaleString()} QKEY (accrued ${ACCR_57} paid ${PAID}) ${MARKER} stage1`
+        ).run()
+        if (r?.meta?.last_row_id) auditIds.push(Number(r.meta.last_row_id))
+        inserted++
+      } else if (p.kind === 'l1_match' || p.kind === 'l2_match') {
+        const level = p.kind === 'l1_match' ? 1 : 2
+        const pct = level === 1 ? '20%' : '10%'
+        // 1) referral_rewards INSERT
+        await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(p.referrer, p.src_uid, level, p.src_amt, p.qkey, p.accrued, PAID).run()
+
+        // 2) qkey_balance 가산
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+          .bind(p.qkey, p.referrer).run()
+
+        // 3) transactions audit
+        const r:any = await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+        `).bind(p.referrer, p.qkey,
+          `Level ${level} referral bonus (${p.src_amt.toLocaleString()} QKEY x ${pct}, accrued ${p.accrued} paid ${PAID}) ${MARKER} stage${p.stage}`
+        ).run()
+        if (r?.meta?.last_row_id) auditIds.push(Number(r.meta.last_row_id))
+        inserted++
+      }
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      plan_total: plan.length,
+      inserted,
+      skipped,
+      total_qkey_added: totalAdd,
+      audit_tx_ids: auditIds
+    })
+  } catch (error: any) {
+    console.error('repair-2026-05-07 error:', error)
+    return c.json({ error: 'D1 error: ' + (error?.message || String(error)) }, 500)
+  }
+})
+
 app.post('/api/admin/rewards/manual-adjust', async (c) => {
   try {
     const db = c.env.DB
