@@ -1570,11 +1570,11 @@ app.post('/api/swap/qkey-to-usdt', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
     }
 
-    // 거래 내역 기록 (QKEY 차감)
+    // 거래 내역 기록 (QKEY 차감) — ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'swap_out', 'QKEY', ?, ?)
-    `).bind(userId, requiredQkey, `QKEY → USDT swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
+    `).bind(userId, -Math.abs(requiredQkey), `QKEY → USDT swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} USDT)`).run()
 
     // Transaction record (USDT increase)
     await db.prepare(`
@@ -1621,8 +1621,8 @@ app.post('/api/swap/qkey-to-qta', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
     }
 
-    // 거래 내역 (QKEY 차감)
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, requiredQkey, `QKEY → QTA swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`).run()
+    // 거래 내역 (QKEY 차감) — ★ 출금성 거래는 음수로 저장
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, -Math.abs(requiredQkey), `QKEY → QTA swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`).run()
 
     // 거래 내역 (QTA 증가 - swap_in으로 기록 → 출금 가능 수량에 반영)
     await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QTA', ?, ?)`).bind(userId, amount, `QKEY → QTA swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`).run()
@@ -1655,7 +1655,8 @@ app.post('/api/swap/qkey-to-qx', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
     }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, requiredQkey, `QKEY → QX swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`).run()
+    // ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, -Math.abs(requiredQkey), `QKEY → QX swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`).run()
 
     await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QX', ?, ?)`).bind(userId, amount, `QKEY → QX swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`).run()
 
@@ -1687,7 +1688,8 @@ app.post('/api/swap/usdt-to-qkey', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, amount, `USDT → QKEY swap (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`).run()
+    // ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, -Math.abs(amount), `USDT → QKEY swap (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`).run()
 
     await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QKEY', ?, ?)`).bind(userId, qkeyToReceive, `USDT → QKEY swap (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`).run()
 
@@ -1719,7 +1721,8 @@ app.post('/api/swap/usdt-to-qta', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, amount, `USDT → QTA swap (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`).run()
+    // ★ 출금성 거래는 음수로 저장
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, -Math.abs(amount), `USDT → QTA swap (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`).run()
 
     await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QTA', ?, ?)`).bind(userId, qtaToReceive, `USDT → QTA swap (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`).run()
 
@@ -1751,7 +1754,8 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, amount, `USDT → QX swap (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`).run()
+    // ★ 출금성 거래는 음수로 저장
+    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, -Math.abs(amount), `USDT → QX swap (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`).run()
 
     await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QX', ?, ?)`).bind(userId, qxToReceive, `USDT → QX swap (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`).run()
 
@@ -6410,6 +6414,84 @@ app.post('/api/admin/diag/sync-balance-to-tx', async (c) => {
 })
 
 // ============================================================
+// 어드민: swap_out / shop_purchase 부호 버그 정정 (사장님 지시 2026-05-07)
+//   - 출금성 거래(swap_out, shop_purchase)는 amount 가 음수여야 정상이나
+//     기존 INSERT 코드에서 양수로 저장된 row 들이 있어 transactions SUM 이 잔액과 불일치
+//   - 잔액(qkey_balance)은 이미 정확히 차감되어 있음 → 잔액은 건드리지 않음
+//   - 양수 row 의 amount 만 음수로 UPDATE → transactions SUM 이 잔액과 일치하게 됨
+//   - 사용자 화면 영향 0 (사용자는 잔액과 reward 테이블만 봄, transactions 부호는 어드민 진단용)
+// ============================================================
+app.post('/api/admin/diag/fix-swap-sign', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body.dryRun !== false
+
+    // QKEY 출금성 거래 중 amount > 0 인 row 조회
+    const rows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, created_at
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND type IN ('swap_out', 'shop_purchase')
+        AND amount > 0
+      ORDER BY user_id, id
+    `).all()
+    const targets = (rows.results || []) as any[]
+
+    let totalAmount = 0
+    const byUser: Record<number, number> = {}
+    for (const r of targets) {
+      totalAmount += Number(r.amount || 0)
+      byUser[r.user_id] = (byUser[r.user_id] || 0) + Number(r.amount || 0)
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        targets_count: targets.length,
+        total_amount_flipped: totalAmount,
+        affected_users: Object.keys(byUser).length,
+        by_user: byUser,
+        targets,
+        note: 'dryRun=true. 잔액은 변경되지 않음. amount 부호만 양수→음수로 정정됩니다.'
+      })
+    }
+
+    // 실제 실행: amount 를 음수로 UPDATE
+    let updatedCount = 0
+    const updateLog: any[] = []
+    for (const r of targets) {
+      const newAmt = -Math.abs(Number(r.amount || 0))
+      const upd = await db.prepare(`UPDATE transactions SET amount = ? WHERE id = ?`)
+        .bind(newAmt, r.id).run()
+      const changed = (upd.meta?.changes || 0)
+      if (changed > 0) {
+        updatedCount += changed
+        updateLog.push({
+          id: r.id, user_id: r.user_id, type: r.type,
+          old_amount: r.amount, new_amount: newAmt,
+          description: r.description
+        })
+      }
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      updated_count: updatedCount,
+      total_amount_flipped: totalAmount,
+      affected_users: Object.keys(byUser).length,
+      by_user: byUser,
+      updates: updateLog
+    })
+  } catch (error) {
+    console.error('fix-swap-sign error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ============================================================
 // 어드민: transactions 테이블 진짜 중복 정리 (사장님 지시 2026-05-07)
 //   - 같은 (user_id, type, coin_type, description) 조합이 2번 이상 INSERT 된 경우
 //     → 가장 큰 id (가장 최근) 1개만 KEEP, 나머지 모두 DELETE
@@ -6869,9 +6951,9 @@ app.post('/api/shop/order', async (c) => {
       shippingName || '', shippingPhone || '', shippingAddress || '', (selectedOptions ? '[옵션: ' + selectedOptions + '] ' : '') + (shippingMemo || '')
     ).run()
 
-    // 거래 기록
+    // 거래 기록 — ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
     await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'shop_purchase', 'QKEY', ?, ?)`).bind(
-      userId, qkeyNeeded, `쇼핑몰 구매: ${product.name} x${qty} (${totalKrw.toLocaleString()}원)`
+      userId, -Math.abs(qkeyNeeded), `쇼핑몰 구매: ${product.name} x${qty} (${totalKrw.toLocaleString()}원)`
     ).run()
 
     return c.json({ success: true, message: `${product.name} 구매 완료! (${qkeyNeeded.toLocaleString()} QKEY 사용)`, qkeyUsed: qkeyNeeded })
