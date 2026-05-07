@@ -6629,17 +6629,23 @@ app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
     const dryRun = body.dryRun !== false
     const fromDate = body.fromDate ? String(body.fromDate) : '2026-04-01'
     const toDate = body.toDate ? String(body.toDate) : '2099-12-31'
+    const limitUser = body.userId ? Number(body.userId) : null  // 배치 처리: 특정 user_id 만
+    const maxRows = body.maxRows ? Number(body.maxRows) : 0     // 배치 처리: 최대 삭제 행 수
     // KST 같은 일자 내 (user_id, type, amount) 중복만 잡음 — 다른 일자의 정상 보상은 보호
-    const sql = `
+    const sqlBase = `
       SELECT id, user_id, type, coin_type, amount, description, created_at,
              date(datetime(created_at, '+9 hours')) AS kst_date
       FROM transactions
       WHERE coin_type = 'QKEY'
         AND type IN ('referral_reward','daily_qkey','direct_referral')
         AND date(datetime(created_at, '+9 hours')) BETWEEN ? AND ?
+        ${limitUser ? 'AND user_id = ?' : ''}
       ORDER BY user_id, type, amount, kst_date, id
     `
-    const rows = await db.prepare(sql).bind(fromDate, toDate).all()
+    const stmt = limitUser
+      ? db.prepare(sqlBase).bind(fromDate, toDate, limitUser)
+      : db.prepare(sqlBase).bind(fromDate, toDate)
+    const rows = await stmt.all()
     const allRows = (rows.results || []) as any[]
 
     const groups: Record<string, any[]> = {}
@@ -6694,8 +6700,11 @@ app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
     let deletedCount = 0
     let balanceSubtracted = 0
     const auditLogs: any[] = []
+    let stoppedEarly = false
     for (const grp of duplicateGroups) {
+      if (maxRows > 0 && deletedCount >= maxRows) { stoppedEarly = true; break }
       for (const r of grp.remove_rows) {
+        if (maxRows > 0 && deletedCount >= maxRows) { stoppedEarly = true; break }
         const del = await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(r.id).run()
         const removed = (del.meta?.changes || 0)
         deletedCount += removed
@@ -6714,13 +6723,14 @@ app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
     }
 
     return c.json({
-      success: true, dryRun: false, scope: { fromDate, toDate },
+      success: true, dryRun: false, scope: { fromDate, toDate, userId: limitUser, maxRows },
       duplicate_groups: duplicateGroups.length,
       deleted_rows: deletedCount,
       balance_subtracted: balanceSubtracted,
       audit_logs_count: auditLogs.length,
       affected_users: Object.keys(balanceDeltaByUser).length,
-      balance_delta_by_user: balanceDeltaByUser
+      balance_delta_by_user: balanceDeltaByUser,
+      stopped_early: stoppedEarly
     })
   } catch (error) {
     console.error('purge-tx-duplicates-v2 error:', error)
