@@ -4186,6 +4186,206 @@ app.get('/api/admin/diag/rewards', async (c) => {
   }
 })
 
+// ★★ 사장님 2026-05-07 지시 ★★ KST 24시간 윈도우 누락 매출자 진단/보충
+// 룰 (재확정):
+//   - KST 어제 00:00:00 ~ 23:59:59 사이에 staking-approve 된 회원 = 어제 매출자
+//   - 가입 시간이 KST 00:01 이든 23:59 이든 무조건 같은 KST 날짜로 묶음
+//   - 점검 cron 은 익일 KST 01:00, 지급 cron 은 익일 KST 07:00 으로 분리
+// body:
+//   { targetDate: 'YYYY-MM-DD' (KST, 점검 대상일, 기본=어제 KST),
+//     paidDate:   'YYYY-MM-DD' (KST, 지급일,    기본=오늘 KST),
+//     dryRun: true|false }
+app.post('/api/admin/rewards/check-missing-by-kst', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body.dryRun !== false  // 기본 true 안전
+
+    // KST 기준 today / yesterday 계산
+    const nowMs = Date.now()
+    const todayKstStr = new Date(nowMs + 9*60*60*1000).toISOString().slice(0,10)
+    const yKstMs = nowMs + 9*60*60*1000 - 24*60*60*1000
+    const yKstStr = new Date(yKstMs).toISOString().slice(0,10)
+
+    const targetDate = body.targetDate ? String(body.targetDate) : yKstStr
+    const paidDate = body.paidDate ? String(body.paidDate) : todayKstStr
+
+    // ★ 핵심: KST 24시간 윈도우 — date(start_date, '+9 hours') = targetDate (KST)
+    // 즉 start_date(UTC) 를 KST 로 변환했을 때 targetDate 와 정확히 같은 날
+    const candidates = await db.prepare(`
+      SELECT 
+        s.user_id, 
+        s.id as staking_id, 
+        s.amount, 
+        s.period_days, 
+        s.period_months, 
+        s.daily_rate, 
+        s.start_date,
+        s.end_date,
+        s.status,
+        date(s.start_date, '+9 hours') as start_date_kst,
+        date(s.end_date, '+9 hours') as end_date_kst,
+        u.email, u.name,
+        (SELECT COUNT(*) FROM daily_rewards dr 
+          WHERE dr.staking_id = s.id AND dr.reward_date = ?) as already_paid_for_target,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id) as total_paid_count
+      FROM staking s
+      LEFT JOIN users u ON u.id = s.user_id
+      WHERE s.status = 'active'
+        AND date(s.start_date, '+9 hours') = ?
+        AND date(s.end_date, '+9 hours') >= ?
+      ORDER BY s.id ASC
+    `).bind(targetDate, targetDate, paidDate).all()
+
+    const all = (candidates.results || []) as any[]
+    const missing = all.filter(r => Number(r.already_paid_for_target) === 0)
+    const already = all.filter(r => Number(r.already_paid_for_target) > 0)
+
+    // dryRun: 분석만
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        kst: { today: todayKstStr, yesterday: yKstStr, targetDate, paidDate },
+        scope_query: `KST 24시간: start_date_kst = ${targetDate}`,
+        candidates_total: all.length,
+        already_paid: already.length,
+        missing: missing.length,
+        rule: '본인 룰: 승인 다음 영업일 첫 배당. 어제 매출자(평일/휴일 무관) → 오늘이 영업일이면 오늘 reward_date=어제 로 보충 1회 지급.',
+        sample_missing: missing.slice(0, 50),
+        sample_already_paid: already.slice(0, 10)
+      })
+    }
+
+    // 실제 보충 — KST 영업일 룰: paidDate 가 영업일이어야 지급 (휴일이면 다음 영업일까지 누적)
+    const paidDateObj = new Date(paidDate + 'T00:00:00Z')
+    paidDateObj.setUTCHours(paidDateObj.getUTCHours() - 9)  // KST→UTC 변환 후 영업일 체크
+    const { isBusinessDay: paidIsBiz, reason: paidReason } = isKoreanBusinessDay(paidDateObj)
+    if (!paidIsBiz) {
+      return c.json({
+        success: false,
+        dryRun: false,
+        message: `paidDate(${paidDate}) 가 KST 영업일이 아닙니다 (${paidReason}). 다음 영업일에 다시 시도해 주세요.`
+      })
+    }
+
+    const USD_TO_QKEY = 150
+    let inserted = 0
+    let totalQkey = 0
+    const inserts: any[] = []
+
+    for (const s of missing) {
+      const dailyRate = (s.daily_rate as number) || getDailyRate(s.amount as number)
+      const usdAmount = (s.amount as number) * dailyRate
+      const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
+      const periodDays = (s.period_days as number) || ((s.period_months as number) * 30)
+      if (Number(s.total_paid_count) >= periodDays) continue
+
+      // 1) daily_rewards 본인 배당 — reward_date = targetDate(어제 KST), paid_date = paidDate(오늘 KST)
+      await db.prepare(`
+        INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(s.user_id, s.staking_id, qkeyAmount, targetDate, paidDate).run()
+
+      // 2) 잔액 반영
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+        .bind(qkeyAmount, s.user_id).run()
+
+      // 3) 거래내역 기록
+      const newCount = Number(s.total_paid_count) + 1
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+      `).bind(s.user_id, qkeyAmount,
+        `[KST 24h 보충] Daily ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+
+      inserted++
+      totalQkey += qkeyAmount
+      inserts.push({ user_id: s.user_id, staking_id: s.staking_id, qkey: qkeyAmount, email: s.email, name: s.name })
+
+      // 4) L1 매칭 (20%)
+      try {
+        const lvl1 = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(s.user_id).first() as any
+        if (lvl1?.referrer_id) {
+          const l1Active = await db.prepare(`
+            SELECT id FROM staking 
+            WHERE user_id = ? AND status = 'active'
+              AND date(start_date, '+9 hours') <= ? AND date(end_date, '+9 hours') >= ?
+            LIMIT 1
+          `).bind(lvl1.referrer_id, targetDate, targetDate).first()
+          if (l1Active) {
+            const l1Exists = await db.prepare(`
+              SELECT COUNT(*) as count FROM referral_rewards
+              WHERE referrer_id = ? AND referee_id = ? AND level = 1 AND reward_date = ?
+            `).bind(lvl1.referrer_id, s.user_id, targetDate).first() as any
+            if (Number(l1Exists?.count || 0) === 0) {
+              const l1Reward = Math.round(qkeyAmount * 0.20)
+              await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+                .bind(l1Reward, lvl1.referrer_id).run()
+              await db.prepare(`
+                INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                VALUES (?, ?, 1, ?, ?, ?, ?)
+              `).bind(lvl1.referrer_id, s.user_id, qkeyAmount, l1Reward, targetDate, paidDate).run()
+              await db.prepare(`
+                INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+              `).bind(lvl1.referrer_id, l1Reward,
+                `[KST 24h 보충] Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+
+              // 5) L2 매칭 (10%)
+              const lvl2 = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(lvl1.referrer_id).first() as any
+              if (lvl2?.referrer_id) {
+                const l2Active = await db.prepare(`
+                  SELECT id FROM staking 
+                  WHERE user_id = ? AND status = 'active'
+                    AND date(start_date, '+9 hours') <= ? AND date(end_date, '+9 hours') >= ?
+                  LIMIT 1
+                `).bind(lvl2.referrer_id, targetDate, targetDate).first()
+                if (l2Active) {
+                  const l2Exists = await db.prepare(`
+                    SELECT COUNT(*) as count FROM referral_rewards
+                    WHERE referrer_id = ? AND referee_id = ? AND level = 2 AND reward_date = ?
+                  `).bind(lvl2.referrer_id, s.user_id, targetDate).first() as any
+                  if (Number(l2Exists?.count || 0) === 0) {
+                    const l2Reward = Math.round(qkeyAmount * 0.10)
+                    await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+                      .bind(l2Reward, lvl2.referrer_id).run()
+                    await db.prepare(`
+                      INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                      VALUES (?, ?, 2, ?, ?, ?, ?)
+                    `).bind(lvl2.referrer_id, s.user_id, qkeyAmount, l2Reward, targetDate, paidDate).run()
+                    await db.prepare(`
+                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                    `).bind(lvl2.referrer_id, l2Reward,
+                      `[KST 24h 보충] Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, KST매출일 ${targetDate} 지급일 ${paidDate})`).run()
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (e: any) {
+        console.error('matching reward error:', e?.message || e)
+      }
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      kst: { today: todayKstStr, yesterday: yKstStr, targetDate, paidDate },
+      candidates_total: all.length,
+      already_paid: already.length,
+      inserted_self_daily: inserted,
+      total_qkey_paid: totalQkey,
+      inserts
+    })
+  } catch (error: any) {
+    console.error('check-missing-by-kst error:', error)
+    return c.json({ error: String(error?.message || error) }, 500)
+  }
+})
+
 // ★★ 사장님 2026-05-07 지시 ★★
 // "영국시간(UTC) 기준으로 reward_date 가 다른 날로 찍혀서 같은 KST 영업일 1회 지급이 2회로 중복 보이는 건 정리"
 // 분석 로직:
