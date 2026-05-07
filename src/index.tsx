@@ -7109,6 +7109,7 @@ app.get('/api/transactions/:userId', async (c) => {
     // 사용자 화면 전용: 당일(KST) 같은 type/coin 거래는 합산 1줄로 압축
     // - _purge_internal / balance_sync / admin_adjust 는 어드민 보정용이므로 사용자에게 숨김
     // - 어드민 화면(/api/admin/diag/transactions, /api/admin/user/:userId) 은 별도 raw 그대로 노출
+    // - ★ 모든 표시는 KST(+9h) 기준: GROUP BY 도 KST 일자, created_at 응답값도 KST 시각으로 변환해서 내보냄
     const transactions = await db.prepare(`
       SELECT
         MAX(id) AS id,
@@ -7116,7 +7117,8 @@ app.get('/api/transactions/:userId', async (c) => {
         coin_type,
         SUM(amount) AS amount,
         MIN(description) AS description,
-        MAX(created_at) AS created_at
+        datetime(MAX(created_at), '+9 hours') AS created_at,
+        date(MAX(created_at), '+9 hours') AS kst_date
       FROM transactions
       WHERE user_id = ?
         AND type NOT IN ('_purge_internal', 'balance_sync', 'admin_adjust')
