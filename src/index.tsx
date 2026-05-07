@@ -8164,7 +8164,7 @@ app.get('/dashboard', (c) => {
                     <!-- USDT Balance (두 번째) -->
                     <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.usdt_balance">USDT Balance</span>
+                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.usdt_balance">USDT 잔액</span>
                             <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
@@ -8257,23 +8257,23 @@ app.get('/dashboard', (c) => {
                             <div id="rewardPreview" class="mt-3 p-3 bg-purple-50 rounded-lg border border-purple-200 hidden">
                                 <p class="text-sm font-bold text-purple-800 mb-1" data-i18n="dash.expected_reward">예상 보상 (관리자 승인 후 지급)</p>
                                 <div class="flex justify-between text-sm">
-                                    <span class="text-gray-600" data-i18n="dash.qta_preview">QTA Reward :</span>
+                                    <span class="text-gray-600" data-i18n="dash.qta_preview">QTA 보상 :</span>
                                     <span id="qtaRewardPreview" class="font-bold text-blue-600">0</span>
                                 </div>
                                 <div id="qxPreviewRow" class="flex justify-between text-sm">
-                                    <span class="text-gray-600" data-i18n="dash.qx_preview">QX Reward :</span>
+                                    <span class="text-gray-600" data-i18n="dash.qx_preview">QX 보상 :</span>
                                     <span id="qxRewardPreview" class="font-bold text-purple-600">0</span>
                                 </div>
                                 <div id="qkeyPreviewRow" class="flex justify-between text-sm">
-                                    <span class="text-gray-600" data-i18n="dash.qkey_preview">QKEY Reward :</span>
+                                    <span class="text-gray-600" data-i18n="dash.qkey_preview">QKEY 보상 :</span>
                                     <span id="qkeyRewardPreview" class="font-bold text-yellow-600">0</span>
                                 </div>
                                 <div class="flex justify-between text-sm mt-1 pt-1 border-t border-purple-200">
-                                    <span class="text-gray-600" data-i18n="dash.daily_rate_label">Daily Rate :</span>
+                                    <span class="text-gray-600" data-i18n="dash.daily_rate_label">일일 수익률 :</span>
                                     <span id="dailyRatePreview" class="font-bold text-green-600">0%</span>
                                 </div>
                                 <div class="flex justify-between text-sm mt-1 pt-1 border-t border-purple-200">
-                                    <span class="text-gray-600" data-i18n="dash.period_label">Period :</span>
+                                    <span class="text-gray-600" data-i18n="dash.period_label">기간 :</span>
                                     <span id="periodPreview" class="font-bold text-blue-600">-</span>
                                 </div>
                             </div>
@@ -8300,18 +8300,18 @@ app.get('/dashboard', (c) => {
                                             class="flex-1 min-w-0 px-2 py-2 bg-gray-50 border border-gray-300 rounded font-mono text-xs sm:text-sm truncate">
                                         <button type="button" onclick="copyCompanyWallet()" 
                                             class="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded font-medium transition">
-                                            <i class="fas fa-copy mr-1"></i><span data-i18n="common.copy">Copy</span>
+                                            <i class="fas fa-copy mr-1"></i><span data-i18n="common.copy">복사</span>
                                         </button>
                                     </div>
                                     <button type="button" onclick="openTxidInput()" 
                                         class="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded font-medium transition">
-                                        <i class="fas fa-receipt mr-1"></i><span data-i18n="dash.txid_entry">Deposit Confirm (TXID)</span>
+                                        <i class="fas fa-receipt mr-1"></i><span data-i18n="dash.txid_entry">입금 확인 (TXID)</span>
                                     </button>
                                 </div>
 
                                 <!-- QR 코드 -->
                                 <div class="bg-white rounded-lg p-3 border border-blue-200 shadow-sm flex flex-col items-center justify-center">
-                                    <label class="block text-xs text-gray-600 mb-2 font-medium" data-i18n="dash.qr_label">Easy deposit via QR code</label>
+                                    <label class="block text-xs text-gray-600 mb-2 font-medium" data-i18n="dash.qr_label">QR 코드로 간편 입금</label>
                                     <div id="qrcode" class="bg-white p-2 rounded"></div>
                                     <p class="text-xs text-gray-500 mt-2 text-center" data-i18n="dash.qr_scan">BEP-20 (BSC)</p>
                                 </div>
@@ -8449,11 +8449,11 @@ app.get('/dashboard', (c) => {
                                 <h3 class="font-bold text-gray-800 text-sm sm:text-base">QTA</h3>
                                 <i class="fas fa-coins text-blue-600 text-lg sm:text-2xl"></i>
                             </div>
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">잔액</p>
                             <p class="text-lg sm:text-2xl font-bold text-blue-600 mb-3 sm:mb-4" id="withdrawQtaBalance">0</p>
                             <button onclick="requestWithdrawal('QTA')" id="withdrawBtn_QTA"
                                 class="withdraw-btn w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
-                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
+                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">출금</span>
                             </button>
                         </div>
                         
@@ -8463,11 +8463,11 @@ app.get('/dashboard', (c) => {
                                 <h3 class="font-bold text-gray-800 text-sm sm:text-base">QX</h3>
                                 <i class="fas fa-coins text-purple-600 text-lg sm:text-2xl"></i>
                             </div>
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">잔액</p>
                             <p class="text-lg sm:text-2xl font-bold text-purple-600 mb-3 sm:mb-4" id="withdrawQxBalance">0</p>
                             <button onclick="requestWithdrawal('QX')" id="withdrawBtn_QX"
                                 class="withdraw-btn w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
-                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
+                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">출금</span>
                             </button>
                         </div>
                         
@@ -8477,11 +8477,11 @@ app.get('/dashboard', (c) => {
                                 <h3 class="font-bold text-gray-800 text-sm sm:text-base">QKEY</h3>
                                 <i class="fas fa-key text-yellow-600 text-lg sm:text-2xl"></i>
                             </div>
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">잔액</p>
                             <p class="text-lg sm:text-2xl font-bold text-yellow-600 mb-3 sm:mb-4" id="withdrawQkeyBalance">0</p>
                             <button onclick="requestWithdrawal('QKEY')" id="withdrawBtn_QKEY"
                                 class="withdraw-btn w-full bg-yellow-600 hover:bg-yellow-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
-                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
+                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">출금</span>
                             </button>
                         </div>
                         
@@ -8491,11 +8491,11 @@ app.get('/dashboard', (c) => {
                                 <h3 class="font-bold text-gray-800 text-sm sm:text-base">USDT</h3>
                                 <i class="fas fa-dollar-sign text-green-600 text-lg sm:text-2xl"></i>
                             </div>
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">Balance</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.balance">잔액</p>
                             <p class="text-lg sm:text-2xl font-bold text-green-600 mb-3 sm:mb-4" id="withdrawUsdtBalance">0</p>
                             <button onclick="requestWithdrawal('USDT')" id="withdrawBtn_USDT"
                                 class="withdraw-btn w-full bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-medium transition text-xs sm:text-sm">
-                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">Withdraw</span>
+                                <i class="fas fa-paper-plane mr-1"></i><span data-i18n="common.withdraw">출금</span>
                             </button>
                         </div>
                     </div>
@@ -8605,22 +8605,22 @@ app.get('/dashboard', (c) => {
                         <!-- 보상 통계 카드 (4개) -->
                         <div class="grid grid-cols-2 gap-2 sm:gap-3 mb-4">
                             <div class="bg-gradient-to-br from-green-50 to-green-100 rounded-lg p-3 border border-green-300">
-                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-coins mr-1 text-green-500"></i><span data-i18n="dash.dividend">Dividend</span></p>
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-coins mr-1 text-green-500"></i><span data-i18n="dash.dividend">배당</span></p>
                                 <p class="text-lg font-bold text-green-700" id="reward-daily-total">0 QKEY</p>
                                 <p class="text-xs text-gray-500"><span id="reward-daily-count">0</span></p>
                             </div>
                             <div class="bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg p-3 border border-orange-300">
-                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-handshake mr-1 text-orange-500"></i><span data-i18n="dash.direct_sales">Direct Sales</span></p>
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-handshake mr-1 text-orange-500"></i><span data-i18n="dash.direct_sales">직판수당</span></p>
                                 <p class="text-lg font-bold text-orange-700" id="reward-direct-total">0 QKEY</p>
                                 <p class="text-xs text-gray-500"><span id="reward-direct-count">0</span></p>
                             </div>
                             <div class="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-3 border border-blue-300">
-                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-hand-holding-usd mr-1 text-blue-500"></i><span data-i18n="dash.level1_bonus">Level 1 Bonus</span></p>
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-hand-holding-usd mr-1 text-blue-500"></i><span data-i18n="dash.level1_bonus">1대 보너스</span></p>
                                 <p class="text-lg font-bold text-blue-700" id="reward-level1-total">0 QKEY</p>
                                 <p class="text-xs text-gray-500"><span id="reward-level1-count">0</span></p>
                             </div>
                             <div class="bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg p-3 border border-purple-300">
-                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-gifts mr-1 text-purple-500"></i><span data-i18n="dash.level2_bonus">Level 2 Bonus</span></p>
+                                <p class="text-xs text-gray-600 mb-1"><i class="fas fa-gifts mr-1 text-purple-500"></i><span data-i18n="dash.level2_bonus">2대 보너스</span></p>
                                 <p class="text-lg font-bold text-purple-700" id="reward-level2-total">0 QKEY</p>
                                 <p class="text-xs text-gray-500"><span id="reward-level2-count">0</span></p>
                             </div>
@@ -8628,7 +8628,7 @@ app.get('/dashboard', (c) => {
 
                         <!-- 누적 총 보상 -->
                         <div class="bg-gradient-to-r from-yellow-50 to-yellow-100 rounded-lg p-3 mb-4 border border-yellow-300 text-center">
-                            <p class="text-xs text-gray-600 mb-1" data-i18n="dash.total_reward">Total Accumulated Reward</p>
+                            <p class="text-xs text-gray-600 mb-1" data-i18n="dash.total_reward">누적 총 보상</p>
                             <p class="text-xl font-bold text-yellow-700" id="reward-grand-total">0 QKEY</p>
                         </div>
 
@@ -8637,15 +8637,15 @@ app.get('/dashboard', (c) => {
                             <table class="w-full text-xs sm:text-sm">
                                 <thead class="bg-gray-100">
                                     <tr>
-                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700" data-i18n="common.date">Date</th>
-                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700" data-i18n="common.category">Category</th>
-                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700" data-i18n="common.details">Details</th>
-                                        <th class="px-2 sm:px-4 py-2 text-right text-xs font-medium text-gray-700" data-i18n="common.amount">Amount</th>
+                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700" data-i18n="common.date">날짜</th>
+                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700" data-i18n="common.category">분류</th>
+                                        <th class="px-2 sm:px-4 py-2 text-left text-xs font-medium text-gray-700" data-i18n="common.details">상세</th>
+                                        <th class="px-2 sm:px-4 py-2 text-right text-xs font-medium text-gray-700" data-i18n="common.amount">금액</th>
                                     </tr>
                                 </thead>
                                 <tbody id="rewards-table-body" class="divide-y divide-gray-200">
                                     <tr>
-                                        <td colspan="4" class="px-4 py-8 text-center text-gray-500" data-i18n="common.loading">Loading...</td>
+                                        <td colspan="4" class="px-4 py-8 text-center text-gray-500" data-i18n="common.loading">로딩 중...</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -10263,7 +10263,7 @@ app.get('/dashboard', (c) => {
                     <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md mx-4">
                         <div class="flex justify-between items-center mb-6">
                             <h2 class="text-2xl font-bold text-gray-800">
-                                <i class="fas fa-user-cog text-purple-600 mr-2"></i><span data-i18n="profile.settings">Profile Settings</span>
+                                <i class="fas fa-user-cog text-purple-600 mr-2"></i><span data-i18n="profile.settings">프로필 설정</span>
                             </h2>
                             <button onclick="closeProfileModal()" class="text-gray-500 hover:text-gray-700">
                                 <i class="fas fa-times text-2xl"></i>
@@ -10274,7 +10274,7 @@ app.get('/dashboard', (c) => {
                             <!-- 이름 -->
                             <div>
                                 <label class="block text-gray-700 font-medium mb-2">
-                                    <i class="fas fa-user mr-2"></i><span data-i18n="profile.name">Name</span>
+                                    <i class="fas fa-user mr-2"></i><span data-i18n="profile.name">이름</span>
                                 </label>
                                 <input type="text" id="profileName" value="\${currentUser.name}" required
                                     class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500">
@@ -10283,17 +10283,17 @@ app.get('/dashboard', (c) => {
                             <!-- 이메일 (읽기 전용) -->
                             <div>
                                 <label class="block text-gray-700 font-medium mb-2">
-                                    <i class="fas fa-envelope mr-2"></i><span data-i18n="profile.email_label">Email</span>
+                                    <i class="fas fa-envelope mr-2"></i><span data-i18n="profile.email_label">이메일</span>
                                 </label>
                                 <input type="email" value="\${currentUser.email}" readonly
                                     class="w-full px-4 py-3 border border-gray-300 rounded-lg bg-gray-100 cursor-not-allowed">
-                                <p class="text-xs text-gray-500 mt-1" data-i18n="profile.email_readonly">Email cannot be changed</p>
+                                <p class="text-xs text-gray-500 mt-1" data-i18n="profile.email_readonly">이메일은 변경할 수 없습니다</p>
                             </div>
                             
                             <!-- 휴대폰 번호 -->
                             <div>
                                 <label class="block text-gray-700 font-medium mb-2">
-                                    <i class="fas fa-phone mr-2"></i><span data-i18n="profile.phone_label">Phone Number</span>
+                                    <i class="fas fa-phone mr-2"></i><span data-i18n="profile.phone_label">휴대폰 번호</span>
                                 </label>
                                 <input type="tel" id="profilePhone" value="\${currentUser.phone || ''}" 
                                     pattern="010[0-9]{8}" placeholder="01012345678"
@@ -10303,7 +10303,7 @@ app.get('/dashboard', (c) => {
                             <!-- QKEY 지갑주소 (읽기 전용) -->
                             <div>
                                 <label class="block text-gray-700 font-medium mb-2">
-                                    <i class="fas fa-wallet mr-2"></i><span data-i18n="profile.qkey_wallet">Wallet (QKEY)</span>
+                                    <i class="fas fa-wallet mr-2"></i><span data-i18n="profile.qkey_wallet">지갑 (QKEY)</span>
                                 </label>
                                 <div class="relative">
                                     <input type="text" value="\${currentUser.wallet_address}" readonly
@@ -10315,14 +10315,14 @@ app.get('/dashboard', (c) => {
                                 </div>
                                 <p class="text-xs text-red-500 mt-1">
                                     <i class="fas fa-exclamation-triangle mr-1"></i>
-                                    <span data-i18n="profile.wallet_contact_admin">Contact admin to change wallet address</span>
+                                    <span data-i18n="profile.wallet_contact_admin">지갑 주소 변경은 관리자에게 문의해주세요</span>
                                 </p>
                             </div>
                             
                             <!-- USDT 지갑주소 (읽기 전용) -->
                             <div>
                                 <label class="block text-gray-700 font-medium mb-2">
-                                    <i class="fas fa-wallet mr-2"></i><span data-i18n="profile.usdt_wallet">Wallet (USDT)</span>
+                                    <i class="fas fa-wallet mr-2"></i><span data-i18n="profile.usdt_wallet">지갑 (USDT)</span>
                                 </label>
                                 <div class="relative">
                                     <input type="text" value="\${currentUser.usdt_wallet_address || ''}" readonly
@@ -10334,18 +10334,18 @@ app.get('/dashboard', (c) => {
                                 </div>
                                 <p class="text-xs text-gray-500 mt-1">
                                     <i class="fas fa-info-circle mr-1"></i>
-                                    <span data-i18n="profile.binance_usdt">Binance (BINANCE) USDT Wallet</span>
+                                    <span data-i18n="profile.binance_usdt">바이널스(BINANCE) USDT 지갑</span>
                                 </p>
                             </div>
                             
                             <!-- 비밀번호 변경 -->
                             <div class="border-t pt-4">
                                 <label class="block text-gray-700 font-medium mb-2">
-                                    <i class="fas fa-lock mr-2"></i><span data-i18n="profile.change_password">Change Password (Optional)</span>
+                                    <i class="fas fa-lock mr-2"></i><span data-i18n="profile.change_password">비밀번호 변경 (선택)</span>
                                 </label>
-                                <input type="password" id="profilePassword" placeholder="New password (only if changing)" data-i18n-placeholder="profile.new_password"
+                                <input type="password" id="profilePassword" placeholder="새 비밀번호 (변경 시에만 입력)" data-i18n-placeholder="profile.new_password"
                                     class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 mb-2">
-                                <input type="password" id="profilePasswordConfirm" placeholder="Confirm new password" data-i18n-placeholder="profile.confirm_password"
+                                <input type="password" id="profilePasswordConfirm" placeholder="새 비밀번호 확인" data-i18n-placeholder="profile.confirm_password"
                                     class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500">
                             </div>
                             
@@ -10494,7 +10494,7 @@ app.get('/dashboard', (c) => {
                     '<div class="flex items-center gap-2 bg-white rounded-lg p-2 border border-gray-200">' +
                         '<i class="fas fa-wallet text-' + color + '-400 text-xs"></i>' +
                         '<span class="text-xs font-mono text-gray-600 flex-1 truncate" title="' + wallet + '">' + walletShort + '</span>' +
-                        (wallet ? '<button data-wallet="' + wallet + '" onclick="copyWallet(this.getAttribute(&apos;data-wallet&apos;))" class="px-2 py-1 bg-' + color + '-100 hover:bg-' + color + '-200 text-' + color + '-700 rounded text-xs font-medium transition whitespace-nowrap"><i class="fas fa-copy mr-1"></i><span data-i18n="common.copy">Copy</span></button>' : '') +
+                        (wallet ? '<button data-wallet="' + wallet + '" onclick="copyWallet(this.getAttribute(&apos;data-wallet&apos;))" class="px-2 py-1 bg-' + color + '-100 hover:bg-' + color + '-200 text-' + color + '-700 rounded text-xs font-medium transition whitespace-nowrap"><i class="fas fa-copy mr-1"></i><span data-i18n="common.copy">복사</span></button>' : '') +
                     '</div>' +
                 '</div>';
             }
@@ -10778,7 +10778,7 @@ app.get('/admin', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <meta name="user-country" content="${userCountry}">
-        <title>Admin Login - QUANTARIUM STAKING</title>
+        <title>관리자 로그인 - QUANTARIUM STAKING</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <link rel="stylesheet" href="/static/tailwind.css">
         <link href="/static/fa/all.min.css" rel="stylesheet">
@@ -13048,7 +13048,7 @@ app.get('/admin/dashboard', (c) => {
                         }
                         
                         tbody.innerHTML = swaps.map(function(s) {
-                            var typeLabel = s.type === 'swap_in' ? '<span class="text-green-600 font-medium">IN</span>' : '<span class="text-red-600 font-medium">OUT</span>';
+                            var typeLabel = s.type === 'swap_in' ? '<span class="text-green-600 font-medium">입금</span>' : '<span class="text-red-600 font-medium">출금</span>';
                             var coinColor = s.coin_type === 'QTA' ? 'blue' : s.coin_type === 'QX' ? 'purple' : s.coin_type === 'QKEY' ? 'yellow' : 'green';
                             var date = new Date(s.created_at).toLocaleString('ko-KR', {timeZone:'Asia/Seoul'});
                             return '<tr class="hover:bg-gray-50">' +
@@ -14620,7 +14620,7 @@ app.get('/check', (c) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Connection Check</title>
+<title>연결 상태 확인</title>
 <style>
 body { font-family: -apple-system, sans-serif; padding: 20px; background: #f0f0f0; }
 .card { background: white; border-radius: 12px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
@@ -14637,33 +14637,33 @@ h2 { font-size: 1.1em; margin-top: 0; border-bottom: 1px solid #eee; padding-bot
 </style>
 </head>
 <body>
-<h1>QUANTARIUM Connection Check</h1>
+<h1>QUANTARIUM 연결 상태 확인</h1>
 <div class="card">
-  <h2>Server Info</h2>
-  <div class="row"><span class="label">Status</span><span class="value ok">Connected OK</span></div>
-  <div class="row"><span class="label">Protocol</span><span class="value">${proto}</span></div>
-  <div class="row"><span class="label">TLS Version</span><span class="value">${tlsVersion || 'N/A'}</span></div>
-  <div class="row"><span class="label">Country</span><span class="value">${cfCountry}</span></div>
+  <h2>서버 정보</h2>
+  <div class="row"><span class="label">상태</span><span class="value ok">정상 연결됨</span></div>
+  <div class="row"><span class="label">프로토콜</span><span class="value">${proto}</span></div>
+  <div class="row"><span class="label">TLS 버전</span><span class="value">${tlsVersion || 'N/A'}</span></div>
+  <div class="row"><span class="label">국가</span><span class="value">${cfCountry}</span></div>
   <div class="row"><span class="label">CF-Ray</span><span class="value">${cfRay}</span></div>
-  <div class="row"><span class="label">Visitor</span><span class="value">${cfVisitor}</span></div>
+  <div class="row"><span class="label">방문자</span><span class="value">${cfVisitor}</span></div>
 </div>
 <div class="card">
-  <h2>Client Info</h2>
+  <h2>클라이언트 정보</h2>
   <div class="row"><span class="label">IP</span><span class="value">${cfConnectingIP}</span></div>
   <div class="row"><span class="label">User-Agent</span><span class="value" style="font-size:0.75em">${ua}</span></div>
 </div>
 <div class="card" id="js-results">
-  <h2>Browser SSL Check</h2>
-  <div id="ssl-status"><span class="label">Checking...</span></div>
+  <h2>브라우저 SSL 점검</h2>
+  <div id="ssl-status"><span class="label">확인 중...</span></div>
 </div>
 <div class="card">
-  <h2>Help</h2>
+  <h2>도움말</h2>
   <p style="font-size:0.85em; color:#555; line-height:1.6;">
-    If you see this page, your connection to QUANTARIUM is <span class="ok">working correctly</span>.<br><br>
-    If the main page shows a security warning:<br>
-    1. Chrome > Settings > Privacy > Clear browsing data > All time > Delete<br>
-    2. Turn airplane mode ON for 5 sec, then OFF<br>
-    3. Try again: <a href="https://quantarium.co.kr/">quantarium.co.kr</a>
+    이 페이지가 보인다면 QUANTARIUM 연결은 <span class="ok">정상 작동 중</span>입니다.<br><br>
+    메인 페이지에 보안 경고가 표시되면:<br>
+    1. Chrome > 설정 > 개인정보 > 인터넷 사용 기록 삭제 > 전체 기간 > 삭제<br>
+    2. 비행기 모드 5초간 ON 후 OFF<br>
+    3. 다시 시도: <a href="https://quantarium.co.kr/">quantarium.co.kr</a>
   </p>
 </div>
 <script>
@@ -14686,20 +14686,20 @@ h2 { font-size: 1.1em; margin-top: 0; border-bottom: 1px solid #eee; padding-bot
       html += '<div class="row"><span class="label">DNS</span><span class="value">' + dns + 'ms</span></div>';
       html += '<div class="row"><span class="label">SSL Handshake</span><span class="value">' + ssl + 'ms</span></div>';
       html += '<div class="row"><span class="label">TTFB</span><span class="value">' + ttfb + 'ms</span></div>';
-      html += '<div class="row"><span class="label">Total Load</span><span class="value">' + total + 'ms</span></div>';
+      html += '<div class="row"><span class="label">전체 로드 시간</span><span class="value">' + total + 'ms</span></div>';
     }
   }
   
   // Test fetch to main page
   fetch('/', {method: 'HEAD'}).then(function(r) {
-    html += '<div class="row"><span class="label">Fetch Test</span><span class="value ' + (r.ok ? 'ok' : 'err') + '">' + r.status + '</span></div>';
+    html += '<div class="row"><span class="label">Fetch 테스트</span><span class="value ' + (r.ok ? 'ok' : 'err') + '">' + r.status + '</span></div>';
     el.innerHTML = html;
   }).catch(function(e) {
-    html += '<div class="row"><span class="label">Fetch Error</span><span class="value err">' + e.message + '</span></div>';
+    html += '<div class="row"><span class="label">Fetch 오류</span><span class="value err">' + e.message + '</span></div>';
     el.innerHTML = html;
   });
   
-  setTimeout(function(){ if(!el.innerHTML.includes('Fetch')) el.innerHTML = html || '<div class="row"><span class="value warn">Timeout</span></div>'; }, 5000);
+  setTimeout(function(){ if(!el.innerHTML.includes('Fetch')) el.innerHTML = html || '<div class="row"><span class="value warn">시간 초과</span></div>'; }, 5000);
 })();
 </script>
 </body>
