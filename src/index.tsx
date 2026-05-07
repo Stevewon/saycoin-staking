@@ -10141,10 +10141,16 @@ app.get('/dashboard', (c) => {
                                     ? 'px-2 sm:px-4 py-2 text-xs text-gray-700 align-top min-w-[180px] max-w-[260px] whitespace-normal break-words'
                                     : 'px-2 sm:px-4 py-2 text-xs text-gray-700 align-top max-w-[180px] whitespace-normal break-words';
 
+                                // ★ KST 강제 표시 (사장님 룰 2026-05-07): DB created_at 은 UTC 저장 → KST(Asia/Seoul) 로 변환해서 24h 표기
+                                // SQLite CURRENT_TIMESTAMP 는 'YYYY-MM-DD HH:MM:SS' (UTC, 타임존 없음) → 'Z' 붙여 명시 파싱
+                                var rawTs = String(reward.created_at || '');
+                                var utcTs = rawTs.indexOf('Z') >= 0 || rawTs.indexOf('+') >= 0 ? rawTs : rawTs.replace(' ', 'T') + 'Z';
+                                var dObj = new Date(utcTs);
+                                var kstDateTxt = dObj.toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit' });
+                                var kstTimeTxt = dObj.toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hour12: false });
                                 return '<tr class="hover:bg-gray-50">' +
                                     '<td class="px-2 sm:px-4 py-2 text-xs text-gray-600 whitespace-nowrap align-top">' +
-                                        new Date(reward.created_at).toLocaleDateString('ko-KR', { month: '2-digit', day: '2-digit' }) +
-                                        ' ' + new Date(reward.created_at).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) +
+                                        kstDateTxt + ' ' + kstTimeTxt +
                                     '</td>' +
                                     '<td class="px-2 sm:px-4 py-2 align-top"><span class="inline-block px-2 py-0.5 ' + badgeClass + ' rounded text-xs font-medium whitespace-nowrap">' + badgeText + '</span></td>' +
                                     '<td class="' + detailsTdClass + '">' + detailsHtml + '</td>' +
