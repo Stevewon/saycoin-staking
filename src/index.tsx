@@ -3885,14 +3885,55 @@ app.post('/api/rewards/daily', async (c) => {
     let rewardedCount = 0
     let totalQkeyRewarded = 0
     let skippedCount = 0
+    let cappedSkipCount = 0
     let processedDates: { staking_id: any, dates: string[] }[] = []
+    const cappedUsers: number[] = []
 
     // 환율: 1 USD = 1,500 KRW, 1 QKEY = 10 KRW → 1 USD = 150 QKEY
     const USD_TO_QKEY = 150
 
+    // ★ 사장님 룰 (2026-05-07) — 200% cap 정책 (B안 사용자 단위 총 합산) ★
+    //   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)이
+    //   사용자가 넣은 진입금액 합계 × 2 × 150(USD→QKEY) 도달 시
+    //   해당 사용자의 모든 신규 수당(본인 daily + 받을 매칭) INSERT 차단.
+    //   출금 무관, 잔액 변동 무관 — 누적 수령액만 추적.
+    async function isUserCapped(userId: number): Promise<{ capped: boolean, paidTotal: number, target: number, percent: number }> {
+      // user_stake_total: active+completed+capped 의 stake amount 합계
+      const stakeRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
+      `).bind(userId).first() as any
+      const stakeTotal = Number(stakeRow?.total || 0)
+      if (stakeTotal <= 0) return { capped: false, paidTotal: 0, target: 0, percent: 0 }
+
+      // user_paid_total: daily_qkey + referral_reward 의 amount 합계 (positive)
+      const paidRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM transactions
+        WHERE user_id = ? AND coin_type = 'QKEY'
+          AND type IN ('daily_qkey', 'referral_reward')
+      `).bind(userId).first() as any
+      const paidTotal = Number(paidRow?.total || 0)
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      const percent = target > 0 ? (paidTotal / target * 100) : 0
+      return { capped: paidTotal >= target, paidTotal, target, percent }
+    }
+
     for (const staking of activeStakings.results) {
       try {
         const periodDays = staking.period_days || (staking.period_months * 30)
+
+        // ★ 200% cap 사전 체크 ★ — 사용자가 이미 cap 도달이면 본인 daily 전체 skip
+        const capState = await isUserCapped(staking.user_id as number)
+        if (capState.capped) {
+          cappedSkipCount++
+          if (!cappedUsers.includes(staking.user_id as number)) cappedUsers.push(staking.user_id as number)
+          // 자동으로 staking.status='capped' 표시 (해당 user 의 모든 active staking)
+          try {
+            await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(staking.user_id).run()
+          } catch(e) {}
+          continue
+        }
 
         // ★ 사장님 룰 (2026-05-07 명확화) ★
         //   reward_date 는 어제(yesterdayKst) 까지만 채움. 오늘 매출은 내일 01:00 cron 에서 처리.
@@ -3929,7 +3970,31 @@ app.post('/api/rewards/daily', async (c) => {
           // 금액별 차등 배당률 적용
           const dailyRate = staking.daily_rate || getDailyRate(staking.amount)
           const usdAmount = staking.amount * dailyRate
-          const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
+          let qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
+
+          // ★ 200% cap 부분 지급 체크 (B안) ★
+          //   accrual loop 내에서 매 영업일마다 누적이 cap 에 닿는지 재계산
+          //   cap 도달 시 정확한 잔여분만 지급하고 staking.status='capped' 처리 후 종료
+          const capCheck = await isUserCapped(staking.user_id as number)
+          if (capCheck.capped) {
+            // 이미 cap 도달 — 본인 daily 더 이상 지급 X
+            cappedSkipCount++
+            if (!cappedUsers.includes(staking.user_id as number)) cappedUsers.push(staking.user_id as number)
+            try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(staking.user_id).run() } catch(e) {}
+            break
+          }
+          // 잔여 한도 = target - paidTotal
+          const remaining = capCheck.target - capCheck.paidTotal
+          if (qkeyAmount > remaining) {
+            // 부분 지급으로 cap 정확히 맞춤
+            qkeyAmount = Math.max(0, Math.floor(remaining))
+            if (qkeyAmount <= 0) {
+              cappedSkipCount++
+              if (!cappedUsers.includes(staking.user_id as number)) cappedUsers.push(staking.user_id as number)
+              try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(staking.user_id).run() } catch(e) {}
+              break
+            }
+          }
 
           // [본인 배당 지급]
           //   reward_date = accrualDate (해당 평일)
@@ -3987,29 +4052,42 @@ app.post('/api/rewards/daily', async (c) => {
                 `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate).first()
 
                 if (l1Exists.count === 0) {
-                  const level1Reward = Math.round(qkeyAmount * 0.20)
-                  await db.prepare(`
-                    UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-                  `).bind(level1Reward, level1Referrer.referrer_id).run()
+                  let level1Reward = Math.round(qkeyAmount * 0.20)
 
-                  await db.prepare(`
-                    INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                    VALUES (?, ?, 1, ?, ?, ?, ?)
-                  `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today).run()
+                  // ★ 200% cap 체크 (B안) — L1 받는 사람 cap 도달 시 부분 지급 또는 차단 ★
+                  const l1Cap = await isUserCapped(level1Referrer.referrer_id as number)
+                  if (l1Cap.capped) {
+                    // L1 추천인 이미 cap → 매칭 수당 0건
+                    try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(level1Referrer.referrer_id).run() } catch(e) {}
+                    if (!cappedUsers.includes(level1Referrer.referrer_id as number)) cappedUsers.push(level1Referrer.referrer_id as number)
+                  } else {
+                    const l1Remaining = l1Cap.target - l1Cap.paidTotal
+                    if (level1Reward > l1Remaining) level1Reward = Math.max(0, Math.floor(l1Remaining))
+                    if (level1Reward > 0) {
+                      await db.prepare(`
+                        UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+                      `).bind(level1Reward, level1Referrer.referrer_id).run()
 
-                  // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
-                  const l1TxExists2 = await db.prepare(`
-                    SELECT id FROM transactions
-                    WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
-                      AND amount = ?
-                      AND date(created_at, '+9 hours') = ?
-                    LIMIT 1
-                  `).bind(level1Referrer.referrer_id, level1Reward, today).first()
-                  if (!l1TxExists2) {
-                    await db.prepare(`
-                      INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                      VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                    `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${today})`).run()
+                      await db.prepare(`
+                        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                        VALUES (?, ?, 1, ?, ?, ?, ?)
+                      `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today).run()
+
+                      // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                      const l1TxExists2 = await db.prepare(`
+                        SELECT id FROM transactions
+                        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                          AND amount = ?
+                          AND date(created_at, '+9 hours') = ?
+                        LIMIT 1
+                      `).bind(level1Referrer.referrer_id, level1Reward, today).first()
+                      if (!l1TxExists2) {
+                        await db.prepare(`
+                          INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                          VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                        `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${today})`).run()
+                      }
+                    }
                   }
                 }
 
@@ -4035,29 +4113,41 @@ app.post('/api/rewards/daily', async (c) => {
                     `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate).first()
 
                     if (l2Exists.count === 0) {
-                      const level2Reward = Math.round(qkeyAmount * 0.10)
-                      await db.prepare(`
-                        UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-                      `).bind(level2Reward, level2Referrer.referrer_id).run()
+                      let level2Reward = Math.round(qkeyAmount * 0.10)
 
-                      await db.prepare(`
-                        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                        VALUES (?, ?, 2, ?, ?, ?, ?)
-                      `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today).run()
+                      // ★ 200% cap 체크 (B안) — L2 받는 사람 cap 도달 시 부분 지급 또는 차단 ★
+                      const l2Cap = await isUserCapped(level2Referrer.referrer_id as number)
+                      if (l2Cap.capped) {
+                        try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(level2Referrer.referrer_id).run() } catch(e) {}
+                        if (!cappedUsers.includes(level2Referrer.referrer_id as number)) cappedUsers.push(level2Referrer.referrer_id as number)
+                      } else {
+                        const l2Remaining = l2Cap.target - l2Cap.paidTotal
+                        if (level2Reward > l2Remaining) level2Reward = Math.max(0, Math.floor(l2Remaining))
+                        if (level2Reward > 0) {
+                          await db.prepare(`
+                            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+                          `).bind(level2Reward, level2Referrer.referrer_id).run()
 
-                      // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
-                      const l2TxExists2 = await db.prepare(`
-                        SELECT id FROM transactions
-                        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
-                          AND amount = ?
-                          AND date(created_at, '+9 hours') = ?
-                        LIMIT 1
-                      `).bind(level2Referrer.referrer_id, level2Reward, today).first()
-                      if (!l2TxExists2) {
-                        await db.prepare(`
-                          INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                          VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                        `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${today})`).run()
+                          await db.prepare(`
+                            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+                            VALUES (?, ?, 2, ?, ?, ?, ?)
+                          `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today).run()
+
+                          // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                          const l2TxExists2 = await db.prepare(`
+                            SELECT id FROM transactions
+                            WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                              AND amount = ?
+                              AND date(created_at, '+9 hours') = ?
+                            LIMIT 1
+                          `).bind(level2Referrer.referrer_id, level2Reward, today).first()
+                          if (!l2TxExists2) {
+                            await db.prepare(`
+                              INSERT INTO transactions (user_id, type, coin_type, amount, description)
+                              VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+                            `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${today})`).run()
+                          }
+                        }
                       }
                     }
                   }
@@ -4081,6 +4171,9 @@ app.post('/api/rewards/daily', async (c) => {
     if (skippedCount > 0) {
       message += ` | ${skippedCount} completed`
     }
+    if (cappedSkipCount > 0) {
+      message += ` | ${cappedSkipCount} CAPPED-skip (200% reached)`
+    }
 
     return c.json({
       success: true,
@@ -4090,11 +4183,130 @@ app.post('/api/rewards/daily', async (c) => {
       rewarded: rewardedCount,
       totalQkey: totalQkeyRewarded,
       skipped: skippedCount,
+      cappedSkipCount: cappedSkipCount,
+      cappedUsers: cappedUsers,
       processedDates: processedDates
     })
   } catch (error) {
     console.error('Daily reward error:', error)
     return c.json({ error: t(c, 'rewards.daily_error') }, 500)
+  }
+})
+
+// ★ 200% Cap 진행률 조회 API (사용자/UI용) ★
+//   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)을
+//   사용자 진입금액 합계 × 2 × 150 (target) 과 비교한 진행률 반환.
+//   단계: <180% green / 180~200% red / >=200% capped
+app.get('/api/staking/progress/:userId', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = Number(c.req.param('userId'))
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return c.json({ error: 'invalid userId' }, 400)
+    }
+    const USD_TO_QKEY = 150
+
+    const stakeRow = await db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total
+      FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
+    `).bind(userId).first() as any
+    const stakeTotal = Number(stakeRow?.total || 0)
+
+    const paidRow = await db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total
+      FROM transactions
+      WHERE user_id = ? AND coin_type = 'QKEY'
+        AND type IN ('daily_qkey', 'referral_reward')
+    `).bind(userId).first() as any
+    const paidTotal = Number(paidRow?.total || 0)
+
+    const target = stakeTotal * 2 * USD_TO_QKEY
+    const percent = target > 0 ? (paidTotal / target * 100) : 0
+
+    // 단계 판정
+    let stage: 'green' | 'red' | 'capped' = 'green'
+    if (percent >= 200) stage = 'capped'
+    else if (percent >= 180) stage = 'red'
+
+    // staking 별 status 반환 (capped 표시용)
+    const stakings = await db.prepare(`
+      SELECT id, amount, daily_rate, start_date, end_date, status
+      FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
+      ORDER BY id ASC
+    `).bind(userId).all()
+
+    return c.json({
+      success: true,
+      user_id: userId,
+      stake_total_usd: stakeTotal,
+      target_qkey: target,
+      paid_total_qkey: paidTotal,
+      percent: Math.round(percent * 100) / 100,
+      stage,
+      capped: stage === 'capped',
+      remaining_qkey: Math.max(0, target - paidTotal),
+      stakings: stakings.results
+    })
+  } catch (error) {
+    console.error('staking progress error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★ 어드민 200% Cap 진단 — 53명 전체 진행률 일람 ★
+app.get('/api/admin/diag/staking-progress', async (c) => {
+  try {
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+
+    const rows = await db.prepare(`
+      SELECT
+        u.id as user_id,
+        u.email,
+        COALESCE(SUM(CASE WHEN s.status IN ('active','completed','capped') THEN s.amount ELSE 0 END), 0) as stake_total,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions
+          WHERE user_id = u.id AND coin_type = 'QKEY'
+            AND type IN ('daily_qkey','referral_reward')) as paid_total
+      FROM users u
+      LEFT JOIN staking s ON s.user_id = u.id
+      GROUP BY u.id
+      ORDER BY u.id ASC
+    `).all()
+
+    const list: any[] = []
+    let cappedCount = 0
+    let warnCount = 0
+    for (const r of rows.results as any[]) {
+      const stake = Number(r.stake_total || 0)
+      if (stake <= 0) continue
+      const paid = Number(r.paid_total || 0)
+      const target = stake * 2 * USD_TO_QKEY
+      const percent = target > 0 ? (paid / target * 100) : 0
+      let stage: 'green' | 'red' | 'capped' = 'green'
+      if (percent >= 200) { stage = 'capped'; cappedCount++ }
+      else if (percent >= 180) { stage = 'red'; warnCount++ }
+      list.push({
+        user_id: r.user_id,
+        email: r.email,
+        stake_total_usd: stake,
+        paid_total_qkey: paid,
+        target_qkey: target,
+        percent: Math.round(percent * 100) / 100,
+        stage,
+        remaining_qkey: Math.max(0, target - paid)
+      })
+    }
+
+    return c.json({
+      success: true,
+      total_active_users: list.length,
+      capped_count: cappedCount,
+      warn_count: warnCount,
+      list
+    })
+  } catch (error) {
+    console.error('admin staking-progress error:', error)
+    return c.json({ error: String(error) }, 500)
   }
 })
 
@@ -7178,6 +7390,260 @@ app.post('/api/admin/diag/fix-missing-rewards-to-policy', async (c) => {
     })
   } catch (error) {
     console.error('fix-missing-rewards-to-policy error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★ 사장님 2026-05-07 명시 GO ★ 롤백 + IN-PLACE UPDATE (절대 새 보정 행 INSERT 금지)
+//   STEP A: 직전 fix-missing-rewards-to-policy 보정 31건(tx_id 1585~1615) DELETE + qkey_balance −amount 환원
+//   STEP B: 53명 기존 transactions/referral_rewards/daily_rewards 행의 amount를 정책 정확값으로 UPDATE
+//           (예: 2,325 → 2,700 그 자리에 그대로 찍힘. 차액 행 별도 INSERT 절대 금지)
+//   STEP C: qkey_balance를 UPDATE된 행의 차액만큼만 조정
+//   행 자체가 없을 때만 신규 INSERT (cron 누락분만 보충)
+//   body: {
+//     dryRun?:bool, kstDate?:string,
+//     rollback: [{tx_id, user_id, amount}],
+//     updates: [{
+//       user_id,
+//       daily?: { tx_id, dr_id, target_amount, staking_id, daily_rate, period_days, accrued_count },
+//       l1?: [{ tx_id, rr_id, referee_id, src_amt, target_amount }],
+//       l2?: [{ tx_id, rr_id, referee_id, src_amt, target_amount }]
+//     }]
+//   }
+app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({})) as any
+    const dryRun = body.dryRun !== false
+    const kstDate = String(body.kstDate || '2026-05-07')
+    const rollback = Array.isArray(body.rollback) ? body.rollback : []
+    const updates = Array.isArray(body.updates) ? body.updates : []
+    const reason = String(body.reason || 'rollback-and-update-inplace-2026-05-07')
+
+    // === 검증 (dryRun 계획 수립) ===
+    const rollbackTotal = rollback.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
+    let plan_tx_updates = 0, plan_rr_updates = 0, plan_dr_updates = 0
+    let plan_tx_inserts = 0, plan_rr_inserts = 0, plan_dr_inserts = 0
+    let plan_balance_delta = 0
+    const planEntries: any[] = []
+    for (const up of updates) {
+      const userId = Number(up.user_id)
+      let userDelta = 0
+      const detail: any = { user_id: userId, daily: null, l1: [], l2: [] }
+      if (up.daily) {
+        const tgt = Number(up.daily.target_amount || 0)
+        const cur = Number(up.daily.current_amount || 0)
+        const diff = tgt - cur
+        userDelta += diff
+        if (up.daily.tx_id) plan_tx_updates += 1; else if (tgt > 0) plan_tx_inserts += 1
+        if (up.daily.dr_id) plan_dr_updates += 1; else if (tgt > 0) plan_dr_inserts += 1
+        detail.daily = { tx_id: up.daily.tx_id || null, dr_id: up.daily.dr_id || null, current: cur, target: tgt, diff }
+      }
+      for (const r of (up.l1 || [])) {
+        const tgt = Number(r.target_amount || 0)
+        const cur = Number(r.current_amount || 0)
+        const diff = tgt - cur
+        userDelta += diff
+        if (r.tx_id) plan_tx_updates += 1; else if (tgt > 0) plan_tx_inserts += 1
+        if (r.rr_id) plan_rr_updates += 1; else if (tgt > 0) plan_rr_inserts += 1
+        detail.l1.push({ tx_id: r.tx_id || null, rr_id: r.rr_id || null, referee_id: r.referee_id, current: cur, target: tgt, diff })
+      }
+      for (const r of (up.l2 || [])) {
+        const tgt = Number(r.target_amount || 0)
+        const cur = Number(r.current_amount || 0)
+        const diff = tgt - cur
+        userDelta += diff
+        if (r.tx_id) plan_tx_updates += 1; else if (tgt > 0) plan_tx_inserts += 1
+        if (r.rr_id) plan_rr_updates += 1; else if (tgt > 0) plan_rr_inserts += 1
+        detail.l2.push({ tx_id: r.tx_id || null, rr_id: r.rr_id || null, referee_id: r.referee_id, current: cur, target: tgt, diff })
+      }
+      detail.user_balance_delta = userDelta
+      plan_balance_delta += userDelta
+      planEntries.push(detail)
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true, dryRun: true,
+        kstDate, reason,
+        plan_rollback_rows: rollback.length,
+        plan_rollback_balance_revert: -rollbackTotal,
+        plan_tx_updates, plan_tx_inserts,
+        plan_rr_updates, plan_rr_inserts,
+        plan_dr_updates, plan_dr_inserts,
+        plan_balance_delta_from_updates: plan_balance_delta,
+        net_balance_change: plan_balance_delta - rollbackTotal,
+        entries: planEntries
+      })
+    }
+
+    // === STEP A: 롤백 (tx DELETE + qkey_balance 환원) ===
+    let deletedRows = 0
+    let revertedBalance = 0
+    for (const r of rollback) {
+      const txId = Number(r.tx_id)
+      const userId = Number(r.user_id)
+      const amount = Number(r.amount)
+      if (!Number.isFinite(txId) || !Number.isFinite(userId) || !Number.isFinite(amount)) continue
+      const exists = await db.prepare(`SELECT id, user_id, amount FROM transactions WHERE id = ?`).bind(txId).first() as any
+      if (!exists) continue
+      if (Number(exists.user_id) !== userId || Math.abs(Number(exists.amount) - amount) > 0.5) continue
+      await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txId).run()
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, userId).run()
+      deletedRows += 1
+      revertedBalance += amount
+    }
+
+    // === STEP B: IN-PLACE UPDATE (기존 행 amount → 정책 정확값) ===
+    // === STEP C: qkey_balance를 차액만큼만 조정 ===
+    let txUpdated = 0, rrUpdated = 0, drUpdated = 0
+    let txInserted = 0, rrInserted = 0, drInserted = 0
+    let totalBalanceDelta = 0
+    const updResults: any[] = []
+    for (const up of updates) {
+      const userId = Number(up.user_id)
+      let userDelta = 0
+      const r: any = { user_id: userId }
+
+      // (1) Daily 처리
+      if (up.daily) {
+        const tgt = Number(up.daily.target_amount || 0)
+        const txId = Number(up.daily.tx_id || 0)
+        const drId = Number(up.daily.dr_id || 0)
+        const stakingId = Number(up.daily.staking_id || 0)
+        const dailyRate = Number(up.daily.daily_rate || 0)
+        const periodDays = Number(up.daily.period_days || 0)
+        const accruedCount = Number(up.daily.accrued_count || 0)
+
+        // transactions: 기존 행 UPDATE / 없으면 INSERT
+        if (txId > 0) {
+          const cur = await db.prepare(`SELECT amount FROM transactions WHERE id = ?`).bind(txId).first() as any
+          if (cur) {
+            const curAmt = Number(cur.amount)
+            const desc = `Daily reward ${tgt.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${accruedCount}/${periodDays}d, accrued ${kstDate} paid ${kstDate})`
+            await db.prepare(`UPDATE transactions SET amount = ?, description = ? WHERE id = ?`).bind(tgt, desc, txId).run()
+            userDelta += (tgt - curAmt)
+            txUpdated += 1
+          }
+        } else if (tgt > 0 && stakingId > 0) {
+          const desc = `Daily reward ${tgt.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${accruedCount}/${periodDays}d, accrued ${kstDate} paid ${kstDate})`
+          await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'daily_qkey', 'QKEY', ?, ?)`).bind(userId, tgt, desc).run()
+          userDelta += tgt
+          txInserted += 1
+        }
+
+        // daily_rewards: 기존 행 UPDATE / 없으면 INSERT (5/8 cron 중복 가드용)
+        if (drId > 0) {
+          await db.prepare(`UPDATE daily_rewards SET usdt_amount = ? WHERE id = ?`).bind(tgt, drId).run()
+          drUpdated += 1
+        } else if (tgt > 0 && stakingId > 0) {
+          const drExists = await db.prepare(`SELECT id FROM daily_rewards WHERE user_id=? AND staking_id=? AND reward_date=?`).bind(userId, stakingId, kstDate).first()
+          if (!drExists) {
+            await db.prepare(`INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date) VALUES (?, ?, ?, ?, ?)`).bind(userId, stakingId, tgt, kstDate, kstDate).run()
+            drInserted += 1
+          }
+        }
+        r.daily = { target: tgt, tx_id: txId, dr_id: drId }
+      }
+
+      // (2) L1 처리 (level=1)
+      const l1Results: any[] = []
+      for (const ref of (up.l1 || [])) {
+        const tgt = Number(ref.target_amount || 0)
+        const txId = Number(ref.tx_id || 0)
+        const rrId = Number(ref.rr_id || 0)
+        const refereeId = Number(ref.referee_id || 0)
+        const srcAmt = Number(ref.src_amt || 0)
+
+        if (txId > 0) {
+          const cur = await db.prepare(`SELECT amount FROM transactions WHERE id = ?`).bind(txId).first() as any
+          if (cur) {
+            const curAmt = Number(cur.amount)
+            const desc = `Level 1 referral bonus (${srcAmt.toLocaleString()} QKEY x 20%, accrued ${kstDate} paid ${kstDate})`
+            await db.prepare(`UPDATE transactions SET amount = ?, description = ? WHERE id = ?`).bind(tgt, desc, txId).run()
+            userDelta += (tgt - curAmt)
+            txUpdated += 1
+          }
+        } else if (tgt > 0 && refereeId > 0) {
+          const desc = `Level 1 referral bonus (${srcAmt.toLocaleString()} QKEY x 20%, accrued ${kstDate} paid ${kstDate})`
+          await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'referral_reward', 'QKEY', ?, ?)`).bind(userId, tgt, desc).run()
+          userDelta += tgt
+          txInserted += 1
+        }
+
+        if (rrId > 0) {
+          await db.prepare(`UPDATE referral_rewards SET reward_amount = ?, original_amount = ? WHERE id = ?`).bind(tgt, srcAmt, rrId).run()
+          rrUpdated += 1
+        } else if (tgt > 0 && refereeId > 0) {
+          const rrExists = await db.prepare(`SELECT id FROM referral_rewards WHERE referrer_id=? AND referee_id=? AND level=1 AND reward_date=?`).bind(userId, refereeId, kstDate).first()
+          if (!rrExists) {
+            await db.prepare(`INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date) VALUES (?, ?, 1, ?, ?, ?, ?)`).bind(userId, refereeId, srcAmt, tgt, kstDate, kstDate).run()
+            rrInserted += 1
+          }
+        }
+        l1Results.push({ referee_id: refereeId, target: tgt, tx_id: txId, rr_id: rrId })
+      }
+      r.l1 = l1Results
+
+      // (3) L2 처리 (level=2)
+      const l2Results: any[] = []
+      for (const ref of (up.l2 || [])) {
+        const tgt = Number(ref.target_amount || 0)
+        const txId = Number(ref.tx_id || 0)
+        const rrId = Number(ref.rr_id || 0)
+        const refereeId = Number(ref.referee_id || 0)
+        const srcAmt = Number(ref.src_amt || 0)
+
+        if (txId > 0) {
+          const cur = await db.prepare(`SELECT amount FROM transactions WHERE id = ?`).bind(txId).first() as any
+          if (cur) {
+            const curAmt = Number(cur.amount)
+            const desc = `Level 2 referral bonus (${srcAmt.toLocaleString()} QKEY x 10%, accrued ${kstDate} paid ${kstDate})`
+            await db.prepare(`UPDATE transactions SET amount = ?, description = ? WHERE id = ?`).bind(tgt, desc, txId).run()
+            userDelta += (tgt - curAmt)
+            txUpdated += 1
+          }
+        } else if (tgt > 0 && refereeId > 0) {
+          const desc = `Level 2 referral bonus (${srcAmt.toLocaleString()} QKEY x 10%, accrued ${kstDate} paid ${kstDate})`
+          await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'referral_reward', 'QKEY', ?, ?)`).bind(userId, tgt, desc).run()
+          userDelta += tgt
+          txInserted += 1
+        }
+
+        if (rrId > 0) {
+          await db.prepare(`UPDATE referral_rewards SET reward_amount = ?, original_amount = ? WHERE id = ?`).bind(tgt, srcAmt, rrId).run()
+          rrUpdated += 1
+        } else if (tgt > 0 && refereeId > 0) {
+          const rrExists = await db.prepare(`SELECT id FROM referral_rewards WHERE referrer_id=? AND referee_id=? AND level=2 AND reward_date=?`).bind(userId, refereeId, kstDate).first()
+          if (!rrExists) {
+            await db.prepare(`INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date) VALUES (?, ?, 2, ?, ?, ?, ?)`).bind(userId, refereeId, srcAmt, tgt, kstDate, kstDate).run()
+            rrInserted += 1
+          }
+        }
+        l2Results.push({ referee_id: refereeId, target: tgt, tx_id: txId, rr_id: rrId })
+      }
+      r.l2 = l2Results
+
+      // STEP C: 잔액을 차액만큼 조정
+      if (userDelta !== 0) {
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(userDelta, userId).run()
+      }
+      r.balance_delta = userDelta
+      totalBalanceDelta += userDelta
+      updResults.push(r)
+    }
+
+    return c.json({
+      success: true, dryRun: false,
+      kstDate, reason,
+      stepA: { deleted_rows: deletedRows, reverted_balance: -revertedBalance },
+      stepB: { tx_updated: txUpdated, rr_updated: rrUpdated, dr_updated: drUpdated, tx_inserted: txInserted, rr_inserted: rrInserted, dr_inserted: drInserted },
+      stepC: { total_balance_delta: totalBalanceDelta },
+      net_balance_change: totalBalanceDelta - revertedBalance,
+      results: updResults
+    })
+  } catch (error) {
+    console.error('rollback-and-update-inplace error:', error)
     return c.json({ error: String(error) }, 500)
   }
 })
