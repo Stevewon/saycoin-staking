@@ -2785,14 +2785,13 @@ app.get('/api/admin/user/:userId', async (c) => {
       SELECT * FROM staking WHERE user_id = ? ORDER BY created_at DESC
     `).bind(userId).all()
 
-    // 배당 내역
+    // 배당 내역 — 정합성 표시를 위해 LIMIT 제거, KST 정렬
     const rewards = await db.prepare(`
       SELECT d.*, s.amount as staking_amount
       FROM daily_rewards d
       LEFT JOIN staking s ON d.staking_id = s.id
       WHERE d.user_id = ?
-      ORDER BY d.created_at DESC
-      LIMIT 50
+      ORDER BY datetime(d.created_at, '+9 hours') DESC, d.id DESC
     `).bind(userId).all()
 
     // 출금 내역
@@ -2800,9 +2799,10 @@ app.get('/api/admin/user/:userId', async (c) => {
       SELECT * FROM withdrawals WHERE user_id = ? ORDER BY created_at DESC
     `).bind(userId).all()
 
-    // 거래 내역
+    // 거래 내역 — 잔액 정합성 표시를 위해 LIMIT 제거 (전체 행 반환, KST 정렬)
     const transactions = await db.prepare(`
-      SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50
+      SELECT * FROM transactions WHERE user_id = ?
+      ORDER BY datetime(created_at, '+9 hours') DESC, id DESC
     `).bind(userId).all()
 
     // 직판수당(매출수당) 내역 — referrer_id 기준으로 본인이 받은 referral_rewards 표시
