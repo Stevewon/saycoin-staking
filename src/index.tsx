@@ -7106,10 +7106,12 @@ app.get('/api/transactions/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
-    // 사용자 화면 전용: 당일(KST) 같은 type/coin 거래는 합산 1줄로 압축
-    // - _purge_internal / balance_sync / admin_adjust 는 어드민 보정용이므로 사용자에게 숨김
+    // 사용자 화면 전용: 사용자가 실제 받은 QKEY 수량만 정확히 표시
+    // - coin_type = 'QKEY' 만 반환 (QTA/QX/USDT staking 보상은 사용자 거래내역에서 제외 → 표시합 부풀림 방지)
+    // - _purge_internal / balance_sync / admin_adjust 어드민 보정용은 사용자에게 숨김
     // - 어드민 화면(/api/admin/diag/transactions, /api/admin/user/:userId) 은 별도 raw 그대로 노출
-    // - ★ 모든 표시는 KST(+9h) 기준: GROUP BY 도 KST 일자, created_at 응답값도 KST 시각으로 변환해서 내보냄
+    // - 모든 표시는 KST(+9h) 기준: GROUP BY 도 KST 일자, created_at 응답값도 KST 시각으로 변환
+    // - 같은 KST 일자/type 거래는 SUM(amount) 으로 1줄 합산 표시
     const transactions = await db.prepare(`
       SELECT
         MAX(id) AS id,
@@ -7121,8 +7123,9 @@ app.get('/api/transactions/:userId', async (c) => {
         date(MAX(created_at), '+9 hours') AS kst_date
       FROM transactions
       WHERE user_id = ?
+        AND coin_type = 'QKEY'
         AND type NOT IN ('_purge_internal', 'balance_sync', 'admin_adjust')
-      GROUP BY date(created_at, '+9 hours'), type, coin_type
+      GROUP BY date(created_at, '+9 hours'), type
       ORDER BY MAX(created_at) DESC
       LIMIT 50
     `).bind(userId).all()
