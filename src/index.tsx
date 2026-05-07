@@ -7053,6 +7053,60 @@ app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
   }
 })
 
+// 옵션3 전용: 이미 삭제된 중복행에 대응하는 _purge_internal 보정행만 INSERT
+//   - 행 삭제 없음, 잔액 UPDATE 없음
+//   - balance-vs-tx 정합성 회복용 (잔액은 이미 정확, raw 합계만 -만큼 줄어든 상태)
+//   - 사용자 화면은 _purge_internal 필터로 자동 숨김 → "정확히 받아야 할 1건"만 표시
+//   - body: { dryRun?:bool, deltas: { [user_id:number]: amount:number }, reason?:string }
+app.post('/api/admin/diag/insert-audit-compensation', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({})) as any
+    const dryRun = body.dryRun !== false
+    const deltas = body.deltas || {}
+    const reason = String(body.reason || 'option3-hidden-compensation')
+
+    const entries = Object.entries(deltas).map(([uid, amt]) => ({ user_id: Number(uid), amount: Number(amt) }))
+    const validEntries = entries.filter(e => Number.isFinite(e.user_id) && Number.isFinite(e.amount) && e.amount > 0)
+    const totalAmount = validEntries.reduce((s, e) => s + e.amount, 0)
+
+    if (dryRun) {
+      return c.json({
+        success: true, dryRun: true,
+        plan_users: validEntries.length,
+        plan_total_amount: totalAmount,
+        plan_rows_to_insert: validEntries.length,
+        entries: validEntries
+      })
+    }
+
+    let inserted = 0
+    let totalSubtracted = 0
+    const results: any[] = []
+    for (const e of validEntries) {
+      const desc = `[옵션3 은닉보정] user=${e.user_id} amount=-${e.amount} reason=${reason}`
+      const ins = await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, '_purge_internal', 'QKEY', ?, ?)
+      `).bind(e.user_id, -e.amount, desc).run()
+      inserted += 1
+      totalSubtracted += e.amount
+      results.push({ user_id: e.user_id, amount: -e.amount, audit_id: (ins.meta as any)?.last_row_id })
+    }
+
+    return c.json({
+      success: true, dryRun: false,
+      inserted_rows: inserted,
+      total_compensated: -totalSubtracted,
+      reason,
+      results
+    })
+  } catch (error) {
+    console.error('insert-audit-compensation error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 사용자별 보상 내역 조회
 app.get('/api/rewards/history/:userId', async (c) => {
   try {
