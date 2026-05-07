@@ -7107,6 +7107,81 @@ app.post('/api/admin/diag/insert-audit-compensation', async (c) => {
   }
 })
 
+// 정책 정답값(referral_rewards/daily_rewards 진실)으로 잔액+transactions 동시 보정
+//   - 14명 누락분만큼 qkey_balance += gap UPDATE + transactions INSERT 1건
+//   - body: { dryRun?:bool, deltas: { [user_id]: { amount:number, type:'referral_reward'|'daily_qkey', desc?:string } }, kstDate?:string, reason?:string }
+//   - 사장님 명시 GO 확보 (2026-05-07): "2700이 맞는걸 확인했으니 맞는쪽으로 전부 바꿔라"
+app.post('/api/admin/diag/fix-missing-rewards-to-policy', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({})) as any
+    const dryRun = body.dryRun !== false
+    const deltas = body.deltas || {}
+    const kstDate = String(body.kstDate || '2026-05-07')
+    const reason = String(body.reason || 'policy-correction-2026-05-07')
+
+    const entries = Object.entries(deltas).map(([uid, v]: [string, any]) => ({
+      user_id: Number(uid),
+      amount: Number(v?.amount ?? 0),
+      tx_type: String(v?.type || 'referral_reward'),
+      desc: String(v?.desc || `[정책보정-${kstDate}] gap=${v?.amount}`)
+    }))
+    const valid = entries.filter(e => Number.isFinite(e.user_id) && Number.isFinite(e.amount) && e.amount > 0)
+    const totalAmount = valid.reduce((s, e) => s + e.amount, 0)
+
+    if (dryRun) {
+      return c.json({
+        success: true, dryRun: true,
+        plan_users: valid.length,
+        plan_total_amount: totalAmount,
+        plan_rows_to_insert: valid.length,
+        plan_balance_updates: valid.length,
+        kstDate, reason,
+        entries: valid
+      })
+    }
+
+    let inserted = 0
+    let balanceUpdated = 0
+    let totalAdded = 0
+    const results: any[] = []
+    for (const e of valid) {
+      // 1) qkey_balance += gap (잔액 보정)
+      const u = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(e.amount, e.user_id).run()
+      const updMeta = (u.meta as any) || {}
+      if ((updMeta.changes ?? 1) > 0) balanceUpdated += 1
+
+      // 2) transactions INSERT (표시 보정)
+      const ins = await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, ?, 'QKEY', ?, ?)
+      `).bind(e.user_id, e.tx_type, e.amount, e.desc).run()
+      inserted += 1
+      totalAdded += e.amount
+
+      results.push({
+        user_id: e.user_id,
+        amount: e.amount,
+        tx_type: e.tx_type,
+        tx_id: (ins.meta as any)?.last_row_id,
+        balance_updated: true
+      })
+    }
+
+    return c.json({
+      success: true, dryRun: false,
+      inserted_rows: inserted,
+      balance_updates: balanceUpdated,
+      total_added: totalAdded,
+      kstDate, reason,
+      results
+    })
+  } catch (error) {
+    console.error('fix-missing-rewards-to-policy error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 사용자별 보상 내역 조회
 app.get('/api/rewards/history/:userId', async (c) => {
   try {
