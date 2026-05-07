@@ -12383,7 +12383,9 @@ app.get('/admin/dashboard', (c) => {
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-coins mr-1 text-yellow-600"></i>' + I18N.t('admin.reward_section') + ' (' + rewards.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (rewards.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.date_label') + '</th><th class="px-2 py-1 text-right">QKEY</th><th class="px-2 py-1 text-right">' + I18N.t('admin.investment_amount') + '</th></tr></thead><tbody class="divide-y">' +
                             rewards.slice(0, 20).map(function(r) {
-                                return '<tr><td class="px-2 py-1">' + r.reward_date + '</td><td class="px-2 py-1 text-right font-bold text-yellow-600">' + Math.round(r.usdt_amount).toLocaleString() + '</td><td class="px-2 py-1 text-right">$' + (r.staking_amount || 0).toLocaleString() + '</td></tr>';
+                                // ★ reward_date 는 이미 KST 'YYYY-MM-DD' 문자열 (백엔드 기록 시점부터 KST). 그대로 사용
+                                //   사용자 화면과 동일한 reward_date 라벨을 표시해 어드민-사용자 간 1:1 일치 보장
+                                return '<tr><td class="px-2 py-1">' + (r.reward_date || '-') + '</td><td class="px-2 py-1 text-right font-bold text-yellow-600">' + Math.round(r.usdt_amount).toLocaleString() + '</td><td class="px-2 py-1 text-right">$' + (r.staking_amount || 0).toLocaleString() + '</td></tr>';
                             }).join('') +
                         '</tbody></table></div>' : '<p class="text-xs text-gray-500 mb-4">' + I18N.t('admin.no_rewards') + '</p>') +
                         // Withdrawal history
@@ -12392,14 +12394,34 @@ app.get('/admin/dashboard', (c) => {
                             withdrawals.map(function(w) {
                                 var wColor = w.status === 'pending' ? 'yellow' : w.status === 'approved' ? 'green' : 'red';
                                 var wText = w.status === 'pending' ? I18N.t('admin.wd_pending') : w.status === 'approved' ? I18N.t('admin.wd_approved') : I18N.t('admin.wd_rejected');
-                                return '<tr><td class="px-2 py-1">' + new Date(w.created_at).toLocaleDateString(I18N.getLang()) + '</td><td class="px-2 py-1 text-center font-bold">' + w.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(w.amount).toLocaleString() + '</td><td class="px-2 py-1 text-center"><span class="px-1 py-0.5 bg-' + wColor + '-100 text-' + wColor + '-700 rounded text-xs">' + wText + '</span></td></tr>';
+                                // ★ KST(Asia/Seoul) 강제 — 사용자 화면과 동일하게 표시 (UTC 보임 버그 수정)
+                                var wRaw = w.created_at;
+                                var wIso = (typeof wRaw === 'string' && wRaw.indexOf('T') === -1) ? (wRaw.replace(' ', 'T') + 'Z') : wRaw;
+                                var wDate = new Date(wIso);
+                                var wDateStr = isNaN(wDate.getTime()) ? (wRaw || '-') : wDate.toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' });
+                                return '<tr><td class="px-2 py-1">' + wDateStr + '</td><td class="px-2 py-1 text-center font-bold">' + w.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(w.amount).toLocaleString() + '</td><td class="px-2 py-1 text-center"><span class="px-1 py-0.5 bg-' + wColor + '-100 text-' + wColor + '-700 rounded text-xs">' + wText + '</span></td></tr>';
                             }).join('') +
                         '</tbody></table></div>' : '<p class="text-xs text-gray-500 mb-4">' + I18N.t('admin.no_withdrawals') + '</p>') +
                         // Recent transactions
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-exchange-alt mr-1 text-blue-600"></i>' + I18N.t('admin.tx_section') + ' (' + transactions.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (transactions.length > 0 ? '<div class="overflow-x-auto"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.date_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.type_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.coin_label') + '</th><th class="px-2 py-1 text-right">' + I18N.t('admin.qty_label') + '</th><th class="px-2 py-1 text-left">' + I18N.t('admin.desc_label') + '</th></tr></thead><tbody class="divide-y">' +
                             transactions.slice(0, 20).map(function(t) {
-                                return '<tr><td class="px-2 py-1 whitespace-nowrap">' + new Date(t.created_at).toLocaleDateString(I18N.getLang()) + '</td><td class="px-2 py-1 text-center">' + t.type + '</td><td class="px-2 py-1 text-center font-bold">' + t.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(t.amount).toLocaleString() + '</td><td class="px-2 py-1 truncate max-w-[150px]" title="' + esc(t.description || '') + '">' + esc(t.description || '-') + '</td></tr>';
+                                // ★ KST(Asia/Seoul) 강제 — 사용자 화면과 동일하게 표시 (UTC 보임 버그 수정)
+                                //   기존: new Date(t.created_at).toLocaleDateString() → 브라우저 로케일 의존, UTC 22:54 → 5/6 으로 잘못 표시
+                                //   수정: 'YYYY-MM-DD HH:mm' KST 24h 풀표기 → 5/6 04:00 vs 5/7 07:54 명확 구분
+                                var tRaw = t.created_at;
+                                var tIso = (typeof tRaw === 'string' && tRaw.indexOf('T') === -1) ? (tRaw.replace(' ', 'T') + 'Z') : tRaw;
+                                var tDate = new Date(tIso);
+                                var tDateStr;
+                                if (isNaN(tDate.getTime())) {
+                                    tDateStr = (tRaw || '-');
+                                } else {
+                                    var parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(tDate);
+                                    var p = {};
+                                    for (var i = 0; i < parts.length; i++) { p[parts[i].type] = parts[i].value; }
+                                    tDateStr = p.year + '-' + p.month + '-' + p.day + ' ' + (p.hour === '24' ? '00' : p.hour) + ':' + p.minute;
+                                }
+                                return '<tr><td class="px-2 py-1 whitespace-nowrap">' + tDateStr + '</td><td class="px-2 py-1 text-center">' + t.type + '</td><td class="px-2 py-1 text-center font-bold">' + t.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(t.amount).toLocaleString() + '</td><td class="px-2 py-1 truncate max-w-[150px]" title="' + esc(t.description || '') + '">' + esc(t.description || '-') + '</td></tr>';
                             }).join('') +
                         '</tbody></table></div>' : '<p class="text-xs text-gray-500">' + I18N.t('admin.no_tx') + '</p>');
 
