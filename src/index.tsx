@@ -2490,7 +2490,7 @@ app.get('/api/admin/rewards', async (c) => {
         COUNT(*) as count,
         COALESCE(SUM(usdt_amount), 0) as total_qkey
       FROM daily_rewards
-      WHERE reward_date = date('now')
+      WHERE reward_date = date('now', '+9 hours')
     `).first()
 
     // 최근 배당 내역 (최근 100건, 사용자 정보 포함)
@@ -3171,21 +3171,21 @@ app.get('/api/admin/signups', async (c) => {
     const todayUsers = await db.prepare(`
       SELECT COUNT(*) as count
       FROM users
-      WHERE date(created_at) = date('now')
+      WHERE date(created_at, '+9 hours') = date('now', '+9 hours')
     `).first()
 
-    // 이번 주 가입자 (최근 7일)
+    // 이번 주 가입자 (최근 7일, KST 기준)
     const weekUsers = await db.prepare(`
       SELECT COUNT(*) as count
       FROM users
-      WHERE date(created_at) >= date('now', '-7 days')
+      WHERE date(created_at, '+9 hours') >= date('now', '+9 hours', '-7 days')
     `).first()
 
-    // 이번 달 가입자 (최근 30일)
+    // 이번 달 가입자 (최근 30일, KST 기준)
     const monthUsers = await db.prepare(`
       SELECT COUNT(*) as count
       FROM users
-      WHERE date(created_at) >= date('now', '-30 days')
+      WHERE date(created_at, '+9 hours') >= date('now', '+9 hours', '-30 days')
     `).first()
 
     // 최근 가입자 목록 (최근 50명)
@@ -3572,8 +3572,8 @@ app.get('/api/admin/export/wallets', async (c) => {
       ].join(',') + '\n'
     }
 
-    // 파일명에 날짜 포함
-    const today = new Date().toISOString().slice(0,10)
+    // 파일명에 날짜 포함 (KST 기준)
+    const today = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0,10)
     return new Response(csv, {
       headers: {
         'Content-Type': 'text/csv; charset=utf-8',
@@ -4112,14 +4112,14 @@ app.get('/api/admin/diag/transactions', async (c) => {
       rows = await db.prepare(
         `SELECT id, user_id, type, coin_type, amount, description, created_at
          FROM transactions
-         WHERE user_id = ? AND date(created_at) = ?
+         WHERE user_id = ? AND date(created_at, '+9 hours') = ?
          ORDER BY id`
       ).bind(userId, date).all()
     } else {
       rows = await db.prepare(
         `SELECT id, user_id, type, coin_type, amount, description, created_at
          FROM transactions
-         WHERE date(created_at) = ?
+         WHERE date(created_at, '+9 hours') = ?
          ORDER BY user_id, id`
       ).bind(date).all()
     }
@@ -4193,7 +4193,7 @@ app.get('/api/admin/diag/rewards', async (c) => {
     const txRewards = await db.prepare(
       `SELECT id, user_id, type, coin_type, amount, description, created_at
        FROM transactions
-       WHERE date(created_at) = ?
+       WHERE date(created_at, '+9 hours') = ?
          AND type IN ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback','rollback_restore')
        ORDER BY id`
     ).bind(date).all()
@@ -4204,7 +4204,7 @@ app.get('/api/admin/diag/rewards', async (c) => {
               COUNT(*) as cnt,
               COALESCE(SUM(amount), 0) as total_amount
        FROM transactions
-       WHERE date(created_at) = ?
+       WHERE date(created_at, '+9 hours') = ?
          AND type IN ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback')
        GROUP BY type`
     ).bind(date).all()
@@ -4219,7 +4219,7 @@ app.get('/api/admin/diag/rewards', async (c) => {
          SUM(CASE WHEN description NOT LIKE '%Level 1%' AND description NOT LIKE '%Level 2%' THEN 1 ELSE 0 END) as other_cnt,
          SUM(CASE WHEN description NOT LIKE '%Level 1%' AND description NOT LIKE '%Level 2%' THEN amount ELSE 0 END) as other_amount
        FROM transactions
-       WHERE date(created_at) = ? AND type = 'referral_reward'`
+       WHERE date(created_at, '+9 hours') = ? AND type = 'referral_reward'`
     ).bind(date).all()
 
     return c.json({
@@ -4690,7 +4690,7 @@ app.post('/api/admin/rewards/rollback-tx-range', async (c) => {
     const rows = await db.prepare(
       `SELECT id, user_id, type, amount, description, created_at
        FROM transactions
-       WHERE date(created_at) BETWEEN ? AND ?
+       WHERE date(created_at, '+9 hours') BETWEEN ? AND ?
          AND type IN ('daily_qkey','referral_reward')
        ORDER BY id`
     ).bind(fromDate, toDate).all()
@@ -4699,7 +4699,7 @@ app.post('/api/admin/rewards/rollback-tx-range', async (c) => {
     const existingRollbacks = await db.prepare(
       `SELECT user_id, SUM(amount) as rolled
        FROM transactions
-       WHERE date(created_at) BETWEEN ? AND ?
+       WHERE date(created_at, '+9 hours') BETWEEN ? AND ?
          AND type IN ('daily_reward_rollback','referral_reward_rollback')
        GROUP BY user_id`
     ).bind(fromDate, toDate).all()
@@ -4793,7 +4793,7 @@ app.post('/api/admin/rewards/reconcile-tx-range', async (c) => {
     const paidRows = await db.prepare(
       `SELECT user_id, COALESCE(SUM(amount), 0) as total
        FROM transactions
-       WHERE date(created_at) BETWEEN ? AND ?
+       WHERE date(created_at, '+9 hours') BETWEEN ? AND ?
          AND type IN ('daily_qkey','referral_reward')
        GROUP BY user_id`
     ).bind(fromDate, toDate).all()
@@ -4801,7 +4801,7 @@ app.post('/api/admin/rewards/reconcile-tx-range', async (c) => {
     const rolledRows = await db.prepare(
       `SELECT user_id, COALESCE(SUM(amount), 0) as total
        FROM transactions
-       WHERE date(created_at) BETWEEN ? AND ?
+       WHERE date(created_at, '+9 hours') BETWEEN ? AND ?
          AND type IN ('daily_reward_rollback','referral_reward_rollback','rollback_restore')
        GROUP BY user_id`
     ).bind(fromDate, toDate).all()
@@ -12579,7 +12579,7 @@ app.get('/admin/dashboard', (c) => {
                     var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
                     var link = document.createElement('a');
                     link.href = URL.createObjectURL(blob);
-                    var now = new Date().toISOString().slice(0, 10);
+                    var now = new Date(Date.now() + 9*60*60*1000).toISOString().slice(0, 10);
                     link.download = 'daily_rewards_' + now + '.csv';
                     document.body.appendChild(link);
                     link.click();
@@ -12593,7 +12593,7 @@ app.get('/admin/dashboard', (c) => {
                     var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
                     var link = document.createElement('a');
                     link.href = URL.createObjectURL(blob);
-                    var now = new Date().toISOString().slice(0, 10);
+                    var now = new Date(Date.now() + 9*60*60*1000).toISOString().slice(0, 10);
                     link.download = 'referral_rewards_' + now + '.csv';
                     document.body.appendChild(link);
                     link.click();
@@ -14754,7 +14754,7 @@ app.get('/admin/dashboard', (c) => {
                     var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
                     var link = document.createElement('a');
                     link.href = URL.createObjectURL(blob);
-                    var now = new Date().toISOString().slice(0,10);
+                    var now = new Date(Date.now() + 9*60*60*1000).toISOString().slice(0,10);
                     link.download = 'shop_orders_' + now + '.csv';
                     link.click();
                     URL.revokeObjectURL(link.href);
@@ -14773,7 +14773,7 @@ app.get('/admin/dashboard', (c) => {
                     var blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
                     var link = document.createElement('a');
                     link.href = URL.createObjectURL(blob);
-                    var now = new Date().toISOString().slice(0,10);
+                    var now = new Date(Date.now() + 9*60*60*1000).toISOString().slice(0,10);
                     // 타입별 파일명 매핑
                     var fileNameMap = {
                         'users': 'users_export_' + now + '.csv',
