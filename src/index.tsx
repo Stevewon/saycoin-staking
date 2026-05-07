@@ -6940,6 +6940,7 @@ app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
     const toDate = body.toDate ? String(body.toDate) : '2099-12-31'
     const limitUser = body.userId ? Number(body.userId) : null  // 배치 처리: 특정 user_id 만
     const maxRows = body.maxRows ? Number(body.maxRows) : 0     // 배치 처리: 최대 삭제 행 수
+    const keepBalance = body.keepBalance === true               // ★ 사장님 명령: 행만 삭제, 잔액 UPDATE 스킵
     // KST 같은 일자 내 (user_id, type, amount) 중복만 잡음 — 다른 일자의 정상 보상은 보호
     const sqlBase = `
       SELECT id, user_id, type, coin_type, amount, description, created_at,
@@ -7018,15 +7019,20 @@ app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
         const removed = (del.meta?.changes || 0)
         deletedCount += removed
         if (removed > 0) {
-          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`)
-            .bind(Number(grp.amount || 0), grp.user_id).run()
-          balanceSubtracted += Number(grp.amount || 0)
-          const desc = `[중복v2 정리] tx_id=${r.id} type=${grp.type} amount=-${grp.amount} kst=${grp.kst_date} keep=${grp.keep_row_id}`
-          const ins = await db.prepare(`
-            INSERT INTO transactions (user_id, type, coin_type, amount, description)
-            VALUES (?, '_purge_internal', 'QKEY', ?, ?)
-          `).bind(grp.user_id, -Number(grp.amount || 0), desc).run()
-          auditLogs.push({ user_id: grp.user_id, deleted_id: r.id, audit_id: (ins.meta as any)?.last_row_id, amount: grp.amount })
+          if (!keepBalance) {
+            await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`)
+              .bind(Number(grp.amount || 0), grp.user_id).run()
+            balanceSubtracted += Number(grp.amount || 0)
+            const desc = `[중복v2 정리] tx_id=${r.id} type=${grp.type} amount=-${grp.amount} kst=${grp.kst_date} keep=${grp.keep_row_id}`
+            const ins = await db.prepare(`
+              INSERT INTO transactions (user_id, type, coin_type, amount, description)
+              VALUES (?, '_purge_internal', 'QKEY', ?, ?)
+            `).bind(grp.user_id, -Number(grp.amount || 0), desc).run()
+            auditLogs.push({ user_id: grp.user_id, deleted_id: r.id, audit_id: (ins.meta as any)?.last_row_id, amount: grp.amount })
+          } else {
+            // keepBalance=true: 잔액 그대로, 행만 삭제 (사장님 명령)
+            auditLogs.push({ user_id: grp.user_id, deleted_id: r.id, audit_id: null, amount: grp.amount, keepBalance: true })
+          }
         }
       }
     }
