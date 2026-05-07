@@ -7106,12 +7106,22 @@ app.get('/api/transactions/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
+    // 사용자 화면 전용: 당일(KST) 같은 type/coin 거래는 합산 1줄로 압축
+    // - _purge_internal / balance_sync / admin_adjust 는 어드민 보정용이므로 사용자에게 숨김
+    // - 어드민 화면(/api/admin/diag/transactions, /api/admin/user/:userId) 은 별도 raw 그대로 노출
     const transactions = await db.prepare(`
-      SELECT id, type, coin_type, amount, description, created_at
+      SELECT
+        MAX(id) AS id,
+        type,
+        coin_type,
+        SUM(amount) AS amount,
+        MIN(description) AS description,
+        MAX(created_at) AS created_at
       FROM transactions
       WHERE user_id = ?
-        AND type != '_purge_internal'
-      ORDER BY created_at DESC
+        AND type NOT IN ('_purge_internal', 'balance_sync', 'admin_adjust')
+      GROUP BY date(created_at, '+9 hours'), type, coin_type
+      ORDER BY MAX(created_at) DESC
       LIMIT 50
     `).bind(userId).all()
 
