@@ -3802,20 +3802,31 @@ app.post('/api/rewards/daily', async (c) => {
 
     const db = c.env.DB
     const now = new Date()
-    // ★ KST 기준 날짜 사용 (UTC가 아니라) — 한국 새벽시간대 휴일 판정 누락 방지
+    // ★ 사장님 2026-05-07 명확화 ★
+    //   "한국시간으로 익일 01시 정도에 cron 이 돌면서 전날 24시간동안 매출을 점검해서
+    //    아침 7시에 뿌려주라는 의미" — 즉, 기준일 = 어제 (KST 00:00:00 ~ 23:59:59)
+    //   cron 실행 시각: KST 01:00 (UTC 16:00 전일 평일 0-4)
+    //   reward_date = 어제(KST)  /  paid_date = 오늘(KST 01:00 처리, 사용자 UI 상 07시 지급 라벨)
+    //
+    //   기존 today 기준 → yesterdayKst 기준으로 전면 변경
     const today = kstDateStr(now)
+    const yesterdayKst = kstDateStr(new Date(now.getTime() - 24 * 60 * 60 * 1000))
 
-    // 영업일 체크: 토/일/공휴일이면 지급 불가 (KST 기준)
-    const { isBusinessDay, reason } = isKoreanBusinessDay(now)
+    // 영업일 체크: 어제(KST) 가 토/일/공휴일이면 지급 불가
+    //   ※ 어제 매출이 없는 휴일이면 cron 자체가 0건 처리 → 룰 B 와 일치
+    //   ※ 단, 어제가 공휴일이면 직전 영업일치는 이미 그 다음 평일 cron 에서 처리됨 (백필 로직)
+    const yesterdayDateObj = new Date(yesterdayKst + 'T00:00:00+09:00')
+    const { isBusinessDay, reason } = isKoreanBusinessDay(yesterdayDateObj)
     if (!isBusinessDay) {
       const reasonText = reason === 'saturday' ? '토요일' : reason === 'sunday' ? '일요일' : '공휴일/국경일'
       return c.json({
         success: true,
-        message: `오늘은 ${reasonText}이므로 배당금 지급이 불가합니다.`,
+        message: `어제(${yesterdayKst})는 ${reasonText}이므로 배당 대상일 아님 (룰 B: 휴일 매출은 다음 평일 cron 에서 처리).`,
         rewarded: 0,
         totalQkey: 0,
         skipped: 0,
-        reason: reason
+        reason: reason,
+        targetDate: yesterdayKst
       })
     }
 
@@ -3832,8 +3843,13 @@ app.post('/api/rewards/daily', async (c) => {
     try { await db.prepare(`ALTER TABLE daily_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
     try { await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
 
-    // 활성 투자 조회 (오늘까지 시작했고 거치기간 종료일이 오늘 이상인 모든 staking)
-    // ★ 누락 보강을 위해 staking.start_date 가 오늘(today) 이전이면 모두 후보 — 휴일 가입자도 포함
+    // ★ 사장님 룰 (2026-05-07 명확화) ★
+    //   기준일 = yesterdayKst (어제 KST 00:00:00 ~ 23:59:59 의 24시간 윈도우 매출 전체 포함)
+    //   ⇒ start_date_kst <= yesterdayKst 인 staking 만 어제 매출로 인정 (휴일 가입자 포함, 룰 B 백필)
+    //   ⇒ end_date_kst   >= yesterdayKst 인 staking 만 거치기간 내 (어제 시점 활성)
+    //
+    //   이렇게 하면 어제 KST 23:59:59 직전에 가입한 회원도 무조건 어제 매출로 잡혀서
+    //   오늘 새벽 01:00 cron 에서 일일배당이 발생함 (영국시간/UTC 경계 문제 완전 차단).
     const activeStakings = await db.prepare(`
       SELECT
         s.user_id,
@@ -3852,7 +3868,7 @@ app.post('/api/rewards/daily', async (c) => {
       WHERE s.status = 'active'
         AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
-    `).bind(today, today).all()
+    `).bind(yesterdayKst, yesterdayKst).all()
 
     if (activeStakings.results.length === 0) {
       return c.json({
@@ -3874,13 +3890,15 @@ app.post('/api/rewards/daily', async (c) => {
       try {
         const periodDays = staking.period_days || (staking.period_months * 30)
 
-        // 이 staking 에 대해 채워야 할 reward_date 목록 산출
-        // - lastRewardDate 가 있으면 그 다음 영업일 ~ today
-        // - 없으면 startDateKst ~ today (휴일이면 자동 skip 되어 첫 평일부터)
+        // ★ 사장님 룰 (2026-05-07 명확화) ★
+        //   reward_date 는 어제(yesterdayKst) 까지만 채움. 오늘 매출은 내일 01:00 cron 에서 처리.
+        //   - lastRewardDate 가 있으면 그 다음 영업일 ~ yesterdayKst
+        //   - 없으면 startDateKst ~ yesterdayKst (휴일이면 자동 skip 되어 첫 평일부터)
+        //   ⇒ 어제 가입자(00시~23시59분)도 startDateKst <= yesterdayKst 라 무조건 포함
         const accrualDates = getStakingAccrualDatesKst(
           (staking.last_reward_date as string) || null,
           staking.start_date_kst as string,
-          today
+          yesterdayKst
         )
 
         if (accrualDates.length === 0) {
@@ -4025,7 +4043,7 @@ app.post('/api/rewards/daily', async (c) => {
       }
     }
 
-    let message = `[지급일 ${today}] ${rewardedCount} rewarded across ${processedDates.length} stakings (${totalQkeyRewarded.toLocaleString()} QKEY)`
+    let message = `[기준일(어제) ${yesterdayKst} / 지급처리일 ${today}] ${rewardedCount} rewarded across ${processedDates.length} stakings (${totalQkeyRewarded.toLocaleString()} QKEY)`
     if (skippedCount > 0) {
       message += ` | ${skippedCount} completed`
     }
@@ -4033,7 +4051,8 @@ app.post('/api/rewards/daily', async (c) => {
     return c.json({
       success: true,
       message: message,
-      paidDate: today,
+      targetDate: yesterdayKst,   // 기준일(어제 KST)
+      paidDate: today,            // 처리일(오늘 KST 01:00)
       rewarded: rewardedCount,
       totalQkey: totalQkeyRewarded,
       skipped: skippedCount,
