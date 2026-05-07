@@ -3786,6 +3786,20 @@ function isWithdrawalWindowOpen(d: Date): boolean {
 // 월~금만 지급 (토/일/공휴일/국경일 제외)
 app.post('/api/rewards/daily', async (c) => {
   try {
+    // ★ 사장님 2026-05-07 지시 ★ 강제 일괄 배당은 cron(GitHub Actions) 전용
+    // GitHub Actions cron 호출은 'X-Cron-Trigger: github-actions' 헤더로 식별
+    // 어드민 UI/사람이 호출하는 경우는 User-Agent 가 axios/Mozilla 등이므로 차단
+    const cronTrigger = c.req.header('X-Cron-Trigger') || ''
+    const userAgent = c.req.header('User-Agent') || ''
+    const isCronCall = cronTrigger === 'github-actions' || /node|github-actions/i.test(userAgent)
+    if (!isCronCall) {
+      return c.json({
+        success: false,
+        error: '강제 일괄 배당은 비활성화되었습니다. 매 평일 KST 07:00 cron 자동 실행 전용입니다. 개별 보정은 /api/admin/rewards/manual-adjust 를 사용하세요.',
+        blocked: true
+      }, 403)
+    }
+
     const db = c.env.DB
     const now = new Date()
     // ★ KST 기준 날짜 사용 (UTC가 아니라) — 한국 새벽시간대 휴일 판정 누락 방지
@@ -4168,6 +4182,130 @@ app.get('/api/admin/diag/rewards', async (c) => {
       tx_referral_breakdown: txReferralBreakdown.results
     })
   } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★ 사장님 2026-05-07 지시 ★★
+// "영국시간(UTC) 기준으로 reward_date 가 다른 날로 찍혀서 같은 KST 영업일 1회 지급이 2회로 중복 보이는 건 정리"
+// 분석 로직:
+//  1) daily_rewards 의 created_at(UTC 저장) 을 KST 로 변환 → kst_date
+//  2) 같은 (user_id, staking_id) 에 대해 다른 reward_date 가 KST 기준 같은 영업일에 들어있으면 중복으로 식별
+//  3) dryRun=true 이면 분석만, false 이면 가장 최근(id 큰) 것만 남기고 나머지는 삭제 + 잔액 차감 + transactions 회수 로그 기록
+app.post('/api/admin/rewards/dedupe-kst-utc', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body.dryRun !== false  // 기본값 true (안전)
+    const targetUserId = body.userId ? Number(body.userId) : null
+    const fromDate = body.fromDate ? String(body.fromDate) : '2026-04-01'
+    const toDate = body.toDate ? String(body.toDate) : '2099-12-31'
+
+    // 모든 daily_rewards 조회 (created_at + reward_date 둘 다)
+    // SQLite datetime(created_at, '+9 hours') 로 KST 변환, KST 날짜만 추출
+    const sql = `
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at,
+             date(datetime(created_at, '+9 hours')) as kst_created_date
+      FROM daily_rewards
+      WHERE reward_date BETWEEN ? AND ?
+      ${targetUserId ? 'AND user_id = ?' : ''}
+      ORDER BY user_id, staking_id, kst_created_date, id
+    `
+    const args: any[] = [fromDate, toDate]
+    if (targetUserId) args.push(targetUserId)
+    const rows = await db.prepare(sql).bind(...args).all()
+    const allRows = (rows.results || []) as any[]
+
+    // KST 기준 중복 그룹핑: (user_id + staking_id + kst_created_date) 가 같으면 중복
+    const groups: Record<string, any[]> = {}
+    for (const r of allRows) {
+      const key = `${r.user_id}|${r.staking_id}|${r.kst_created_date}`
+      if (!groups[key]) groups[key] = []
+      groups[key].push(r)
+    }
+
+    // 중복 그룹 (2개 이상) 만 추출
+    const duplicateGroups: any[] = []
+    let totalDuplicateRows = 0
+    let totalDuplicateAmount = 0
+    for (const key in groups) {
+      const grp = groups[key]
+      if (grp.length < 2) continue
+      // reward_date 가 서로 다르면 UTC/KST 경계 문제로 의심
+      const distinctRewardDates = Array.from(new Set(grp.map(r => r.reward_date)))
+      const isUtcBoundaryIssue = distinctRewardDates.length > 1
+      const keepRow = grp.reduce((a, b) => (b.id > a.id ? b : a))  // id 가장 큰 것 유지
+      const removeRows = grp.filter(r => r.id !== keepRow.id)
+      const removeAmount = removeRows.reduce((sum, r) => sum + Number(r.usdt_amount || 0), 0)
+      totalDuplicateRows += removeRows.length
+      totalDuplicateAmount += removeAmount
+      duplicateGroups.push({
+        key,
+        user_id: grp[0].user_id,
+        staking_id: grp[0].staking_id,
+        kst_created_date: grp[0].kst_created_date,
+        distinct_reward_dates: distinctRewardDates,
+        is_utc_boundary_issue: isUtcBoundaryIssue,
+        rows_total: grp.length,
+        keep_row_id: keepRow.id,
+        keep_row: keepRow,
+        remove_rows: removeRows,
+        remove_amount: removeAmount
+      })
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        scope: { fromDate, toDate, userId: targetUserId },
+        analyzed_rows: allRows.length,
+        duplicate_groups: duplicateGroups.length,
+        rows_to_remove: totalDuplicateRows,
+        amount_to_subtract: totalDuplicateAmount,
+        groups: duplicateGroups,
+        note: 'dryRun=true 분석만 수행. 실제 삭제는 dryRun:false 로 다시 호출하세요.'
+      })
+    }
+
+    // 실제 삭제 + 잔액 차감 + transactions 회수 로그
+    let deletedCount = 0
+    let balanceSubtracted = 0
+    const txLogs: any[] = []
+    for (const grp of duplicateGroups) {
+      for (const r of grp.remove_rows) {
+        // 1) daily_rewards 삭제
+        const del = await db.prepare(`DELETE FROM daily_rewards WHERE id = ?`).bind(r.id).run()
+        const removed = (del.meta?.changes || 0)
+        deletedCount += removed
+        if (removed > 0) {
+          // 2) 잔액 차감
+          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`)
+            .bind(Number(r.usdt_amount || 0), r.user_id).run()
+          balanceSubtracted += Number(r.usdt_amount || 0)
+          // 3) transactions 회수 로그
+          const desc = `[KST/UTC 중복 정리] daily_reward_id=${r.id} reward_date=${r.reward_date} kst_date=${r.kst_created_date} amount=-${r.usdt_amount}`
+          const ins = await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'daily_reward_rollback', 'QKEY', ?, ?)
+          `).bind(r.user_id, -Number(r.usdt_amount || 0), desc).run()
+          txLogs.push({ user_id: r.user_id, deleted_id: r.id, tx_id: (ins.meta as any)?.last_row_id })
+        }
+      }
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      scope: { fromDate, toDate, userId: targetUserId },
+      duplicate_groups: duplicateGroups.length,
+      deleted_rows: deletedCount,
+      balance_subtracted: balanceSubtracted,
+      tx_logs: txLogs,
+      groups: duplicateGroups
+    })
+  } catch (error) {
+    console.error('dedupe-kst-utc error:', error)
     return c.json({ error: String(error) }, 500)
   }
 })
@@ -10394,19 +10532,19 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
-                <!-- 일일 배당 지급 버튼 -->
+                <!-- 일일 배당 자동화 안내 (강제 일괄 지급 버튼 비활성화 — 사장님 2026-05-07 지시) -->
                 <div class="bg-white rounded-lg shadow-md p-4 sm:p-6 mb-4 sm:mb-6">
                     <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                         <div>
-                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-coins text-yellow-600 mr-2"></i><span data-i18n="admin.daily_reward_title">일일 배당금 지급</span></h3>
-                            <p class="text-sm text-gray-600 mt-1" data-i18n="admin.daily_reward_desc">활성 투자 건에 대한 일일 QKEY 배당금을 지급합니다</p>
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clock text-blue-600 mr-2"></i>일일 배당 자동화 (KST 07:00)</h3>
+                            <p class="text-sm text-gray-600 mt-1">매 평일 한국시간 오전 7시에 GitHub Actions cron 으로 자동 지급됩니다 (월~금)</p>
+                            <p class="text-xs text-gray-500 mt-1">개별 회원 보정은 아래 회원관리 → '잔액 조정' 또는 '/api/admin/rewards/manual-adjust' 사용</p>
                         </div>
-                        <button onclick="executeDailyReward()" id="dailyRewardBtn"
-                            class="px-6 py-3 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg font-bold transition text-sm sm:text-base whitespace-nowrap">
-                            <i class="fas fa-play mr-2"></i><span data-i18n="admin.daily_reward_btn">배당금 지급 실행</span>
+                        <button disabled
+                            class="px-6 py-3 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed text-sm sm:text-base whitespace-nowrap"
+                            title="강제 일괄 배당은 비활성화됨 (cron 자동 실행 전용)">
+                            <i class="fas fa-lock mr-2"></i>자동 실행 전용
                         </button>
-                    </div>
-                    <div id="dailyRewardResult" class="mt-3 hidden">
                     </div>
                 </div>
 
@@ -11964,44 +12102,11 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // ============================================
-            // 일일 배당금 지급 실행
+            // 일일 배당금 지급 실행 (사장님 2026-05-07 지시로 비활성화 — cron 자동 전용)
             // ============================================
             async function executeDailyReward() {
-                if (!confirm(I18N.t('admin.daily_reward_confirm'))) return;
-                
-                var btn = document.getElementById('dailyRewardBtn');
-                btn.disabled = true;
-                btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>' + I18N.t('admin.daily_reward_processing');
-
-                try {
-                    const response = await axios.post('/api/rewards/daily');
-                    if (response.data.success) {
-                        var resultEl = document.getElementById('dailyRewardResult');
-                        resultEl.classList.remove('hidden');
-                        
-                        // 비영업일 (토/일/공휴일)이면 노란색 경고
-                        if (response.data.reason && response.data.reason !== 'business_day') {
-                            resultEl.innerHTML = '<div class="bg-yellow-50 border border-yellow-300 rounded-lg p-3">' +
-                                '<p class="text-sm font-bold text-yellow-800"><i class="fas fa-exclamation-triangle mr-1"></i>' + response.data.message + '</p>' +
-                            '</div>';
-                        } else {
-                            resultEl.innerHTML = '<div class="bg-green-50 border border-green-300 rounded-lg p-3">' +
-                                '<p class="text-sm font-bold text-green-800"><i class="fas fa-check-circle mr-1"></i>' + response.data.message + '</p>' +
-                                '<div class="grid grid-cols-3 gap-2 mt-2 text-center">' +
-                                    '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_people') + '</p><p class="font-bold text-green-600">' + (response.data.rewarded || 0) + I18N.t('admin.people_unit') + '</p></div>' +
-                                    '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_total_qkey') + '</p><p class="font-bold text-yellow-600">' + (response.data.totalQkey || 0).toLocaleString() + '</p></div>' +
-                                    '<div><p class="text-xs text-gray-600">' + I18N.t('admin.daily_reward_skipped') + '</p><p class="font-bold text-gray-600">' + (response.data.skipped || 0) + I18N.t('admin.cases_unit') + '</p></div>' +
-                                '</div>' +
-                            '</div>';
-                        }
-                        await loadStatistics();
-                    }
-                } catch (error) {
-                    alert(error.response?.data?.error || I18N.t('admin.daily_reward_fail'));
-                }
-
-                btn.disabled = false;
-                btn.innerHTML = '<i class="fas fa-play mr-2"></i>' + I18N.t('admin.daily_reward_btn');
+                alert('일일 배당은 매 평일 KST 07:00 cron 자동 실행 전용입니다. 개별 회원 보정은 회원관리 → 잔액 조정 또는 /api/admin/rewards/manual-adjust 를 사용해 주세요.');
+                return;
             }
 
             // ============================================
