@@ -7418,6 +7418,13 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
     const kstDate = String(body.kstDate || '2026-05-07')
     const rollback = Array.isArray(body.rollback) ? body.rollback : []
     const updates = Array.isArray(body.updates) ? body.updates : []
+    // 중복/초과 행 DELETE (잔액도 차감)
+    // rr_delete: [{rr_id, tx_id, user_id, amount}]  - referral_rewards 행 + 매칭 tx 행 동시 삭제
+    // tx_delete: [{tx_id, user_id, amount}]         - transactions 단독 삭제 (잔액 -amount)
+    // dr_delete: [{dr_id, tx_id, user_id, amount}]  - daily_rewards + 매칭 tx 동시 삭제
+    const rrDelete = Array.isArray(body.rr_delete) ? body.rr_delete : []
+    const txDelete = Array.isArray(body.tx_delete) ? body.tx_delete : []
+    const drDelete = Array.isArray(body.dr_delete) ? body.dr_delete : []
     const reason = String(body.reason || 'rollback-and-update-inplace-2026-05-07')
 
     // === 검증 (dryRun 계획 수립) ===
@@ -7462,17 +7469,26 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
       planEntries.push(detail)
     }
 
+    // 중복/초과 행 DELETE 계획 합계
+    const rrDeleteTotal = rrDelete.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
+    const txDeleteTotal = txDelete.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
+    const drDeleteTotal = drDelete.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
+    const totalDeleteAmount = rrDeleteTotal + txDeleteTotal + drDeleteTotal
+
     if (dryRun) {
       return c.json({
         success: true, dryRun: true,
         kstDate, reason,
         plan_rollback_rows: rollback.length,
         plan_rollback_balance_revert: -rollbackTotal,
+        plan_rr_delete_rows: rrDelete.length, plan_rr_delete_balance_revert: -rrDeleteTotal,
+        plan_tx_delete_rows: txDelete.length, plan_tx_delete_balance_revert: -txDeleteTotal,
+        plan_dr_delete_rows: drDelete.length, plan_dr_delete_balance_revert: -drDeleteTotal,
         plan_tx_updates, plan_tx_inserts,
         plan_rr_updates, plan_rr_inserts,
         plan_dr_updates, plan_dr_inserts,
         plan_balance_delta_from_updates: plan_balance_delta,
-        net_balance_change: plan_balance_delta - rollbackTotal,
+        net_balance_change: plan_balance_delta - rollbackTotal - totalDeleteAmount,
         entries: planEntries
       })
     }
@@ -7492,6 +7508,75 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
       await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, userId).run()
       deletedRows += 1
       revertedBalance += amount
+    }
+
+    // === STEP A2: 중복/초과 행 DELETE (rr_delete + 매칭 tx + 잔액 -amount) ===
+    let rrDeleted = 0, rrDelTxDeleted = 0
+    let totalRrDeletedAmount = 0
+    for (const r of rrDelete) {
+      const rrId = Number(r.rr_id)
+      const txId = Number(r.tx_id || 0)
+      const userId = Number(r.user_id)
+      const amount = Number(r.amount)
+      if (!Number.isFinite(rrId) || !Number.isFinite(userId) || !Number.isFinite(amount)) continue
+      const rrExists = await db.prepare(`SELECT id, referrer_id, reward_amount FROM referral_rewards WHERE id = ?`).bind(rrId).first() as any
+      if (!rrExists) continue
+      if (Number(rrExists.referrer_id) !== userId || Math.abs(Number(rrExists.reward_amount) - amount) > 0.5) continue
+      await db.prepare(`DELETE FROM referral_rewards WHERE id = ?`).bind(rrId).run()
+      rrDeleted += 1
+      // 매칭 transactions DELETE (tx_id 지정된 경우만, 안전)
+      if (txId > 0) {
+        const txExists = await db.prepare(`SELECT id, user_id, amount, type FROM transactions WHERE id = ?`).bind(txId).first() as any
+        if (txExists && Number(txExists.user_id) === userId && Math.abs(Number(txExists.amount) - amount) < 0.5 && txExists.type === 'referral_reward') {
+          await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txId).run()
+          rrDelTxDeleted += 1
+        }
+      }
+      // 잔액 -amount
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, userId).run()
+      totalRrDeletedAmount += amount
+    }
+
+    // === STEP A3: tx_delete 단독 (잔액 -amount) ===
+    let txDeleted = 0
+    let totalTxDeletedAmount = 0
+    for (const r of txDelete) {
+      const txId = Number(r.tx_id)
+      const userId = Number(r.user_id)
+      const amount = Number(r.amount)
+      if (!Number.isFinite(txId) || !Number.isFinite(userId) || !Number.isFinite(amount)) continue
+      const exists = await db.prepare(`SELECT id, user_id, amount FROM transactions WHERE id = ?`).bind(txId).first() as any
+      if (!exists) continue
+      if (Number(exists.user_id) !== userId || Math.abs(Number(exists.amount) - amount) > 0.5) continue
+      await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txId).run()
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, userId).run()
+      txDeleted += 1
+      totalTxDeletedAmount += amount
+    }
+
+    // === STEP A4: dr_delete (daily_rewards + 매칭 tx + 잔액 -amount) ===
+    let drDeleted = 0, drDelTxDeleted = 0
+    let totalDrDeletedAmount = 0
+    for (const r of drDelete) {
+      const drId = Number(r.dr_id)
+      const txId = Number(r.tx_id || 0)
+      const userId = Number(r.user_id)
+      const amount = Number(r.amount)
+      if (!Number.isFinite(drId) || !Number.isFinite(userId) || !Number.isFinite(amount)) continue
+      const drExists = await db.prepare(`SELECT id, user_id, usdt_amount FROM daily_rewards WHERE id = ?`).bind(drId).first() as any
+      if (!drExists) continue
+      if (Number(drExists.user_id) !== userId || Math.abs(Number(drExists.usdt_amount) - amount) > 0.5) continue
+      await db.prepare(`DELETE FROM daily_rewards WHERE id = ?`).bind(drId).run()
+      drDeleted += 1
+      if (txId > 0) {
+        const txExists = await db.prepare(`SELECT id, user_id, amount, type FROM transactions WHERE id = ?`).bind(txId).first() as any
+        if (txExists && Number(txExists.user_id) === userId && Math.abs(Number(txExists.amount) - amount) < 0.5 && txExists.type === 'daily_qkey') {
+          await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txId).run()
+          drDelTxDeleted += 1
+        }
+      }
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, userId).run()
+      totalDrDeletedAmount += amount
     }
 
     // === STEP B: IN-PLACE UPDATE (기존 행 amount → 정책 정확값) ===
@@ -7637,9 +7722,12 @@ app.post('/api/admin/diag/rollback-and-update-inplace', async (c) => {
       success: true, dryRun: false,
       kstDate, reason,
       stepA: { deleted_rows: deletedRows, reverted_balance: -revertedBalance },
+      stepA2_rr_delete: { rr_deleted: rrDeleted, matched_tx_deleted: rrDelTxDeleted, balance_revert: -totalRrDeletedAmount },
+      stepA3_tx_delete: { tx_deleted: txDeleted, balance_revert: -totalTxDeletedAmount },
+      stepA4_dr_delete: { dr_deleted: drDeleted, matched_tx_deleted: drDelTxDeleted, balance_revert: -totalDrDeletedAmount },
       stepB: { tx_updated: txUpdated, rr_updated: rrUpdated, dr_updated: drUpdated, tx_inserted: txInserted, rr_inserted: rrInserted, dr_inserted: drInserted },
       stepC: { total_balance_delta: totalBalanceDelta },
-      net_balance_change: totalBalanceDelta - revertedBalance,
+      net_balance_change: totalBalanceDelta - revertedBalance - totalRrDeletedAmount - totalTxDeletedAmount - totalDrDeletedAmount,
       results: updResults
     })
   } catch (error) {
