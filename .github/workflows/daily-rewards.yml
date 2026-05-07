@@ -3,7 +3,7 @@ name: Daily QKEY Rewards (KST 07:00)
 on:
   schedule:
     # KST 09:00 = UTC 00:00 (매일)
-    - cron: "0 22 * * 0-4"
+    - cron: "0 16 * * 0-4"
   workflow_dispatch:
 
 concurrency:
