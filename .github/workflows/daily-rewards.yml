@@ -75,8 +75,11 @@ jobs:
 
               console.log('[2/2] Pay daily rewards');
               const rewardRes = await post(apiBase + '/api/rewards/daily', {}, {
-                'Authorization': 'Bearer ' + token
+                'Authorization': 'Bearer ' + token,
+                'X-Cron-Trigger': 'github-actions',
+                'User-Agent': 'github-actions-cron/1.0 node'
               });
+
               console.log('Reward HTTP', rewardRes.status);
               console.log('Reward response:', rewardRes.body);
               const rewardJson = JSON.parse(rewardRes.body);
