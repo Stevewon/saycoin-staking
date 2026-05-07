@@ -6409,6 +6409,135 @@ app.post('/api/admin/diag/sync-balance-to-tx', async (c) => {
   }
 })
 
+// ============================================================
+// 어드민: transactions 테이블 진짜 중복 정리 (사장님 지시 2026-05-07)
+//   - 같은 (user_id, type, coin_type, description) 조합이 2번 이상 INSERT 된 경우
+//     → 가장 큰 id (가장 최근) 1개만 KEEP, 나머지 모두 DELETE
+//   - DELETE 시 users.qkey_balance 에서 해당 amount 만큼 차감 (과지급분 회수)
+//   - 회수 transaction 은 type='_purge_internal' 로 기록 (사용자 화면에서 숨김 처리됨)
+//   - 사용자 화면(rewards 섹션)은 daily_rewards/referral_rewards 테이블 기반 → 영향 없음
+//   - 어드민 화면(transactions 섹션)에서 중복 row 사라짐 → 사용자 화면과 1:1 일치
+// ============================================================
+app.post('/api/admin/diag/purge-tx-duplicates', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body.dryRun !== false  // 기본 true (안전)
+    const fromDate = body.fromDate ? String(body.fromDate) : '2026-04-01'
+    const toDate = body.toDate ? String(body.toDate) : '2099-12-31'
+
+    // 같은 (user_id, type, coin_type, description) 그룹의 모든 row 조회
+    const sql = `
+      SELECT id, user_id, type, coin_type, amount, description, created_at
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND date(datetime(created_at, '+9 hours')) BETWEEN ? AND ?
+      ORDER BY user_id, type, description, id
+    `
+    const rows = await db.prepare(sql).bind(fromDate, toDate).all()
+    const allRows = (rows.results || []) as any[]
+
+    // 그룹핑
+    const groups: Record<string, any[]> = {}
+    for (const r of allRows) {
+      const key = `${r.user_id}|${r.type}|${r.coin_type}|${r.description || ''}`
+      if (!groups[key]) groups[key] = []
+      groups[key].push(r)
+    }
+
+    // 중복 그룹 (2개 이상) 만 추출
+    const duplicateGroups: any[] = []
+    let totalDuplicateRows = 0
+    let totalDuplicateAmount = 0
+    const removeRowIds: number[] = []
+    const balanceDeltaByUser: Record<number, number> = {}
+    for (const key in groups) {
+      const grp = groups[key]
+      if (grp.length < 2) continue
+      // id 가장 큰 것 KEEP (가장 최근)
+      const keepRow = grp.reduce((a: any, b: any) => (b.id > a.id ? b : a))
+      const removeRows = grp.filter((r: any) => r.id !== keepRow.id)
+      const removeAmount = removeRows.reduce((sum: number, r: any) => sum + Number(r.amount || 0), 0)
+      totalDuplicateRows += removeRows.length
+      totalDuplicateAmount += removeAmount
+      for (const r of removeRows) {
+        removeRowIds.push(r.id)
+        balanceDeltaByUser[r.user_id] = (balanceDeltaByUser[r.user_id] || 0) + Number(r.amount || 0)
+      }
+      duplicateGroups.push({
+        key,
+        user_id: grp[0].user_id,
+        type: grp[0].type,
+        description: grp[0].description,
+        rows_total: grp.length,
+        keep_row_id: keepRow.id,
+        keep_row: keepRow,
+        remove_rows: removeRows,
+        remove_amount: removeAmount
+      })
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        scope: { fromDate, toDate },
+        analyzed_rows: allRows.length,
+        duplicate_groups: duplicateGroups.length,
+        rows_to_remove: totalDuplicateRows,
+        amount_to_subtract: totalDuplicateAmount,
+        affected_users: Object.keys(balanceDeltaByUser).length,
+        balance_delta_by_user: balanceDeltaByUser,
+        groups: duplicateGroups,
+        note: 'dryRun=true 분석만 수행. 실제 정리는 dryRun:false 로 다시 호출하세요.'
+      })
+    }
+
+    // 실제 실행: DELETE + 잔액 차감 + 감사 로그(_purge_internal)
+    let deletedCount = 0
+    let balanceSubtracted = 0
+    const auditLogs: any[] = []
+    for (const grp of duplicateGroups) {
+      for (const r of grp.remove_rows) {
+        // 1) transactions DELETE
+        const del = await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(r.id).run()
+        const removed = (del.meta?.changes || 0)
+        deletedCount += removed
+        if (removed > 0) {
+          // 2) qkey_balance 차감
+          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`)
+            .bind(Number(r.amount || 0), r.user_id).run()
+          balanceSubtracted += Number(r.amount || 0)
+          // 3) 감사 로그 (사용자 화면에서 숨김 처리되는 type='_purge_internal' 사용)
+          //    잔액 변경분이 거래내역 SUM 과 자동 일치하도록 음수 row 1개 추가
+          const desc = `[중복 거래 정리] tx_id=${r.id} type=${r.type} amount=-${r.amount} created=${r.created_at} keep=${grp.keep_row_id}`
+          const ins = await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, '_purge_internal', 'QKEY', ?, ?)
+          `).bind(r.user_id, -Number(r.amount || 0), desc).run()
+          auditLogs.push({ user_id: r.user_id, deleted_id: r.id, audit_id: (ins.meta as any)?.last_row_id, amount: r.amount })
+        }
+      }
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      scope: { fromDate, toDate },
+      duplicate_groups: duplicateGroups.length,
+      deleted_rows: deletedCount,
+      balance_subtracted: balanceSubtracted,
+      audit_logs_count: auditLogs.length,
+      affected_users: Object.keys(balanceDeltaByUser).length,
+      balance_delta_by_user: balanceDeltaByUser,
+      audit_logs: auditLogs
+    })
+  } catch (error) {
+    console.error('purge-tx-duplicates error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 사용자별 보상 내역 조회
 app.get('/api/rewards/history/:userId', async (c) => {
   try {
@@ -6460,7 +6589,9 @@ app.get('/api/user/:userId', async (c) => {
   }
 })
 
-// 거래 내역 조회
+// 거래 내역 조회 (사용자 화면)
+//   ★ '_purge_internal' 타입은 어드민의 내부 정리용 감사 로그이므로 사용자 화면에서 숨김
+//     (잔액 변동분만 거래내역 SUM 과 일치시키기 위한 보정 row, 사용자에겐 노출 X)
 app.get('/api/transactions/:userId', async (c) => {
   try {
     const userId = c.req.param('userId')
@@ -6470,6 +6601,7 @@ app.get('/api/transactions/:userId', async (c) => {
       SELECT id, type, coin_type, amount, description, created_at
       FROM transactions
       WHERE user_id = ?
+        AND type != '_purge_internal'
       ORDER BY created_at DESC
       LIMIT 50
     `).bind(userId).all()
