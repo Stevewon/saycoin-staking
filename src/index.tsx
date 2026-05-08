@@ -3749,7 +3749,8 @@ function getPrevBusinessDayKst(today: Date): { dateStr: string, daysBack: number
 function getStakingAccrualDatesKst(
   lastRewardDate: string | null,
   startDateKst: string,
-  todayKst: string
+  todayKst: string,
+  firstBusinessDayKst?: string
 ): string[] {
   // 시작점: lastRewardDate 가 있으면 그 다음날, 없으면 startDateKst 부터
   let cursorStr: string
@@ -3759,7 +3760,7 @@ function getStakingAccrualDatesKst(
   } else {
     cursorStr = startDateKst
   }
-  // 끝점: todayKst (포함)
+  // 끝점: todayKst (포함) — 일반 백필 endDate (= yesterdayKst 가 전달됨)
   const endDate = new Date(todayKst + 'T00:00:00Z')
   let cursor = new Date(cursorStr + 'T00:00:00Z')
   const result: string[] = []
@@ -3772,6 +3773,31 @@ function getStakingAccrualDatesKst(
     if (isBusinessDay) result.push(dateStr)
     cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000)
     safety++
+  }
+  // ★ 사장님 정책 (2026-05-08 영구) — 휴일 진입자 첫 평일 데일리 1회 강제 지급 (B 방안) ★
+  //   사장님 원문: "공휴일 진입자는 언제 진입하든 첫 평일에 딱 1회 지급"
+  //   조건: lastRewardDate 가 NULL (첫 지급)
+  //         AND startDateKst 가 휴일(토/일/공휴일)
+  //         AND 정상 백필 결과가 0건 (yesterdayKst 까지 영업일이 없음)
+  //         AND firstBusinessDayKst 가 전달됨 (cron 실행일 = 오늘 첫 평일)
+  //   → firstBusinessDayKst 를 첫 reward_date 로 강제 push
+  //   예: 5/11(월) cron 시
+  //     - 5/9(토) 진입자: 결과 0건 → push [5/11] 1건
+  //     - 5/10(일) 진입자: 결과 0건 → push [5/11] 1건
+  //     - 5/8(금) 진입자: 결과 [5/8] 1건 → 강제 push 미발동 (8일 1회 정책 일치)
+  if (!lastRewardDate && result.length === 0 && firstBusinessDayKst) {
+    const startObj = new Date(startDateKst + 'T00:00:00Z')
+    const fbdObj = new Date(firstBusinessDayKst + 'T00:00:00Z')
+    if (startObj.getTime() <= fbdObj.getTime()) {
+      const startCheck = new Date(startObj.getTime() - 9 * 60 * 60 * 1000)
+      const { isBusinessDay: startIsBiz } = isKoreanBusinessDay(startCheck)
+      const fbdCheck = new Date(fbdObj.getTime() - 9 * 60 * 60 * 1000)
+      const { isBusinessDay: fbdIsBiz } = isKoreanBusinessDay(fbdCheck)
+      if (!startIsBiz && fbdIsBiz) {
+        // 휴일 진입자 + firstBusinessDayKst 가 평일 → 첫 평일 1건 강제 push
+        result.push(firstBusinessDayKst)
+      }
+    }
   }
   return result
 }
@@ -3816,21 +3842,25 @@ app.post('/api/rewards/daily', async (c) => {
     const today = kstDateStr(now)
     const yesterdayKst = kstDateStr(new Date(now.getTime() - 24 * 60 * 60 * 1000))
 
-    // 영업일 체크: 어제(KST) 가 토/일/공휴일이면 지급 불가
-    //   ※ 어제 매출이 없는 휴일이면 cron 자체가 0건 처리 → 룰 B 와 일치
-    //   ※ 단, 어제가 공휴일이면 직전 영업일치는 이미 그 다음 평일 cron 에서 처리됨 (백필 로직)
-    const yesterdayDateObj = new Date(yesterdayKst + 'T00:00:00+09:00')
-    const { isBusinessDay, reason } = isKoreanBusinessDay(yesterdayDateObj)
+    // ★ 사장님 정책 (2026-05-08 영구) — 진입 차단 룰 변경 ★
+    //   기존: 어제(KST)가 휴일이면 cron 전체 차단 → 휴일 진입자 첫 평일 데일리 누락 발생
+    //   변경: "오늘(KST)이 평일이면" cron 진행 (어제가 휴일이어도 진행)
+    //         → getStakingAccrualDatesKst 가 staking 별로 누락된 영업일만 백필
+    //         → 휴일 진입자(예: 5/9·5/10 진입)는 첫 평일(5/11) cron 에서 [5/11] 1건 강제 지급
+    //         → 평일 진입자(5/8) 는 [5/8] 1건만 지급 (사장님: "8일진입자는 좀 억울하겠지만")
+    //   오늘 자체가 휴일이면 cron skip (룰 B 그대로)
+    const todayDateObjKst = new Date(today + 'T00:00:00+09:00')
+    const { isBusinessDay, reason } = isKoreanBusinessDay(todayDateObjKst)
     if (!isBusinessDay) {
       const reasonText = reason === 'saturday' ? '토요일' : reason === 'sunday' ? '일요일' : '공휴일/국경일'
       return c.json({
         success: true,
-        message: `어제(${yesterdayKst})는 ${reasonText}이므로 배당 대상일 아님 (룰 B: 휴일 매출은 다음 평일 cron 에서 처리).`,
+        message: `오늘(${today})은 ${reasonText}이므로 배당 처리 불가 (룰 B: 휴일 cron skip, 다음 평일 cron 에서 일괄 백필).`,
         rewarded: 0,
         totalQkey: 0,
         skipped: 0,
         reason: reason,
-        targetDate: yesterdayKst
+        targetDate: today
       })
     }
 
@@ -3940,10 +3970,14 @@ app.post('/api/rewards/daily', async (c) => {
         //   - lastRewardDate 가 있으면 그 다음 영업일 ~ yesterdayKst
         //   - 없으면 startDateKst ~ yesterdayKst (휴일이면 자동 skip 되어 첫 평일부터)
         //   ⇒ 어제 가입자(00시~23시59분)도 startDateKst <= yesterdayKst 라 무조건 포함
+        // ★ 사장님 정책 (2026-05-08) — 4번째 인자 today 전달 (B 방안) ★
+        //   휴일 진입자(5/9 토·5/10 일 등) 첫 평일 데일리 1회 강제 지급용
+        //   일반 백필 endDate = yesterdayKst 그대로 유지 (5/8 진입자: [5/8] 1건만)
         const accrualDates = getStakingAccrualDatesKst(
           (staking.last_reward_date as string) || null,
           staking.start_date_kst as string,
-          yesterdayKst
+          yesterdayKst,
+          today
         )
 
         if (accrualDates.length === 0) {
