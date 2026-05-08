@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
+import { PLAN_138_MAY11, PLAN_138_MAY11_COUNT, PLAN_138_MAY11_TOTAL_QKEY } from './exec_138_may11_data'
 
 type Bindings = {
   DB: D1Database;
@@ -7295,6 +7296,175 @@ app.post('/api/admin/diag/purge-tx-duplicates-v2', async (c) => {
     })
   } catch (error) {
     console.error('purge-tx-duplicates-v2 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ============================================================
+// 어드민: 사장님 5/11 보스 명령 — 138 INSERT 1회 추가 지급 (B-2 manual)
+//   - 목적: 5/8에 잘못 reward_date=5/8 로 기록된 138건(= 실제 5/7분)에 대해
+//           기존 47명에게만 5/11에 reward_date=5/8, paid_date=5/11 로
+//           1회 추가 INSERT (총 +203,820 QKEY)
+//   - 신규 진입자(5/9, 5/10, 5/11)는 절대 건드리지 않음 (PLAN 데이터에 없음)
+//   - DB UNIQUE 제약 없음 → 중복 INSERT 가능 (D1 SELECT 사전 검증 완료)
+//   - 기존 EXISTS 가드 우회 (이번 1회만 의도적 중복 INSERT)
+//   - 호출 방식: GitHub Actions workflow_dispatch 수동 트리거 (B-2)
+//   - 안전장치 (5중):
+//       1) dryRun 기본값 = true
+//       2) confirm = "BOSS_GO_511" 필수 (오타 시 차단)
+//       3) PLAN_138_MAY11 데이터 src/exec_138_may11_data.ts 에 하드코딩
+//       4) 마커 트랜잭션 검사 (이미 실행됐으면 409 차단)
+//       5) 사전/사후 잔액 SELECT 비교 + balance_deltas 응답 영구 기록
+// ============================================================
+app.post('/api/admin/rewards/exec-138-may11-duplicate', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const dryRun = body.dryRun !== false  // 기본 true
+    const confirm = body.confirm
+
+    // [안전장치 2] confirm 토큰 검증
+    if (!dryRun && confirm !== 'BOSS_GO_511') {
+      return c.json({
+        success: false,
+        error: 'confirm token mismatch. dryRun=false 실행 시 body.confirm="BOSS_GO_511" 필수.'
+      }, 400)
+    }
+
+    // [안전장치 4] 이미 실행됐는지 마커 트랜잭션 검사
+    const markerType = '_exec_138_may11_marker'
+    const existingMarker = await db.prepare(`
+      SELECT id FROM transactions WHERE type = ? LIMIT 1
+    `).bind(markerType).first()
+    if (!dryRun && existingMarker) {
+      return c.json({
+        success: false,
+        error: '이미 실행됨. 마커 트랜잭션 존재. 재실행 금지.',
+        marker_id: (existingMarker as any).id
+      }, 409)
+    }
+
+    // 사전 잔액 스냅샷 (138 plan 의 unique userId 만)
+    const allUserIds = Array.from(new Set(PLAN_138_MAY11.map(p => p.userId)))
+    const beforeBalances: Record<number, number> = {}
+    for (const uid of allUserIds) {
+      const r = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+      beforeBalances[uid] = Number((r as any)?.qkey_balance || 0)
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        plan_count: PLAN_138_MAY11_COUNT,
+        plan_total_qkey: PLAN_138_MAY11_TOTAL_QKEY,
+        affected_users: allUserIds.length,
+        before_balances: beforeBalances,
+        marker_exists: !!existingMarker,
+        note: 'dryRun=true. 실제 INSERT 안 됨. body.dryRun=false & confirm="BOSS_GO_511" 로 실행.'
+      })
+    }
+
+    // 실제 실행
+    const results: any[] = []
+    let succeeded = 0
+    let failed = 0
+    let totalQkeyAdded = 0
+    const reason = '사장님 명령 5/11 보스 추가 지급 (5/8자 1회 추가) - boss-ordered exec_138_may11'
+
+    for (const item of PLAN_138_MAY11) {
+      try {
+        if (item.kind === 'daily') {
+          // daily_rewards INSERT (EXISTS 가드 우회)
+          await db.prepare(`
+            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+            VALUES (?, ?, ?, '2026-05-08', '2026-05-11')
+          `).bind(item.userId, item.stakingId, item.amount).run()
+
+          // users.qkey_balance UPDATE
+          await db.prepare(`
+            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+          `).bind(item.amount, item.userId).run()
+
+          // transactions INSERT
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
+          `).bind(item.userId, item.amount, reason).run()
+
+        } else if (item.kind === 'l1' || item.kind === 'l2') {
+          const level = item.kind === 'l1' ? 1 : 2
+          // referral_rewards INSERT (EXISTS 가드 우회)
+          await db.prepare(`
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+            VALUES (?, ?, ?, ?, ?, '2026-05-08', '2026-05-11')
+          `).bind(item.userId, item.refereeId, level, item.amount, item.amount).run()
+
+          // users.qkey_balance UPDATE (referrer = userId)
+          await db.prepare(`
+            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+          `).bind(item.amount, item.userId).run()
+
+          // transactions INSERT
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'referral_reward', 'QKEY', ?, ?)
+          `).bind(item.userId, item.amount, reason).run()
+        }
+
+        succeeded++
+        totalQkeyAdded += item.amount
+        results.push({ ok: true, kind: item.kind, userId: item.userId, amount: item.amount })
+
+      } catch (err) {
+        failed++
+        results.push({ ok: false, kind: item.kind, userId: item.userId, amount: item.amount, error: String(err) })
+      }
+    }
+
+    // 마커 트랜잭션 INSERT (이번 1회 표시, 재실행 차단용)
+    await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+      VALUES (1, ?, 'QKEY', 0, '5/11 boss-ordered exec_138_may11 marker')
+    `).bind(markerType).run()
+
+    // 사후 잔액 스냅샷 + 변동량 계산 (롤백용 영구 기록)
+    const afterBalances: Record<number, number> = {}
+    const balanceDeltas: Record<number, number> = {}
+    for (const uid of allUserIds) {
+      const r = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+      afterBalances[uid] = Number((r as any)?.qkey_balance || 0)
+      balanceDeltas[uid] = afterBalances[uid] - beforeBalances[uid]
+    }
+
+    return c.json({
+      success: true,
+      dryRun: false,
+      plan_count: PLAN_138_MAY11_COUNT,
+      plan_total_qkey: PLAN_138_MAY11_TOTAL_QKEY,
+      attempted: PLAN_138_MAY11.length,
+      succeeded,
+      failed,
+      total_qkey_added: totalQkeyAdded,
+      affected_users: allUserIds.length,
+      before_balances: beforeBalances,
+      after_balances: afterBalances,
+      balance_deltas: balanceDeltas,
+      results,
+      rollback_hint: {
+        daily_rewards: "DELETE FROM daily_rewards WHERE paid_date='2026-05-11' AND reward_date='2026-05-08'",
+        referral_rewards: "DELETE FROM referral_rewards WHERE paid_date='2026-05-11' AND reward_date='2026-05-08'",
+        transactions: "DELETE FROM transactions WHERE description LIKE '%exec_138_may11%'",
+        marker: "DELETE FROM transactions WHERE type='_exec_138_may11_marker'",
+        balance: "balance_deltas 참조하여 UPDATE users SET qkey_balance = qkey_balance - delta WHERE id = ?"
+      },
+      note: succeeded === 138 && failed === 0
+        ? '✅ 138/138 모두 성공. +203,820 QKEY 정확 반영.'
+        : `⚠️ ${succeeded} 성공, ${failed} 실패. results 배열 확인 필요.`
+    })
+
+  } catch (error) {
+    console.error('exec-138-may11-duplicate error:', error)
     return c.json({ error: String(error) }, 500)
   }
 })
