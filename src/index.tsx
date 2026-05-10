@@ -323,6 +323,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': '추천코드', 'csv.staking_amount': '투자금액($)', 'csv.join_date': '가입일',
     'csv.daily_total': '일일배당합계(QKEY)', 'csv.referral_total': '추천보상합계(QKEY)',
     'csv.total_reward': '총수당(QKEY)',
+    'dash.cap_title': '수당 진행률 (200% 캡)',
+    'dash.cap_paid': '누적 수령',
+    'dash.cap_target': '목표',
+    'dash.cap_blocked': '200% 도달 — 수당 지급이 차단되었습니다',
   },
   en: {
     'auth.admin_required': 'Admin authentication required',
@@ -439,6 +443,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': 'Referral Code', 'csv.staking_amount': 'Staking($)', 'csv.join_date': 'Join Date',
     'csv.daily_total': 'Daily Total(QKEY)', 'csv.referral_total': 'Referral Total(QKEY)',
     'csv.total_reward': 'Total Reward(QKEY)',
+    'dash.cap_title': 'Reward Progress (200% Cap)',
+    'dash.cap_paid': 'Paid',
+    'dash.cap_target': 'Target',
+    'dash.cap_blocked': '200% reached — Reward payouts have been blocked',
   },
   ja: {
     'auth.admin_required': '管理者認証が必要です',
@@ -555,6 +563,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': '紹介コード', 'csv.staking_amount': '投資金額($)', 'csv.join_date': '加入日',
     'csv.daily_total': '日次配当合計(QKEY)', 'csv.referral_total': '紹介報酬合計(QKEY)',
     'csv.total_reward': '総手当(QKEY)',
+    'dash.cap_title': '手当進捗 (200%キャップ)',
+    'dash.cap_paid': '累計受領',
+    'dash.cap_target': '目標',
+    'dash.cap_blocked': '200%到達 — 手当支給が遮断されました',
   },
   zh: {
     'auth.admin_required': '需要管理员认证',
@@ -671,6 +683,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': '推荐码', 'csv.staking_amount': '投资金额($)', 'csv.join_date': '注册日',
     'csv.daily_total': '日分红合计(QKEY)', 'csv.referral_total': '推荐奖励合计(QKEY)',
     'csv.total_reward': '总奖金(QKEY)',
+    'dash.cap_title': '奖金进度 (200%上限)',
+    'dash.cap_paid': '累计领取',
+    'dash.cap_target': '目标',
+    'dash.cap_blocked': '达到200% — 奖金发放已被阻止',
   },
   vi: {
     'auth.admin_required': 'Cần xác thực quản trị viên',
@@ -787,6 +803,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': 'Mã giới thiệu', 'csv.staking_amount': 'Đầu tư($)', 'csv.join_date': 'Ngày tham gia',
     'csv.daily_total': 'Tổng hàng ngày(QKEY)', 'csv.referral_total': 'Tổng giới thiệu(QKEY)',
     'csv.total_reward': 'Tổng thưởng(QKEY)',
+    'dash.cap_title': 'Tiến độ thưởng (Giới hạn 200%)',
+    'dash.cap_paid': 'Đã nhận',
+    'dash.cap_target': 'Mục tiêu',
+    'dash.cap_blocked': 'Đạt 200% — Việc chi trả thưởng đã bị chặn',
   },
   th: {
     'auth.admin_required': 'ต้องการการยืนยันตัวตนของผู้ดูแลระบบ',
@@ -903,6 +923,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': 'รหัสแนะนำ', 'csv.staking_amount': 'ลงทุน($)', 'csv.join_date': 'วันที่เข้าร่วม',
     'csv.daily_total': 'รวมรายวัน(QKEY)', 'csv.referral_total': 'รวมแนะนำ(QKEY)',
     'csv.total_reward': 'รวมรางวัล(QKEY)',
+    'dash.cap_title': 'ความคืบหน้ารางวัล (เพดาน 200%)',
+    'dash.cap_paid': 'รับสะสม',
+    'dash.cap_target': 'เป้าหมาย',
+    'dash.cap_blocked': 'ถึง 200% — การจ่ายรางวัลถูกระงับ',
   }
 }
 
@@ -4241,7 +4265,8 @@ app.post('/api/rewards/daily', async (c) => {
 // ★ 200% Cap 진행률 조회 API (사용자/UI용) ★
 //   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)을
 //   사용자 진입금액 합계 × 2 × 150 (target) 과 비교한 진행률 반환.
-//   단계: <180% green / 180~200% red / >=200% capped
+//   단계 (사장님 정책 2026-05-10 수정):
+//     <100% green / 100~150% orange / 150~200% red / >=200% capped
 app.get('/api/staking/progress/:userId', async (c) => {
   try {
     const db = c.env.DB
@@ -4268,10 +4293,11 @@ app.get('/api/staking/progress/:userId', async (c) => {
     const target = stakeTotal * 2 * USD_TO_QKEY
     const percent = target > 0 ? (paidTotal / target * 100) : 0
 
-    // 단계 판정
-    let stage: 'green' | 'red' | 'capped' = 'green'
+    // 단계 판정 (사장님 정책 2026-05-10 수정 — 100/150/200 임계값)
+    let stage: 'green' | 'orange' | 'red' | 'capped' = 'green'
     if (percent >= 200) stage = 'capped'
-    else if (percent >= 180) stage = 'red'
+    else if (percent >= 150) stage = 'red'
+    else if (percent >= 100) stage = 'orange'
 
     // staking 별 status 반환 (capped 표시용)
     const stakings = await db.prepare(`
@@ -4321,15 +4347,18 @@ app.get('/api/admin/diag/staking-progress', async (c) => {
     const list: any[] = []
     let cappedCount = 0
     let warnCount = 0
+    let orangeCount = 0
     for (const r of rows.results as any[]) {
       const stake = Number(r.stake_total || 0)
       if (stake <= 0) continue
       const paid = Number(r.paid_total || 0)
       const target = stake * 2 * USD_TO_QKEY
       const percent = target > 0 ? (paid / target * 100) : 0
-      let stage: 'green' | 'red' | 'capped' = 'green'
+      // 단계 판정 (사장님 정책 2026-05-10 수정 — 100/150/200 임계값)
+      let stage: 'green' | 'orange' | 'red' | 'capped' = 'green'
       if (percent >= 200) { stage = 'capped'; cappedCount++ }
-      else if (percent >= 180) { stage = 'red'; warnCount++ }
+      else if (percent >= 150) { stage = 'red'; warnCount++ }
+      else if (percent >= 100) { stage = 'orange'; orangeCount++ }
       list.push({
         user_id: r.user_id,
         email: r.email,
@@ -4347,6 +4376,7 @@ app.get('/api/admin/diag/staking-progress', async (c) => {
       total_active_users: list.length,
       capped_count: cappedCount,
       warn_count: warnCount,
+      orange_count: orangeCount,
       list
     })
   } catch (error) {
@@ -9591,6 +9621,25 @@ app.get('/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 200% Cap 진행률 바 (QX/QKEY 카드 아래, 가로 전체) -->
+                <div id="capProgressCard" class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8 hidden">
+                    <div class="flex items-center justify-between mb-2 sm:mb-3">
+                        <div class="flex items-center">
+                            <i class="fas fa-tachometer-alt text-purple-600 mr-2"></i>
+                            <span class="text-sm sm:text-base font-bold text-gray-800" data-i18n="dash.cap_title">수당 진행률 (200% 캡)</span>
+                        </div>
+                        <span id="capPercentText" class="text-sm sm:text-base font-bold text-gray-700">0.00%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-4 sm:h-5 overflow-hidden">
+                        <div id="capProgressBar" class="h-full rounded-full transition-all duration-500 bg-green-500" style="width:0%"></div>
+                    </div>
+                    <div class="flex items-center justify-between mt-2 text-xs sm:text-sm text-gray-600">
+                        <span><span data-i18n="dash.cap_paid">누적 수령</span>: <span id="capPaidText">0</span> QKEY</span>
+                        <span><span data-i18n="dash.cap_target">목표</span>: <span id="capTargetText">0</span> QKEY</span>
+                    </div>
+                    <p id="capCappedNotice" class="hidden mt-3 text-center text-sm font-bold text-red-600" data-i18n="dash.cap_blocked">200% 도달 — 수당 지급이 차단되었습니다</p>
+                </div>
+
                 <!-- Staking Section -->
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
@@ -10246,8 +10295,63 @@ app.get('/dashboard', (c) => {
                 await Promise.allSettled([
                     loadUserInfo(),
                     loadStakings(),
-                    loadReferrals()
+                    loadReferrals(),
+                    loadCapProgress()
                 ]);
+            }
+
+            // ★ 200% Cap 진행률 로드 (사장님 정책 2026-05-10: 100/150/200 임계값)
+            async function loadCapProgress() {
+                try {
+                    const response = await axios.get(\`/api/staking/progress/\${currentUser.id}\`);
+                    if (!response.data || !response.data.success) return;
+                    const d = response.data;
+                    const card = document.getElementById('capProgressCard');
+                    const bar = document.getElementById('capProgressBar');
+                    const pctText = document.getElementById('capPercentText');
+                    const paidText = document.getElementById('capPaidText');
+                    const tgtText = document.getElementById('capTargetText');
+                    const notice = document.getElementById('capCappedNotice');
+                    if (!card || !bar || !pctText) return;
+
+                    // stake_total 이 0 이면 카드 자체 숨김
+                    if (!d.target_qkey || d.target_qkey <= 0) {
+                        card.classList.add('hidden');
+                        return;
+                    }
+                    card.classList.remove('hidden');
+
+                    const pct = Number(d.percent || 0);
+                    const visualPct = Math.min(100, pct / 2 * 100); // 0~200% 를 0~100% 막대 폭으로 매핑
+
+                    // 사장님 정책: <100 green / 100~150 orange / 150~200 red / >=200 capped(red)
+                    let colorCls = 'bg-green-500';
+                    if (pct >= 200) colorCls = 'bg-red-600';
+                    else if (pct >= 150) colorCls = 'bg-red-500';
+                    else if (pct >= 100) colorCls = 'bg-orange-500';
+
+                    bar.className = 'h-full rounded-full transition-all duration-500 ' + colorCls;
+                    bar.style.width = visualPct.toFixed(2) + '%';
+
+                    pctText.textContent = pct.toFixed(2) + '%';
+                    if (paidText) paidText.textContent = Number(d.paid_total_qkey || 0).toLocaleString();
+                    if (tgtText) tgtText.textContent = Number(d.target_qkey || 0).toLocaleString();
+
+                    // % 텍스트 색상도 동기화
+                    pctText.className = 'text-sm sm:text-base font-bold ' + (
+                        pct >= 200 ? 'text-red-600' :
+                        pct >= 150 ? 'text-red-500' :
+                        pct >= 100 ? 'text-orange-500' : 'text-green-600'
+                    );
+
+                    // 200% 도달 시 차단 안내
+                    if (notice) {
+                        if (d.capped || pct >= 200) notice.classList.remove('hidden');
+                        else notice.classList.add('hidden');
+                    }
+                } catch (error) {
+                    console.error('Failed to load cap progress:', error);
+                }
             }
 
             // 사용자 정보 로드
