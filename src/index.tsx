@@ -2051,7 +2051,7 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
           await db.prepare(`
             INSERT INTO transactions (user_id, type, coin_type, amount, description)
             VALUES (?, 'direct_referral', 'QKEY', ?, ?)
-          `).bind(referrer.referrer_id, directBonusQkey, `Direct referral bonus ($${staking.amount.toLocaleString()} x 10% = ${directBonusQkey.toLocaleString()} QKEY)`).run()
+          `).bind(referrer.referrer_id, directBonusQkey, '직접 추천 보너스').run()
 
           // 직접판매수당은 매출 발생 즉시 지급(공휴일 무관) → reward_date / paid_date 모두 오늘 KST
           await db.prepare(`
@@ -4056,7 +4056,7 @@ app.post('/api/rewards/daily', async (c) => {
             await db.prepare(`
               INSERT INTO transactions (user_id, type, coin_type, amount, description)
               VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-            `).bind(staking.user_id, qkeyAmount, `Daily reward ${qkeyAmount.toLocaleString()} QKEY (${(dailyRate*100).toFixed(1)}%, ${newCount}/${periodDays}d, accrued ${accrualDate} paid ${today})`).run()
+            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)').run()
           }
 
           rewardedCount++
@@ -4120,7 +4120,7 @@ app.post('/api/rewards/daily', async (c) => {
                         await db.prepare(`
                           INSERT INTO transactions (user_id, type, coin_type, amount, description)
                           VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                        `).bind(level1Referrer.referrer_id, level1Reward, `Level 1 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 20%, accrued ${accrualDate} paid ${today})`).run()
+                        `).bind(level1Referrer.referrer_id, level1Reward, '추천 보너스 (Level 1)').run()
                       }
                     }
                   }
@@ -4180,7 +4180,7 @@ app.post('/api/rewards/daily', async (c) => {
                             await db.prepare(`
                               INSERT INTO transactions (user_id, type, coin_type, amount, description)
                               VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                            `).bind(level2Referrer.referrer_id, level2Reward, `Level 2 referral bonus (${qkeyAmount.toLocaleString()} QKEY x 10%, accrued ${accrualDate} paid ${today})`).run()
+                            `).bind(level2Referrer.referrer_id, level2Reward, '추천 보너스 (Level 2)').run()
                           }
                         }
                       }
