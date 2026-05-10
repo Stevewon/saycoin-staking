@@ -6723,7 +6723,7 @@ app.post('/api/admin/rewards/manual-adjust', async (c) => {
         await db.prepare(`
           INSERT INTO transactions (user_id, type, coin_type, amount, description)
           VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-        `).bind(userId, amount, `Daily reward ${amount.toLocaleString()} QKEY (manual insert by admin, accrued ${rewardDate} paid ${finalPaid}) reason=${reason}`).run()
+        `).bind(userId, amount, '일일 배당 (QKEY)').run()
 
       } else if (type === 'l1' || type === 'l2') {
         if (!refereeId) return c.json({ error: 'l1/l2 는 refereeId 필요' }, 400)
@@ -6743,7 +6743,7 @@ app.post('/api/admin/rewards/manual-adjust', async (c) => {
         await db.prepare(`
           INSERT INTO transactions (user_id, type, coin_type, amount, description)
           VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-        `).bind(userId, amount, `Level ${level} referral bonus ${amount.toLocaleString()} QKEY (manual insert by admin, accrued ${rewardDate} paid ${finalPaid}) reason=${reason}`).run()
+        `).bind(userId, amount, `추천 보너스 (Level ${level})`).run()
       } else {
         return c.json({ error: 'type 은 daily|l1|l2' }, 400)
       }
@@ -7370,7 +7370,8 @@ app.post('/api/admin/rewards/exec-138-may11-duplicate', async (c) => {
     let succeeded = 0
     let failed = 0
     let totalQkeyAdded = 0
-    const reason = '사장님 명령 5/11 보스 추가 지급 (5/8자 1회 추가) - boss-ordered exec_138_may11'
+    // 사용자 노출 description (간결화 — 내부 사정 텍스트 금지)
+    const dailyDesc = '일일 배당 (QKEY)'
 
     for (const item of PLAN_138_MAY11) {
       try {
@@ -7386,14 +7387,15 @@ app.post('/api/admin/rewards/exec-138-may11-duplicate', async (c) => {
             UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
           `).bind(item.amount, item.userId).run()
 
-          // transactions INSERT
+          // transactions INSERT (사용자 노출 텍스트만)
           await db.prepare(`
             INSERT INTO transactions (user_id, type, coin_type, amount, description)
             VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-          `).bind(item.userId, item.amount, reason).run()
+          `).bind(item.userId, item.amount, dailyDesc).run()
 
         } else if (item.kind === 'l1' || item.kind === 'l2') {
           const level = item.kind === 'l1' ? 1 : 2
+          const refDesc = `추천 보너스 (Level ${level})`
           // referral_rewards INSERT (EXISTS 가드 우회)
           await db.prepare(`
             INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
@@ -7405,11 +7407,11 @@ app.post('/api/admin/rewards/exec-138-may11-duplicate', async (c) => {
             UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
           `).bind(item.amount, item.userId).run()
 
-          // transactions INSERT
+          // transactions INSERT (사용자 노출 텍스트만)
           await db.prepare(`
             INSERT INTO transactions (user_id, type, coin_type, amount, description)
             VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-          `).bind(item.userId, item.amount, reason).run()
+          `).bind(item.userId, item.amount, refDesc).run()
         }
 
         succeeded++
@@ -7422,10 +7424,10 @@ app.post('/api/admin/rewards/exec-138-may11-duplicate', async (c) => {
       }
     }
 
-    // 마커 트랜잭션 INSERT (이번 1회 표시, 재실행 차단용)
+    // 마커 트랜잭션 INSERT (이번 1회 표시, 재실행 차단용) — 내부 marker, 일반 사용자 화면엔 type 필터로 숨김
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
-      VALUES (1, ?, 'QKEY', 0, '5/11 boss-ordered exec_138_may11 marker')
+      VALUES (1, ?, 'QKEY', 0, 'internal_marker')
     `).bind(markerType).run()
 
     // 사후 잔액 스냅샷 + 변동량 계산 (롤백용 영구 기록)
