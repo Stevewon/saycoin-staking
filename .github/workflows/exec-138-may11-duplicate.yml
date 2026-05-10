@@ -1,0 +1,55 @@
+name: Exec 138 May11 Duplicate (Boss Manual Trigger)
+
+# 사장님 5/11 보스 명령 - 138 INSERT 1회 추가 지급 (B-2 manual)
+# - schedule 절대 추가 안 함 (workflow_dispatch 만 사용)
+# - 사장님이 GitHub Actions UI에서 직접 클릭하여 트리거
+# - dryRun=true 로 먼저 시뮬레이션, 결과 확인 후 dryRun=false 로 실제 실행
+
+on:
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: 'dryRun (true=시뮬레이션, false=실제 실행). 처음엔 true 권장.'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      confirm:
+        description: 'dryRun=false 일 때만 "BOSS_GO_511" 입력 필요 (오타 시 차단)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  exec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call exec-138-may11-duplicate endpoint
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          API_BASE: https://pqcpay.co.kr
+        run: |
+          echo "=== Exec 138 May11 Duplicate ==="
+          echo "dryRun=${{ inputs.dryRun }}"
+          echo "confirm=${{ inputs.confirm }}"
+          echo "API_BASE=$API_BASE"
+          echo ""
+          curl -sS -X POST "$API_BASE/api/admin/rewards/exec-138-may11-duplicate" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"dryRun\": ${{ inputs.dryRun }}, \"confirm\": \"${{ inputs.confirm }}\"}" \
+            -o result.json -w "HTTP_STATUS=%{http_code}\n"
+          echo ""
+          echo "=== Response ==="
+          cat result.json
+          echo ""
+
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exec-138-may11-result
+          path: result.json
+          retention-days: 90
