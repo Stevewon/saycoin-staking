@@ -9581,8 +9581,8 @@ app.get('/dashboard', (c) => {
                         <p class="text-xl sm:text-3xl font-bold" id="qxBalance">0</p>
                     </div>
                     
-                    <!-- QKEY (다섯 번째 - full width on mobile) -->
-                    <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-yellow-500 to-yellow-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
+                    <!-- QKEY (다섯 번째 - QX 옆 배치) -->
+                    <div class="bg-gradient-to-br from-yellow-500 to-yellow-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qkey_coin">QKEY 코인</span>
                             <i class="fas fa-key text-xl sm:text-2xl"></i>
