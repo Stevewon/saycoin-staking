@@ -2048,16 +2048,26 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
             UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
           `).bind(directBonusQkey, referrer.referrer_id).run()
 
-          await db.prepare(`
-            INSERT INTO transactions (user_id, type, coin_type, amount, description)
-            VALUES (?, 'direct_referral', 'QKEY', ?, ?)
-          `).bind(referrer.referrer_id, directBonusQkey, '직접 추천 보너스').run()
-
           // 직접판매수당은 매출 발생 즉시 지급(공휴일 무관) → reward_date / paid_date 모두 오늘 KST
-          await db.prepare(`
+          // [패치 2026-05-11] ref_id 1:1 매핑 — referral_rewards 먼저 INSERT 후 last_row_id 캡처
+          const rrDirectIns = await db.prepare(`
             INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
             VALUES (?, ?, 0, ?, ?, date('now', '+9 hours'), date('now', '+9 hours'))
           `).bind(referrer.referrer_id, staking.user_id, staking.amount, directBonusQkey).run()
+          const rrDirectId = (rrDirectIns as any)?.meta?.last_row_id ?? null
+
+          // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
+          const dirTxExists = await db.prepare(`
+            SELECT id FROM transactions
+            WHERE type = 'direct_referral' AND ref_id = ?
+            LIMIT 1
+          `).bind(rrDirectId).first()
+          if (!dirTxExists) {
+            await db.prepare(`
+              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+              VALUES (?, 'direct_referral', 'QKEY', ?, ?, ?)
+            `).bind(referrer.referrer_id, directBonusQkey, '직접 추천 보너스', rrDirectId).run()
+          }
         } else {
           console.log(`[직접추천수당 스킵] 추천인 #${referrer.referrer_id} 본인 스테이킹 미완료 (referee #${staking.user_id})`)
         }
@@ -4034,29 +4044,29 @@ app.post('/api/rewards/daily', async (c) => {
           // [본인 배당 지급]
           //   reward_date = accrualDate (해당 평일)
           //   paid_date   = today       (오늘 cron 실행일)
-          await db.prepare(`
+          // [패치 2026-05-11] ref_id 1:1 매핑 — daily_rewards INSERT 후 last_row_id 캡처
+          const drIns = await db.prepare(`
             INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
             VALUES (?, ?, ?, ?, ?)
           `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, today).run()
+          const drId = (drIns as any)?.meta?.last_row_id ?? null
 
           await db.prepare(`
             UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
           `).bind(qkeyAmount, staking.user_id).run()
 
           const newCount = currentRewardedCount + 1
-          // EXISTS 가드 — (user, type='daily_qkey', amount, KST date) 중복 INSERT 차단
+          // EXISTS 가드 (ref_id 1:1) — 동일 daily_rewards.id 에 대응하는 transactions 행 차단
           const dqExists2 = await db.prepare(`
             SELECT id FROM transactions
-            WHERE user_id = ? AND type = 'daily_qkey' AND coin_type = 'QKEY'
-              AND amount = ?
-              AND date(created_at, '+9 hours') = ?
+            WHERE type = 'daily_qkey' AND ref_id = ?
             LIMIT 1
-          `).bind(staking.user_id, qkeyAmount, today).first()
+          `).bind(drId).first()
           if (!dqExists2) {
             await db.prepare(`
-              INSERT INTO transactions (user_id, type, coin_type, amount, description)
-              VALUES (?, 'daily_qkey', 'QKEY', ?, ?)
-            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)').run()
+              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+              VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId).run()
           }
 
           rewardedCount++
@@ -4103,24 +4113,24 @@ app.post('/api/rewards/daily', async (c) => {
                         UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
                       `).bind(level1Reward, level1Referrer.referrer_id).run()
 
-                      await db.prepare(`
+                      // [패치 2026-05-11] ref_id 1:1 매핑 — referral_rewards 먼저 INSERT 후 last_row_id 캡처
+                      const rrL1Ins = await db.prepare(`
                         INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
                         VALUES (?, ?, 1, ?, ?, ?, ?)
                       `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today).run()
+                      const rrL1Id = (rrL1Ins as any)?.meta?.last_row_id ?? null
 
-                      // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                      // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
                       const l1TxExists2 = await db.prepare(`
                         SELECT id FROM transactions
-                        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
-                          AND amount = ?
-                          AND date(created_at, '+9 hours') = ?
+                        WHERE type = 'referral_reward' AND ref_id = ?
                         LIMIT 1
-                      `).bind(level1Referrer.referrer_id, level1Reward, today).first()
+                      `).bind(rrL1Id).first()
                       if (!l1TxExists2) {
                         await db.prepare(`
-                          INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                          VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                        `).bind(level1Referrer.referrer_id, level1Reward, '추천 보너스 (Level 1)').run()
+                          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+                          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+                        `).bind(level1Referrer.referrer_id, level1Reward, '추천 보너스 (Level 1)', rrL1Id).run()
                       }
                     }
                   }
@@ -4163,24 +4173,24 @@ app.post('/api/rewards/daily', async (c) => {
                             UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
                           `).bind(level2Reward, level2Referrer.referrer_id).run()
 
-                          await db.prepare(`
+                          // [패치 2026-05-11] ref_id 1:1 매핑 — referral_rewards 먼저 INSERT 후 last_row_id 캡처
+                          const rrL2Ins = await db.prepare(`
                             INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
                             VALUES (?, ?, 2, ?, ?, ?, ?)
                           `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today).run()
+                          const rrL2Id = (rrL2Ins as any)?.meta?.last_row_id ?? null
 
-                          // EXISTS 가드 — (referrer, type='referral_reward', amount, KST date) 중복 INSERT 차단
+                          // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
                           const l2TxExists2 = await db.prepare(`
                             SELECT id FROM transactions
-                            WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
-                              AND amount = ?
-                              AND date(created_at, '+9 hours') = ?
+                            WHERE type = 'referral_reward' AND ref_id = ?
                             LIMIT 1
-                          `).bind(level2Referrer.referrer_id, level2Reward, today).first()
+                          `).bind(rrL2Id).first()
                           if (!l2TxExists2) {
                             await db.prepare(`
-                              INSERT INTO transactions (user_id, type, coin_type, amount, description)
-                              VALUES (?, 'referral_reward', 'QKEY', ?, ?)
-                            `).bind(level2Referrer.referrer_id, level2Reward, '추천 보너스 (Level 2)').run()
+                              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+                              VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+                            `).bind(level2Referrer.referrer_id, level2Reward, '추천 보너스 (Level 2)', rrL2Id).run()
                           }
                         }
                       }
