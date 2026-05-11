@@ -1343,6 +1343,36 @@ app.post('/api/user/update-profile', async (c) => {
 // API Routes - Withdrawal
 // ============================================
 
+// ★ 출금 수수료 정책 상수 (사장님 결재 2026-05-11, A/A/A)
+//   - 어떤 코인이든 무조건 신청 수량의 5% 공제
+//   - 잔액에서 100% 차감, 회사 5% 공제, 사용자 실수령 95%
+//   - 거절 시 100% 환불 + 수수료 reverse 행 INSERT
+const WITHDRAWAL_FEE_RATE = 0.05
+
+// ★ Lazy migration: withdrawals 테이블에 fee/net_amount/fee_rate 컬럼 보장
+//   원격 D1 직접 ALTER 불가 환경 대응 — 코드 진입 시 자체 적용
+let _withdrawalFeeSchemaEnsured = false
+async function ensureWithdrawalFeeSchema(db: any) {
+  if (_withdrawalFeeSchemaEnsured) return
+  try {
+    const info = await db.prepare(`PRAGMA table_info(withdrawals)`).all()
+    const cols = new Set((info.results || []).map((r: any) => r.name))
+    if (!cols.has('fee')) {
+      await db.prepare(`ALTER TABLE withdrawals ADD COLUMN fee REAL DEFAULT 0`).run()
+    }
+    if (!cols.has('net_amount')) {
+      await db.prepare(`ALTER TABLE withdrawals ADD COLUMN net_amount REAL DEFAULT 0`).run()
+    }
+    if (!cols.has('fee_rate')) {
+      await db.prepare(`ALTER TABLE withdrawals ADD COLUMN fee_rate REAL DEFAULT 0.05`).run()
+    }
+    _withdrawalFeeSchemaEnsured = true
+  } catch (e) {
+    // ALTER 실패는 무시 (이미 적용된 경우 등) — INSERT 시점에 다시 시도되지 않도록 플래그 set
+    _withdrawalFeeSchemaEnsured = true
+  }
+}
+
 // 출금 신청 (금요일 오전 10시 ~ 오후 2시 KST만 가능)
 app.post('/api/withdrawal/request', async (c) => {
   try {
@@ -1371,6 +1401,9 @@ app.post('/api/withdrawal/request', async (c) => {
 
     const db = c.env.DB
 
+    // ★ Lazy migration: withdrawals 테이블에 fee/net_amount/fee_rate 컬럼 확보
+    await ensureWithdrawalFeeSchema(db)
+
     // 사용자 잔액 확인
     const user = await db.prepare(`
       SELECT qta_balance, qx_balance, qkey_balance, usdt_balance FROM users WHERE id = ?
@@ -1390,7 +1423,11 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
     }
 
-    // 잔액 즉시 차감 (출금 신청 시점) - 경쟁조건 방지: UPDATE 결과 확인
+    // ★ 5% 출금 수수료 계산 (사장님 정책 2026-05-11)
+    const fee = Math.round(amount * WITHDRAWAL_FEE_RATE * 100) / 100  // 소수점 2자리 반올림
+    const netAmount = Math.round((amount - fee) * 100) / 100           // 사용자 실수령액
+
+    // 잔액 즉시 차감 (출금 신청 시점, 신청 원본 수량 100% 차감) - 경쟁조건 방지: UPDATE 결과 확인
     const deductResult = await db.prepare(`
       UPDATE users SET ${balanceField} = ${balanceField} - ? WHERE id = ? AND ${balanceField} >= ?
     `).bind(amount, userId, amount).run()
@@ -1399,11 +1436,24 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
     }
 
-    // 출금 신청 생성
+    // 출금 신청 생성 (수수료/실수령액 함께 저장)
     const withdrawalResult = await db.prepare(`
-      INSERT INTO withdrawals (user_id, coin_type, amount, wallet_address, status)
-      VALUES (?, ?, ?, ?, 'pending')
-    `).bind(userId, coinType, amount, walletAddress).run()
+      INSERT INTO withdrawals (user_id, coin_type, amount, wallet_address, status, fee, net_amount, fee_rate)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+    `).bind(userId, coinType, amount, walletAddress, fee, netAmount, WITHDRAWAL_FEE_RATE).run()
+
+    // ★ 거래내역(transactions) 기록 — 사장님 .md 룰 준수 (사용자 노출 안전 한국어)
+    //   1) 출금 신청 본 거래 (음수 amount, 신청 원본 수량)
+    await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+      VALUES (?, 'withdrawal', ?, ?, ?)
+    `).bind(userId, coinType, -Math.abs(amount), '출금 신청').run()
+
+    //   2) 출금 수수료 공제 거래 (음수 amount, 5%) — 사장님 명시 문구 그대로
+    await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+      VALUES (?, 'withdrawal_fee', ?, ?, ?)
+    `).bind(userId, coinType, -Math.abs(fee), '출금수수료 공제 5%').run()
 
     return c.json({ 
       success: true, 
@@ -1412,6 +1462,9 @@ app.post('/api/withdrawal/request', async (c) => {
         id: withdrawalResult.meta.last_row_id,
         coinType: coinType,
         amount: amount,
+        fee: fee,
+        net_amount: netAmount,
+        fee_rate: WITHDRAWAL_FEE_RATE,
         status: 'pending'
       }
     })
@@ -2764,11 +2817,14 @@ app.post('/api/admin/withdrawal/approve/:withdrawalId', async (c) => {
   }
 })
 
-// 관리자: 출금 거절 (잔액 환불)
+// 관리자: 출금 거절 (잔액 환불 + 수수료 reverse)
 app.post('/api/admin/withdrawal/reject/:withdrawalId', async (c) => {
   try {
     const db = c.env.DB
     const withdrawalId = c.req.param('withdrawalId')
+
+    // ★ Lazy migration: 거절 시점에도 스키마 보장 (fee 컬럼 SELECT 안전성)
+    await ensureWithdrawalFeeSchema(db)
 
     const withdrawal = await db.prepare(`
       SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'
@@ -2778,7 +2834,7 @@ app.post('/api/admin/withdrawal/reject/:withdrawalId', async (c) => {
       return c.json({ error: t(c, 'admin.wd_pending_not_found') }, 404)
     }
 
-    // 잔액 환불
+    // 잔액 환불 (신청 원본 수량 100% 환불 — A안 결재)
     const balanceField = withdrawal.coin_type === 'QTA' ? 'qta_balance' :
                          withdrawal.coin_type === 'QX' ? 'qx_balance' :
                          withdrawal.coin_type === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
@@ -2790,6 +2846,22 @@ app.post('/api/admin/withdrawal/reject/:withdrawalId', async (c) => {
     await db.prepare(`
       UPDATE withdrawals SET status = 'rejected' WHERE id = ?
     `).bind(withdrawalId).run()
+
+    // ★ 거래내역(transactions) reverse 행 INSERT — 사용자 노출 안전 한국어
+    //   1) 출금 신청 본 거래 환불 (양수 amount, 신청 원본 수량)
+    await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description)
+      VALUES (?, 'withdrawal_refund', ?, ?, ?)
+    `).bind(withdrawal.user_id, withdrawal.coin_type, Math.abs(withdrawal.amount as number), '출금 신청 거절 환불').run()
+
+    //   2) 출금 수수료 환불 (양수 amount, 5%) — fee 컬럼이 있을 때만
+    const feeValue = (withdrawal.fee || 0) as number
+    if (feeValue > 0) {
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'withdrawal_fee_refund', ?, ?, ?)
+      `).bind(withdrawal.user_id, withdrawal.coin_type, Math.abs(feeValue), '출금수수료 환불 5%').run()
+    }
 
     return c.json({ success: true, message: t(c, 'admin.wd_reject_success') })
   } catch (error) {
@@ -9876,9 +9948,14 @@ app.get('/dashboard', (c) => {
 
                 <!-- Withdrawal Section (항상 표시, 금요일 10~14시 KST만 버튼 활성화) -->
                 <div id="withdrawalSection" class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
-                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4">
+                    <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-2">
                         <i class="fas fa-money-bill-wave mr-2 text-green-600"></i><span data-i18n="dash.withdrawal_title">코인 출금 신청</span>
                     </h2>
+                    <!-- 사장님 정책 2026-05-11: 출금 5% 수수료 공제 안내 (전 코인 공통) -->
+                    <p class="text-xs sm:text-sm text-orange-700 font-semibold mb-4 flex items-center">
+                        <i class="fas fa-info-circle mr-1 text-orange-500"></i>
+                        <span data-i18n="dash.withdrawal_fee_notice">코인 출금 신청시 5%가 공제됩니다</span>
+                    </p>
                     
                     <div class="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
                         <!-- 출금 시간 안내 -->
@@ -11405,7 +11482,7 @@ app.get('/dashboard', (c) => {
                     return;
                 }
                 
-                const amountStr = prompt(coinType + ' ' + I18N.t('dash.withdrawal_title') + '\\n\\n' + I18N.t('dash.balance') + ': ' + balance.toLocaleString() + '\\n\\n' + I18N.t('alert.enter_valid_amount') + ':');
+                const amountStr = prompt(coinType + ' ' + I18N.t('dash.withdrawal_title') + '\\n\\n' + I18N.t('dash.balance') + ': ' + balance.toLocaleString() + '\\n' + I18N.t('dash.withdrawal_fee_notice') + '\\n\\n' + I18N.t('alert.enter_valid_amount') + ':');
                 
                 if (!amountStr) return;
                 
@@ -11421,10 +11498,19 @@ app.get('/dashboard', (c) => {
                     return;
                 }
                 
+                // ★ 5% 수수료 미리보기 (사장님 정책 2026-05-11)
+                const _feeRate = 0.05;
+                const _fee = Math.round(amount * _feeRate * 100) / 100;
+                const _net = Math.round((amount - _fee) * 100) / 100;
+                
                 // USDT는 USDT 지갑주소 사용, 나머지는 QKEY 지갑주소 사용
                 const withdrawWallet = (coinType === 'USDT') ? (currentUser.usdt_wallet_address || currentUser.wallet_address) : currentUser.wallet_address;
                 const walletLabel = (coinType === 'USDT') ? 'USDT ' + I18N.t('profile.qkey_wallet') : 'QKEY ' + I18N.t('profile.qkey_wallet');
-                if (confirm(coinType + ' ' + amount.toLocaleString() + ' ' + I18N.t('dash.withdrawal_title') + '?\\n\\n' + walletLabel + ': ' + withdrawWallet)) {
+                const _confirmMsg = coinType + ' ' + amount.toLocaleString() + ' ' + I18N.t('dash.withdrawal_title') + '?\\n\\n'
+                    + I18N.t('dash.wd_fee_label') + ' (5%): -' + _fee.toLocaleString() + ' ' + coinType + '\\n'
+                    + I18N.t('dash.wd_net_label') + ': ' + _net.toLocaleString() + ' ' + coinType + '\\n\\n'
+                    + walletLabel + ': ' + withdrawWallet;
+                if (confirm(_confirmMsg)) {
                     try {
                         const response = await axios.post('/api/withdrawal/request', {
                             userId: currentUser.id,
