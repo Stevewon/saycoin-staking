@@ -29,25 +29,48 @@ const I18N = {
     this.applyAll();
   },
 
+  // ★ Country(ISO-3166 alpha2) -> Language code 매핑
+  //   사장님 정책 (2026-05-10): IP 기준 각 나라 언어로 자동 표시
+  //   - KR: 무조건 한국어 (사용자 변경 불가, 기존 정책 유지)
+  //   - JP: 일본어 / CN·HK·TW·MO·SG: 중국어 / VN: 베트남어 / TH: 태국어
+  //   - 그 외 모든 국가: 영어
+  _countryToLang(country) {
+    if (!country) return null;
+    const c = country.toUpperCase();
+    if (c === 'KR') return 'ko';
+    if (c === 'JP') return 'ja';
+    if (c === 'CN' || c === 'HK' || c === 'TW' || c === 'MO' || c === 'SG') return 'zh';
+    if (c === 'VN') return 'vi';
+    if (c === 'TH') return 'th';
+    return 'en';
+  },
+
   // Initialize
   init() {
-    // 서버에서 전달한 국가 정보 확인
+    // 서버에서 전달한 국가 정보 확인 (Cloudflare CF-IPCountry 헤더 기반)
     const countryMeta = document.querySelector('meta[name="user-country"]');
     const userCountry = countryMeta ? countryMeta.getAttribute('content').toUpperCase() : '';
     this._isKoreaIP = (userCountry === 'KR');
 
     if (this._isKoreaIP) {
-      // 한국 IP: 무조건 한국어, localStorage도 강제
+      // 한국 IP: 무조건 한국어, localStorage도 강제 (기존 정책 유지)
       this._currentLang = 'ko';
       localStorage.setItem('quantarium_lang', 'ko');
     } else {
+      // 한국 외 IP: 우선순위 → 사용자 수동 선택(localStorage) > IP 국가 > 브라우저 언어 > 영어
       const saved = localStorage.getItem('quantarium_lang');
       if (saved && this._translations[saved]) {
         this._currentLang = saved;
       } else {
-        // Auto-detect from browser
-        const browserLang = (navigator.language || navigator.userLanguage || 'ko').substring(0, 2);
-        this._currentLang = this._translations[browserLang] ? browserLang : 'ko';
+        // ★ 1순위: IP 국가 기반 자동 매핑 (사장님 신규 정책 2026-05-10)
+        const ipLang = this._countryToLang(userCountry);
+        if (ipLang && this._translations[ipLang]) {
+          this._currentLang = ipLang;
+        } else {
+          // 2순위 fallback: 브라우저 언어
+          const browserLang = (navigator.language || navigator.userLanguage || 'en').substring(0, 2);
+          this._currentLang = this._translations[browserLang] ? browserLang : 'en';
+        }
       }
     }
     document.documentElement.lang = this._currentLang;
