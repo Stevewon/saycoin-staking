@@ -4457,6 +4457,289 @@ app.get('/api/admin/diag/staking-progress', async (c) => {
   }
 })
 
+// ★★★ 5/12 일일 배당 사전 예정액 dry-run (2026-05-11 사장님 옵션 A 결재) ★★★
+//   /api/rewards/daily 와 100% 동일한 산식으로 계산하되 INSERT/UPDATE 절대 안 함 (읽기 전용)
+//   기준일: ?targetDate=YYYY-MM-DD 쿼리로 지정 (없으면 자동 = 오늘 KST)
+//   응답: 사용자별 예정 daily/L1/L2/총액 + 전체 합계 + 200% Cap 사전 스킵자 명단
+//   사용 예: GET /api/admin/daily-preview?targetDate=2026-05-12
+//     → 5/12 cron 이 실행될 때의 예정 지급액 사전 보고
+app.get('/api/admin/daily-preview', async (c) => {
+  try {
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+
+    // targetDate = cron 실행일 (= paid_date / today), 미지정 시 오늘 KST
+    const now = new Date()
+    const todayAuto = kstDateStr(now)
+    const targetDate = c.req.query('targetDate') || todayAuto
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      return c.json({ error: 'targetDate=YYYY-MM-DD 필요' }, 400)
+    }
+    // yesterdayKst = targetDate - 1일 (실제 cron 의 reward_date 기준일)
+    const tdObj = new Date(targetDate + 'T00:00:00Z')
+    const yesterdayKst = new Date(tdObj.getTime() - 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+
+    // targetDate(= cron 실행일) 이 평일인지 체크
+    const todayDateObjKst = new Date(targetDate + 'T00:00:00+09:00')
+    const { isBusinessDay: targetIsBiz, reason: targetReason } = isKoreanBusinessDay(todayDateObjKst)
+    if (!targetIsBiz) {
+      return c.json({
+        success: true,
+        preview: true,
+        targetDate,
+        yesterdayKst,
+        message: `${targetDate} 는 휴일(${targetReason}) — cron skip 예정 (지급 0건)`,
+        cron_will_run: false,
+        plan_total_users: 0,
+        plan_total_qkey: 0,
+        plan_daily_qkey: 0,
+        plan_l1_qkey: 0,
+        plan_l2_qkey: 0,
+        cap_skip_users: [],
+        users: []
+      })
+    }
+
+    // 활성 staking 조회 (실제 cron 과 동일 쿼리)
+    const activeStakings = await db.prepare(`
+      SELECT
+        s.user_id,
+        s.id as staking_id,
+        s.amount,
+        s.period_days,
+        s.period_months,
+        s.daily_rate,
+        s.start_date,
+        s.end_date,
+        date(s.start_date, '+9 hours') as start_date_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
+      FROM staking s
+      WHERE s.status = 'active'
+        AND date(s.end_date, '+9 hours') >= date(?)
+        AND date(s.start_date, '+9 hours') <= date(?)
+      ORDER BY s.user_id ASC, s.id ASC
+    `).bind(yesterdayKst, yesterdayKst).all()
+
+    // 사용자별 dry-run 누적 (실제 cron 의 isUserCapped 와 동일하게 simulatedPaid 추적)
+    // userId → { email, stake_total, paid_total (real db), simulated_paid (preview 누적), daily, l1, l2, total, capped, capStage }
+    type PreviewUserState = {
+      user_id: number,
+      email: string | null,
+      stake_total: number,
+      paid_total_real: number,  // DB 현재 누적
+      target: number,
+      remaining_initial: number,
+      simulated_paid: number,    // dry-run 동안 누적 (cap 판정용)
+      daily_qkey: number,
+      l1_qkey: number,
+      l2_qkey: number,
+      total_qkey: number,
+      cap_hit_during: boolean,
+      capped_initial: boolean,
+      stakings_processed: { staking_id: number, accrual_dates: string[], amount: number, daily_rate: number, per_day_qkey: number }[]
+    }
+    const userMap = new Map<number, PreviewUserState>()
+    const capSkipUsers: number[] = []
+
+    async function getOrInitUser(userId: number): Promise<PreviewUserState> {
+      let u = userMap.get(userId)
+      if (u) return u
+      const stakeRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
+      `).bind(userId).first() as any
+      const paidRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM transactions
+        WHERE user_id = ? AND coin_type = 'QKEY'
+          AND type IN ('daily_qkey', 'referral_reward')
+      `).bind(userId).first() as any
+      const emailRow = await db.prepare(`SELECT email FROM users WHERE id = ?`).bind(userId).first() as any
+      const stake_total = Number(stakeRow?.total || 0)
+      const paid_total_real = Number(paidRow?.total || 0)
+      const target = stake_total * 2 * USD_TO_QKEY
+      const remaining_initial = Math.max(0, target - paid_total_real)
+      const capped_initial = stake_total > 0 && paid_total_real >= target
+      u = {
+        user_id: userId,
+        email: emailRow?.email || null,
+        stake_total,
+        paid_total_real,
+        target,
+        remaining_initial,
+        simulated_paid: paid_total_real,
+        daily_qkey: 0,
+        l1_qkey: 0,
+        l2_qkey: 0,
+        total_qkey: 0,
+        cap_hit_during: false,
+        capped_initial,
+        stakings_processed: []
+      }
+      userMap.set(userId, u)
+      return u
+    }
+
+    // ===== dry-run 메인 루프 (실제 cron 과 동일 흐름) =====
+    for (const staking of activeStakings.results as any[]) {
+      const ownerState = await getOrInitUser(staking.user_id as number)
+      if (ownerState.capped_initial) {
+        if (!capSkipUsers.includes(staking.user_id as number)) capSkipUsers.push(staking.user_id as number)
+        continue
+      }
+      const periodDays = staking.period_days || (staking.period_months * 30)
+      const accrualDates = getStakingAccrualDatesKst(
+        (staking.last_reward_date as string) || null,
+        staking.start_date_kst as string,
+        yesterdayKst,
+        targetDate
+      )
+      if (accrualDates.length === 0) continue
+
+      const stakingDailyRate = staking.daily_rate || getDailyRate(staking.amount as number)
+      const stakingProcessed: string[] = []
+      let perDayQkey = Math.round((staking.amount as number) * stakingDailyRate * USD_TO_QKEY)
+
+      for (const accrualDate of accrualDates) {
+        const currentRewardedCount = (staking.rewarded_count as number) + stakingProcessed.length
+        if (currentRewardedCount >= periodDays) break
+
+        // 본인 cap 재확인 (cron 의 isUserCapped 와 동일 — simulated_paid 사용)
+        if (ownerState.simulated_paid >= ownerState.target) {
+          ownerState.cap_hit_during = true
+          if (!capSkipUsers.includes(ownerState.user_id)) capSkipUsers.push(ownerState.user_id)
+          break
+        }
+        let qkeyAmount = perDayQkey
+        const remaining = ownerState.target - ownerState.simulated_paid
+        if (qkeyAmount > remaining) qkeyAmount = Math.max(0, Math.floor(remaining))
+        if (qkeyAmount <= 0) {
+          ownerState.cap_hit_during = true
+          if (!capSkipUsers.includes(ownerState.user_id)) capSkipUsers.push(ownerState.user_id)
+          break
+        }
+
+        ownerState.daily_qkey += qkeyAmount
+        ownerState.simulated_paid += qkeyAmount
+        stakingProcessed.push(accrualDate)
+
+        // L1 매칭 (20%)
+        const lvl1 = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(staking.user_id).first() as any
+        if (lvl1 && lvl1.referrer_id) {
+          const l1Active = await db.prepare(`
+            SELECT id FROM staking
+            WHERE user_id = ? AND status = 'active'
+              AND date(start_date, '+9 hours') <= date(?)
+              AND date(end_date, '+9 hours') >= date(?)
+            LIMIT 1
+          `).bind(lvl1.referrer_id, accrualDate, accrualDate).first()
+          if (l1Active) {
+            const l1State = await getOrInitUser(lvl1.referrer_id as number)
+            if (!l1State.capped_initial && l1State.simulated_paid < l1State.target) {
+              let l1Reward = Math.round(qkeyAmount * 0.20)
+              const l1Rem = l1State.target - l1State.simulated_paid
+              if (l1Reward > l1Rem) l1Reward = Math.max(0, Math.floor(l1Rem))
+              if (l1Reward > 0) {
+                l1State.l1_qkey += l1Reward
+                l1State.simulated_paid += l1Reward
+              }
+            } else {
+              if (!capSkipUsers.includes(lvl1.referrer_id as number)) capSkipUsers.push(lvl1.referrer_id as number)
+            }
+
+            // L2 매칭 (10%)
+            const lvl2 = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(lvl1.referrer_id).first() as any
+            if (lvl2 && lvl2.referrer_id) {
+              const l2Active = await db.prepare(`
+                SELECT id FROM staking
+                WHERE user_id = ? AND status = 'active'
+                  AND date(start_date, '+9 hours') <= date(?)
+                  AND date(end_date, '+9 hours') >= date(?)
+                LIMIT 1
+              `).bind(lvl2.referrer_id, accrualDate, accrualDate).first()
+              if (l2Active) {
+                const l2State = await getOrInitUser(lvl2.referrer_id as number)
+                if (!l2State.capped_initial && l2State.simulated_paid < l2State.target) {
+                  let l2Reward = Math.round(qkeyAmount * 0.10)
+                  const l2Rem = l2State.target - l2State.simulated_paid
+                  if (l2Reward > l2Rem) l2Reward = Math.max(0, Math.floor(l2Rem))
+                  if (l2Reward > 0) {
+                    l2State.l2_qkey += l2Reward
+                    l2State.simulated_paid += l2Reward
+                  }
+                } else {
+                  if (!capSkipUsers.includes(lvl2.referrer_id as number)) capSkipUsers.push(lvl2.referrer_id as number)
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (stakingProcessed.length > 0) {
+        ownerState.stakings_processed.push({
+          staking_id: staking.staking_id as number,
+          accrual_dates: stakingProcessed,
+          amount: staking.amount as number,
+          daily_rate: stakingDailyRate,
+          per_day_qkey: perDayQkey
+        })
+      }
+    }
+
+    // 집계
+    const users: any[] = []
+    let totalDaily = 0, totalL1 = 0, totalL2 = 0
+    for (const u of userMap.values()) {
+      u.total_qkey = u.daily_qkey + u.l1_qkey + u.l2_qkey
+      if (u.total_qkey > 0 || u.capped_initial || u.cap_hit_during) {
+        users.push({
+          user_id: u.user_id,
+          email: u.email,
+          stake_total_usd: u.stake_total,
+          paid_total_real_qkey: u.paid_total_real,
+          target_qkey: u.target,
+          remaining_qkey_before: u.remaining_initial,
+          plan_daily_qkey: u.daily_qkey,
+          plan_l1_qkey: u.l1_qkey,
+          plan_l2_qkey: u.l2_qkey,
+          plan_total_qkey: u.total_qkey,
+          simulated_paid_after: u.simulated_paid,
+          capped_initial: u.capped_initial,
+          cap_hit_during: u.cap_hit_during,
+          stakings: u.stakings_processed
+        })
+        totalDaily += u.daily_qkey
+        totalL1 += u.l1_qkey
+        totalL2 += u.l2_qkey
+      }
+    }
+    users.sort((a, b) => b.plan_total_qkey - a.plan_total_qkey)
+
+    return c.json({
+      success: true,
+      preview: true,
+      targetDate,
+      yesterdayKst,
+      message: `[DRY-RUN] ${targetDate} cron 실행 예정 — 기준일(어제) ${yesterdayKst}`,
+      cron_will_run: true,
+      plan_total_users: users.filter(u => u.plan_total_qkey > 0).length,
+      plan_total_qkey: totalDaily + totalL1 + totalL2,
+      plan_daily_qkey: totalDaily,
+      plan_l1_qkey: totalL1,
+      plan_l2_qkey: totalL2,
+      cap_skip_users: capSkipUsers,
+      cap_skip_count: capSkipUsers.length,
+      active_stakings_count: activeStakings.results.length,
+      users
+    })
+  } catch (error) {
+    console.error('daily-preview error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민 진단: 특정 날짜 + 특정 사용자의 transactions 조회 (중복지급 원인 파악용)
 app.get('/api/admin/diag/transactions', async (c) => {
   try {
