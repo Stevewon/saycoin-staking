@@ -3991,6 +3991,28 @@ app.post('/api/rewards/daily', async (c) => {
     //
     //   이렇게 하면 어제 KST 23:59:59 직전에 가입한 회원도 무조건 어제 매출로 잡혀서
     //   오늘 새벽 01:00 cron 에서 일일배당이 발생함 (영국시간/UTC 경계 문제 완전 차단).
+    //
+    // ★★★ 사장님 영구 룰 (2026-05-12 사용자 증가 대응) ★★★
+    //   Cloudflare Workers subrequest 한도(1000/req) 초과 방지를 위해 batch 페이지네이션 도입
+    //   - 트리거는 1개 cron(daily-rewards.yml) 그대로 유지 (단일화 룰 준수)
+    //   - 1개 cron job 이 내부적으로 batch 호출 N회 반복 → 외부에서는 1회 cron 으로 보임
+    //   - 잔액 즉시 반영 룰 유지: 각 batch 응답 종료 = 해당 batch 의 잔액 반영 완료 (캐시/지연 없음)
+    //   - 쿼리: ?batchSize=20&offset=0 (기본 batchSize=20, offset=0)
+    //   - 응답: { ..., batchSize, offset, batch_processed, has_more }
+    //   - 워크플로 스크립트에서 has_more=false 까지 반복 호출
+    const batchSize = Math.max(1, Math.min(50, parseInt(c.req.query('batchSize') || '20') || 20))
+    const offset = Math.max(0, parseInt(c.req.query('offset') || '0') || 0)
+
+    // 전체 대상 수 (모니터링/응답용)
+    const totalRow = await db.prepare(`
+      SELECT COUNT(*) as cnt
+      FROM staking s
+      WHERE s.status = 'active'
+        AND date(s.end_date, '+9 hours') >= date(?)
+        AND date(s.start_date, '+9 hours') <= date(?)
+    `).bind(yesterdayKst, yesterdayKst).first() as any
+    const totalActive = Number(totalRow?.cnt || 0)
+
     const activeStakings = await db.prepare(`
       SELECT
         s.user_id,
@@ -4009,13 +4031,20 @@ app.post('/api/rewards/daily', async (c) => {
       WHERE s.status = 'active'
         AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
-    `).bind(yesterdayKst, yesterdayKst).all()
+      ORDER BY s.id ASC
+      LIMIT ? OFFSET ?
+    `).bind(yesterdayKst, yesterdayKst, batchSize, offset).all()
 
     if (activeStakings.results.length === 0) {
       return c.json({
         success: true,
         message: t(c, 'rewards.no_active'),
-        rewarded: 0
+        rewarded: 0,
+        batchSize,
+        offset,
+        batch_processed: 0,
+        total_active: totalActive,
+        has_more: false
       })
     }
 
@@ -4308,12 +4337,19 @@ app.post('/api/rewards/daily', async (c) => {
       }
     }
 
-    let message = `[기준일(어제) ${yesterdayKst} / 지급처리일 ${today}] ${rewardedCount} rewarded across ${processedDates.length} stakings (${totalQkeyRewarded.toLocaleString()} QKEY)`
+    const batchProcessed = activeStakings.results.length
+    const nextOffset = offset + batchProcessed
+    const hasMore = nextOffset < totalActive
+
+    let message = `[기준일(어제) ${yesterdayKst} / 지급처리일 ${today}] batch ${offset}~${nextOffset}/${totalActive} : ${rewardedCount} rewarded across ${processedDates.length} stakings (${totalQkeyRewarded.toLocaleString()} QKEY)`
     if (skippedCount > 0) {
       message += ` | ${skippedCount} completed`
     }
     if (cappedSkipCount > 0) {
       message += ` | ${cappedSkipCount} CAPPED-skip (200% reached)`
+    }
+    if (hasMore) {
+      message += ` | has_more=true (next offset=${nextOffset})`
     }
 
     return c.json({
@@ -4326,7 +4362,14 @@ app.post('/api/rewards/daily', async (c) => {
       skipped: skippedCount,
       cappedSkipCount: cappedSkipCount,
       cappedUsers: cappedUsers,
-      processedDates: processedDates
+      processedDates: processedDates,
+      // ★ batch 페이지네이션 메타 (2026-05-12 사용자 증가 대응) ★
+      batchSize,
+      offset,
+      batch_processed: batchProcessed,
+      next_offset: nextOffset,
+      total_active: totalActive,
+      has_more: hasMore
     })
   } catch (error) {
     console.error('Daily reward error:', error)
