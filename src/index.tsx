@@ -5176,11 +5176,12 @@ app.post('/api/diag/backfill-may12-missing', async (c) => {
         steps: [] as string[]
       }
 
-      // 1) staking 정보 조회 (rewarded_count 는 daily_rewards 서브쿼리로 계산)
+      // 1) staking 정보 조회 (rewarded_count + last_reward_date 모두 daily_rewards 서브쿼리로 계산)
       const staking = await db.prepare(`
         SELECT s.id as staking_id, s.user_id, s.amount, s.daily_rate, s.status,
-               s.start_date, s.end_date, s.period_days, s.period_months, s.last_reward_date,
+               s.start_date, s.end_date, s.period_days, s.period_months,
                (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
+               (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date,
                u.email as user_email
         FROM staking s
         LEFT JOIN users u ON u.id = s.user_id
