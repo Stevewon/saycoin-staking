@@ -6343,6 +6343,101 @@ app.post('/api/diag/exec-delete-solbat-phase3', async (c) => {
   }
 })
 
+// ★★★ 솔밧 L2 Phase 3 6건 원복 (사장님 명시 지시 2026-05-12: 어제처럼 1,950으로 돌려놔) ★★★
+//   경로: POST /api/diag/restore-solbat-phase3?key=ADMIN_PW&confirm=GO
+//   목적: exec-delete-solbat-phase3 으로 DELETE 된 6건을 원복 (INSERT) + qkey_balance +1,875
+//   - 대상 ref_id: 688, 698, 725, 729, 731, 773 (원장은 그대로 보존됨)
+//   - 원래 tx created_at (UTC): 2026-05-11 00:00:00 = KST 09:00:00 정각 (사장님 어제 본 행)
+//   - amount 매핑: 688/698/725/729/731=75, 773=1500 (합 1,875)
+//   - confirm=GO 필수
+app.post('/api/diag/restore-solbat-phase3', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요' }, 400)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+    const ORIG_CREATED_UTC = '2026-05-11 00:00:00'  // KST 09:00:00
+    const REVERT_AMOUNT = 1875
+
+    // 원장 6행 매핑 (ref_id, amount)
+    const ITEMS = [
+      { ref_id: 688, amount: 75 },
+      { ref_id: 698, amount: 75 },
+      { ref_id: 725, amount: 75 },
+      { ref_id: 729, amount: 75 },
+      { ref_id: 731, amount: 75 },
+      { ref_id: 773, amount: 1500 },
+    ]
+
+    // 사전 검증 — 원장 6행이 그대로 존재하는지 + 현재 tx 에 중복 INSERT 방지
+    const refIds = ITEMS.map(i => i.ref_id)
+    const placeholders = refIds.map(() => '?').join(',')
+    const rrRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, reward_amount FROM referral_rewards WHERE id IN (${placeholders})
+    `).bind(...refIds).all()
+    if ((rrRows.results || []).length !== 6) {
+      return c.json({ error: 'abort', reason: `원장 6행 누락 — found ${(rrRows.results || []).length}` }, 400)
+    }
+
+    const existingTx = await db.prepare(`
+      SELECT id, ref_id FROM transactions WHERE ref_id IN (${placeholders}) AND user_id = ? AND type = 'referral_reward'
+    `).bind(...refIds, SOLBAT_ID).all()
+    if ((existingTx.results || []).length > 0) {
+      return c.json({
+        error: 'abort',
+        reason: '이미 tx 가 존재 — 중복 INSERT 방지',
+        existing: existingTx.results,
+      }, 400)
+    }
+
+    const before: any = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+    const beforeBalance = Number(before.qkey_balance)
+
+    // 실제 INSERT 6건 (원본 created_at = '2026-05-11 00:00:00' UTC = KST 09:00:00 정각)
+    const insertedIds: number[] = []
+    for (const item of ITEMS) {
+      const res = await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+        VALUES (?, 'referral_reward', 'QKEY', ?, '추천 보너스 (Level 2)', ?, ?)
+      `).bind(SOLBAT_ID, item.amount, item.ref_id, ORIG_CREATED_UTC).run()
+      const id = (res.meta as any) && (res.meta as any).last_row_id
+      insertedIds.push(id)
+    }
+
+    // qkey_balance 원복: +1875
+    await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(REVERT_AMOUNT, SOLBAT_ID).run()
+
+    const after: any = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+    const afterBalance = Number(after.qkey_balance)
+
+    // 사후 검증: 5/11 KST tx 합계
+    const recheck = await db.prepare(`
+      SELECT id, amount, ref_id, datetime(created_at, '+9 hours') AS kst
+      FROM transactions
+      WHERE user_id = ? AND type = 'referral_reward'
+        AND description LIKE '%Level 2%'
+        AND date(created_at, '+9 hours') = '2026-05-11'
+      ORDER BY datetime(created_at, '+9 hours') ASC, id ASC
+    `).bind(SOLBAT_ID).all()
+    const rows = (recheck.results || []) as any[]
+    const sumAll = rows.reduce((a, r) => a + Number(r.amount), 0)
+
+    return c.json({
+      success: true,
+      restored: true,
+      inserted_tx_ids: insertedIds,
+      balance: { before: beforeBalance, after: afterBalance, diff: afterBalance - beforeBalance },
+      recheck_may11_kst: { tx_count: rows.length, tx_sum: sumAll, rows },
+      note: '사장님 명시 지시 (2026-05-12): 어제처럼 1,950 으로 원복 완료',
+    })
+  } catch (error) {
+    console.error('restore-solbat-phase3 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧 산하 조직원 데일리 + L1/L2 매칭 배당 정합성 일괄 분석 — 사장님 GO 결재 (2026-05-12, read-only) ★★★
 //   경로: GET /api/diag/solbat-downline-audit?key=ADMIN_PW
 //   목적: 솔밧(u#44) 산하 전체 조직원(L1/L2/L3+ 모두) 의 배당 정합성 정밀 진단
