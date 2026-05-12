@@ -1705,19 +1705,30 @@ app.post('/api/swap/qkey-to-qta', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (${(user.qkey_balance || 0).toLocaleString()} QKEY / ${requiredQkey.toLocaleString()} QKEY)` }, 400)
     }
 
-    // QKEY 차감 & QTA 증가 - 경쟁조건 방지
+    // QKEY 차감 & QTA 증가 - 경쟁조건 방지 (원자적 UPDATE)
     const swapQtaResult = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ?, qta_balance = qta_balance + ? WHERE id = ? AND qkey_balance >= ?`).bind(requiredQkey, amount, userId, requiredQkey).run()
     if (!swapQtaResult.meta.changes || swapQtaResult.meta.changes === 0) {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
     }
 
-    // 거래 내역 (QKEY 차감) — ★ 출금성 거래는 음수로 저장
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, -Math.abs(requiredQkey), `QKEY → QTA swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`).run()
+    // ★ 스왑 거래내역 보강 (영구룰 #112 한국어 안전 + ref_id dedupe + 실패 시 rollback)
+    const swapTs = Date.now()
+    const refOut = `swap_${userId}_${swapTs}_out`
+    const refIn = `swap_${userId}_${swapTs}_in`
+    const descKor = `QKEY → QTA 스왑 (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`
+    try {
+      // 거래 내역 (QKEY 차감) — ★ 출금성 거래는 음수로 저장
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'QKEY', ?, ?, ?)`).bind(userId, -Math.abs(requiredQkey), descKor, refOut).run()
+      // 거래 내역 (QTA 증가 - swap_in으로 기록 → 출금 가능 수량에 반영)
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QTA', ?, ?, ?)`).bind(userId, amount, descKor, refIn).run()
+    } catch (txErr) {
+      // tx INSERT 실패 시 잔액 역방향 rollback (스왑 로직 보강 #4)
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ?, qta_balance = qta_balance - ? WHERE id = ?`).bind(requiredQkey, amount, userId).run()
+      console.error('swap qkey->qta tx insert failed, balance rolled back:', txErr)
+      return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
+    }
 
-    // 거래 내역 (QTA 증가 - swap_in으로 기록 → 출금 가능 수량에 반영)
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QTA', ?, ?)`).bind(userId, amount, `QKEY → QTA swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA)`).run()
-
-    return c.json({ success: true, message: `${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA`, swap: { from: 'QKEY', to: 'QTA', qkeyUsed: requiredQkey, received: amount } })
+    return c.json({ success: true, message: `${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QTA`, swap: { from: 'QKEY', to: 'QTA', qkeyUsed: requiredQkey, received: amount, ref_id: refOut } })
   } catch (error) {
     return c.json({ error: t(c, 'swap.error') }, 500)
   }
@@ -1745,12 +1756,22 @@ app.post('/api/swap/qkey-to-qx', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
     }
 
-    // ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'QKEY', ?, ?)`).bind(userId, -Math.abs(requiredQkey), `QKEY → QX swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`).run()
+    // ★ 스왑 거래내역 보강 (영구룰 #112 한국어 + ref_id dedupe + 실패 시 rollback)
+    const swapTs = Date.now()
+    const refOut = `swap_${userId}_${swapTs}_out`
+    const refIn = `swap_${userId}_${swapTs}_in`
+    const descKor = `QKEY → QX 스왑 (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`
+    try {
+      // ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'QKEY', ?, ?, ?)`).bind(userId, -Math.abs(requiredQkey), descKor, refOut).run()
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QX', ?, ?, ?)`).bind(userId, amount, descKor, refIn).run()
+    } catch (txErr) {
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ?, qx_balance = qx_balance - ? WHERE id = ?`).bind(requiredQkey, amount, userId).run()
+      console.error('swap qkey->qx tx insert failed, balance rolled back:', txErr)
+      return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
+    }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QX', ?, ?)`).bind(userId, amount, `QKEY → QX swap (${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX)`).run()
-
-    return c.json({ success: true, message: `${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX`, swap: { from: 'QKEY', to: 'QX', qkeyUsed: requiredQkey, received: amount } })
+    return c.json({ success: true, message: `${requiredQkey.toLocaleString()} QKEY → ${amount.toLocaleString()} QX`, swap: { from: 'QKEY', to: 'QX', qkeyUsed: requiredQkey, received: amount, ref_id: refOut } })
   } catch (error) {
     return c.json({ error: t(c, 'swap.error') }, 500)
   }
@@ -1778,12 +1799,22 @@ app.post('/api/swap/usdt-to-qkey', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
 
-    // ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, -Math.abs(amount), `USDT → QKEY swap (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`).run()
+    // ★ 스왑 거래내역 보강 (영구룰 #112 한국어 + ref_id dedupe + 실패 시 rollback)
+    const swapTs = Date.now()
+    const refOut = `swap_${userId}_${swapTs}_out`
+    const refIn = `swap_${userId}_${swapTs}_in`
+    const descKor = `USDT → QKEY 스왑 (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`
+    try {
+      // ★ 출금성 거래는 음수로 저장 (잔액=tx_sum 정합성)
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'USDT', ?, ?, ?)`).bind(userId, -Math.abs(amount), descKor, refOut).run()
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QKEY', ?, ?, ?)`).bind(userId, qkeyToReceive, descKor, refIn).run()
+    } catch (txErr) {
+      await db.prepare(`UPDATE users SET usdt_balance = usdt_balance + ?, qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, qkeyToReceive, userId).run()
+      console.error('swap usdt->qkey tx insert failed, balance rolled back:', txErr)
+      return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
+    }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QKEY', ?, ?)`).bind(userId, qkeyToReceive, `USDT → QKEY swap (${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY)`).run()
-
-    return c.json({ success: true, message: `${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY`, swap: { from: 'USDT', to: 'QKEY', usdtUsed: amount, received: qkeyToReceive } })
+    return c.json({ success: true, message: `${amount.toLocaleString()} USDT → ${qkeyToReceive.toLocaleString()} QKEY`, swap: { from: 'USDT', to: 'QKEY', usdtUsed: amount, received: qkeyToReceive, ref_id: refOut } })
   } catch (error) {
     return c.json({ error: t(c, 'swap.error') }, 500)
   }
@@ -1811,12 +1842,22 @@ app.post('/api/swap/usdt-to-qta', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
 
-    // ★ 출금성 거래는 음수로 저장
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, -Math.abs(amount), `USDT → QTA swap (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`).run()
+    // ★ 스왑 거래내역 보강 (영구룰 #112 한국어 + ref_id dedupe + 실패 시 rollback)
+    const swapTs = Date.now()
+    const refOut = `swap_${userId}_${swapTs}_out`
+    const refIn = `swap_${userId}_${swapTs}_in`
+    const descKor = `USDT → QTA 스왑 (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`
+    try {
+      // ★ 출금성 거래는 음수로 저장
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'USDT', ?, ?, ?)`).bind(userId, -Math.abs(amount), descKor, refOut).run()
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QTA', ?, ?, ?)`).bind(userId, qtaToReceive, descKor, refIn).run()
+    } catch (txErr) {
+      await db.prepare(`UPDATE users SET usdt_balance = usdt_balance + ?, qta_balance = qta_balance - ? WHERE id = ?`).bind(amount, qtaToReceive, userId).run()
+      console.error('swap usdt->qta tx insert failed, balance rolled back:', txErr)
+      return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
+    }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QTA', ?, ?)`).bind(userId, qtaToReceive, `USDT → QTA swap (${amount} USDT → ${qtaToReceive.toLocaleString()} QTA)`).run()
-
-    return c.json({ success: true, message: `${amount} USDT → ${qtaToReceive.toLocaleString()} QTA`, swap: { from: 'USDT', to: 'QTA', usdtUsed: amount, received: qtaToReceive } })
+    return c.json({ success: true, message: `${amount} USDT → ${qtaToReceive.toLocaleString()} QTA`, swap: { from: 'USDT', to: 'QTA', usdtUsed: amount, received: qtaToReceive, ref_id: refOut } })
   } catch (error) {
     return c.json({ error: t(c, 'swap.error') }, 500)
   }
@@ -1844,12 +1885,22 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
 
-    // ★ 출금성 거래는 음수로 저장
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_out', 'USDT', ?, ?)`).bind(userId, -Math.abs(amount), `USDT → QX swap (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`).run()
+    // ★ 스왑 거래내역 보강 (영구룰 #112 한국어 + ref_id dedupe + 실패 시 rollback)
+    const swapTs = Date.now()
+    const refOut = `swap_${userId}_${swapTs}_out`
+    const refIn = `swap_${userId}_${swapTs}_in`
+    const descKor = `USDT → QX 스왑 (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`
+    try {
+      // ★ 출금성 거래는 음수로 저장
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'USDT', ?, ?, ?)`).bind(userId, -Math.abs(amount), descKor, refOut).run()
+      await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QX', ?, ?, ?)`).bind(userId, qxToReceive, descKor, refIn).run()
+    } catch (txErr) {
+      await db.prepare(`UPDATE users SET usdt_balance = usdt_balance + ?, qx_balance = qx_balance - ? WHERE id = ?`).bind(amount, qxToReceive, userId).run()
+      console.error('swap usdt->qx tx insert failed, balance rolled back:', txErr)
+      return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
+    }
 
-    await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'swap_in', 'QX', ?, ?)`).bind(userId, qxToReceive, `USDT → QX swap (${amount} USDT → ${qxToReceive.toLocaleString()} QX)`).run()
-
-    return c.json({ success: true, message: `${amount} USDT → ${qxToReceive.toLocaleString()} QX`, swap: { from: 'USDT', to: 'QX', usdtUsed: amount, received: qxToReceive } })
+    return c.json({ success: true, message: `${amount} USDT → ${qxToReceive.toLocaleString()} QX`, swap: { from: 'USDT', to: 'QX', usdtUsed: amount, received: qxToReceive, ref_id: refOut } })
   } catch (error) {
     return c.json({ error: t(c, 'swap.error') }, 500)
   }
