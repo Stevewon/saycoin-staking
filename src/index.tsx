@@ -5042,7 +5042,7 @@ app.get('/api/diag/rewards-by-date', async (c) => {
 
     // daily_rewards (그 날짜의 발생일)
     const drRows = await db.prepare(`
-      SELECT dr.id, dr.staking_id, dr.user_id, u.email, dr.reward_date, dr.paid_date, dr.amount, dr.created_at
+      SELECT dr.id, dr.staking_id, dr.user_id, u.email, dr.reward_date, dr.paid_date, dr.usdt_amount
       FROM daily_rewards dr
       LEFT JOIN users u ON u.id = dr.user_id
       WHERE dr.reward_date = ?
@@ -5062,7 +5062,7 @@ app.get('/api/diag/rewards-by-date', async (c) => {
       success: true,
       date,
       daily_rewards_count: drRows.results.length,
-      daily_rewards_sum_qkey: (drRows.results as any[]).reduce((s, r) => s + Number(r.amount || 0), 0),
+      daily_rewards_sum_usdt: (drRows.results as any[]).reduce((s, r) => s + Number(r.usdt_amount || 0), 0),
       transactions_count: txRows.results.length,
       transactions_sum_qkey: (txRows.results as any[]).reduce((s, r) => s + Number(r.amount || 0), 0),
       daily_rewards: drRows.results,
