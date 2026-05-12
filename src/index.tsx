@@ -6816,6 +6816,176 @@ app.get('/api/diag/dump-after-may11-cutoff', async (c) => {
   }
 })
 
+// ★★★ KST 5/11 23:59:59 이전 상태로 D1 전체 원복 EXEC — 사장님 명시 지시 (2026-05-12) ★★★
+//   경로: POST /api/diag/exec-revert-to-may11-cutoff?key=ADMIN_PW&confirm=GO
+//   사장님 명령 원문: "5월 11일 23시59분까지의 원장 상태로 돌려놓으라니깐"
+//   동작:
+//   1) cutoff (UTC 2026-05-11 14:59:59) 이후 INSERT 된 transactions 전부 DELETE
+//      → 회원별 coin_type 별 amount 합 = 잔액 환원 delta
+//   2) cutoff 이후 INSERT 된 daily_rewards 전부 DELETE
+//   3) cutoff 이후 INSERT 된 referral_rewards 전부 DELETE
+//   4) 영향 회원의 qkey_balance / qta_balance / qx_balance / usdt_balance 환원
+//   - confirm=GO 필수
+//   - 사후 검증: cutoff 이후 행 0건 확인 + 영향 회원 잔액 before/after 보고
+app.post('/api/diag/exec-revert-to-may11-cutoff', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요' }, 400)
+    const db = c.env.DB
+    const CUTOFF_UTC = '2026-05-11 14:59:59'  // = KST 2026-05-11 23:59:59
+
+    // 1) cutoff 이후 transactions 추출 (DELETE 대상 + 잔액 환원 delta 계산)
+    const txAfter: any = await db.prepare(`
+      SELECT id, user_id, coin_type, amount FROM transactions WHERE created_at > ?
+    `).bind(CUTOFF_UTC).all()
+    const txRows = (txAfter.results || []) as any[]
+
+    // 회원별 코인별 환원 delta 계산
+    const deltaByUser = new Map<number, { qkey: number, qta: number, qx: number, usdt: number }>()
+    const txIds: number[] = []
+    for (const t of txRows) {
+      const uid = Number(t.user_id)
+      const amt = Number(t.amount) || 0
+      const coin = String(t.coin_type || '').toUpperCase()
+      const cur = deltaByUser.get(uid) || { qkey: 0, qta: 0, qx: 0, usdt: 0 }
+      if (coin === 'QKEY') cur.qkey += amt
+      else if (coin === 'QTA') cur.qta += amt
+      else if (coin === 'QX') cur.qx += amt
+      else if (coin === 'USDT') cur.usdt += amt
+      deltaByUser.set(uid, cur)
+      txIds.push(Number(t.id))
+    }
+
+    // 영향 회원 before 잔액 캡쳐
+    const userIds = Array.from(deltaByUser.keys())
+    const beforeBalances: any[] = []
+    for (const uid of userIds) {
+      const u: any = await db.prepare(`
+        SELECT id, name, email, qkey_balance, qta_balance, qx_balance, usdt_balance
+        FROM users WHERE id = ?
+      `).bind(uid).first()
+      beforeBalances.push({
+        user_id: uid,
+        name: u?.name,
+        before: {
+          qkey: Number(u?.qkey_balance) || 0,
+          qta: Number(u?.qta_balance) || 0,
+          qx: Number(u?.qx_balance) || 0,
+          usdt: Number(u?.usdt_balance) || 0,
+        },
+        delta: deltaByUser.get(uid),
+      })
+    }
+
+    // 2) daily_rewards cutoff 이후 (reward_date 또는 paid_date 가 5/12 이상)
+    const dailyAfter: any = await db.prepare(`
+      SELECT id FROM daily_rewards
+      WHERE reward_date >= '2026-05-12' OR paid_date >= '2026-05-12'
+    `).all()
+    const dailyIds = (dailyAfter.results || []).map((r: any) => Number(r.id))
+
+    // 3) referral_rewards cutoff 이후
+    const rrAfter: any = await db.prepare(`
+      SELECT id FROM referral_rewards
+      WHERE created_at > ?
+         OR reward_date >= '2026-05-12'
+         OR paid_date >= '2026-05-12'
+    `).bind(CUTOFF_UTC).all()
+    const rrIds = (rrAfter.results || []).map((r: any) => Number(r.id))
+
+    // 4) 실제 DELETE 실행
+    //    chunked DELETE (D1 IN(...) placeholder 한계 고려, 100건씩)
+    //    TSX 파일에서 제네릭 화살표 함수 파싱 문제 회피 위해 일반 함수로 작성
+    function chunk(arr: any[], n: number): any[][] {
+      const out: any[][] = []
+      for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n))
+      return out
+    }
+
+    let txDeleted = 0
+    for (const part of chunk(txIds, 100)) {
+      if (part.length === 0) continue
+      const ph = part.map(() => '?').join(',')
+      const r: any = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...part).run()
+      txDeleted += (r.meta?.changes ?? part.length)
+    }
+    let dailyDeleted = 0
+    for (const part of chunk(dailyIds, 100)) {
+      if (part.length === 0) continue
+      const ph = part.map(() => '?').join(',')
+      const r: any = await db.prepare(`DELETE FROM daily_rewards WHERE id IN (${ph})`).bind(...part).run()
+      dailyDeleted += (r.meta?.changes ?? part.length)
+    }
+    let rrDeleted = 0
+    for (const part of chunk(rrIds, 100)) {
+      if (part.length === 0) continue
+      const ph = part.map(() => '?').join(',')
+      const r: any = await db.prepare(`DELETE FROM referral_rewards WHERE id IN (${ph})`).bind(...part).run()
+      rrDeleted += (r.meta?.changes ?? part.length)
+    }
+
+    // 5) 잔액 환원 (회원별 코인별)
+    for (const [uid, d] of deltaByUser.entries()) {
+      await db.prepare(`
+        UPDATE users
+        SET qkey_balance = qkey_balance - ?,
+            qta_balance  = qta_balance  - ?,
+            qx_balance   = qx_balance   - ?,
+            usdt_balance = usdt_balance - ?
+        WHERE id = ?
+      `).bind(d.qkey, d.qta, d.qx, d.usdt, uid).run()
+    }
+
+    // 6) 사후 검증: cutoff 이후 행 잔존 확인
+    const verifyTx: any = await db.prepare(`SELECT COUNT(*) AS c FROM transactions WHERE created_at > ?`).bind(CUTOFF_UTC).first()
+    const verifyDaily: any = await db.prepare(`SELECT COUNT(*) AS c FROM daily_rewards WHERE reward_date >= '2026-05-12' OR paid_date >= '2026-05-12'`).first()
+    const verifyRr: any = await db.prepare(`SELECT COUNT(*) AS c FROM referral_rewards WHERE created_at > ? OR reward_date >= '2026-05-12' OR paid_date >= '2026-05-12'`).bind(CUTOFF_UTC).first()
+
+    // 영향 회원 after 잔액
+    const afterBalances: any[] = []
+    for (const b of beforeBalances) {
+      const u: any = await db.prepare(`
+        SELECT qkey_balance, qta_balance, qx_balance, usdt_balance FROM users WHERE id = ?
+      `).bind(b.user_id).first()
+      afterBalances.push({
+        user_id: b.user_id,
+        name: b.name,
+        before: b.before,
+        delta: b.delta,
+        after: {
+          qkey: Number(u?.qkey_balance) || 0,
+          qta: Number(u?.qta_balance) || 0,
+          qx: Number(u?.qx_balance) || 0,
+          usdt: Number(u?.usdt_balance) || 0,
+        },
+      })
+    }
+
+    return c.json({
+      success: true,
+      cutoff: { kst: '2026-05-11 23:59:59', utc: CUTOFF_UTC },
+      deleted: {
+        transactions: txDeleted,
+        daily_rewards: dailyDeleted,
+        referral_rewards: rrDeleted,
+      },
+      affected_users: afterBalances.length,
+      verify_remaining: {
+        transactions_after_cutoff: Number(verifyTx?.c) || 0,
+        daily_rewards_after_cutoff: Number(verifyDaily?.c) || 0,
+        referral_rewards_after_cutoff: Number(verifyRr?.c) || 0,
+      },
+      balances: afterBalances,
+      note: '사장님 명시 지시 (2026-05-12): 5월 11일 23시59분 이전 원장 상태로 전부 원복 완료',
+    })
+  } catch (error) {
+    console.error('exec-revert-to-may11-cutoff error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧 L2 referee 6건 staking 금액 정밀 확인 — 사장님 지시 (2026-05-12, read-only) ★★★
 //   경로: GET /api/diag/solbat-l2-referee-stakes?key=ADMIN_PW
 //   목적: ref_id 688,698,725,729,731,773 의 referee 각자 staking 진입 금액 확인
