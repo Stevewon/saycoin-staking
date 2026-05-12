@@ -5424,6 +5424,139 @@ app.post('/api/diag/exec-delete-may11-phase4-only', async (c) => {
 })
 
 
+// ★★★★★ 특정 user 지급 내역서 — daily_rewards / referral_rewards / transactions 합산 (2026-05-12) ★★★★★
+//   경로: GET /api/diag/user-payout-ledger?user_id=N&key=ADMIN_PW [&from=YYYY-MM-DD] [&to=YYYY-MM-DD]
+//   조회: 해당 user 의 모든 QKEY 수령 내역 (own_daily + referral_reward L1/L2) + 잔액
+//   기본 기간: 전체 (from/to 없을 때)
+app.get('/api/diag/user-payout-ledger', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const userIdQ = c.req.query('user_id') || ''
+    const userId = Number(userIdQ)
+    if (!Number.isFinite(userId) || userId <= 0) return c.json({ error: 'invalid user_id' }, 400)
+    const from = c.req.query('from') || ''
+    const to = c.req.query('to') || ''
+    const db = c.env.DB
+
+    // user 정보
+    const user = await db.prepare(`
+      SELECT id, name, email, referrer_id, qkey_balance, qta_balance, qx_balance
+      FROM users WHERE id = ?
+    `).bind(userId).first() as any
+    if (!user) return c.json({ error: 'user not found' }, 404)
+
+    // staking 정보
+    const stakings = await db.prepare(`
+      SELECT id, amount, daily_rate, period_days, period_months,
+        date(start_date,'+9 hours') AS start_kst,
+        date(end_date,'+9 hours') AS end_kst, status
+      FROM staking WHERE user_id = ? ORDER BY id
+    `).bind(userId).all()
+
+    // daily_rewards (own_daily)
+    const drQuery = from && to
+      ? `SELECT id, staking_id, usdt_amount AS qkey_amount, reward_date, paid_date
+         FROM daily_rewards WHERE user_id = ? AND reward_date >= ? AND reward_date <= ?
+         ORDER BY reward_date, staking_id`
+      : `SELECT id, staking_id, usdt_amount AS qkey_amount, reward_date, paid_date
+         FROM daily_rewards WHERE user_id = ?
+         ORDER BY reward_date, staking_id`
+    const drStmt = from && to ? db.prepare(drQuery).bind(userId, from, to) : db.prepare(drQuery).bind(userId)
+    const drRows = await drStmt.all()
+    const drList = (drRows.results || []) as any[]
+
+    // referral_rewards (받은 매칭 보너스, referrer_id 기준)
+    const rrQuery = from && to
+      ? `SELECT id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+         FROM referral_rewards WHERE referrer_id = ? AND reward_date >= ? AND reward_date <= ?
+         ORDER BY reward_date, level, referee_id`
+      : `SELECT id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+         FROM referral_rewards WHERE referrer_id = ?
+         ORDER BY reward_date, level, referee_id`
+    const rrStmt = from && to ? db.prepare(rrQuery).bind(userId, from, to) : db.prepare(rrQuery).bind(userId)
+    const rrRows = await rrStmt.all()
+    const rrList = (rrRows.results || []) as any[]
+
+    // transactions (모든 QKEY 입금)
+    const txQuery = from && to
+      ? `SELECT id, type, coin_type, amount, description, ref_id,
+                created_at, date(created_at,'+9 hours') AS created_kst
+         FROM transactions
+         WHERE user_id = ? AND coin_type = 'QKEY' AND amount > 0
+           AND date(created_at,'+9 hours') >= ? AND date(created_at,'+9 hours') <= ?
+         ORDER BY id`
+      : `SELECT id, type, coin_type, amount, description, ref_id,
+                created_at, date(created_at,'+9 hours') AS created_kst
+         FROM transactions
+         WHERE user_id = ? AND coin_type = 'QKEY' AND amount > 0
+         ORDER BY id`
+    const txStmt = from && to ? db.prepare(txQuery).bind(userId, from, to) : db.prepare(txQuery).bind(userId)
+    const txRows = await txStmt.all()
+    const txList = (txRows.results || []) as any[]
+
+    // 합계 산출
+    const drSum = drList.reduce((s, r) => s + Number(r.qkey_amount || 0), 0)
+    const rrL1Sum = rrList.filter(r => Number(r.level) === 1).reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+    const rrL2Sum = rrList.filter(r => Number(r.level) === 2).reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+    const rrL1Count = rrList.filter(r => Number(r.level) === 1).length
+    const rrL2Count = rrList.filter(r => Number(r.level) === 2).length
+    const txSum = txList.reduce((s, r) => s + Number(r.amount || 0), 0)
+    const txByType: Record<string, { count: number, sum: number }> = {}
+    for (const t of txList) {
+      const k = String(t.type)
+      if (!txByType[k]) txByType[k] = { count: 0, sum: 0 }
+      txByType[k].count++
+      txByType[k].sum += Number(t.amount || 0)
+    }
+
+    // stake_total + target + remaining (200% Cap)
+    const stakeTotal = (stakings.results || []).reduce((s: number, r: any) => {
+      if (['active','completed','capped'].includes(String(r.status))) return s + Number(r.amount || 0)
+      return s
+    }, 0)
+    const target = stakeTotal * 2 * 150
+    const remaining = Math.max(0, target - txSum)
+    const cappedPercent = target > 0 ? (txSum / target * 100) : 0
+
+    return c.json({
+      success: true,
+      user: {
+        id: user.id, name: user.name, email: user.email,
+        referrer_id: user.referrer_id,
+        qkey_balance: user.qkey_balance, qta_balance: user.qta_balance, qx_balance: user.qx_balance,
+      },
+      stakings: stakings.results || [],
+      filter: { from: from || 'ALL', to: to || 'ALL' },
+      summary: {
+        own_daily_count: drList.length,
+        own_daily_sum_qkey: drSum,
+        referral_l1_count: rrL1Count,
+        referral_l1_sum_qkey: rrL1Sum,
+        referral_l2_count: rrL2Count,
+        referral_l2_sum_qkey: rrL2Sum,
+        transactions_count: txList.length,
+        transactions_sum_qkey: txSum,
+        transactions_by_type: txByType,
+      },
+      cap_progress: {
+        stake_total_usdt: stakeTotal,
+        target_qkey: target,
+        paid_total_qkey: txSum,
+        remaining_qkey: remaining,
+        percent: Math.round(cappedPercent * 100) / 100,
+      },
+      daily_rewards: drList,
+      referral_rewards: rrList,
+      transactions: txList,
+    })
+  } catch (error) {
+    console.error('user-payout-ledger error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+
 // ★★★★★ 5/8 reward_date AND paid_date=2026-05-11 중복 47건 정밀 삭제 — 옵션 A (2026-05-12) ★★★★★
 //   배경: 5/11 cron 실행 시 5/8 적립분이 재INSERT 되어 (staking_id, reward_date)='5/8' 동일 행이
 //         paid_date=2026-05-08 + paid_date=2026-05-11 두 번 들어감 (47 staking 영향)
