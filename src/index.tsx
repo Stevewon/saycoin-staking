@@ -22515,8 +22515,8 @@ app.get('/api/diag/audit-user-referral-tx-gap', async (c) => {
 // 추측 0건. staking.daily_rate 컬럼 D1 직접 조회.
 // ============================================================
 app.get('/api/diag/audit-holiday-entrant-weekday-gap', async (c) => {
-  const key = c.req.query('key')
-  if (key !== c.env.ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
 
   try {
     const db = c.env.DB
