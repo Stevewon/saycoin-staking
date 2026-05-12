@@ -5457,6 +5457,217 @@ app.post('/api/diag/backfill-may12-missing', async (c) => {
   }
 })
 
+// ★★★ 솔밧(u#44) L2 매칭 미러링 누락 2건 정밀 백필 (Phase 1, 2026-05-12 사장님 C안 결재) ★★★
+//   원장 referral_rewards 25건 / 9,150 QKEY  vs  transactions 미러링 23건 / 7,500 QKEY
+//   누락 2건: rr#347 (150 QKEY, 2026-05-06 referee u#49) + rr#524 (1,500 QKEY, 2026-05-06 referee u#76)
+//   ★ 잔액(users.qkey_balance) 절대 안 건드림 — 이미 정확히 반영됨 ★
+//   ★ description 영구룰 100% 준수: '추천 보너스 (Level 2)' 만 사용 ★
+//   경로: POST /api/diag/backfill-l2-mirror-missing?key=ADMIN_PW&dry_run=1|0
+app.post('/api/diag/backfill-l2-mirror-missing', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const dryRun = c.req.query('dry_run') === '1'
+    const db = c.env.DB
+
+    // 정밀 진단으로 확정된 누락 2건 — referral_rewards.id 하드코드
+    const TARGET_RR_IDS = [347, 524]
+    const results: any[] = []
+    let inserted = 0
+    let alreadyExists = 0
+    let notFound = 0
+
+    for (const rrId of TARGET_RR_IDS) {
+      // 1. 원장 referral_rewards 행 조회
+      const rr = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date
+        FROM referral_rewards
+        WHERE id = ?
+      `).bind(rrId).first() as any
+
+      if (!rr) {
+        results.push({ rr_id: rrId, status: 'not_found_in_referral_rewards' })
+        notFound++
+        continue
+      }
+
+      // 2. EXISTS 가드 — 이미 미러링 존재하면 skip
+      const exists = await db.prepare(`
+        SELECT id FROM transactions
+        WHERE type = 'referral_reward' AND ref_id = ?
+        LIMIT 1
+      `).bind(rrId).first()
+
+      if (exists) {
+        results.push({
+          rr_id: rrId,
+          referrer_id: rr.referrer_id,
+          referee_id: rr.referee_id,
+          level: rr.level,
+          reward_amount: rr.reward_amount,
+          status: 'already_exists',
+          existing_tx_id: (exists as any).id,
+        })
+        alreadyExists++
+        continue
+      }
+
+      // 3. dry_run 모드 — INSERT 미수행
+      if (dryRun) {
+        results.push({
+          rr_id: rrId,
+          referrer_id: rr.referrer_id,
+          referee_id: rr.referee_id,
+          level: rr.level,
+          reward_amount: rr.reward_amount,
+          paid_date: rr.paid_date,
+          status: 'would_insert',
+          planned_description: rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)',
+        })
+        continue
+      }
+
+      // 4. 실 INSERT — description 영구룰 안전 한국어만, 잔액 미수정
+      const desc = rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+      const paidDateIso = (rr.paid_date || rr.reward_date) + ' 00:00:00'
+
+      const ins = await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+        VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+      `).bind(rr.referrer_id, rr.reward_amount, desc, rrId, paidDateIso).run()
+
+      const newTxId = (ins as any)?.meta?.last_row_id ?? null
+      results.push({
+        rr_id: rrId,
+        referrer_id: rr.referrer_id,
+        referee_id: rr.referee_id,
+        level: rr.level,
+        reward_amount: rr.reward_amount,
+        paid_date: rr.paid_date,
+        status: 'inserted',
+        new_tx_id: newTxId,
+      })
+      inserted++
+    }
+
+    return c.json({
+      success: true,
+      mode: dryRun ? 'dry_run' : 'real',
+      target_count: TARGET_RR_IDS.length,
+      inserted_count: inserted,
+      already_exists_count: alreadyExists,
+      not_found_count: notFound,
+      results,
+      note: '잔액(users.qkey_balance) 절대 안 건드림 — referral_rewards 원장에 의해 이미 정확히 반영됨',
+    })
+  } catch (error) {
+    console.error('backfill-l2-mirror-missing error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★ 전 회원 referral_rewards vs transactions 미러링 차이 일괄 백필 (Phase 3, C안) ★★★
+//   level IN (1,2) 만 대상 (L0 직판은 type='direct_referral' 로 별도 미러링)
+//   EXISTS 가드 + description 영구룰 100% 준수 + 잔액 절대 미수정
+//   경로: POST /api/diag/backfill-referral-mirror-all?key=ADMIN_PW&dry_run=1|0&level=1|2|all&limit=N
+app.post('/api/diag/backfill-referral-mirror-all', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const dryRun = c.req.query('dry_run') === '1'
+    const levelParam = c.req.query('level') || 'all'
+    const limit = Math.min(Number(c.req.query('limit') || 500), 1000)
+    const db = c.env.DB
+
+    // 대상 level 절
+    let levelClause = ''
+    if (levelParam === '1') levelClause = 'AND rr.level = 1'
+    else if (levelParam === '2') levelClause = 'AND rr.level = 2'
+    else levelClause = 'AND rr.level IN (1, 2)'
+
+    // 1. 원장 referral_rewards 중 transactions.ref_id 와 매핑 안된 행만 추출
+    const missing = await db.prepare(`
+      SELECT rr.id, rr.referrer_id, rr.referee_id, rr.level, rr.reward_amount, rr.reward_date, rr.paid_date
+      FROM referral_rewards rr
+      LEFT JOIN transactions tx
+        ON tx.type = 'referral_reward' AND tx.ref_id = rr.id
+      WHERE tx.id IS NULL
+        ${levelClause}
+        AND COALESCE(rr.reward_amount, 0) > 0
+      ORDER BY rr.id ASC
+      LIMIT ?
+    `).bind(limit).all() as any
+
+    const missingRows = (missing.results || []) as any[]
+    const results: any[] = []
+    let inserted = 0
+
+    for (const rr of missingRows) {
+      const desc = rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+      const paidDateIso = (rr.paid_date || rr.reward_date) + ' 00:00:00'
+
+      if (dryRun) {
+        results.push({
+          rr_id: rr.id,
+          referrer_id: rr.referrer_id,
+          referee_id: rr.referee_id,
+          level: rr.level,
+          reward_amount: rr.reward_amount,
+          paid_date: rr.paid_date,
+          status: 'would_insert',
+          planned_description: desc,
+        })
+        continue
+      }
+
+      // 실 INSERT
+      const ins = await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+        VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+      `).bind(rr.referrer_id, rr.reward_amount, desc, rr.id, paidDateIso).run()
+
+      const newTxId = (ins as any)?.meta?.last_row_id ?? null
+      results.push({
+        rr_id: rr.id,
+        referrer_id: rr.referrer_id,
+        referee_id: rr.referee_id,
+        level: rr.level,
+        reward_amount: rr.reward_amount,
+        paid_date: rr.paid_date,
+        status: 'inserted',
+        new_tx_id: newTxId,
+      })
+      inserted++
+    }
+
+    // 영향 받은 사용자 통계 (referrer_id 별 누락 건수/금액)
+    const byReferrer: Record<string, { count: number, sum: number }> = {}
+    for (const r of missingRows) {
+      const k = String(r.referrer_id)
+      if (!byReferrer[k]) byReferrer[k] = { count: 0, sum: 0 }
+      byReferrer[k].count += 1
+      byReferrer[k].sum += Number(r.reward_amount || 0)
+    }
+
+    return c.json({
+      success: true,
+      mode: dryRun ? 'dry_run' : 'real',
+      level_filter: levelParam,
+      total_missing_in_scan: missingRows.length,
+      limit_applied: limit,
+      inserted_count: inserted,
+      by_referrer: byReferrer,
+      results,
+      note: '잔액 절대 미수정 — referral_rewards 원장이 이미 잔액 반영. transactions 미러링만 추가.',
+    })
+  } catch (error) {
+    console.error('backfill-referral-mirror-all error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
 //   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
 app.get('/api/diag/search-user', async (c) => {
