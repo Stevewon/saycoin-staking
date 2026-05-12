@@ -19466,7 +19466,10 @@ app.get('/admin/dashboard', (c) => {
                         // Reward history
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-coins mr-1 text-yellow-600"></i>' + I18N.t('admin.reward_section') + ' (' + rewards.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (rewards.length > 0 ? '<div class="overflow-x-auto mb-4"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.date_label') + '</th><th class="px-2 py-1 text-right">QKEY</th><th class="px-2 py-1 text-right">' + I18N.t('admin.investment_amount') + '</th></tr></thead><tbody class="divide-y">' +
-                            rewards.slice(0, 20).map(function(r) {
+                            // ★★ 2026-05-12 사장님 지시: slice(0,20) 하드 제한 제거 — 전체 배당내역 표시
+                            //   서버 API 는 LIMIT 없이 전체 반환 중 (src/index.tsx L2907-2914)
+                            //   모달 본문 스크롤로 긴 목록도 확인 가능
+                            rewards.map(function(r) {
                                 // ★ reward_date 는 이미 KST 'YYYY-MM-DD' 문자열 (백엔드 기록 시점부터 KST). 그대로 사용
                                 //   사용자 화면과 동일한 reward_date 라벨을 표시해 어드민-사용자 간 1:1 일치 보장
                                 return '<tr><td class="px-2 py-1">' + (r.reward_date || '-') + '</td><td class="px-2 py-1 text-right font-bold text-yellow-600">' + Math.round(r.usdt_amount).toLocaleString() + '</td><td class="px-2 py-1 text-right">$' + (r.staking_amount || 0).toLocaleString() + '</td></tr>';
@@ -19489,7 +19492,10 @@ app.get('/admin/dashboard', (c) => {
                         // Recent transactions
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-exchange-alt mr-1 text-blue-600"></i>' + I18N.t('admin.tx_section') + ' (' + transactions.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (transactions.length > 0 ? '<div class="overflow-x-auto"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.date_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.type_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.coin_label') + '</th><th class="px-2 py-1 text-right">' + I18N.t('admin.qty_label') + '</th><th class="px-2 py-1 text-left">' + I18N.t('admin.desc_label') + '</th></tr></thead><tbody class="divide-y">' +
-                            transactions.slice(0, 20).map(function(t) {
+                            // ★★ 2026-05-12 사장님 지시: slice(0,20) 하드 제한 제거 — 전체 거래내역 표시
+                            //   서버 API 는 LIMIT 없이 전체 반환 중 (src/index.tsx L2921-2928)
+                            //   모달 본문 스크롤로 긴 목록도 확인 가능 (L18091 max-h-[90vh] flex flex-col)
+                            transactions.map(function(t) {
                                 // ★★ 2026-05-12 이중 KST 변환 버그 FIX (사장님 지시)
                                 //   서버는 이미 datetime(created_at,'+9 hours') 적용해서 KST 로 보냄 (src/index.tsx L2913)
                                 //   여기서 'Z' 붙여 UTC 로 가정 후 다시 Asia/Seoul 변환 = +9h 이중 적용 → 5/13 표시 버그
