@@ -6447,6 +6447,229 @@ app.get('/api/diag/solbat-dup-referees', async (c) => {
   }
 })
 
+// ★★★ 솔밧 산하 중복 그룹 전체 정리 DRY-RUN PREVIEW — 사장님 지시 (2026-05-12, read-only) ★★★
+//   경로: GET /api/diag/dryrun-cleanup-solbat-dups?key=ADMIN_PW
+//   목적: 옵션 1 (1명1행 정리) 의 정확한 영향(잔액/tx/원장) 사전 미리보기
+//     사장님 명시 지시: "옵션 1 (DB 깨끗하게 정리, 1명1행) 그리고 다른 중복자 다 찾아서 원래대로 돌려놔!"
+//
+//   본 endpoint 가 보고하는 것 (DB UPDATE 0건):
+//   - 29 중복 그룹 각각: keep_ref_id(첫 행) + new_amount(expected) + delete_ref_ids(나머지)
+//   - 각 그룹별 원장(referral_rewards) UPDATE 1건 + DELETE N건 미리보기
+//   - 각 그룹별 tx(transactions) UPDATE 1건 + DELETE N건 미리보기
+//   - 각 referrer 별 qkey_balance 정정 영향 합계 (현재 sum_reward → expected_reward 차이)
+//   - safety_checks:
+//       * sum_matches_expected = true 인 그룹은 정리 후 합계 보존 확인
+//       * keep ref_id 의 tx 미러 존재 여부 확인
+//       * 5/03 L0 표기 같은 이상한 행 별도 표시 (사장님 결재 필요)
+//   - 본 endpoint 호출 시 DB 변경 0건. exec 는 별도 endpoint 에서 confirm=GO 로 진행
+app.get('/api/diag/dryrun-cleanup-solbat-dups', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+
+    // 1) 솔밧 산하 전체 회원 (재귀 CTE)
+    const downline = await db.prepare(`
+      WITH RECURSIVE tree(id, level) AS (
+        SELECT id, 1 AS level FROM users WHERE referrer_id = ?
+        UNION ALL
+        SELECT u.id, t.level + 1 FROM users u JOIN tree t ON u.referrer_id = t.id WHERE t.level < 10
+      )
+      SELECT id FROM tree
+    `).bind(SOLBAT_ID).all()
+    const allIds = [SOLBAT_ID, ...(downline.results || []).map((r: any) => r.id)]
+    const idPlaceholders = allIds.map(() => '?').join(',')
+
+    // 2) (referrer, referee, level, reward_date) 다중 행 그룹 추출
+    const dupGroups = await db.prepare(`
+      SELECT referrer_id, referee_id, level, reward_date,
+             COUNT(*) AS cnt, SUM(reward_amount) AS sum_reward,
+             GROUP_CONCAT(id, ',') AS ref_ids,
+             GROUP_CONCAT(reward_amount, ',') AS amounts
+      FROM referral_rewards
+      WHERE referrer_id IN (${idPlaceholders})
+      GROUP BY referrer_id, referee_id, level, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY referrer_id ASC, referee_id ASC, level ASC, reward_date ASC
+    `).bind(...allIds).all()
+
+    // 3) 각 그룹별 정리 plan 계산
+    const groups: any[] = []
+    const balanceImpactByReferrer = new Map<number, { name: string, delta: number, groups: number }>()
+    let totalRrUpdateCount = 0
+    let totalRrDeleteCount = 0
+    let totalTxUpdateCount = 0
+    let totalTxDeleteCount = 0
+    const suspiciousRows: any[] = []  // 이상한 5/03 L0 amount=15000 행 별도
+
+    for (const g of (dupGroups.results || [])) {
+      const gg: any = g
+      const referee: any = await db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).bind(gg.referee_id).first()
+      const referrer: any = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id = ?`).bind(gg.referrer_id).first()
+
+      // referee staking 총합
+      const stakes = await db.prepare(`
+        SELECT id, amount, status, date(created_at, '+9 hours') AS staked_kst_date
+        FROM staking
+        WHERE user_id = ? AND status IN ('active', 'completed', 'capped')
+        ORDER BY created_at ASC
+      `).bind(gg.referee_id).all()
+      const totalStake = (stakes.results || []).reduce((a: number, s: any) => a + Number(s.amount), 0)
+
+      // expected rate
+      const lvl = Number(gg.level)
+      const rate = lvl === 1 ? 0.15 : (lvl === 2 ? 0.075 : 0)
+      const expectedReward = Math.round(totalStake * rate)
+      const sumReward = Number(gg.sum_reward)
+
+      // ref_id 정렬: 가장 오래된(작은 id) 가 keep
+      const refIdsArrRaw: number[] = (gg.ref_ids || '').split(',').map((s: string) => parseInt(s, 10))
+      const refIdsArr = refIdsArrRaw.slice().sort((a, b) => a - b)
+      const amountsArr: number[] = (gg.amounts || '').split(',').map((s: string) => Number(s))
+      const keepRefId = refIdsArr[0]
+      const deleteRefIds = refIdsArr.slice(1)
+
+      // 원장 keep 행의 현재 amount
+      const keepRow: any = await db.prepare(`
+        SELECT id, reward_amount, original_amount, paid_date
+        FROM referral_rewards WHERE id = ?
+      `).bind(keepRefId).first()
+      const keepCurrentAmount = keepRow ? Number(keepRow.reward_amount) : 0
+      const rrUpdateNeeded = expectedReward !== keepCurrentAmount
+
+      // tx 미러 추출
+      const refPh = refIdsArr.map(() => '?').join(',')
+      const txMirrors: any = await db.prepare(`
+        SELECT id AS tx_id, ref_id, amount, description,
+               datetime(created_at, '+9 hours') AS tx_kst
+        FROM transactions
+        WHERE ref_id IN (${refPh}) AND user_id = ? AND type = 'referral_reward'
+        ORDER BY ref_id ASC, id ASC
+      `).bind(...refIdsArr, gg.referrer_id).all()
+      const txRows = (txMirrors.results || []) as any[]
+      const keepTxRows = txRows.filter(t => Number(t.ref_id) === keepRefId)
+      const deleteTxRows = txRows.filter(t => Number(t.ref_id) !== keepRefId)
+      const keepTxId = keepTxRows.length > 0 ? keepTxRows[0].tx_id : null
+      const keepTxCurrentAmount = keepTxRows.length > 0 ? Number(keepTxRows[0].amount) : 0
+      const txUpdateNeeded = keepTxId !== null && keepTxCurrentAmount !== expectedReward
+      const txKeepMissing = keepTxRows.length === 0  // keep 의 tx 미러 없음 (safety)
+
+      // 잔액 영향 계산 (referrer 의 qkey_balance):
+      //   정리 후 referrer 에게 발생할 변화 = (expected) - (sum_reward 현재)
+      //   현재 잔액엔 sum_reward 가 이미 반영돼 있음 (tx 합) → expected 로 줄여야 함
+      const balanceDelta = expectedReward - sumReward  // 음수면 차감
+      const cur = balanceImpactByReferrer.get(Number(gg.referrer_id)) || { name: referrer?.name || `u#${gg.referrer_id}`, delta: 0, groups: 0 }
+      cur.delta += balanceDelta
+      cur.groups += 1
+      balanceImpactByReferrer.set(Number(gg.referrer_id), cur)
+
+      // 이상한 행 식별 (L0 표기 또는 amount=15000 같은 abnormal)
+      const hasL0 = lvl !== 1 && lvl !== 2
+      const hasAbnormalAmount = amountsArr.some(a => a === 15000 || a >= 10000)
+      const isSuspicious = hasL0 || hasAbnormalAmount || (referrer && Number(gg.reward_date.substring(0, 10).replace(/-/g, '')) < 20260504)
+
+      if (isSuspicious) {
+        suspiciousRows.push({
+          referrer: { id: gg.referrer_id, name: referrer?.name },
+          referee: { id: gg.referee_id, name: referee?.name },
+          level: lvl,
+          reward_date: gg.reward_date,
+          ref_ids: refIdsArr,
+          amounts: amountsArr,
+          reason: { hasL0, hasAbnormalAmount },
+        })
+      }
+
+      totalRrUpdateCount += rrUpdateNeeded ? 1 : 0
+      totalRrDeleteCount += deleteRefIds.length
+      totalTxUpdateCount += txUpdateNeeded ? 1 : 0
+      totalTxDeleteCount += deleteTxRows.length
+
+      groups.push({
+        referrer: { id: gg.referrer_id, name: referrer?.name },
+        referee: { id: gg.referee_id, name: referee?.name },
+        level: lvl,
+        reward_date: gg.reward_date,
+        dup_count: gg.cnt,
+        current: {
+          ref_ids: refIdsArr,
+          amounts: amountsArr,
+          sum_reward: sumReward,
+        },
+        referee_total_stake: totalStake,
+        expected_reward: expectedReward,
+        sum_matches_expected: sumReward === expectedReward,
+        plan: {
+          rr: {
+            keep_ref_id: keepRefId,
+            keep_current_amount: keepCurrentAmount,
+            update_to: expectedReward,
+            update_needed: rrUpdateNeeded,
+            delete_ref_ids: deleteRefIds,
+          },
+          tx: {
+            keep_tx_id: keepTxId,
+            keep_tx_current_amount: keepTxCurrentAmount,
+            update_to: expectedReward,
+            update_needed: txUpdateNeeded,
+            keep_missing: txKeepMissing,
+            delete_tx_ids: deleteTxRows.map(t => t.tx_id),
+            delete_tx_sum: deleteTxRows.reduce((a, t) => a + Number(t.amount), 0),
+          },
+          balance_delta: balanceDelta,  // referrer qkey_balance 변화량 (대부분 음수)
+        },
+        suspicious: isSuspicious,
+      })
+    }
+
+    // 4) referrer 별 잔액 영향 합계 + 현재 잔액 & 정리 후 예상 잔액
+    const balanceImpactArr: any[] = []
+    for (const [refId, info] of balanceImpactByReferrer.entries()) {
+      const u: any = await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id = ?`).bind(refId).first()
+      const before = u ? Number(u.qkey_balance) : 0
+      balanceImpactArr.push({
+        referrer_id: refId,
+        name: info.name,
+        groups_affected: info.groups,
+        balance_before: before,
+        balance_delta: info.delta,
+        balance_after_preview: before + info.delta,
+      })
+    }
+    balanceImpactArr.sort((a, b) => a.referrer_id - b.referrer_id)
+
+    // 5) 총합
+    const totalBalanceDelta = balanceImpactArr.reduce((a, b) => a + Number(b.balance_delta), 0)
+
+    return c.json({
+      success: true,
+      mode: 'dry_run',
+      scope: { solbat_id: SOLBAT_ID, downline_count: allIds.length - 1, total_users: allIds.length },
+      summary: {
+        dup_group_count: groups.length,
+        rr_update_count: totalRrUpdateCount,
+        rr_delete_count: totalRrDeleteCount,
+        tx_update_count: totalTxUpdateCount,
+        tx_delete_count: totalTxDeleteCount,
+        total_balance_delta_qkey: totalBalanceDelta,  // 합쳐서 잔액에 가해질 총 변화량
+        suspicious_group_count: suspiciousRows.length,
+      },
+      balance_impact_by_referrer: balanceImpactArr,
+      groups,
+      suspicious_groups: suspiciousRows,
+      next_step: {
+        exec_endpoint: 'POST /api/diag/exec-cleanup-solbat-dups?key=ADMIN_PW&confirm=GO',
+        guard: '이상한 그룹(suspicious_groups) 은 별도 결재 — 본 exec 에서 제외 옵션(skip_suspicious=1) 기본 ON',
+      },
+      note: 'read-only DRY-RUN — DB 변경 0건. 사장님 결재 후 exec endpoint 에서 실제 정리 진행',
+    })
+  } catch (error) {
+    console.error('dryrun-cleanup-solbat-dups error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧 L2 referee 6건 staking 금액 정밀 확인 — 사장님 지시 (2026-05-12, read-only) ★★★
 //   경로: GET /api/diag/solbat-l2-referee-stakes?key=ADMIN_PW
 //   목적: ref_id 688,698,725,729,731,773 의 referee 각자 staking 진입 금액 확인
