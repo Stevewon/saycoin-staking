@@ -4786,6 +4786,170 @@ app.post('/api/rewards/daily-v2', async (c) => {
 })
 
 
+// ★★★★★ 5/12 v2 cron 오염분 전체 DELETE — 사장님 옵션 A 결재 (2026-05-12) ★★★★★
+//   대상: paid_date = '2026-05-12' 인 daily_rewards / referral_rewards + 관련 transactions
+//   처리:
+//     1. daily_rewards (paid_date='2026-05-12') 식별 → ref_id 로 연결된 daily_qkey tx 삭제
+//     2. referral_rewards (paid_date='2026-05-12') 식별 → ref_id 로 연결된 referral_reward tx 삭제
+//     3. daily_rewards / referral_rewards 행 자체 삭제
+//     4. 사용자별 qkey_balance 환원 (차감)
+//   gate: key=ADMIN_PW + confirm=GO
+app.post('/api/diag/exec-delete-may12-v2-pollution', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const dryRun = confirm !== 'GO'
+    const db = c.env.DB
+    const paidDate = '2026-05-12'
+
+    // STEP A: 삭제 대상 식별
+    const drRows = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE paid_date = ?
+    `).bind(paidDate).all()
+    const drList = (drRows.results || []) as any[]
+    const drIds = drList.map(r => Number(r.id))
+
+    const rrRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date = ?
+    `).bind(paidDate).all()
+    const rrList = (rrRows.results || []) as any[]
+    const rrIds = rrList.map(r => Number(r.id))
+
+    // STEP B: 연결된 transactions 식별 (ref_id 매칭) + 미연결 v2 tx (created_at KST 5/12 + daily_qkey/referral_reward)
+    const dqTxRows = drIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount FROM transactions
+          WHERE type = 'daily_qkey' AND ref_id IN (${drIds.map(()=>'?').join(',')})
+        `).bind(...drIds).all()
+      : { results: [] as any[] }
+    const dqTxList = ((dqTxRows as any).results || []) as any[]
+
+    const rrTxRows = rrIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount FROM transactions
+          WHERE type = 'referral_reward' AND ref_id IN (${rrIds.map(()=>'?').join(',')})
+        `).bind(...rrIds).all()
+      : { results: [] as any[] }
+    const rrTxList = ((rrTxRows as any).results || []) as any[]
+
+    // 추가: paid_date='2026-05-12' 인데 ref_id 가 누락된 tx (cutoff 보호용)
+    const orphanTxRows = await db.prepare(`
+      SELECT id, user_id, type, amount, description, created_at
+      FROM transactions
+      WHERE date(created_at, '+9 hours') = ?
+        AND type IN ('daily_qkey', 'referral_reward')
+        AND (ref_id IS NULL OR ref_id NOT IN (
+          SELECT id FROM daily_rewards WHERE paid_date != ?
+          UNION ALL
+          SELECT id FROM referral_rewards WHERE paid_date != ?
+        ))
+    `).bind(paidDate, paidDate, paidDate).all()
+    const orphanTxList = (orphanTxRows.results || []) as any[]
+
+    // 모든 tx id 집합 (중복 제거)
+    const allTxIdsSet = new Set<number>()
+    for (const t of dqTxList) allTxIdsSet.add(Number(t.id))
+    for (const t of rrTxList) allTxIdsSet.add(Number(t.id))
+    for (const t of orphanTxList) allTxIdsSet.add(Number(t.id))
+    const allTxIds = Array.from(allTxIdsSet)
+
+    // STEP C: 사용자별 환원 금액 집계
+    const refundByUser = new Map<number, number>()
+    const txDetailRows = allTxIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount FROM transactions
+          WHERE id IN (${allTxIds.map(()=>'?').join(',')})
+        `).bind(...allTxIds).all()
+      : { results: [] as any[] }
+    for (const t of ((txDetailRows as any).results || [])) {
+      const uid = Number(t.user_id)
+      refundByUser.set(uid, (refundByUser.get(uid) || 0) + Number(t.amount || 0))
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'dry_run',
+        note: 'DB 무변경. confirm=GO 추가 시 실제 삭제 + 잔액 환원',
+        paid_date_target: paidDate,
+        delete_plan: {
+          daily_rewards_count: drList.length,
+          daily_rewards_ids: drIds,
+          referral_rewards_count: rrList.length,
+          referral_rewards_ids: rrIds,
+          transactions_count: allTxIds.length,
+          transactions_ids: allTxIds,
+          refund_by_user: Object.fromEntries(refundByUser),
+          total_refund_qkey: Array.from(refundByUser.values()).reduce((s,v)=>s+v,0),
+        }
+      })
+    }
+
+    // STEP D: 실제 삭제 (사용자 GO)
+    let deletedTxCount = 0
+    let deletedDrCount = 0
+    let deletedRrCount = 0
+    let balanceUpdatedCount = 0
+
+    // 1. transactions 삭제 (chunks of 50)
+    for (let i = 0; i < allTxIds.length; i += 50) {
+      const chunk = allTxIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM transactions WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedTxCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 2. daily_rewards 삭제
+    for (let i = 0; i < drIds.length; i += 50) {
+      const chunk = drIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM daily_rewards WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedDrCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 3. referral_rewards 삭제
+    for (let i = 0; i < rrIds.length; i += 50) {
+      const chunk = rrIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM referral_rewards WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedRrCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 4. 사용자별 잔액 차감 환원
+    for (const [uid, amt] of refundByUser.entries()) {
+      const res = await db.prepare(`
+        UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+      `).bind(amt, uid).run()
+      balanceUpdatedCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    return c.json({
+      success: true,
+      mode: 'exec',
+      paid_date_target: paidDate,
+      result: {
+        deleted_transactions: deletedTxCount,
+        deleted_daily_rewards: deletedDrCount,
+        deleted_referral_rewards: deletedRrCount,
+        users_balance_refunded: balanceUpdatedCount,
+        total_refund_qkey: Array.from(refundByUser.values()).reduce((s,v)=>s+v,0),
+        refund_by_user: Object.fromEntries(refundByUser),
+      },
+      note: '5/12 v2 cron 오염분 전부 삭제 완료. 사장님 결재 후 v2 결함 수정 + 재실행 단계 진행 가능'
+    })
+  } catch (error) {
+    console.error('exec-delete-may12-v2-pollution error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+
 // ★ 200% Cap 진행률 조회 API (사용자/UI용) ★
 //   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)을
 //   사용자 진입금액 합계 × 2 × 150 (target) 과 비교한 진행률 반환.
