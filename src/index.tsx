@@ -5457,6 +5457,110 @@ app.post('/api/diag/backfill-may12-missing', async (c) => {
   }
 })
 
+// ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
+//   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
+app.get('/api/diag/search-user', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const q = c.req.query('q') || ''
+    if (!q || q.length < 1) return c.json({ error: 'q 파라미터 필요' }, 400)
+
+    const db = c.env.DB
+    const term = '%' + q + '%'
+    const users = await db.prepare(`
+      SELECT u.id, u.name, u.email, u.country, u.language, u.referral_code, u.referrer_id, u.created_at,
+        u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance,
+        COALESCE(SUM(CASE WHEN s.status IN ('active','completed','capped') THEN s.amount ELSE 0 END), 0) as staking_amount,
+        COUNT(DISTINCT s.id) as staking_count
+      FROM users u
+      LEFT JOIN staking s ON u.id = s.user_id
+      WHERE u.email LIKE ? OR u.name LIKE ? OR u.referral_code LIKE ?
+      GROUP BY u.id
+      ORDER BY u.id ASC
+      LIMIT 50
+    `).bind(term, term, term).all()
+
+    return c.json({ success: true, query: q, count: users.results.length, users: users.results })
+  } catch (error) {
+    console.error('search-user diag error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★ 특정 사용자 상세 (잔액 + 스테이킹 + 일일배당 + 추천보너스 + 거래내역) ★★★
+//   경로: /api/diag/user-detail?user_id=N&from=YYYY-MM-DD&to=YYYY-MM-DD&key=ADMIN_PW
+app.get('/api/diag/user-detail', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const userId = Number(c.req.query('user_id') || 0)
+    if (!userId) return c.json({ error: 'user_id 필요' }, 400)
+    const from = c.req.query('from') || '2026-05-01'
+    const to = c.req.query('to') || '2026-05-31'
+
+    const db = c.env.DB
+
+    const user = await db.prepare(`
+      SELECT id, name, email, country, language, referral_code, referrer_id, created_at,
+        qta_balance, qx_balance, qkey_balance, usdt_balance
+      FROM users WHERE id = ?
+    `).bind(userId).first() as any
+
+    if (!user) return c.json({ error: 'user not found' }, 404)
+
+    const referrer = user.referrer_id ? await db.prepare(`
+      SELECT id, name, email, referral_code FROM users WHERE id = ?
+    `).bind(user.referrer_id).first() : null
+
+    const stakings = await db.prepare(`
+      SELECT id, amount, daily_rate, status, start_date, end_date, period_days, period_months
+      FROM staking WHERE user_id = ? ORDER BY id ASC
+    `).bind(userId).all()
+
+    const dailyRewards = await db.prepare(`
+      SELECT id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards
+      WHERE user_id = ? AND reward_date BETWEEN ? AND ?
+      ORDER BY reward_date ASC, id ASC
+    `).bind(userId, from, to).all()
+
+    const referralRewardsReceived = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards
+      WHERE referrer_id = ? AND reward_date BETWEEN ? AND ?
+      ORDER BY reward_date ASC, id ASC
+    `).bind(userId, from, to).all()
+
+    const transactions = await db.prepare(`
+      SELECT id, type, coin_type, amount, description, created_at, ref_id
+      FROM transactions
+      WHERE user_id = ? AND date(created_at, '+9 hours') BETWEEN ? AND ?
+      ORDER BY id ASC
+    `).bind(userId, from, to).all()
+
+    return c.json({
+      success: true,
+      from, to,
+      user,
+      referrer,
+      stakings: stakings.results,
+      daily_rewards_count: dailyRewards.results.length,
+      daily_rewards_sum: (dailyRewards.results as any[]).reduce((s, r) => s + Number(r.usdt_amount || 0), 0),
+      daily_rewards: dailyRewards.results,
+      referral_rewards_received_count: referralRewardsReceived.results.length,
+      referral_rewards_received_sum: (referralRewardsReceived.results as any[]).reduce((s, r) => s + Number(r.reward_amount || 0), 0),
+      referral_rewards_received: referralRewardsReceived.results,
+      transactions_count: transactions.results.length,
+      transactions: transactions.results
+    })
+  } catch (error) {
+    console.error('user-detail diag error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 특정 사용자 다운라인 명단 + 기간 내 매출/배당 추적 (사실 확인용 영구 진단) ★★★
 //   경로: /api/diag/downline-trace?user_id=N&from=YYYY-MM-DD&to=YYYY-MM-DD&key=ADMIN_PW
 //   읽기 전용:
