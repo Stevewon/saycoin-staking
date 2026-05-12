@@ -21746,10 +21746,9 @@ app.post('/api/diag/exec-fix-solbat-may8-l1l2-missing', async (c) => {
       const rrId = Number((r1 as any).meta?.last_row_id || 0)
 
       await db.prepare(`
-        INSERT INTO transactions
-          (user_id, type, amount, coin_type, description, reference_id, created_at)
-        VALUES (?, 'referral_reward', ?, 'QKEY', '추천 보너스 (Level 1)', ?, datetime('now'))
-      `).bind(SOLBAT_ID, finalL1Missing, rrId).run()
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'referral_reward', 'QKEY', ?, '추천 보너스 (Level 1)')
+      `).bind(SOLBAT_ID, finalL1Missing).run()
 
       inserted.push({ type: 'L1', referee: 45, amount: finalL1Missing, rr_id: rrId })
     }
@@ -21763,10 +21762,9 @@ app.post('/api/diag/exec-fix-solbat-may8-l1l2-missing', async (c) => {
       const rrId = Number((r2 as any).meta?.last_row_id || 0)
 
       await db.prepare(`
-        INSERT INTO transactions
-          (user_id, type, amount, coin_type, description, reference_id, created_at)
-        VALUES (?, 'referral_reward', ?, 'QKEY', '추천 보너스 (Level 2)', ?, datetime('now'))
-      `).bind(SOLBAT_ID, finalL2Missing, rrId).run()
+        INSERT INTO transactions (user_id, type, coin_type, amount, description)
+        VALUES (?, 'referral_reward', 'QKEY', ?, '추천 보너스 (Level 2)')
+      `).bind(SOLBAT_ID, finalL2Missing).run()
 
       inserted.push({ type: 'L2', referee: 49, amount: finalL2Missing, rr_id: rrId })
     }
