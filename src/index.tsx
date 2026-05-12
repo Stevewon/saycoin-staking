@@ -4783,6 +4783,249 @@ app.get('/api/admin/daily-preview', async (c) => {
   }
 })
 
+// ★★★ 일일 배당 누락 영구 진단 엔드포인트 (2026-05-12 사장님 결재 옵션 B) ★★★
+//   경로: /api/diag/missing-rewards (admin/* 미들웨어 우회 — 자체 ?key= 보호)
+//   파라미터:
+//     ?from=YYYY-MM-DD   (필수, 검사 시작일 KST)
+//     ?to=YYYY-MM-DD     (필수, 검사 종료일 KST, from <= to)
+//     ?key=ADMIN_PW      (필수, ADMIN_PW 와 100% 일치 시만 응답)
+//     ?staking_id=N      (선택, 특정 staking 만 검사)
+//   동작:
+//     1) status IN (active, completed, capped) 모든 staking 조회
+//        (start_date <= to_date 인 것만, 발생 가능 staking 한정)
+//     2) 각 staking 의 발생해야 했던 영업일(KST) 목록 산출
+//        - getStakingAccrualDatesKst(null, start_date_kst, to_date, firstBusinessDayKst)
+//        - start_date_kst 가 from 보다 이르면 from 으로 클램프 (구간 검사)
+//        - firstBusinessDayKst = start_date_kst 가 휴일이면 그 다음 첫 평일 (없으면 to_date)
+//     3) daily_rewards 테이블에서 reward_date BETWEEN from AND to AND staking_id = ? 조회
+//     4) 차집합 = 누락 영업일 목록
+//   응답: 누락 staking 명단 + 누락일자 + user_id/email/총 누락건수
+//   ★ 읽기 전용 (INSERT/UPDATE/DELETE 절대 안 함) ★
+app.get('/api/diag/missing-rewards', async (c) => {
+  try {
+    // 자체 보호 (admin 미들웨어 우회 경로이므로 key 강제 검증)
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) {
+      return c.json({ error: 'unauthorized' }, 401)
+    }
+
+    const db = c.env.DB
+    const from = c.req.query('from') || ''
+    const to = c.req.query('to') || ''
+    const stakingIdFilter = c.req.query('staking_id') || ''
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      return c.json({ error: 'from=YYYY-MM-DD 필요' }, 400)
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return c.json({ error: 'to=YYYY-MM-DD 필요' }, 400)
+    }
+    const fromObj = new Date(from + 'T00:00:00Z')
+    const toObj = new Date(to + 'T00:00:00Z')
+    if (fromObj.getTime() > toObj.getTime()) {
+      return c.json({ error: 'from <= to 필요' }, 400)
+    }
+
+    // active/completed/capped staking 모두 조회 (start_date <= to)
+    let stakingsQuery = `
+      SELECT
+        s.id as staking_id,
+        s.user_id,
+        u.email,
+        s.amount,
+        s.period_days,
+        s.period_months,
+        s.daily_rate,
+        s.status,
+        s.start_date,
+        s.end_date,
+        date(s.start_date, '+9 hours') as start_date_kst,
+        date(s.end_date, '+9 hours') as end_date_kst
+      FROM staking s
+      LEFT JOIN users u ON u.id = s.user_id
+      WHERE s.status IN ('active','completed','capped')
+        AND date(s.start_date, '+9 hours') <= date(?)
+    `
+    const bindArgs: any[] = [to]
+    if (stakingIdFilter && /^\d+$/.test(stakingIdFilter)) {
+      stakingsQuery += ` AND s.id = ?`
+      bindArgs.push(stakingIdFilter)
+    }
+    stakingsQuery += ` ORDER BY s.user_id ASC, s.id ASC`
+    const stakings = await db.prepare(stakingsQuery).bind(...bindArgs).all()
+
+    // 사용자 200% Cap 상태 (참고용 — 누락 발견 시 cap 으로 인한 정상 스킵 구분)
+    const USD_TO_QKEY = 150
+    const userCapMap = new Map<number, { stake_total: number, paid_total: number, target: number, capped: boolean }>()
+    async function getUserCap(userId: number) {
+      let u = userCapMap.get(userId)
+      if (u) return u
+      const stakeRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
+      `).bind(userId).first() as any
+      const paidRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM transactions
+        WHERE user_id = ? AND coin_type = 'QKEY'
+          AND type IN ('daily_qkey', 'referral_reward')
+      `).bind(userId).first() as any
+      const stake_total = Number(stakeRow?.total || 0)
+      const paid_total = Number(paidRow?.total || 0)
+      const target = stake_total * 2 * USD_TO_QKEY
+      const capped = stake_total > 0 && paid_total >= target
+      u = { stake_total, paid_total, target, capped }
+      userCapMap.set(userId, u)
+      return u
+    }
+
+    // 휴일 진입자 firstBusinessDay 계산 헬퍼 — start_date_kst 가 휴일이면 그 다음 첫 평일
+    function calcFirstBusinessDay(startDateKst: string, toDateKst: string): string {
+      const startObj = new Date(startDateKst + 'T00:00:00Z')
+      const startCheck = new Date(startObj.getTime() - 9 * 60 * 60 * 1000)
+      const { isBusinessDay: startIsBiz } = isKoreanBusinessDay(startCheck)
+      if (startIsBiz) return startDateKst
+      // 휴일이면 최대 14일 뒤까지 다음 평일 탐색
+      for (let i = 1; i <= 14; i++) {
+        const candidate = new Date(startObj.getTime() + i * 24 * 60 * 60 * 1000)
+        const check = new Date(candidate.getTime() - 9 * 60 * 60 * 1000)
+        const { isBusinessDay } = isKoreanBusinessDay(check)
+        if (isBusinessDay) return candidate.toISOString().split('T')[0]
+      }
+      return toDateKst
+    }
+
+    type MissRow = {
+      staking_id: number,
+      user_id: number,
+      email: string | null,
+      status: string,
+      start_date_kst: string,
+      end_date_kst: string,
+      amount: number,
+      expected_dates: string[],         // from~to 사이 발생해야 했던 영업일
+      actual_dates: string[],            // from~to 사이 실제 지급된 reward_date
+      missing_dates: string[],           // 차집합 = 누락 영업일
+      missing_count: number,
+      user_capped: boolean,              // 본인 200% cap 여부 (정상 스킵 구분용)
+      note: string
+    }
+
+    const missList: MissRow[] = []
+    const fullList: any[] = []
+    let totalChecked = 0
+    let totalMissing = 0
+    let totalMissingDates = 0
+
+    for (const st of stakings.results as any[]) {
+      totalChecked++
+      const stakingId = st.staking_id as number
+      const startKst = st.start_date_kst as string
+      const endKst = st.end_date_kst as string
+      // 검사 구간: [max(from, start_date_kst) .. min(to, end_date_kst)]
+      const effFromObj = new Date(Math.max(
+        fromObj.getTime(),
+        new Date(startKst + 'T00:00:00Z').getTime()
+      ))
+      const effToObj = new Date(Math.min(
+        toObj.getTime(),
+        new Date(endKst + 'T00:00:00Z').getTime()
+      ))
+      if (effFromObj.getTime() > effToObj.getTime()) continue
+      const effFrom = effFromObj.toISOString().split('T')[0]
+      const effTo = effToObj.toISOString().split('T')[0]
+
+      // 발생해야 했던 영업일 산출 (lastRewardDate=null → start_date 부터 풀 발생)
+      const firstBizDay = calcFirstBusinessDay(startKst, effTo)
+      const allAccrualDates = getStakingAccrualDatesKst(null, startKst, effTo, firstBizDay)
+      // 검사 구간으로 클램프 (effFrom 이전 영업일은 별도 cron 에서 처리됐을 수 있음)
+      const expectedInRange = allAccrualDates.filter(d => d >= effFrom && d <= effTo)
+
+      // 실제 지급 조회
+      const actualRows = await db.prepare(`
+        SELECT reward_date FROM daily_rewards
+        WHERE staking_id = ? AND reward_date >= ? AND reward_date <= ?
+        ORDER BY reward_date ASC
+      `).bind(stakingId, effFrom, effTo).all()
+      const actualDates = (actualRows.results as any[]).map(r => r.reward_date as string)
+      const actualSet = new Set(actualDates)
+
+      // 차집합 = 누락
+      const missingDates = expectedInRange.filter(d => !actualSet.has(d))
+
+      // user cap 상태 (정상 스킵 구분)
+      const userCap = await getUserCap(st.user_id as number)
+
+      let note = ''
+      if (missingDates.length > 0 && userCap.capped) {
+        note = '본인 200% cap 도달 — 누락이 정상일 수 있음 (cron 의 cap 스킵)'
+      } else if (missingDates.length > 0) {
+        note = '실제 누락 — 백필 검토 필요'
+      } else {
+        note = 'OK'
+      }
+
+      const row: MissRow = {
+        staking_id: stakingId,
+        user_id: st.user_id as number,
+        email: st.email || null,
+        status: st.status as string,
+        start_date_kst: startKst,
+        end_date_kst: endKst,
+        amount: Number(st.amount || 0),
+        expected_dates: expectedInRange,
+        actual_dates: actualDates,
+        missing_dates: missingDates,
+        missing_count: missingDates.length,
+        user_capped: userCap.capped,
+        note
+      }
+      fullList.push(row)
+      if (missingDates.length > 0) {
+        missList.push(row)
+        totalMissing++
+        totalMissingDates += missingDates.length
+      }
+    }
+
+    // 누락 staking 우선 정렬 (누락 건수 많은 순)
+    missList.sort((a, b) => b.missing_count - a.missing_count)
+    fullList.sort((a, b) => b.missing_count - a.missing_count)
+
+    // 날짜별 누락 통계
+    const byDate = new Map<string, number>()
+    for (const m of missList) {
+      for (const d of m.missing_dates) {
+        byDate.set(d, (byDate.get(d) || 0) + 1)
+      }
+    }
+    const missingByDate: { date: string, count: number }[] = []
+    for (const [date, count] of byDate.entries()) {
+      missingByDate.push({ date, count })
+    }
+    missingByDate.sort((a, b) => a.date.localeCompare(b.date))
+
+    return c.json({
+      success: true,
+      diag: true,
+      readonly: true,
+      from,
+      to,
+      summary: {
+        total_stakings_checked: totalChecked,
+        stakings_with_missing: totalMissing,
+        total_missing_date_rows: totalMissingDates,
+        missing_by_date: missingByDate
+      },
+      missing_stakings: missList,
+      all_stakings: fullList
+    })
+  } catch (error) {
+    console.error('missing-rewards diag error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민 진단: 특정 날짜 + 특정 사용자의 transactions 조회 (중복지급 원인 파악용)
 app.get('/api/admin/diag/transactions', async (c) => {
   try {
