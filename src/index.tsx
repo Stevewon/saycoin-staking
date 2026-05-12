@@ -6230,6 +6230,119 @@ app.get('/api/diag/dryrun-delete-solbat-phase3', async (c) => {
   }
 })
 
+// ★★★ 솔밧 L2 5/11 Phase 3 중복 6건 실제 삭제 + 잔액 정정 — D안-2 사장님 GO 결재 (2026-05-12) ★★★
+//   경로: POST /api/diag/exec-delete-solbat-phase3?key=ADMIN_PW&confirm=GO
+//   목적: dry_run preview 검증 완료된 6건 tx 삭제 + 솔밧 qkey_balance -1875 정정
+//   - 삭제 대상: tx#2667,2676,2703,2707,2709,2750 (Phase 3 중복 미러)
+//   - 잔액 정정: 122,850 → 120,975 (-1,875)
+//   - 원장(referral_rewards) 6행은 보존 (정상 데이터)
+//   - safety: tx 6건 정확 일치 + 합 1875 정확 일치 사전 검증, 불일치 시 abort
+//   - confirm=GO 파라미터 필수 (실수 방지)
+app.post('/api/diag/exec-delete-solbat-phase3', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (사장님 명시 GO 확인용)' }, 400)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+    const TARGET_TX_IDS = [2667, 2676, 2703, 2707, 2709, 2750]
+    const EXPECTED_REVERT = 1875
+
+    // 1) 사전 검증 — dry_run 과 동일 safety 검사
+    const placeholders = TARGET_TX_IDS.map(() => '?').join(',')
+    const txRows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description
+      FROM transactions WHERE id IN (${placeholders})
+    `).bind(...TARGET_TX_IDS).all()
+    const found = (txRows.results || []) as any[]
+    if (found.length !== 6) {
+      return c.json({ error: 'abort', reason: `target tx count mismatch — expected 6, found ${found.length}` }, 400)
+    }
+    const allSolbat = found.every(r => r.user_id === SOLBAT_ID)
+    const allReferral = found.every(r => r.type === 'referral_reward')
+    const allL2 = found.every(r => (r.description || '').indexOf('Level 2') !== -1)
+    const totalAmount = found.reduce((a, r) => a + Number(r.amount), 0)
+    if (!allSolbat || !allReferral || !allL2) {
+      return c.json({ error: 'abort', reason: 'safety check failed (user/type/level mismatch)', allSolbat, allReferral, allL2 }, 400)
+    }
+    if (totalAmount !== EXPECTED_REVERT) {
+      return c.json({ error: 'abort', reason: `revert amount mismatch — expected ${EXPECTED_REVERT}, got ${totalAmount}` }, 400)
+    }
+
+    // 2) 현재 잔액 snapshot
+    const before: any = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+    const beforeBalance = Number(before.qkey_balance)
+
+    // 3) 실제 실행: 6건 DELETE + qkey_balance -1875
+    const deleteResult = await db.prepare(`
+      DELETE FROM transactions WHERE id IN (${placeholders}) AND user_id = ? AND type = 'referral_reward'
+    `).bind(...TARGET_TX_IDS, SOLBAT_ID).run()
+
+    const updateResult = await db.prepare(`
+      UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?
+    `).bind(EXPECTED_REVERT, SOLBAT_ID).run()
+
+    // 4) 사후 검증
+    const after: any = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+    const afterBalance = Number(after.qkey_balance)
+
+    const stillExists = await db.prepare(`
+      SELECT id FROM transactions WHERE id IN (${placeholders})
+    `).bind(...TARGET_TX_IDS).all()
+
+    // 5) 솔밧 L2 5/11 KST tx 재확인
+    const recheck = await db.prepare(`
+      SELECT id, amount, ref_id,
+             datetime(created_at, '+9 hours') AS created_at_kst,
+             substr(datetime(created_at, '+9 hours'), 12, 2) AS kst_hour
+      FROM transactions
+      WHERE user_id = ? AND type = 'referral_reward'
+        AND description LIKE '%Level 2%'
+        AND date(created_at, '+9 hours') = '2026-05-11'
+      ORDER BY datetime(created_at, '+9 hours') ASC, id ASC
+    `).bind(SOLBAT_ID).all()
+    const recheckRows = (recheck.results || []) as any[]
+    const recheckSum = recheckRows.reduce((a, r) => a + Number(r.amount), 0)
+
+    return c.json({
+      success: true,
+      executed: true,
+      target_tx_ids: TARGET_TX_IDS,
+      delete_result: {
+        rows_affected: deleteResult.meta && (deleteResult.meta as any).changes,
+        rows_still_exist_after_delete: (stillExists.results || []).length,
+      },
+      balance_change: {
+        before: beforeBalance,
+        after: afterBalance,
+        diff: afterBalance - beforeBalance,
+        expected_diff: -EXPECTED_REVERT,
+        matches_expected: (afterBalance - beforeBalance) === -EXPECTED_REVERT,
+      },
+      update_result: {
+        rows_affected: updateResult.meta && (updateResult.meta as any).changes,
+      },
+      recheck_may11_kst: {
+        tx_count: recheckRows.length,
+        tx_sum: recheckSum,
+        expected_sum: 1950,
+        matches_excel_truth: recheckSum === 1950,
+        rows: recheckRows,
+      },
+      summary: {
+        deleted: `transactions 6행 (Phase 3 중복 미러)`,
+        balance_updated: `users.qkey_balance: ${beforeBalance} → ${afterBalance}`,
+        kept: 'referral_rewards 원장 6행 (정상 데이터, 보존)',
+      },
+      note: '사장님 GO 결재 (2026-05-12) 실행 완료',
+    })
+  } catch (error) {
+    console.error('exec-delete-solbat-phase3 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
 //   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
 app.get('/api/diag/search-user', async (c) => {
