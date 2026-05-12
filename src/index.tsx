@@ -2907,8 +2907,11 @@ app.get('/api/admin/user/:userId', async (c) => {
     `).bind(userId).all()
 
     // 거래 내역 — 잔액 정합성 표시를 위해 LIMIT 제거 (전체 행 반환, KST 정렬)
+    // ★ KST 표시 영구룰 (사장님 C안 결재 2026-05-12): created_at 응답값을 KST(+9h) 변환
     const transactions = await db.prepare(`
-      SELECT * FROM transactions WHERE user_id = ?
+      SELECT id, user_id, type, coin_type, amount, description, ref_id,
+             datetime(created_at, '+9 hours') AS created_at
+      FROM transactions WHERE user_id = ?
       ORDER BY datetime(created_at, '+9 hours') DESC, id DESC
     `).bind(userId).all()
 
@@ -3588,12 +3591,14 @@ app.get('/api/admin/export/withdrawals', async (c) => {
 app.get('/api/admin/swaps', async (c) => {
   try {
     const db = c.env.DB
+    // ★ KST 표시 영구룰 (사장님 C안 결재 2026-05-12): DB 무변경, SELECT 표시값만 KST(+9h) 변환
     const swaps = await db.prepare(`
-      SELECT t.id, t.user_id, u.email, u.name, t.type, t.coin_type, t.amount, t.description, t.created_at
+      SELECT t.id, t.user_id, u.email, u.name, t.type, t.coin_type, t.amount, t.description,
+             datetime(t.created_at, '+9 hours') AS created_at
       FROM transactions t
       JOIN users u ON t.user_id = u.id
       WHERE t.type IN ('swap_in', 'swap_out')
-      ORDER BY t.created_at DESC
+      ORDER BY datetime(t.created_at, '+9 hours') DESC, t.id DESC
       LIMIT 500
     `).all()
 
@@ -5892,11 +5897,14 @@ app.get('/api/diag/user-detail', async (c) => {
       ORDER BY reward_date ASC, id ASC
     `).bind(userId, from, to).all()
 
+    // ★ KST 표시 영구룰 (사장님 C안 결재 2026-05-12): created_at 응답값을 KST(+9h) 변환
     const transactions = await db.prepare(`
-      SELECT id, type, coin_type, amount, description, created_at, ref_id
+      SELECT id, type, coin_type, amount, description,
+             datetime(created_at, '+9 hours') AS created_at,
+             ref_id
       FROM transactions
       WHERE user_id = ? AND date(created_at, '+9 hours') BETWEEN ? AND ?
-      ORDER BY id ASC
+      ORDER BY datetime(created_at, '+9 hours') ASC, id ASC
     `).bind(userId, from, to).all()
 
     return c.json({
