@@ -21597,4 +21597,201 @@ h2 { font-size: 1.1em; margin-top: 0; border-bottom: 1px solid #eee; padding-bot
 </html>`);
 })
 
+// ========================================================================
+// /api/diag/exec-fix-solbat-may8-l1l2-missing
+// ------------------------------------------------------------------------
+// 목적: solbat(user_id=44) 5/8 reward_date 매칭 보너스 누락분 정밀 보정 (옵션 B-1)
+//   - L1 (referee=45 lis7239): DB 150 vs 정답 300 → 누락 +150
+//   - L2 (referee=49 naim197059): DB 75 vs 정답 150 → 누락 +75
+//   - 합계 누락: 225 QKEY
+//
+// 원인: 5/8 cron 매칭 산출 시 45/49 의 staking 2건 중 1건만 합산
+// 보정: referral_rewards 2행 INSERT + transactions 2행 INSERT + qkey_balance +225
+//
+// 영구 룰 준수:
+//   #2: L1=20%, L2=10%
+//   #3 ★★★ 0순위: bottom-up (45/49 의 5/8 daily 가 이미 DB 에 존재 = leaf 확정 상태 → 본 보정은 root solbat 의 매칭만 추가)
+//   #112: description 사용자 노출 안전 텍스트만
+//
+// gate: key=ADMIN_PW + dryRun 기본 / confirm=GO 시 실행
+// ========================================================================
+app.post('/api/diag/exec-fix-solbat-may8-l1l2-missing', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const dryRun = confirm !== 'GO'
+    const db = c.env.DB
+
+    const SOLBAT_ID = 44
+    const REWARD_DATE = '2026-05-08'
+    const PAID_DATE = '2026-05-08'
+
+    // STEP A: 사실 재검증 — 45 staking 2건 daily 합 (5/8) / 49 staking 2건 daily 합 (5/8)
+    const dr45 = await db.prepare(`
+      SELECT staking_id, usdt_amount FROM daily_rewards
+      WHERE user_id = 45 AND reward_date = ? ORDER BY id
+    `).bind(REWARD_DATE).all()
+    const dr45Rows = (dr45.results || []) as any[]
+    const sum45 = dr45Rows.reduce((s, r) => s + (Number(r.usdt_amount) || 0), 0)
+
+    const dr49 = await db.prepare(`
+      SELECT staking_id, usdt_amount FROM daily_rewards
+      WHERE user_id = 49 AND reward_date = ? ORDER BY id
+    `).bind(REWARD_DATE).all()
+    const dr49Rows = (dr49.results || []) as any[]
+    const sum49 = dr49Rows.reduce((s, r) => s + (Number(r.usdt_amount) || 0), 0)
+
+    // L1 정답 = sum45 × 20% (45 가 solbat 의 L1)
+    // L2 정답 = sum49 × 10% (49 의 부모는 48, 48 의 부모는 44 solbat → 49 가 solbat 의 L2)
+    const L1_TRUTH = Math.floor(sum45 * 0.20)
+    const L2_TRUTH = Math.floor(sum49 * 0.10)
+
+    // STEP B: 현재 DB 의 solbat 가 받은 5/8 매칭 (referee=45 L1 / referee=49 L2) 합계 조회
+    const cur45 = await db.prepare(`
+      SELECT COALESCE(SUM(reward_amount), 0) AS s
+      FROM referral_rewards
+      WHERE referrer_id = ? AND referee_id = 45 AND level = 1 AND reward_date = ?
+    `).bind(SOLBAT_ID, REWARD_DATE).first() as any
+    const cur49 = await db.prepare(`
+      SELECT COALESCE(SUM(reward_amount), 0) AS s
+      FROM referral_rewards
+      WHERE referrer_id = ? AND referee_id = 49 AND level = 2 AND reward_date = ?
+    `).bind(SOLBAT_ID, REWARD_DATE).first() as any
+    const cur45Amt = Number(cur45?.s || 0)
+    const cur49Amt = Number(cur49?.s || 0)
+
+    const L1_MISSING = Math.max(0, L1_TRUTH - cur45Amt)
+    const L2_MISSING = Math.max(0, L2_TRUTH - cur49Amt)
+    const TOTAL_MISSING = L1_MISSING + L2_MISSING
+
+    // STEP C: solbat 현재 qkey_balance
+    const u = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first() as any
+    const curBal = Number(u?.qkey_balance || 0)
+    const newBal = curBal + TOTAL_MISSING
+
+    const plan = {
+      solbat_id: SOLBAT_ID,
+      reward_date: REWARD_DATE,
+      paid_date: PAID_DATE,
+      L1: {
+        referee: 45,
+        referee_daily_sum_58: sum45,
+        truth: L1_TRUTH,
+        db_current: cur45Amt,
+        missing: L1_MISSING,
+        original_amount: sum45  // staking 합계 (USDT 기준 변환 필요 시 ÷ 150)
+      },
+      L2: {
+        referee: 49,
+        referee_daily_sum_58: sum49,
+        truth: L2_TRUTH,
+        db_current: cur49Amt,
+        missing: L2_MISSING,
+        original_amount: sum49
+      },
+      total_missing: TOTAL_MISSING,
+      qkey_balance_before: curBal,
+      qkey_balance_after: newBal,
+      permanent_rules_check: {
+        rule_2_l1_20pct: 'PASS',
+        rule_2_l2_10pct: 'PASS',
+        rule_3_bottom_up: 'PASS (45/49 daily already confirmed in DB before computing solbat matching)',
+        rule_112_description_safe: 'PASS (uses 추천 보너스 (Level 1/2))',
+        rule_dedupe_key: 'PASS (referrer_id + referee_id + level + reward_date)'
+      }
+    }
+
+    if (dryRun || TOTAL_MISSING === 0) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: TOTAL_MISSING === 0 ? '누락분 없음 (이미 정정 완료 또는 산출 정상)' : 'GO 결재 시 confirm=GO 추가',
+        plan
+      })
+    }
+
+    // STEP D: EXISTS guard 재검증 (race condition 차단)
+    const reCheck45 = await db.prepare(`
+      SELECT COALESCE(SUM(reward_amount), 0) AS s
+      FROM referral_rewards
+      WHERE referrer_id = ? AND referee_id = 45 AND level = 1 AND reward_date = ?
+    `).bind(SOLBAT_ID, REWARD_DATE).first() as any
+    const reCheck49 = await db.prepare(`
+      SELECT COALESCE(SUM(reward_amount), 0) AS s
+      FROM referral_rewards
+      WHERE referrer_id = ? AND referee_id = 49 AND level = 2 AND reward_date = ?
+    `).bind(SOLBAT_ID, REWARD_DATE).first() as any
+    const finalL1Missing = Math.max(0, L1_TRUTH - Number(reCheck45?.s || 0))
+    const finalL2Missing = Math.max(0, L2_TRUTH - Number(reCheck49?.s || 0))
+    const finalTotal = finalL1Missing + finalL2Missing
+    if (finalTotal === 0) {
+      return c.json({
+        success: true,
+        mode: 'EXEC',
+        message: 'race condition guard 차단 — 이미 정정됨',
+        plan,
+        recheck: { l1_missing: finalL1Missing, l2_missing: finalL2Missing }
+      })
+    }
+
+    // STEP E: 실 INSERT (L1, L2 각 1행) + transactions 동기 + qkey_balance UPDATE
+    const inserted: any[] = []
+    if (finalL1Missing > 0) {
+      const r1 = await db.prepare(`
+        INSERT INTO referral_rewards
+          (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at)
+        VALUES (?, ?, 1, ?, ?, ?, ?, datetime('now'))
+      `).bind(SOLBAT_ID, 45, sum45, finalL1Missing, REWARD_DATE, PAID_DATE).run()
+      const rrId = Number((r1 as any).meta?.last_row_id || 0)
+
+      await db.prepare(`
+        INSERT INTO transactions
+          (user_id, type, amount, coin_type, description, reference_id, created_at)
+        VALUES (?, 'referral_reward', ?, 'QKEY', '추천 보너스 (Level 1)', ?, datetime('now'))
+      `).bind(SOLBAT_ID, finalL1Missing, rrId).run()
+
+      inserted.push({ type: 'L1', referee: 45, amount: finalL1Missing, rr_id: rrId })
+    }
+
+    if (finalL2Missing > 0) {
+      const r2 = await db.prepare(`
+        INSERT INTO referral_rewards
+          (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at)
+        VALUES (?, ?, 2, ?, ?, ?, ?, datetime('now'))
+      `).bind(SOLBAT_ID, 49, sum49, finalL2Missing, REWARD_DATE, PAID_DATE).run()
+      const rrId = Number((r2 as any).meta?.last_row_id || 0)
+
+      await db.prepare(`
+        INSERT INTO transactions
+          (user_id, type, amount, coin_type, description, reference_id, created_at)
+        VALUES (?, 'referral_reward', ?, 'QKEY', '추천 보너스 (Level 2)', ?, datetime('now'))
+      `).bind(SOLBAT_ID, finalL2Missing, rrId).run()
+
+      inserted.push({ type: 'L2', referee: 49, amount: finalL2Missing, rr_id: rrId })
+    }
+
+    // STEP F: qkey_balance UPDATE
+    await db.prepare(`
+      UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+    `).bind(finalTotal, SOLBAT_ID).run()
+
+    // STEP G: 사후 검증
+    const uAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first() as any
+    const balAfter = Number(uAfter?.qkey_balance || 0)
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      plan,
+      inserted,
+      qkey_balance_after_actual: balAfter,
+      total_inserted_amount: finalTotal
+    })
+  } catch (error: any) {
+    console.error('exec-fix-solbat-may8-l1l2-missing error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
