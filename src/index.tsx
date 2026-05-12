@@ -22119,4 +22119,173 @@ app.get('/api/diag/audit-tx-double-kst', async (c) => {
   }
 })
 
+// ========================================================================
+// /api/diag/downline-daily-by-date
+// ------------------------------------------------------------------------
+// 목적 (사장님 명령 2026-05-12):
+//   "솔밧의 하위 레벨에 해당하는 사람들의 데일리 수당을 일자별로 보고하라"
+//
+// 영구 룰 준수:
+//   - 룰 #3 ★★★ 0순위 bottom-up: L2 leaf -> L1 -> root 순으로 트리 traverse
+//   - 룰 #7: daily_rewards.usdt_amount 컬럼 = 실제 QKEY 단위 (USDT 단위 해석 금지)
+//   - 추측 0건: staking.daily_rate / daily_rewards 모두 D1 실데이터 직접 조회
+//
+// 출력:
+//   1. 트리 구조 (L1 회원 목록 + 각 L1 산하 L2 회원 목록)
+//   2. 일자별 합계: reward_date | L1 합계(QKEY) | L2 합계(QKEY) | 전체 합계
+//   3. 회원별 일자별 상세: user_id, name, level, reward_date, qkey_amount, staking_amount
+//
+// gate: key=ADMIN_PW, user_id (default 44=solbat), from/to (default 5/8 ~ 5/12)
+// ========================================================================
+app.get('/api/diag/downline-daily-by-date', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const rootId = parseInt(c.req.query('user_id') || '44', 10)
+    const fromDate = c.req.query('from') || '2026-05-08'
+    const toDate = c.req.query('to') || '2026-05-12'
+
+    // root 사용자 정보
+    const rootUser = await db.prepare(`
+      SELECT id, email, name, referral_code, qkey_balance FROM users WHERE id = ?
+    `).bind(rootId).first() as any
+    if (!rootUser) return c.json({ error: `user ${rootId} not found` }, 404)
+
+    // L1: root 가 추천한 회원 (referrer_id = root)
+    const l1Rows = await db.prepare(`
+      SELECT id, email, name, referral_code, referrer_id, qkey_balance, created_at
+      FROM users WHERE referrer_id = ?
+      ORDER BY id ASC
+    `).bind(rootId).all()
+    const l1Members = (l1Rows.results || []) as any[]
+    const l1Ids = l1Members.map(u => u.id)
+
+    // L2: L1 회원들이 추천한 회원 (referrer_id IN L1Ids)
+    let l2Members: any[] = []
+    if (l1Ids.length > 0) {
+      const ph = l1Ids.map(() => '?').join(',')
+      const l2Rows = await db.prepare(`
+        SELECT id, email, name, referral_code, referrer_id, qkey_balance, created_at
+        FROM users WHERE referrer_id IN (${ph})
+        ORDER BY referrer_id ASC, id ASC
+      `).bind(...l1Ids).all()
+      l2Members = (l2Rows.results || []) as any[]
+    }
+    const l2Ids = l2Members.map(u => u.id)
+
+    // 트리 구조 (bottom-up 표시: L2 leaf -> L1 -> root)
+    const tree = {
+      root: { id: rootUser.id, name: rootUser.name, email: rootUser.email, qkey_balance: rootUser.qkey_balance },
+      L1: l1Members.map(m => ({
+        id: m.id, name: m.name, email: m.email, qkey_balance: m.qkey_balance,
+        L2_children: l2Members.filter(x => x.referrer_id === m.id).map(x => ({
+          id: x.id, name: x.name, email: x.email, qkey_balance: x.qkey_balance
+        }))
+      })),
+      counts: { L1: l1Members.length, L2: l2Members.length }
+    }
+
+    // 회원별 일자별 daily_rewards (룰 #7: usdt_amount = QKEY 단위)
+    const allIds = [...l1Ids, ...l2Ids]
+    let dailyRows: any[] = []
+    if (allIds.length > 0) {
+      const ph = allIds.map(() => '?').join(',')
+      const dr = await db.prepare(`
+        SELECT d.user_id, u.name AS user_name, u.email AS user_email,
+               d.reward_date, d.paid_date,
+               d.usdt_amount AS qkey_amount,
+               s.amount AS staking_amount, s.daily_rate AS staking_rate,
+               datetime(d.created_at, '+9 hours') AS created_at_kst
+        FROM daily_rewards d
+        LEFT JOIN users u ON d.user_id = u.id
+        LEFT JOIN staking s ON d.staking_id = s.id
+        WHERE d.user_id IN (${ph})
+          AND d.reward_date >= ?
+          AND d.reward_date <= ?
+        ORDER BY d.reward_date ASC, d.user_id ASC
+      `).bind(...allIds, fromDate, toDate).all()
+      dailyRows = (dr.results || []) as any[]
+    }
+
+    // level 라벨 부여 (L1 / L2)
+    const l1Set = new Set(l1Ids)
+    const detailRows = dailyRows.map(r => ({
+      reward_date: r.reward_date,
+      paid_date: r.paid_date,
+      level: l1Set.has(r.user_id) ? 'L1' : 'L2',
+      user_id: r.user_id,
+      user_name: r.user_name,
+      user_email: r.user_email,
+      qkey_amount: Math.round(Number(r.qkey_amount || 0)),
+      staking_amount: Number(r.staking_amount || 0),
+      staking_rate_pct: r.staking_rate ? (Number(r.staking_rate) * 100).toFixed(2) + '%' : '-',
+      created_at_kst: r.created_at_kst
+    }))
+
+    // 일자별 합계 (L1 / L2 / 전체)
+    const byDateMap: Record<string, any> = {}
+    for (const row of detailRows) {
+      const d = row.reward_date
+      if (!byDateMap[d]) byDateMap[d] = { reward_date: d, L1_qkey: 0, L2_qkey: 0, total_qkey: 0, L1_count: 0, L2_count: 0 }
+      if (row.level === 'L1') {
+        byDateMap[d].L1_qkey += row.qkey_amount
+        byDateMap[d].L1_count += 1
+      } else {
+        byDateMap[d].L2_qkey += row.qkey_amount
+        byDateMap[d].L2_count += 1
+      }
+      byDateMap[d].total_qkey += row.qkey_amount
+    }
+    const byDate = Object.values(byDateMap).sort((a: any, b: any) => a.reward_date.localeCompare(b.reward_date))
+
+    // 회원별 일자별 합계 (개인 + 일자 grouping)
+    const byMemberMap: Record<string, any> = {}
+    for (const row of detailRows) {
+      const k = `${row.user_id}_${row.reward_date}`
+      if (!byMemberMap[k]) {
+        byMemberMap[k] = {
+          user_id: row.user_id, user_name: row.user_name,
+          level: row.level, reward_date: row.reward_date,
+          qkey_amount: 0, rows: 0
+        }
+      }
+      byMemberMap[k].qkey_amount += row.qkey_amount
+      byMemberMap[k].rows += 1
+    }
+    const byMember = Object.values(byMemberMap).sort((a: any, b: any) => {
+      if (a.reward_date !== b.reward_date) return a.reward_date.localeCompare(b.reward_date)
+      if (a.level !== b.level) return a.level.localeCompare(b.level)
+      return a.user_id - b.user_id
+    })
+
+    // 총합
+    const grandTotal = detailRows.reduce((s, r) => s + r.qkey_amount, 0)
+    const grandL1 = detailRows.filter(r => r.level === 'L1').reduce((s, r) => s + r.qkey_amount, 0)
+    const grandL2 = detailRows.filter(r => r.level === 'L2').reduce((s, r) => s + r.qkey_amount, 0)
+
+    return c.json({
+      success: true,
+      root: { id: rootUser.id, name: rootUser.name, email: rootUser.email },
+      period: { from: fromDate, to: toDate },
+      tree,
+      summary: {
+        L1_member_count: l1Members.length,
+        L2_member_count: l2Members.length,
+        total_daily_rows: detailRows.length,
+        grand_total_qkey: grandTotal,
+        grand_L1_qkey: grandL1,
+        grand_L2_qkey: grandL2,
+      },
+      by_date: byDate,
+      by_member_per_date: byMember,
+      detail_rows: detailRows,
+      note: '룰 #3 bottom-up 트리 / 룰 #7 daily_rewards.usdt_amount = QKEY / staking.daily_rate D1 직접 조회 / 추측 0건'
+    })
+  } catch (error: any) {
+    console.error('downline-daily-by-date error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
