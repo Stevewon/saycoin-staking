@@ -5821,6 +5821,150 @@ app.get('/api/diag/all-swaps', async (c) => {
   }
 })
 
+// ★★★ 솔밧 L2 5/11 KST 자 tx 정밀 역추적 — D안 결재 (2026-05-12, read-only) ★★★
+//   경로: /api/diag/solbat-l2-trace?key=ADMIN_PW
+//   목적: NULL ref 6건 (KST 7시대) vs Phase 3 6건 (KST 9시대) 이중 미러링 1:1 매칭 검증
+//   - 솔밧(u#44) L2 referral_reward tx 중 KST date(created_at,'+9 hours')=2026-05-11 행 전체
+//   - NULL ref 행: ref_id IS NULL → referee 추정 (amount+created_at 인접 referral_rewards 매칭)
+//   - Phase 3 행: ref_id NOT NULL → referral_rewards JOIN 으로 referee/reward_date/paid_date 직접 확인
+//   - 잔액(qkey_balance) / DB UPDATE 0건 — 순수 SELECT 만
+app.get('/api/diag/solbat-l2-trace', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+    const KST_DATE = '2026-05-11'
+
+    // 1) 솔밧 L2 tx 전체 (KST 5/11)
+    const txAll = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at AS created_at_utc,
+             datetime(created_at, '+9 hours') AS created_at_kst,
+             substr(datetime(created_at, '+9 hours'), 12, 2) AS kst_hour
+      FROM transactions
+      WHERE user_id = ?
+        AND type = 'referral_reward'
+        AND description LIKE '%Level 2%'
+        AND date(created_at, '+9 hours') = ?
+      ORDER BY datetime(created_at, '+9 hours') ASC, id ASC
+    `).bind(SOLBAT_ID, KST_DATE).all()
+
+    const txRows = txAll.results || []
+    const nullRefRows = txRows.filter((r: any) => r.ref_id === null)
+    const phase3Rows = txRows.filter((r: any) => r.ref_id !== null)
+
+    // 2) Phase 3 행의 referee_id / reward_date / paid_date (referral_rewards JOIN)
+    const phase3Detailed: any[] = []
+    for (const row of phase3Rows) {
+      const r: any = row
+      const rr = await db.prepare(`
+        SELECT id AS ref_id, referrer_id, referee_id, level, amount,
+               reward_date, paid_date,
+               datetime(created_at, '+9 hours') AS rr_created_kst
+        FROM referral_rewards
+        WHERE id = ?
+      `).bind(r.ref_id).first()
+      const refereeUser: any = rr ? await db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).bind((rr as any).referee_id).first() : null
+      phase3Detailed.push({
+        tx_id: r.id,
+        tx_kst: r.created_at_kst,
+        tx_hour: r.kst_hour,
+        tx_amount: r.amount,
+        ref_id: r.ref_id,
+        ledger: rr,
+        referee: refereeUser,
+      })
+    }
+
+    // 3) NULL ref 행의 referee 후보 추정 — 같은 amount + created_at 인접 referral_rewards (referrer_id=44 AND level=2)
+    const nullRefDetailed: any[] = []
+    for (const row of nullRefRows) {
+      const r: any = row
+      // 후보 1: 같은 amount AND referrer=44 AND level=2 인 모든 referral_rewards 행
+      const candidates = await db.prepare(`
+        SELECT id AS ref_id, referee_id, amount, reward_date, paid_date,
+               datetime(created_at, '+9 hours') AS rr_created_kst,
+               ABS(strftime('%s', created_at) - strftime('%s', ?)) AS sec_diff
+        FROM referral_rewards
+        WHERE referrer_id = ? AND level = 2 AND amount = ?
+        ORDER BY sec_diff ASC
+        LIMIT 5
+      `).bind(r.created_at_utc, SOLBAT_ID, r.amount).all()
+
+      // 후보 referee names
+      const candRows = candidates.results || []
+      const enriched = [] as any[]
+      for (const c2 of candRows) {
+        const cc: any = c2
+        const u: any = await db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).bind(cc.referee_id).first()
+        enriched.push({ ...cc, referee: u })
+      }
+
+      nullRefDetailed.push({
+        tx_id: r.id,
+        tx_kst: r.created_at_kst,
+        tx_hour: r.kst_hour,
+        tx_amount: r.amount,
+        ref_id: null,
+        referee_candidates: enriched,
+      })
+    }
+
+    // 4) 1:1 매칭 시도 — NULL ref 행 각각에 대해 (amount, referee_id) 가 Phase 3 행과 일치하는지
+    const matches: any[] = []
+    for (const nr of nullRefDetailed) {
+      const matched: any[] = []
+      for (const cand of nr.referee_candidates) {
+        // Phase 3 detailed 에 referee_id 동일 + amount 동일 행 찾기
+        const hit = phase3Detailed.find(p =>
+          p.ledger && p.ledger.referee_id === cand.referee_id && Number(p.tx_amount) === Number(nr.tx_amount)
+        )
+        if (hit) {
+          matched.push({
+            null_ref_tx_id: nr.tx_id,
+            null_ref_kst: nr.tx_kst,
+            phase3_tx_id: hit.tx_id,
+            phase3_kst: hit.tx_kst,
+            phase3_ref_id: hit.ref_id,
+            referee_id: cand.referee_id,
+            referee_name: cand.referee && cand.referee.name,
+            amount: nr.tx_amount,
+            ledger_reward_date: hit.ledger.reward_date,
+            ledger_paid_date: hit.ledger.paid_date,
+          })
+        }
+      }
+      matches.push({ null_ref_tx_id: nr.tx_id, amount: nr.tx_amount, matched })
+    }
+
+    // 5) 합계 검증
+    const sumByHour: Record<string, number> = {}
+    for (const r of txRows) {
+      const rr: any = r
+      sumByHour[rr.kst_hour] = (sumByHour[rr.kst_hour] || 0) + Number(rr.amount)
+    }
+
+    return c.json({
+      success: true,
+      target: { user_id: SOLBAT_ID, kst_date: KST_DATE },
+      counts: {
+        tx_total: txRows.length,
+        null_ref: nullRefRows.length,
+        phase3: phase3Rows.length,
+      },
+      sum_by_kst_hour: sumByHour,
+      tx_rows: txRows,
+      null_ref_detailed: nullRefDetailed,
+      phase3_detailed: phase3Detailed,
+      one_to_one_matches: matches,
+      note: 'read-only — DB/잔액 무변경 보장',
+    })
+  } catch (error) {
+    console.error('solbat-l2-trace error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
 //   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
 app.get('/api/diag/search-user', async (c) => {
