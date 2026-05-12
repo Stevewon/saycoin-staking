@@ -23195,6 +23195,61 @@ app.get('/api/diag/audit-511-referral-duplicate', async (c) => {
 })
 
 // ============================================================
+// /api/diag/user-tx-trace
+// ----------------------------------------------------
+// 사장님 명령 (2026-05-12): 정분 등 특정 회원 전체 거래내역 + 코인별 누적합 추적
+// ============================================================
+app.get('/api/diag/user-tx-trace', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+
+  try {
+    const db = c.env.DB
+    const uid = parseInt(c.req.query('user_id') || '0', 10)
+    if (!uid) return c.json({ error: 'user_id 파라미터 필수' }, 400)
+
+    const u = await db.prepare(`SELECT id, name, email, qkey_balance, qx_balance, qta_balance, usdt_balance FROM users WHERE id = ?`).bind(uid).first() as any
+    if (!u) return c.json({ error: '사용자 없음' }, 404)
+
+    const txs = await db.prepare(`
+      SELECT id, type, coin_type, amount, description, ref_id, created_at,
+             date(datetime(created_at, '+9 hours')) AS kst_date
+      FROM transactions WHERE user_id = ? ORDER BY id ASC
+    `).bind(uid).all()
+
+    const rows = (txs.results || []) as any[]
+    const running: Record<string, number> = { QKEY: 0, QX: 0, QTA: 0, USDT: 0 }
+    const trail: any[] = []
+    for (const r of rows) {
+      const ct = r.coin_type
+      if (ct && running[ct] !== undefined) running[ct] += Number(r.amount) || 0
+      trail.push({
+        id: r.id, type: r.type, coin: r.coin_type, amount: r.amount, desc: r.description,
+        ref_id: r.ref_id, created: r.created_at, kst_date: r.kst_date,
+        running_qkey: running.QKEY, running_qx: running.QX, running_qta: running.QTA, running_usdt: running.USDT,
+      })
+    }
+
+    return c.json({
+      success: true,
+      user: u,
+      tx_count: rows.length,
+      final_sums: running,
+      balance_vs_sum: {
+        qkey: { balance: u.qkey_balance, sum: running.QKEY, diff: (Number(u.qkey_balance)||0) - running.QKEY },
+        qx: { balance: u.qx_balance, sum: running.QX, diff: (Number(u.qx_balance)||0) - running.QX },
+        qta: { balance: u.qta_balance, sum: running.QTA, diff: (Number(u.qta_balance)||0) - running.QTA },
+        usdt: { balance: u.usdt_balance, sum: running.USDT, diff: (Number(u.usdt_balance)||0) - running.USDT },
+      },
+      trail,
+    })
+  } catch (error: any) {
+    console.error('user-tx-trace error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/audit-balance-vs-tx-mismatch
 // ----------------------------------------------------
 // 사장님 명령 (2026-05-12): 정분 등 스왑 후 잔액 불일치 전수조사
