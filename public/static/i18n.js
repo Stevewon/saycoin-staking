@@ -483,7 +483,7 @@ I18N._translations['ko'] = {
   'admin.downline_title': '산하 매출',
   'admin.downline_search': '산하 검색',
   'admin.downline_search_prompt': '이름 또는 이메일로 검색',
-  'admin.signups_title': '가입 현황'
+  'admin.signups_title': '가입 현황',
 
   // === admin.* keys auto-merged from server SERVER_I18N (2026-05-12) ===
   'admin.pending_not_found': '승인 대기 중인 투자를 찾을 수 없습니다',
@@ -932,7 +932,7 @@ I18N._translations['en'] = {
   'admin.id_placeholder': 'Enter admin ID',
   'admin.password_placeholder': 'Enter password',
   'admin.search_email_name': 'Search by email or name',
-  'admin.downline_search_placeholder': 'Enter name or email'
+  'admin.downline_search_placeholder': 'Enter name or email',
   // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
   'admin.tx_type_daily_qkey': 'Daily Reward',
   'admin.tx_type_daily_reward': 'Daily Reward',
@@ -1243,7 +1243,7 @@ I18N._translations['ja'] = {
   'admin.id_placeholder': '管理者IDを入力',
   'admin.password_placeholder': 'パスワードを入力',
   'admin.search_email_name': 'メールまたは名前で検索',
-  'admin.downline_search_placeholder': '名前またはメールを入力'
+  'admin.downline_search_placeholder': '名前またはメールを入力',
   // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
   'admin.tx_type_daily_qkey': '日次配当',
   'admin.tx_type_daily_reward': '日次配当',
@@ -1554,7 +1554,7 @@ I18N._translations['zh'] = {
   'admin.id_placeholder': '输入管理员ID',
   'admin.password_placeholder': '输入密码',
   'admin.search_email_name': '按邮箱或姓名搜索',
-  'admin.downline_search_placeholder': '输入姓名或邮箱'
+  'admin.downline_search_placeholder': '输入姓名或邮箱',
   // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
   'admin.tx_type_daily_qkey': '每日分红',
   'admin.tx_type_daily_reward': '每日分红',
@@ -1865,7 +1865,7 @@ I18N._translations['vi'] = {
   'admin.id_placeholder': 'Nhập ID quản trị',
   'admin.password_placeholder': 'Nhập mật khẩu',
   'admin.search_email_name': 'Tìm theo email hoặc tên',
-  'admin.downline_search_placeholder': 'Nhập tên hoặc email'
+  'admin.downline_search_placeholder': 'Nhập tên hoặc email',
   // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
   'admin.tx_type_daily_qkey': 'Thưởng hàng ngày',
   'admin.tx_type_daily_reward': 'Thưởng hàng ngày',
@@ -2176,7 +2176,7 @@ I18N._translations['th'] = {
   'admin.id_placeholder': 'กรอก ID ผู้ดูแล',
   'admin.password_placeholder': 'กรอกรหัสผ่าน',
   'admin.search_email_name': 'ค้นหาตามอีเมลหรือชื่อ',
-  'admin.downline_search_placeholder': 'กรอกชื่อหรืออีเมล'
+  'admin.downline_search_placeholder': 'กรอกชื่อหรืออีเมล',
   // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
   'admin.tx_type_daily_qkey': 'รางวัลรายวัน',
   'admin.tx_type_daily_reward': 'รางวัลรายวัน',
