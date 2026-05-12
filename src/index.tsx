@@ -5026,6 +5026,54 @@ app.get('/api/diag/missing-rewards', async (c) => {
   }
 })
 
+// ★★★ 특정 날짜 daily_rewards 실제 D1 row 조회 (사실 확인용) ★★★
+//   경로: /api/diag/rewards-by-date?date=YYYY-MM-DD&key=ADMIN_PW
+//   읽기 전용 — 그 날짜의 daily_rewards 테이블 전체 row + transactions 5/12 daily_qkey/referral_reward 행 모두 노출
+app.get('/api/diag/rewards-by-date', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    const date = c.req.query('date') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return c.json({ error: 'date=YYYY-MM-DD 필요' }, 400)
+    }
+
+    // daily_rewards (그 날짜의 발생일)
+    const drRows = await db.prepare(`
+      SELECT dr.id, dr.staking_id, dr.user_id, u.email, dr.reward_date, dr.paid_date, dr.amount, dr.created_at
+      FROM daily_rewards dr
+      LEFT JOIN users u ON u.id = dr.user_id
+      WHERE dr.reward_date = ?
+      ORDER BY dr.id ASC
+    `).bind(date).all()
+
+    // transactions (그 날짜의 paid — KST 기준 created_at)
+    const txRows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, created_at
+      FROM transactions
+      WHERE date(created_at, '+9 hours') = ?
+        AND type IN ('daily_qkey','referral_reward')
+      ORDER BY id ASC
+    `).bind(date).all()
+
+    return c.json({
+      success: true,
+      date,
+      daily_rewards_count: drRows.results.length,
+      daily_rewards_sum_qkey: (drRows.results as any[]).reduce((s, r) => s + Number(r.amount || 0), 0),
+      transactions_count: txRows.results.length,
+      transactions_sum_qkey: (txRows.results as any[]).reduce((s, r) => s + Number(r.amount || 0), 0),
+      daily_rewards: drRows.results,
+      transactions: txRows.results
+    })
+  } catch (error) {
+    console.error('rewards-by-date diag error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 어드민 진단: 특정 날짜 + 특정 사용자의 transactions 조회 (중복지급 원인 파악용)
 app.get('/api/admin/diag/transactions', async (c) => {
   try {
