@@ -6343,6 +6343,110 @@ app.post('/api/diag/exec-delete-solbat-phase3', async (c) => {
   }
 })
 
+// ★★★ 솔밧 산하 전체 referral_rewards 중복자 일괄 식별 — 사장님 지시 (2026-05-12, read-only) ★★★
+//   경로: GET /api/diag/solbat-dup-referees?key=ADMIN_PW
+//   목적: 같은 (referrer, referee, level, reward_date) 조합으로 2개 이상 분리 INSERT 된 행 모두 식별
+//   - 솔밧(u#44) 본인 + 산하 22명 모든 referrer 기준으로 검사
+//   - 분리된 행들을 1명1행 으로 합쳤을 때 정상 staking*7.5% 와 일치하는지 검증
+//   - read-only: DB 변경 0건
+app.get('/api/diag/solbat-dup-referees', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+
+    // 1) 솔밧 산하 전체 회원 (재귀 CTE)
+    const downline = await db.prepare(`
+      WITH RECURSIVE tree(id, level) AS (
+        SELECT id, 1 AS level FROM users WHERE referrer_id = ?
+        UNION ALL
+        SELECT u.id, t.level + 1 FROM users u JOIN tree t ON u.referrer_id = t.id WHERE t.level < 10
+      )
+      SELECT id FROM tree
+    `).bind(SOLBAT_ID).all()
+    const allIds = [SOLBAT_ID, ...(downline.results || []).map((r: any) => r.id)]
+    const idPlaceholders = allIds.map(() => '?').join(',')
+
+    // 2) (referrer, referee, level, reward_date) 다중 행 그룹 추출
+    const dupGroups = await db.prepare(`
+      SELECT referrer_id, referee_id, level, reward_date,
+             COUNT(*) AS cnt, SUM(reward_amount) AS sum_reward,
+             GROUP_CONCAT(id, ',') AS ref_ids,
+             GROUP_CONCAT(reward_amount, ',') AS amounts
+      FROM referral_rewards
+      WHERE referrer_id IN (${idPlaceholders})
+      GROUP BY referrer_id, referee_id, level, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY referrer_id ASC, referee_id ASC, reward_date ASC
+    `).bind(...allIds).all()
+
+    // 3) 각 그룹별 referee staking 합 + expected vs sum_reward 비교
+    const groups: any[] = []
+    for (const g of (dupGroups.results || [])) {
+      const gg: any = g
+      const referee: any = await db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).bind(gg.referee_id).first()
+      const referrer: any = await db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).bind(gg.referrer_id).first()
+
+      const stakes = await db.prepare(`
+        SELECT id, amount, status, date(created_at, '+9 hours') AS staked_kst_date
+        FROM staking
+        WHERE user_id = ? AND status IN ('active', 'completed', 'capped')
+        ORDER BY created_at ASC
+      `).bind(gg.referee_id).all()
+      const totalStake = (stakes.results || []).reduce((a: number, s: any) => a + Number(s.amount), 0)
+
+      // L2 expected = totalStake * 7.5%, L1 expected = totalStake * 15%
+      const rate = Number(gg.level) === 1 ? 0.15 : 0.075
+      const expectedReward = Math.round(totalStake * rate)
+      const sumReward = Number(gg.sum_reward)
+
+      // tx 미러 행도 같이 추출 (각 ref_id 별)
+      const refIdsArr = (gg.ref_ids || '').split(',').map((s: string) => parseInt(s, 10))
+      const refPh = refIdsArr.map(() => '?').join(',')
+      const txMirrors = await db.prepare(`
+        SELECT id AS tx_id, ref_id, amount,
+               datetime(created_at, '+9 hours') AS tx_kst
+        FROM transactions
+        WHERE ref_id IN (${refPh}) AND user_id = ? AND type = 'referral_reward'
+        ORDER BY id ASC
+      `).bind(...refIdsArr, gg.referrer_id).all()
+
+      groups.push({
+        referrer: referrer ? { id: referrer.id, name: referrer.name } : { id: gg.referrer_id },
+        referee: referee ? { id: referee.id, name: referee.name, email: referee.email } : { id: gg.referee_id },
+        level: gg.level,
+        reward_date: gg.reward_date,
+        dup_count: gg.cnt,
+        ref_ids: refIdsArr,
+        amounts: (gg.amounts || '').split(',').map((s: string) => Number(s)),
+        sum_reward: sumReward,
+        referee_total_stake: totalStake,
+        expected_reward: expectedReward,
+        sum_matches_expected: sumReward === expectedReward,
+        tx_mirrors: txMirrors.results,
+        action_suggestion: {
+          keep_first_ref_id: refIdsArr[0],
+          set_to_amount: expectedReward,
+          delete_other_ref_ids: refIdsArr.slice(1),
+          // tx 미러도 동일하게: 첫 번째 ref_id 의 tx 들 amount UPDATE, 나머지 ref_id 의 tx 들 DELETE
+        },
+      })
+    }
+
+    return c.json({
+      success: true,
+      scope: { solbat_id: SOLBAT_ID, downline_count: allIds.length - 1, total: allIds.length },
+      dup_group_count: groups.length,
+      groups,
+      note: 'read-only — DB 무변경. 같은 (referrer,referee,level,reward_date) 다중 행 식별',
+    })
+  } catch (error) {
+    console.error('solbat-dup-referees error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧 L2 referee 6건 staking 금액 정밀 확인 — 사장님 지시 (2026-05-12, read-only) ★★★
 //   경로: GET /api/diag/solbat-l2-referee-stakes?key=ADMIN_PW
 //   목적: ref_id 688,698,725,729,731,773 의 referee 각자 staking 진입 금액 확인
