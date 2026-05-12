@@ -45,7 +45,7 @@ jobs:
               }, extraHeaders || {});
               const req = https.request({
                 hostname: u.hostname,
-                path: u.pathname,
+                path: u.pathname + (u.search || ''),
                 method: 'POST',
                 headers: headers
               }, function(res) {
@@ -72,8 +72,8 @@ jobs:
                 console.error('Admin login failed');
                 process.exit(1);
               }
-              const token = loginJson.token;
-                            console.log('[2/2] Pay daily rewards (batched)');
+              const token = loginJson.token;console.log('Admin login OK (token length=' + token.length + ')');
+              console.log('[2/2] Pay daily rewards (batched)');
               const BATCH_SIZE = 10;
               let offset = 0;
               let totalRewarded = 0;
