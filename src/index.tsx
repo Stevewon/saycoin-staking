@@ -22959,8 +22959,8 @@ app.get('/api/diag/fix-holiday-entrant-512-daily', async (c) => {
 
         // transactions (description 한국어 안전 — 영구룰 #112)
         await db.prepare(`
-          INSERT INTO transactions (user_id, type, amount, coin_type, description, ref_id, status, created_at)
-          VALUES (?, 'daily_reward', ?, 'QKEY', ?, ?, 'completed', datetime('now'))
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'daily_reward', 'QKEY', ?, ?, ?)
         `).bind(uid, p.self_qkey, '일일 배당 (QKEY)', refIdSelf).run()
 
         // 잔액 증가
@@ -22974,8 +22974,8 @@ app.get('/api/diag/fix-holiday-entrant-512-daily', async (c) => {
       if (p.l1 && !p.l1.already_inserted) {
         const refIdL1 = `fix_512_s${sid}_l1`
         await db.prepare(`
-          INSERT INTO transactions (user_id, type, amount, coin_type, description, ref_id, status, created_at)
-          VALUES (?, 'referral_reward', ?, 'QKEY', ?, ?, 'completed', datetime('now'))
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
         `).bind(p.l1.user_id, p.l1.qkey, '추천 보너스 (Level 1)', refIdL1).run()
 
         await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.l1.qkey, p.l1.user_id).run()
@@ -22996,8 +22996,8 @@ app.get('/api/diag/fix-holiday-entrant-512-daily', async (c) => {
       if (p.l2 && !p.l2.already_inserted) {
         const refIdL2 = `fix_512_s${sid}_l2`
         await db.prepare(`
-          INSERT INTO transactions (user_id, type, amount, coin_type, description, ref_id, status, created_at)
-          VALUES (?, 'referral_reward', ?, 'QKEY', ?, ?, 'completed', datetime('now'))
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
         `).bind(p.l2.user_id, p.l2.qkey, '추천 보너스 (Level 2)', refIdL2).run()
 
         await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.l2.qkey, p.l2.user_id).run()
