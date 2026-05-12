@@ -5424,6 +5424,315 @@ app.post('/api/diag/exec-delete-may11-phase4-only', async (c) => {
 })
 
 
+// ★★★★★ 5/11 Phase 4 매칭 보너스 안전 재실행 (L1 20% / L2 10%) — 사장님 영구 룰 준수 (2026-05-12) ★★★★★
+//   사장님 영구 룰 #3 ★★★ 0순위 — bottom-up traversal:
+//     "무조건 당일 데일리 배당을 실시할 경우에는 배당에 해당하는 맨 아래 데일리 정산된
+//      하부부터 데일리 정산을 하면서 위로 올라갈것"
+//   - depth desc 정렬로 leaf → root 순회 (자식 own_daily 확정 후 부모 매칭 산출)
+//   - L1 = 자식 own_daily × 0.20 (사장님 정책)
+//   - L2 = 자식 own_daily × 0.10 (사장님 정책)
+//
+//   중복 차단 강화 (이전 75건/15그룹 중복 사고 대응):
+//   1. Pre-compute 방식: 메모리에서 전체 plan 산출 후 한 번에 INSERT
+//   2. 매 INSERT 직전 DB 재확인 (double-check lock) — race condition 차단
+//   3. dedupe key: (referrer_id, referee_id, level, reward_date) — 1회만 허용
+//   4. txExists guard: ref_id 매칭 + (user_id, type, amount, KST date) 매칭 모두 검증
+//   5. dry_run 필수 — preview 안 보고 confirm=GO 금지
+//
+//   경로: POST /api/diag/exec-may11-phase4-safe
+//     ?key=ADMIN_PW [&confirm=GO]
+//   - reward_date = '2026-05-11' (고정)
+//   - paid_date = '2026-05-12' (고정)
+//   - 200% Cap, EXISTS guard, depth desc 정렬 적용
+app.post('/api/diag/exec-may11-phase4-safe', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const dryRun = confirm !== 'GO'
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+    const REWARD_DATE = '2026-05-11'
+    const PAID_DATE = '2026-05-12'
+
+    // === STEP 1: daily_rewards (reward_date=2026-05-11) 조회 — 매칭 산출 입력 ===
+    const drRows = await db.prepare(`
+      SELECT id AS dr_id, user_id, staking_id, usdt_amount AS qkey_amount
+      FROM daily_rewards
+      WHERE reward_date = ?
+      ORDER BY user_id, staking_id
+    `).bind(REWARD_DATE).all()
+    const drList = ((drRows.results || []) as any[]).map(r => ({
+      dr_id: Number(r.dr_id),
+      user_id: Number(r.user_id),
+      staking_id: Number(r.staking_id),
+      qkey_amount: Number(r.qkey_amount),
+    }))
+
+    // === STEP 2: 회원별 stake_total / paid_total / referrer 트리 ===
+    const stakeTotalsRaw = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) AS total
+      FROM staking WHERE status IN ('active','completed','capped')
+      GROUP BY user_id
+    `).all()
+    const stakeTotalByUser = new Map<number, number>()
+    for (const r of (stakeTotalsRaw.results || []) as any[]) {
+      stakeTotalByUser.set(Number(r.user_id), Number(r.total) || 0)
+    }
+    const paidTotalsRaw = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) AS total
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')
+      GROUP BY user_id
+    `).all()
+    const paidTotalByUser = new Map<number, number>()
+    for (const r of (paidTotalsRaw.results || []) as any[]) {
+      paidTotalByUser.set(Number(r.user_id), Number(r.total) || 0)
+    }
+    const targetOf = (uid: number) => (stakeTotalByUser.get(uid) || 0) * 2 * USD_TO_QKEY
+    const paidOf = (uid: number) => paidTotalByUser.get(uid) || 0
+    const isCapped = (uid: number) => { const t = targetOf(uid); return t > 0 && paidOf(uid) >= t }
+    const remainingOf = (uid: number) => Math.max(0, targetOf(uid) - paidOf(uid))
+    const addPaid = (uid: number, amt: number) => paidTotalByUser.set(uid, (paidTotalByUser.get(uid) || 0) + amt)
+
+    const usersRaw = await db.prepare(`SELECT id, referrer_id FROM users`).all()
+    const referrerOf = new Map<number, number | null>()
+    for (const u of (usersRaw.results || []) as any[]) {
+      referrerOf.set(Number(u.id), u.referrer_id != null ? Number(u.referrer_id) : null)
+    }
+    const depthMemo = new Map<number, number>()
+    function computeDepth(uid: number, stack: Set<number>): number {
+      if (depthMemo.has(uid)) return depthMemo.get(uid)!
+      if (stack.has(uid)) { depthMemo.set(uid, 0); return 0 }
+      stack.add(uid)
+      const rid = referrerOf.get(uid)
+      if (rid == null) { depthMemo.set(uid, 0); stack.delete(uid); return 0 }
+      const d = 1 + computeDepth(rid, stack)
+      depthMemo.set(uid, d); stack.delete(uid); return d
+    }
+    for (const r of drList) computeDepth(r.user_id, new Set())
+
+    // === STEP 3: bottom-up 정렬 (depth desc — leaf → root) ===
+    //   사장님 영구 룰 #3 준수: 자식 own_daily 확정 후 부모 매칭 산출
+    drList.sort((a, b) => {
+      const da = depthMemo.get(a.user_id) || 0
+      const db_ = depthMemo.get(b.user_id) || 0
+      if (db_ !== da) return db_ - da
+      if (a.user_id !== b.user_id) return a.user_id - b.user_id
+      return a.staking_id - b.staking_id
+    })
+
+    // === STEP 4: 기존 referral_rewards (reward_date=2026-05-11) 조회 — dedupe key ===
+    const existingRR = await db.prepare(`
+      SELECT referrer_id, referee_id, level FROM referral_rewards WHERE reward_date = ?
+    `).bind(REWARD_DATE).all()
+    const existingKey = new Set<string>()
+    for (const r of (existingRR.results || []) as any[]) {
+      existingKey.add(`${r.referrer_id}_${r.referee_id}_${r.level}`)
+    }
+
+    // === STEP 5: parent active staking + depth 계산 — 매칭 plan pre-compute ===
+    type PlanItem = {
+      referrer_id: number, referee_id: number, level: 1 | 2,
+      original_amount: number, reward_amount: number,
+      reason: string
+    }
+    const plan: PlanItem[] = []
+    const skipped: { referee_id: number, level: number, reason: string }[] = []
+
+    // user별 own_daily 합 (자식이 여러 staking 있으면 합산해서 한 번만 매칭)
+    const ownDailyByUser = new Map<number, number>()
+    for (const r of drList) {
+      ownDailyByUser.set(r.user_id, (ownDailyByUser.get(r.user_id) || 0) + r.qkey_amount)
+    }
+
+    // bottom-up: depth desc 정렬된 자식 user 순회
+    const processedReferees = new Set<number>()
+    for (const r of drList) {
+      if (processedReferees.has(r.user_id)) continue
+      processedReferees.add(r.user_id)
+      const childUid = r.user_id
+      const childOwn = ownDailyByUser.get(childUid) || 0
+      if (childOwn <= 0) continue
+
+      const parentId = referrerOf.get(childUid)
+      if (parentId == null) {
+        skipped.push({ referee_id: childUid, level: 1, reason: 'no parent' })
+        continue
+      }
+
+      // L1 매칭 (parent 의 active staking + cap + dedupe check)
+      const l1Key = `${parentId}_${childUid}_1`
+      if (existingKey.has(l1Key)) {
+        skipped.push({ referee_id: childUid, level: 1, reason: 'already exists' })
+      } else {
+        const parentActive = await db.prepare(`
+          SELECT id FROM staking WHERE user_id=? AND status='active'
+            AND date(start_date,'+9 hours')<=date(?) AND date(end_date,'+9 hours')>=date(?)
+          LIMIT 1
+        `).bind(parentId, REWARD_DATE, REWARD_DATE).first()
+        if (!parentActive) {
+          skipped.push({ referee_id: childUid, level: 1, reason: `parent ${parentId} no active staking` })
+        } else if (isCapped(parentId)) {
+          skipped.push({ referee_id: childUid, level: 1, reason: `parent ${parentId} capped` })
+        } else {
+          let l1 = Math.round(childOwn * 0.20)
+          const rem = remainingOf(parentId)
+          if (l1 > rem) l1 = Math.max(0, Math.floor(rem))
+          if (l1 > 0) {
+            plan.push({
+              referrer_id: parentId, referee_id: childUid, level: 1,
+              original_amount: childOwn, reward_amount: l1,
+              reason: 'L1 20% match'
+            })
+            existingKey.add(l1Key)  // 같은 호출 내 중복 차단
+            addPaid(parentId, l1)
+          }
+        }
+      }
+
+      // L2 매칭 (grandparent)
+      const grandId = referrerOf.get(parentId)
+      if (grandId == null) {
+        skipped.push({ referee_id: childUid, level: 2, reason: 'no grandparent' })
+        continue
+      }
+      const l2Key = `${grandId}_${childUid}_2`
+      if (existingKey.has(l2Key)) {
+        skipped.push({ referee_id: childUid, level: 2, reason: 'already exists' })
+      } else {
+        const grandActive = await db.prepare(`
+          SELECT id FROM staking WHERE user_id=? AND status='active'
+            AND date(start_date,'+9 hours')<=date(?) AND date(end_date,'+9 hours')>=date(?)
+          LIMIT 1
+        `).bind(grandId, REWARD_DATE, REWARD_DATE).first()
+        if (!grandActive) {
+          skipped.push({ referee_id: childUid, level: 2, reason: `grandparent ${grandId} no active staking` })
+        } else if (isCapped(grandId)) {
+          skipped.push({ referee_id: childUid, level: 2, reason: `grandparent ${grandId} capped` })
+        } else {
+          let l2 = Math.round(childOwn * 0.10)
+          const rem = remainingOf(grandId)
+          if (l2 > rem) l2 = Math.max(0, Math.floor(rem))
+          if (l2 > 0) {
+            plan.push({
+              referrer_id: grandId, referee_id: childUid, level: 2,
+              original_amount: childOwn, reward_amount: l2,
+              reason: 'L2 10% match'
+            })
+            existingKey.add(l2Key)
+            addPaid(grandId, l2)
+          }
+        }
+      }
+    }
+
+    // === STEP 6: plan 요약 ===
+    const l1Plan = plan.filter(p => p.level === 1)
+    const l2Plan = plan.filter(p => p.level === 2)
+    const l1Sum = l1Plan.reduce((s, p) => s + p.reward_amount, 0)
+    const l2Sum = l2Plan.reduce((s, p) => s + p.reward_amount, 0)
+
+    // user별 환산 (받을 사람 = referrer)
+    const recvByUser = new Map<number, number>()
+    for (const p of plan) {
+      recvByUser.set(p.referrer_id, (recvByUser.get(p.referrer_id) || 0) + p.reward_amount)
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'dry_run',
+        note: 'DB 무변경. confirm=GO 추가 시 INSERT 진행',
+        target: { reward_date: REWARD_DATE, paid_date: PAID_DATE },
+        input: {
+          daily_rewards_count: drList.length,
+          unique_referee_users: ownDailyByUser.size,
+        },
+        plan_summary: {
+          l1_count: l1Plan.length, l1_total_qkey: l1Sum,
+          l2_count: l2Plan.length, l2_total_qkey: l2Sum,
+          grand_total_qkey: l1Sum + l2Sum,
+        },
+        receive_by_user: Object.fromEntries(recvByUser),
+        skipped_count: skipped.length,
+        skipped_sample: skipped.slice(0, 30),
+        plan_sample: plan.slice(0, 20),
+      })
+    }
+
+    // === STEP 7: 실제 INSERT (confirm=GO) — double-check lock 적용 ===
+    let l1Count = 0, l1Total = 0, l2Count = 0, l2Total = 0
+    let txInserted = 0, balanceUpdated = 0
+    const insertErrors: any[] = []
+
+    for (const p of plan) {
+      try {
+        // Double-check: INSERT 직전 DB 재확인 (race condition 차단)
+        const exists = await db.prepare(`
+          SELECT id FROM referral_rewards
+          WHERE referrer_id=? AND referee_id=? AND level=? AND reward_date=?
+          LIMIT 1
+        `).bind(p.referrer_id, p.referee_id, p.level, REWARD_DATE).first()
+        if (exists) {
+          insertErrors.push({ ...p, error: 'double-check: already exists' })
+          continue
+        }
+
+        // INSERT referral_rewards
+        const rrIns = await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(p.referrer_id, p.referee_id, p.level, p.original_amount, p.reward_amount, REWARD_DATE, PAID_DATE).run()
+        const rrId = (rrIns as any)?.meta?.last_row_id ?? null
+
+        // INSERT transactions (ref_id 매칭 guard)
+        const txEx = await db.prepare(`
+          SELECT id FROM transactions WHERE type='referral_reward' AND ref_id=? LIMIT 1
+        `).bind(rrId).first()
+        if (!txEx) {
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+            VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+          `).bind(p.referrer_id, p.reward_amount, p.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)', rrId).run()
+          txInserted++
+        }
+
+        // UPDATE qkey_balance
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(p.reward_amount, p.referrer_id).run()
+        balanceUpdated++
+
+        if (p.level === 1) { l1Count++; l1Total += p.reward_amount }
+        else { l2Count++; l2Total += p.reward_amount }
+      } catch (err) {
+        insertErrors.push({ ...p, error: String(err) })
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: 'exec',
+      target: { reward_date: REWARD_DATE, paid_date: PAID_DATE },
+      result: {
+        l1_count: l1Count, l1_total_qkey: l1Total,
+        l2_count: l2Count, l2_total_qkey: l2Total,
+        grand_total_qkey: l1Total + l2Total,
+        tx_inserted: txInserted,
+        balance_updated_count: balanceUpdated,
+      },
+      receive_by_user: Object.fromEntries(recvByUser),
+      skipped_count: skipped.length,
+      insert_errors_count: insertErrors.length,
+      insert_errors_sample: insertErrors.slice(0, 5),
+      note: '사장님 영구 룰 #3 bottom-up traversal 준수 (depth desc, L1=20%, L2=10%). EXISTS guard 3중 (pre-compute + memory set + double-check lock)'
+    })
+  } catch (error) {
+    console.error('exec-may11-phase4-safe error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+
 // ★ 200% Cap 진행률 조회 API (사용자/UI용) ★
 //   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)을
 //   사용자 진입금액 합계 × 2 × 150 (target) 과 비교한 진행률 반환.
