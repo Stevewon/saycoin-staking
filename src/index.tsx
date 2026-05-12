@@ -19511,7 +19511,29 @@ app.get('/admin/dashboard', (c) => {
                                 // ★★ 카테고리(type) 한국어 i18n 변환 — raw enum 노출 차단
                                 var typeText = I18N.t('admin.tx_type_' + (t.type || 'unknown'));
                                 if (typeText === 'admin.tx_type_' + (t.type || 'unknown')) typeText = (t.type || '-');
-                                return '<tr><td class="px-2 py-1 whitespace-nowrap">' + tDateStr + '</td><td class="px-2 py-1 text-center">' + esc(typeText) + '</td><td class="px-2 py-1 text-center font-bold">' + t.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(t.amount).toLocaleString() + '</td><td class="px-2 py-1 truncate max-w-[150px]" title="' + esc(t.description || '') + '">' + esc(t.description || '-') + '</td></tr>';
+                                // ★★ 2026-05-12 사장님 지시: 1대/2대 매칭 색상 복원
+                                //   description 에 'Level 1' / 'Level 2' 포함 → 배지 색상 적용
+                                //   1대 = 파랑 (blue) / 2대 = 초록 (green) / direct = 보라 (purple) / 그 외 = 회색
+                                var tDesc = t.description || '';
+                                var typeBadgeClass = 'bg-gray-100 text-gray-700';
+                                var rowBgClass = '';
+                                if (tDesc.indexOf('Level 1') >= 0) {
+                                    typeBadgeClass = 'bg-blue-100 text-blue-700 font-bold';
+                                    rowBgClass = 'bg-blue-50/30';
+                                } else if (tDesc.indexOf('Level 2') >= 0) {
+                                    typeBadgeClass = 'bg-green-100 text-green-700 font-bold';
+                                    rowBgClass = 'bg-green-50/30';
+                                } else if (t.type === 'direct_referral' || tDesc.indexOf('직판') >= 0 || tDesc.indexOf('직접') >= 0) {
+                                    typeBadgeClass = 'bg-purple-100 text-purple-700 font-bold';
+                                    rowBgClass = 'bg-purple-50/30';
+                                } else if (t.type === 'referral_reward') {
+                                    typeBadgeClass = 'bg-indigo-100 text-indigo-700';
+                                } else if (t.type === 'daily_reward' || t.type === 'daily_qkey') {
+                                    typeBadgeClass = 'bg-yellow-100 text-yellow-700';
+                                } else if (t.type === 'withdrawal' || (t.amount && parseFloat(t.amount) < 0)) {
+                                    typeBadgeClass = 'bg-red-100 text-red-700';
+                                }
+                                return '<tr class="' + rowBgClass + '"><td class="px-2 py-1 whitespace-nowrap">' + tDateStr + '</td><td class="px-2 py-1 text-center"><span class="px-1.5 py-0.5 rounded text-xs ' + typeBadgeClass + '">' + esc(typeText) + '</span></td><td class="px-2 py-1 text-center font-bold">' + t.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(t.amount).toLocaleString() + '</td><td class="px-2 py-1 truncate max-w-[150px]" title="' + esc(tDesc) + '">' + esc(tDesc || '-') + '</td></tr>';
                             }).join('') +
                         '</tbody></table></div>' : '<p class="text-xs text-gray-500">' + I18N.t('admin.no_tx') + '</p>');
 
