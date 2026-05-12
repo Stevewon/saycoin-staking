@@ -5668,6 +5668,73 @@ app.post('/api/diag/backfill-referral-mirror-all', async (c) => {
   }
 })
 
+// ★★★ 전체 스왑 내역 dump — 사실 확인용 영구 진단 (read-only) ★★★
+//   경로: /api/diag/all-swaps?key=ADMIN_PW&user_id=N(옵션)&limit=N(옵션)
+//   목적: 어드민 "스왑 내역 관리" 화면에 노출되는 28건 raw dump
+//   인증: ?key=ADMIN_PW (admin Bearer 토큰 없이도 사장님 검증 가능)
+app.get('/api/diag/all-swaps', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const filterUser = c.req.query('user_id') || ''
+    const limit = parseInt(c.req.query('limit') || '500', 10)
+
+    const db = c.env.DB
+    const baseSql = `
+      SELECT t.id, t.user_id, u.email, u.name, t.type, t.coin_type, t.amount, t.description, t.created_at
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      WHERE t.type IN ('swap_in', 'swap_out')
+      ${filterUser ? 'AND t.user_id = ?' : ''}
+      ORDER BY t.id ASC
+      LIMIT ?
+    `
+    const stmt = filterUser
+      ? db.prepare(baseSql).bind(parseInt(filterUser, 10), limit)
+      : db.prepare(baseSql).bind(limit)
+    const swaps = await stmt.all()
+
+    // 통계
+    const stats = await db.prepare(`
+      SELECT
+        COUNT(*) as total_count,
+        COUNT(DISTINCT user_id) as unique_users,
+        SUM(CASE WHEN type = 'swap_out' AND coin_type = 'QKEY' THEN amount ELSE 0 END) as total_qkey_used,
+        SUM(CASE WHEN type = 'swap_out' AND coin_type = 'USDT' THEN amount ELSE 0 END) as total_usdt_used,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'QTA' THEN amount ELSE 0 END) as total_qta_received,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'QX' THEN amount ELSE 0 END) as total_qx_received,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'USDT' THEN amount ELSE 0 END) as total_usdt_received,
+        SUM(CASE WHEN type = 'swap_in' AND coin_type = 'QKEY' THEN amount ELSE 0 END) as total_qkey_received
+      FROM transactions
+      WHERE type IN ('swap_in', 'swap_out')
+    `).first()
+
+    // user_id 별 카운트
+    const perUserSql = `
+      SELECT t.user_id, u.name, u.email, COUNT(*) as cnt,
+        SUM(CASE WHEN t.type='swap_out' THEN 1 ELSE 0 END) as out_cnt,
+        SUM(CASE WHEN t.type='swap_in'  THEN 1 ELSE 0 END) as in_cnt
+      FROM transactions t JOIN users u ON t.user_id=u.id
+      WHERE t.type IN ('swap_in','swap_out')
+      GROUP BY t.user_id, u.name, u.email
+      ORDER BY cnt DESC
+    `
+    const perUser = await db.prepare(perUserSql).all()
+
+    return c.json({
+      success: true,
+      filter: { user_id: filterUser || null, limit },
+      total_rows: (swaps.results || []).length,
+      stats,
+      per_user: perUser.results,
+      swaps: swaps.results,
+    })
+  } catch (error) {
+    console.error('all-swaps error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
 //   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
 app.get('/api/diag/search-user', async (c) => {
