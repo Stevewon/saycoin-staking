@@ -22028,6 +22028,50 @@ app.get('/api/diag/audit-tx-double-kst', async (c) => {
       FROM transactions
     `).first() as any
 
+    // STEP 5: daily_rewards.created_at 미래 일자 (+9h 시 5/13+ KST)
+    //   회원관리 화면 user-detail 의 rewards 쿼리: ORDER BY datetime(d.created_at,'+9h')
+    //   응답 컬럼은 raw d.* 그대로 → 클라이언트가 +9h 추가 변환할 가능성도 있음
+    //   하지만 raw created_at 자체가 KST 시각으로 박혀있으면 즉시 5/13 표시
+    const drFuture = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at,
+             datetime(created_at,'+9 hours') AS plus9h_kst
+      FROM daily_rewards
+      WHERE created_at >= '2026-05-12 15:00:00'
+         OR datetime(created_at,'+9 hours') >= '2026-05-13 00:00:00'
+         OR reward_date >= '2026-05-13'
+         OR paid_date  >= '2026-05-13'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 200
+    `).all()
+
+    // STEP 6: referral_rewards 미래 일자 (어드민 user-detail 의 referralRewards 쿼리)
+    //   응답: r.created_at / r.reward_date / r.paid_date raw 그대로
+    const rrFuture = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date, created_at,
+             datetime(created_at,'+9 hours') AS plus9h_kst
+      FROM referral_rewards
+      WHERE created_at >= '2026-05-12 15:00:00'
+         OR datetime(created_at,'+9 hours') >= '2026-05-13 00:00:00'
+         OR reward_date >= '2026-05-13'
+         OR paid_date  >= '2026-05-13'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 200
+    `).all()
+
+    // STEP 7: withdrawals 미래 일자 (어드민 user-detail 의 withdrawals 쿼리: SELECT * raw)
+    let wdFuture: any = { results: [] }
+    try {
+      wdFuture = await db.prepare(`
+        SELECT id, user_id, amount, status, created_at,
+               datetime(created_at,'+9 hours') AS plus9h_kst
+        FROM withdrawals
+        WHERE created_at >= '2026-05-12 15:00:00'
+           OR datetime(created_at,'+9 hours') >= '2026-05-13 00:00:00'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 200
+      `).all()
+    } catch (e) { /* withdrawals 스키마 차이 시 무시 */ }
+
     return c.json({
       success: true,
       stats: stat,
@@ -22042,6 +22086,18 @@ app.get('/api/diag/audit-tx-double-kst', async (c) => {
       future_display_after_5_13: {
         count: (futureRows.results || []).length,
         rows: futureRows.results || []
+      },
+      daily_rewards_future: {
+        count: (drFuture.results || []).length,
+        rows: drFuture.results || []
+      },
+      referral_rewards_future: {
+        count: (rrFuture.results || []).length,
+        rows: rrFuture.results || []
+      },
+      withdrawals_future: {
+        count: (wdFuture.results || []).length,
+        rows: wdFuture.results || []
       },
       note: 'KST 시각으로 저장된 의심 행: +9h 어드민 쿼리 거치면 미래 일자 표시. 정답은 UTC 저장 + 어드민 +9h 변환 일관성.'
     })
