@@ -7173,6 +7173,285 @@ app.post('/api/diag/restore-solbat-phase3', async (c) => {
   }
 })
 
+// ★★★ 5/12 cron 사전 예측 — bottom-up 각 계정별 데일리 합 산출 (사장님 영구 룰 2026-05-12, read-only) ★★★
+//   경로: GET /api/diag/daily-preview-bottom-up?key=ADMIN_PW&targetDate=2026-05-12
+//   사장님 영구 명령: "맨 아래 데일리 정산된 하부부터 데일리 정산하면서 위로 올라갈것"
+//   - read-only / INSERT/UPDATE/DELETE 0건
+//   - 정확한 cron 룰 적용:
+//       (a) reward_date = yesterdayKst (= targetDate - 1)
+//       (b) 활성 staking 조건: start_date_kst <= yesterdayKst AND end_date_kst >= yesterdayKst AND status='active'
+//       (c) 본인 데일리(QKEY) = staking.amount × staking.daily_rate × 150 (D1 daily_rate 직접 조회, 추측 금지)
+//       (d) L1 매칭(QKEY) = Σ(L1 산하 회원의 본인 데일리) × 20%
+//       (e) L2 매칭(QKEY) = Σ(L2 산하 회원의 본인 데일리) × 10%
+//   - bottom-up 순회: 트리 depth 계산 후 max_depth → 0 역순으로 산출
+app.get('/api/diag/daily-preview-bottom-up', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+
+    const now = new Date()
+    const todayAuto = kstDateStr(now)
+    const targetDate = c.req.query('targetDate') || todayAuto
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      return c.json({ error: 'targetDate=YYYY-MM-DD 필요' }, 400)
+    }
+    const tdObj = new Date(targetDate + 'T00:00:00Z')
+    const ydObj = new Date(tdObj.getTime() - 24 * 60 * 60 * 1000)
+    const yesterdayKst = ydObj.toISOString().slice(0, 10)
+
+    // STEP 1: yesterdayKst 시점 active staking 전체 조회
+    const activeRows = await db.prepare(`
+      SELECT
+        s.user_id,
+        s.id AS staking_id,
+        s.amount,
+        s.daily_rate,
+        s.period_days,
+        s.period_months,
+        date(s.start_date, '+9 hours') AS start_date_kst,
+        date(s.end_date, '+9 hours') AS end_date_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) AS rewarded_count
+      FROM staking s
+      WHERE s.status = 'active'
+        AND date(s.end_date, '+9 hours') >= date(?)
+        AND date(s.start_date, '+9 hours') <= date(?)
+      ORDER BY s.user_id ASC, s.id ASC
+    `).bind(yesterdayKst, yesterdayKst).all()
+
+    // 회원별 stake_total / paid_total 일괄 조회 (200% cap target)
+    const stakeTotalsRaw = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount), 0) AS total
+      FROM staking
+      WHERE status IN ('active','completed','capped')
+      GROUP BY user_id
+    `).all()
+    const stakeTotalByUser = new Map<number, number>()
+    for (const r of (stakeTotalsRaw.results || []) as any[]) {
+      stakeTotalByUser.set(Number(r.user_id), Number(r.total) || 0)
+    }
+    const paidTotalsRaw = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount), 0) AS total
+      FROM transactions
+      WHERE coin_type = 'QKEY' AND type IN ('daily_qkey', 'referral_reward')
+      GROUP BY user_id
+    `).all()
+    const paidTotalByUser = new Map<number, number>()
+    for (const r of (paidTotalsRaw.results || []) as any[]) {
+      paidTotalByUser.set(Number(r.user_id), Number(r.total) || 0)
+    }
+
+    // STEP 2: 회원별 본인 데일리(own_daily) 산출 (cap 사전 보정)
+    type OwnEntry = { user_id: number, own_daily: number, staking_count: number, capped: boolean }
+    const ownByUser = new Map<number, OwnEntry>()
+    let totalOwnDaily = 0
+    let cappedSkipCount = 0
+    const cappedSkipUsers: number[] = []
+
+    for (const s of (activeRows.results || []) as any[]) {
+      const uid = Number(s.user_id)
+      const amount = Number(s.amount) || 0
+      const rate = Number(s.daily_rate) || 0
+      const rewardedCount = Number(s.rewarded_count) || 0
+      const periodDays = Number(s.period_days) || (Number(s.period_months) * 30) || 0
+
+      if (periodDays > 0 && rewardedCount >= periodDays) continue
+
+      const stakeTotal = stakeTotalByUser.get(uid) || 0
+      const paidTotal = paidTotalByUser.get(uid) || 0
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      const isCapped = target > 0 && paidTotal >= target
+
+      if (isCapped) {
+        cappedSkipCount++
+        if (!cappedSkipUsers.includes(uid)) cappedSkipUsers.push(uid)
+        const cur = ownByUser.get(uid) || { user_id: uid, own_daily: 0, staking_count: 0, capped: true }
+        cur.capped = true
+        cur.staking_count++
+        ownByUser.set(uid, cur)
+        continue
+      }
+
+      let qkeyAmount = Math.round(amount * rate * USD_TO_QKEY)
+      const remaining = target - paidTotal
+      if (target > 0 && qkeyAmount > remaining) {
+        qkeyAmount = Math.max(0, Math.floor(remaining))
+      }
+
+      const cur = ownByUser.get(uid) || { user_id: uid, own_daily: 0, staking_count: 0, capped: false }
+      cur.own_daily += qkeyAmount
+      cur.staking_count++
+      ownByUser.set(uid, cur)
+      totalOwnDaily += qkeyAmount
+    }
+
+    // STEP 3: 회원 referrer 관계 조회
+    const usersRaw = await db.prepare(`
+      SELECT id, name, email, referrer_id FROM users
+    `).all()
+    const userInfo = new Map<number, { name: string, email: string, referrer_id: number | null }>()
+    for (const u of (usersRaw.results || []) as any[]) {
+      userInfo.set(Number(u.id), {
+        name: String(u.name || ''),
+        email: String(u.email || ''),
+        referrer_id: u.referrer_id != null ? Number(u.referrer_id) : null,
+      })
+    }
+
+    // STEP 4: bottom-up 매칭 보너스 산출
+    const activeStakingUsersRaw = await db.prepare(`
+      SELECT DISTINCT user_id FROM staking
+      WHERE status = 'active'
+        AND date(end_date, '+9 hours') >= date(?)
+        AND date(start_date, '+9 hours') <= date(?)
+    `).bind(yesterdayKst, yesterdayKst).all()
+    const activeStakingUserSet = new Set<number>()
+    for (const r of (activeStakingUsersRaw.results || []) as any[]) {
+      activeStakingUserSet.add(Number(r.user_id))
+    }
+
+    type MatchEntry = {
+      l1_match: number, l2_match: number,
+      l1_contributors: { user_id: number, contribution: number }[],
+      l2_contributors: { user_id: number, contribution: number }[],
+    }
+    const matchByUser = new Map<number, MatchEntry>()
+
+    function computeDepth(uid: number, memo: Map<number, number>, stack: Set<number>): number {
+      if (memo.has(uid)) return memo.get(uid)!
+      if (stack.has(uid)) { memo.set(uid, 0); return 0 }
+      stack.add(uid)
+      const info = userInfo.get(uid)
+      if (!info || info.referrer_id == null) {
+        memo.set(uid, 0)
+        stack.delete(uid)
+        return 0
+      }
+      const d = 1 + computeDepth(info.referrer_id, memo, stack)
+      memo.set(uid, d)
+      stack.delete(uid)
+      return d
+    }
+    const depthMemo = new Map<number, number>()
+    const ownEntries = Array.from(ownByUser.values())
+    for (const e of ownEntries) computeDepth(e.user_id, depthMemo, new Set())
+    ownEntries.sort((a, b) => (depthMemo.get(b.user_id) || 0) - (depthMemo.get(a.user_id) || 0))
+
+    for (const child of ownEntries) {
+      if (child.own_daily <= 0) continue
+      const childInfo = userInfo.get(child.user_id)
+      if (!childInfo) continue
+
+      const parentId = childInfo.referrer_id
+      if (parentId != null && activeStakingUserSet.has(parentId)) {
+        const contribution = Math.round(child.own_daily * 0.20)
+        if (contribution > 0) {
+          const m = matchByUser.get(parentId) || { l1_match: 0, l2_match: 0, l1_contributors: [], l2_contributors: [] }
+          m.l1_match += contribution
+          m.l1_contributors.push({ user_id: child.user_id, contribution })
+          matchByUser.set(parentId, m)
+        }
+      }
+
+      const parentInfo = parentId != null ? userInfo.get(parentId) : null
+      const grandId = parentInfo ? parentInfo.referrer_id : null
+      if (grandId != null && activeStakingUserSet.has(grandId)) {
+        const contribution = Math.round(child.own_daily * 0.10)
+        if (contribution > 0) {
+          const m = matchByUser.get(grandId) || { l1_match: 0, l2_match: 0, l1_contributors: [], l2_contributors: [] }
+          m.l2_match += contribution
+          m.l2_contributors.push({ user_id: child.user_id, contribution })
+          matchByUser.set(grandId, m)
+        }
+      }
+    }
+
+    // STEP 5: 회원별 최종 예상 데일리 합 + cap 보정
+    type FinalEntry = {
+      user_id: number, name: string, email: string, depth: number,
+      staking_count: number, own_daily: number, l1_match: number, l2_match: number,
+      total_pre_cap: number, total_after_cap: number, capped: boolean,
+      paid_total: number, target: number, remaining_before: number,
+      l1_contributors: { user_id: number, contribution: number }[],
+      l2_contributors: { user_id: number, contribution: number }[],
+    }
+    const finalList: FinalEntry[] = []
+
+    const allUserIds = new Set<number>()
+    for (const u of ownByUser.keys()) allUserIds.add(u)
+    for (const u of matchByUser.keys()) allUserIds.add(u)
+
+    let grandTotalOwn = 0, grandTotalL1 = 0, grandTotalL2 = 0, grandTotalFinal = 0
+
+    for (const uid of allUserIds) {
+      const own = ownByUser.get(uid)
+      const match = matchByUser.get(uid) || { l1_match: 0, l2_match: 0, l1_contributors: [], l2_contributors: [] }
+      const info = userInfo.get(uid)
+      const stakeTotal = stakeTotalByUser.get(uid) || 0
+      const paidTotal = paidTotalByUser.get(uid) || 0
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      const remaining = Math.max(0, target - paidTotal)
+      const isCappedAlready = !!own?.capped || (target > 0 && paidTotal >= target)
+
+      const ownDaily = own?.own_daily || 0
+      const totalPreCap = ownDaily + match.l1_match + match.l2_match
+
+      let totalAfterCap = totalPreCap
+      if (isCappedAlready) totalAfterCap = 0
+      else if (target > 0 && totalPreCap > remaining) totalAfterCap = remaining
+
+      grandTotalOwn += ownDaily
+      grandTotalL1 += match.l1_match
+      grandTotalL2 += match.l2_match
+      grandTotalFinal += totalAfterCap
+
+      finalList.push({
+        user_id: uid,
+        name: info?.name || '',
+        email: info?.email || '',
+        depth: depthMemo.get(uid) || 0,
+        staking_count: own?.staking_count || 0,
+        own_daily: ownDaily,
+        l1_match: match.l1_match,
+        l2_match: match.l2_match,
+        total_pre_cap: totalPreCap,
+        total_after_cap: totalAfterCap,
+        capped: isCappedAlready,
+        paid_total: paidTotal,
+        target,
+        remaining_before: remaining,
+        l1_contributors: match.l1_contributors,
+        l2_contributors: match.l2_contributors,
+      })
+    }
+
+    finalList.sort((a, b) => b.total_after_cap - a.total_after_cap)
+
+    return c.json({
+      success: true,
+      note: '사장님 영구 룰 (2026-05-12): bottom-up 순회, read-only, DB 무변경',
+      target_date: targetDate,
+      yesterday_kst: yesterdayKst,
+      active_staking_user_count: activeStakingUserSet.size,
+      active_staking_row_count: (activeRows.results || []).length,
+      capped_skip_count: cappedSkipCount,
+      capped_skip_users: cappedSkipUsers,
+      grand_totals: {
+        own_daily: grandTotalOwn,
+        l1_match: grandTotalL1,
+        l2_match: grandTotalL2,
+        final_after_cap: grandTotalFinal,
+      },
+      user_count: finalList.length,
+      list: finalList,
+    })
+  } catch (error) {
+    console.error('daily-preview-bottom-up error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧 산하 조직원 데일리 + L1/L2 매칭 배당 정합성 일괄 분석 — 사장님 GO 결재 (2026-05-12, read-only) ★★★
 //   경로: GET /api/diag/solbat-downline-audit?key=ADMIN_PW
 //   목적: 솔밧(u#44) 산하 전체 조직원(L1/L2/L3+ 모두) 의 배당 정합성 정밀 진단
