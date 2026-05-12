@@ -5966,6 +5966,166 @@ app.get('/api/diag/solbat-l2-trace', async (c) => {
   }
 })
 
+// ★★★ 솔밧 L2 5/04일 진입자 매핑 검증 — D안-2 결재 (2026-05-12, read-only) ★★★
+//   경로: /api/diag/solbat-l2-may04-verify?key=ADMIN_PW
+//   목적: 사장님 엑셀 1,950 (5/04일 2대 정상 발생액) 진실 기준 검증
+//   - 솔밧(u#44) 의 1대(직추천) 회원 명단 → 그 회원들의 1대(=솔밧의 2대) 회원 명단
+//   - 각 2대 회원의 5/04일 신규 스테이킹 → 정상 L2 발생액 계산 (10% of L1 보너스)
+//   - tx KST 5/11 07시대 7건 (cron) vs 09시대 6건 (Phase 3) 양쪽 매칭 비교
+//   - referee 별 1:1 분포로 어느 쪽이 진실 데이터인지 판정
+//   - 잔액(qkey_balance) / DB UPDATE 0건 — 순수 SELECT 만
+app.get('/api/diag/solbat-l2-may04-verify', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+    const ENTRY_DATE = '2026-05-04'  // 사장님 엑셀 기준 진입일
+
+    // 1) 솔밧 직추천(L1) 회원 명단
+    const l1Users = await db.prepare(`
+      SELECT id, name, email, referrer_id, created_at,
+             datetime(created_at, '+9 hours') AS created_kst
+      FROM users
+      WHERE referrer_id = ?
+      ORDER BY id ASC
+    `).bind(SOLBAT_ID).all()
+
+    // 2) 솔밧 2대(=L1 회원들의 직추천) 명단
+    const l2Users = await db.prepare(`
+      SELECT u.id, u.name, u.email, u.referrer_id AS l1_id,
+             datetime(u.created_at, '+9 hours') AS created_kst,
+             date(u.created_at, '+9 hours') AS created_kst_date,
+             l1.name AS l1_name
+      FROM users u
+      JOIN users l1 ON u.referrer_id = l1.id
+      WHERE l1.referrer_id = ?
+      ORDER BY u.created_at ASC, u.id ASC
+    `).bind(SOLBAT_ID).all()
+
+    // 3) 2대 회원들 중 5/04 KST 진입자 + 각자 5/04 스테이킹
+    const may04L2: any[] = []
+    for (const u of (l2Users.results || [])) {
+      const uu: any = u
+      if (uu.created_kst_date !== ENTRY_DATE) continue
+      const stakes = await db.prepare(`
+        SELECT id, amount, status,
+               datetime(created_at, '+9 hours') AS staked_kst,
+               date(created_at, '+9 hours') AS staked_kst_date
+        FROM staking
+        WHERE user_id = ? AND date(created_at, '+9 hours') = ?
+        ORDER BY created_at ASC
+      `).bind(uu.id, ENTRY_DATE).all()
+      may04L2.push({ ...uu, stakes: stakes.results || [] })
+    }
+
+    // 4) 5/04 진입 2대 회원에 대한 referral_rewards 원장 행 (솔밧이 받은 L2 보너스)
+    const rrLedger = await db.prepare(`
+      SELECT rr.id AS ref_id, rr.referee_id, rr.original_amount, rr.reward_amount,
+             rr.reward_date, rr.paid_date,
+             datetime(rr.created_at, '+9 hours') AS rr_created_kst,
+             u.name AS referee_name, u.email AS referee_email,
+             date(u.created_at, '+9 hours') AS referee_entry_kst_date
+      FROM referral_rewards rr
+      JOIN users u ON rr.referee_id = u.id
+      WHERE rr.referrer_id = ? AND rr.level = 2
+        AND date(u.created_at, '+9 hours') = ?
+      ORDER BY rr.id ASC
+    `).bind(SOLBAT_ID, ENTRY_DATE).all()
+
+    // 5) tx KST 5/11 자 솔밧 L2 행 전체 (07시대 vs 09시대)
+    const txMay11 = await db.prepare(`
+      SELECT id, amount, ref_id, created_at AS created_at_utc,
+             datetime(created_at, '+9 hours') AS created_at_kst,
+             substr(datetime(created_at, '+9 hours'), 12, 2) AS kst_hour
+      FROM transactions
+      WHERE user_id = ? AND type = 'referral_reward'
+        AND description LIKE '%Level 2%'
+        AND date(created_at, '+9 hours') = '2026-05-11'
+      ORDER BY datetime(created_at, '+9 hours') ASC, id ASC
+    `).bind(SOLBAT_ID).all()
+    const txRows = txMay11.results || []
+    const tx07 = txRows.filter((r: any) => r.kst_hour === '07')
+    const tx09 = txRows.filter((r: any) => r.kst_hour === '09')
+
+    // 6) 정상 발생액 계산 (5/04 진입 2대 회원 stakes 기준, L2 = original_amount * 7.5%)
+    //    Q: 75 = $1000 * 7.5% (1대 $5 일일 + 2대 = 본인 진입 보너스), 1500 = $10000 * 15%
+    //    사장님 엑셀 패턴: 1대 진입 보너스 → 솔밧 L2 = original_amount * 0.075
+    let expectedTotal = 0
+    const expectedRows: any[] = []
+    for (const u of may04L2) {
+      for (const s of u.stakes) {
+        const amt = Number(s.amount)
+        // 사장님 엑셀 룰: $1000→75, $2000→150, $10000→1500 (즉 7.5%)
+        const expected = Math.round(amt * 0.075)
+        expectedTotal += expected
+        expectedRows.push({
+          referee_id: u.id, referee_name: u.name, l1_id: u.l1_id, l1_name: u.l1_name,
+          staking_id: s.id, staking_amount: amt,
+          expected_l2_qkey: expected,
+        })
+      }
+    }
+
+    // 7) referee_id 별 분포 비교 (07시대 cron tx vs 09시대 Phase3 tx vs 원장 vs 기대값)
+    //    07시대 NULL ref 는 referee 모름 → amount 분포만 비교
+    const sum07 = tx07.reduce((a: number, r: any) => a + Number(r.amount), 0)
+    const sum09 = tx09.reduce((a: number, r: any) => a + Number(r.amount), 0)
+    const sumLedger = (rrLedger.results || []).reduce((a: number, r: any) => a + Number(r.reward_amount), 0)
+
+    // 07시대 ref_id 있는 행 → referee_id 매핑
+    const tx07WithRef: any[] = []
+    for (const r of tx07) {
+      const rr: any = r
+      if (rr.ref_id) {
+        const led: any = await db.prepare(`SELECT referee_id FROM referral_rewards WHERE id = ?`).bind(rr.ref_id).first()
+        tx07WithRef.push({ tx_id: rr.id, ref_id: rr.ref_id, amount: rr.amount, referee_id: led && led.referee_id })
+      } else {
+        tx07WithRef.push({ tx_id: rr.id, ref_id: null, amount: rr.amount, referee_id: null })
+      }
+    }
+
+    // 09시대 ref_id → referee_id 매핑
+    const tx09WithRef: any[] = []
+    for (const r of tx09) {
+      const rr: any = r
+      const led: any = await db.prepare(`SELECT referee_id FROM referral_rewards WHERE id = ?`).bind(rr.ref_id).first()
+      tx09WithRef.push({ tx_id: rr.id, ref_id: rr.ref_id, amount: rr.amount, referee_id: led && led.referee_id })
+    }
+
+    // 8) 판정 요약
+    const verdict: any = {
+      excel_truth: 1950,
+      tx_07_sum: sum07,
+      tx_09_sum: sum09,
+      ledger_sum_may04_entrants: sumLedger,
+      expected_sum_from_stakes: expectedTotal,
+      tx_07_matches_excel: sum07 === 1950,
+      tx_09_matches_excel: sum09 === 1950,
+      conclusion_hint: sum07 === 1950 ? '07시대 cron 7건이 정상, 09시대 6건이 사후 중복 의심' :
+                       sum09 === 1950 ? '09시대 Phase 3 6건이 정상, 07시대 7건이 사후 중복 의심' :
+                       '양쪽 모두 엑셀 1,950 과 불일치 — 추가 분석 필요',
+    }
+
+    return c.json({
+      success: true,
+      target: { user_id: SOLBAT_ID, entry_date: ENTRY_DATE },
+      l1_user_count: (l1Users.results || []).length,
+      l2_user_total: (l2Users.results || []).length,
+      may04_l2_entrants: may04L2,
+      expected_l2_rewards: { rows: expectedRows, total: expectedTotal },
+      ledger_may04_entrants: rrLedger.results,
+      tx_07_kst_cron: tx07WithRef,
+      tx_09_kst_phase3: tx09WithRef,
+      verdict,
+      note: 'read-only — DB/잔액 무변경 보장. 사장님 엑셀 1,950 이 진실 기준.',
+    })
+  } catch (error) {
+    console.error('solbat-l2-may04-verify error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
 //   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
 app.get('/api/diag/search-user', async (c) => {
