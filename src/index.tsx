@@ -21792,4 +21792,166 @@ app.post('/api/diag/exec-fix-solbat-may8-l1l2-missing', async (c) => {
   }
 })
 
+// ========================================================================
+// /api/diag/audit-may8-matching-missing
+// ------------------------------------------------------------------------
+// 목적: 5/8 reward_date 매칭 보너스 누락 전수 진단 (read-only)
+//
+// 사장님 지적 (2026-05-12):
+//   "2천달라 하부에 오늘날짜로 150개가 쌓여야 하는데 1명꺼가 75만 들어가 있을꺼야
+//    그걸 밝혀내 하부 데일리 배당내역하고"
+//
+// 진단 로직 (영구 룰 #3 ★★★ 0순위 bottom-up):
+//   STEP 1: 5/8 daily_rewards 가 발생한 모든 user 의 reward_date=2026-05-08 daily 합계 산출
+//           (= 각 user 의 5/8 하부 데일리 사실)
+//   STEP 2: 각 user 의 referrer (L1 부모) / 조부모 (L2 부모) 매칭 정답 계산
+//           L1 정답 = user_5/8_daily_sum × 0.20
+//           L2 정답 = user_5/8_daily_sum × 0.10
+//   STEP 3: referral_rewards WHERE reward_date='2026-05-08' AND referee_id=user AND level=1/2 합계 조회
+//   STEP 4: 정답 vs DB 차이 = 누락 금액
+//
+// 출력: 누락 발생한 (referrer, referee, level) 명단 + 누락 합계 + 영향 받는 사용자 수
+//
+// gate: key=ADMIN_PW (read-only)
+// ========================================================================
+app.get('/api/diag/audit-may8-matching-missing', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const REWARD_DATE = '2026-05-08'
+
+    // STEP 1: 5/8 daily 발생자 + 각자의 daily 합계 (= 하부 데일리 사실)
+    const drAgg = await db.prepare(`
+      SELECT user_id, SUM(usdt_amount) AS daily_sum, COUNT(*) AS staking_count
+      FROM daily_rewards
+      WHERE reward_date = ?
+      GROUP BY user_id
+      HAVING SUM(usdt_amount) > 0
+      ORDER BY user_id
+    `).bind(REWARD_DATE).all()
+    const dailyByUser = (drAgg.results || []) as any[]
+
+    // STEP 2: 각 user 의 referrer (L1 부모) 조회
+    const userIds = dailyByUser.map(r => Number(r.user_id))
+    if (userIds.length === 0) {
+      return c.json({ success: true, message: 'no 5/8 daily', total_missing: 0, items: [] })
+    }
+    const placeholders = userIds.map(() => '?').join(',')
+    const refMap = await db.prepare(`
+      SELECT id, referrer_id FROM users WHERE id IN (${placeholders})
+    `).bind(...userIds).all()
+    const refRows = (refMap.results || []) as any[]
+    const userToRef: Record<number, number | null> = {}
+    for (const r of refRows) {
+      userToRef[Number(r.id)] = r.referrer_id ? Number(r.referrer_id) : null
+    }
+
+    // L2 부모 = referrer 의 referrer
+    const l1Parents = new Set<number>()
+    for (const uid of userIds) {
+      const p = userToRef[uid]
+      if (p) l1Parents.add(p)
+    }
+    let l2Map: Record<number, number | null> = {}
+    if (l1Parents.size > 0) {
+      const ph = Array.from(l1Parents).map(() => '?').join(',')
+      const l2q = await db.prepare(`
+        SELECT id, referrer_id FROM users WHERE id IN (${ph})
+      `).bind(...Array.from(l1Parents)).all()
+      for (const r of (l2q.results || []) as any[]) {
+        l2Map[Number(r.id)] = r.referrer_id ? Number(r.referrer_id) : null
+      }
+    }
+
+    // STEP 3 & 4: 각 referee 별 L1/L2 정답 vs DB 비교
+    const items: any[] = []
+    let totalMissingL1 = 0
+    let totalMissingL2 = 0
+    let affectedReferrers = new Set<number>()
+
+    for (const row of dailyByUser) {
+      const refereeId = Number(row.user_id)
+      const dailySum = Number(row.daily_sum) || 0
+      const stakingCount = Number(row.staking_count) || 0
+      const l1Parent = userToRef[refereeId]
+      const l2Parent = l1Parent ? l2Map[l1Parent] : null
+
+      // L1 정답
+      if (l1Parent) {
+        const l1Truth = Math.floor(dailySum * 0.20)
+        const l1Db = await db.prepare(`
+          SELECT COALESCE(SUM(reward_amount), 0) AS s
+          FROM referral_rewards
+          WHERE referrer_id = ? AND referee_id = ? AND level = 1 AND reward_date = ?
+        `).bind(l1Parent, refereeId, REWARD_DATE).first() as any
+        const l1Cur = Number(l1Db?.s || 0)
+        const l1Missing = Math.max(0, l1Truth - l1Cur)
+        if (l1Missing > 0) {
+          items.push({
+            referee_id: refereeId,
+            referee_daily_sum: dailySum,
+            staking_count: stakingCount,
+            level: 1,
+            referrer_id: l1Parent,
+            truth: l1Truth,
+            db_current: l1Cur,
+            missing: l1Missing
+          })
+          totalMissingL1 += l1Missing
+          affectedReferrers.add(l1Parent)
+        }
+      }
+
+      // L2 정답
+      if (l2Parent) {
+        const l2Truth = Math.floor(dailySum * 0.10)
+        const l2Db = await db.prepare(`
+          SELECT COALESCE(SUM(reward_amount), 0) AS s
+          FROM referral_rewards
+          WHERE referrer_id = ? AND referee_id = ? AND level = 2 AND reward_date = ?
+        `).bind(l2Parent, refereeId, REWARD_DATE).first() as any
+        const l2Cur = Number(l2Db?.s || 0)
+        const l2Missing = Math.max(0, l2Truth - l2Cur)
+        if (l2Missing > 0) {
+          items.push({
+            referee_id: refereeId,
+            referee_daily_sum: dailySum,
+            staking_count: stakingCount,
+            level: 2,
+            referrer_id: l2Parent,
+            truth: l2Truth,
+            db_current: l2Cur,
+            missing: l2Missing
+          })
+          totalMissingL2 += l2Missing
+          affectedReferrers.add(l2Parent)
+        }
+      }
+    }
+
+    // 정렬: referrer_id, level, referee_id
+    items.sort((a, b) => a.referrer_id - b.referrer_id || a.level - b.level || a.referee_id - b.referee_id)
+
+    return c.json({
+      success: true,
+      reward_date: REWARD_DATE,
+      summary: {
+        total_referee_with_daily: dailyByUser.length,
+        total_missing_l1: totalMissingL1,
+        total_missing_l2: totalMissingL2,
+        total_missing_qkey: totalMissingL1 + totalMissingL2,
+        affected_referrers_count: affectedReferrers.size,
+        affected_referrer_ids: Array.from(affectedReferrers).sort((a, b) => a - b),
+        missing_item_count: items.length
+      },
+      items,
+      note: '영구 룰 #3 ★★★ 0순위 bottom-up: 각 referee 5/8 daily 사실 확정 후 referrer 매칭 정답 산출 (L1=20%, L2=10%)'
+    })
+  } catch (error: any) {
+    console.error('audit-may8-matching-missing error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
