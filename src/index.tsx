@@ -6343,6 +6343,98 @@ app.post('/api/diag/exec-delete-solbat-phase3', async (c) => {
   }
 })
 
+// ★★★ 솔밧 L2 referee 6건 staking 금액 정밀 확인 — 사장님 지시 (2026-05-12, read-only) ★★★
+//   경로: GET /api/diag/solbat-l2-referee-stakes?key=ADMIN_PW
+//   목적: ref_id 688,698,725,729,731,773 의 referee 각자 staking 진입 금액 확인
+//   - 사장님 지시: "6명중 1명이 2천달라면 150이 되야하는데 75로 계산했자나"
+//   - referee_id 별 모든 staking 행 + amount 확인
+//   - 정상 L2 = original_amount * 7.5% 인지 검증 ($2,000 → 150, $1,000 → 75)
+//   - read-only: DB UPDATE 0건
+app.get('/api/diag/solbat-l2-referee-stakes', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const REF_IDS = [688, 698, 725, 729, 731, 773]
+    const placeholders = REF_IDS.map(() => '?').join(',')
+
+    // 1) 원장 6행 + referee 정보
+    const rrRows = await db.prepare(`
+      SELECT rr.id AS ref_id, rr.referee_id, rr.original_amount, rr.reward_amount,
+             rr.reward_date, rr.paid_date,
+             datetime(rr.created_at, '+9 hours') AS rr_kst,
+             u.name AS referee_name, u.email AS referee_email,
+             date(u.created_at, '+9 hours') AS referee_signup_kst
+      FROM referral_rewards rr
+      JOIN users u ON rr.referee_id = u.id
+      WHERE rr.id IN (${placeholders})
+      ORDER BY rr.id ASC
+    `).bind(...REF_IDS).all()
+
+    // 2) 각 referee 의 전체 staking 행 + 그 중 5/04 KST 진입분
+    const detailed: any[] = []
+    let totalExpected = 0
+    for (const r of (rrRows.results || [])) {
+      const rr: any = r
+      const stakes = await db.prepare(`
+        SELECT id, amount, status,
+               datetime(created_at, '+9 hours') AS staked_kst,
+               date(created_at, '+9 hours') AS staked_kst_date,
+               start_date, end_date
+        FROM staking
+        WHERE user_id = ?
+        ORDER BY created_at ASC
+      `).bind(rr.referee_id).all()
+
+      const stakeRows = (stakes.results || []) as any[]
+      const totalStakeAmount = stakeRows
+        .filter((s: any) => ['active', 'completed', 'capped'].includes(s.status))
+        .reduce((a: number, s: any) => a + Number(s.amount), 0)
+
+      // L2 정상값 = sum(staking.amount) * 0.075 (사장님 엑셀 룰: $1,000 → 75, $2,000 → 150)
+      const expectedL2 = Math.round(totalStakeAmount * 0.075)
+      const actualL2 = Number(rr.reward_amount)
+      const isCorrect = expectedL2 === actualL2
+      if (!isCorrect) totalExpected += (expectedL2 - actualL2)
+
+      detailed.push({
+        ref_id: rr.ref_id,
+        referee: { id: rr.referee_id, name: rr.referee_name, email: rr.referee_email, signup_kst: rr.referee_signup_kst },
+        ledger: {
+          original_amount: rr.original_amount,
+          reward_amount: actualL2,
+          reward_date: rr.reward_date,
+          paid_date: rr.paid_date,
+          rr_kst: rr.rr_kst,
+        },
+        stakes: stakeRows,
+        total_stake_amount: totalStakeAmount,
+        expected_l2_qkey: expectedL2,
+        actual_l2_qkey: actualL2,
+        diff: expectedL2 - actualL2,
+        is_correct: isCorrect,
+        action_required: isCorrect ? null : `reward_amount ${actualL2} → ${expectedL2} (+${expectedL2 - actualL2})`,
+      })
+    }
+
+    return c.json({
+      success: true,
+      target_ref_ids: REF_IDS,
+      summary: {
+        total_ref_count: REF_IDS.length,
+        correct_count: detailed.filter(d => d.is_correct).length,
+        incorrect_count: detailed.filter(d => !d.is_correct).length,
+        total_diff_to_add: totalExpected,
+      },
+      detailed,
+      note: 'read-only — DB 무변경. 사장님 지시: 6명중 1명이 $2,000 → L2=150 인데 75 인지 확인',
+    })
+  } catch (error) {
+    console.error('solbat-l2-referee-stakes error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧 L2 Phase 3 6건 원복 (사장님 명시 지시 2026-05-12: 어제처럼 1,950으로 돌려놔) ★★★
 //   경로: POST /api/diag/restore-solbat-phase3?key=ADMIN_PW&confirm=GO
 //   목적: exec-delete-solbat-phase3 으로 DELETE 된 6건을 원복 (INSERT) + qkey_balance +1,875
