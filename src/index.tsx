@@ -22837,7 +22837,11 @@ app.get('/api/diag/fix-holiday-entrant-512-daily', async (c) => {
     const db = c.env.DB
     const TARGET_DATE = '2026-05-12'
     const PAID_DATE = '2026-05-12'
-    const TARGET_STAKINGS = [97, 94, 95, 96, 98] // 5/9+5/10 휴일진입 5건
+    const ALL_TARGET_STAKINGS = [97, 94, 95, 96, 98] // 5/9+5/10 휴일진입 5건
+    const onlyParam = c.req.query('only') || ''
+    const TARGET_STAKINGS = onlyParam
+      ? onlyParam.split(',').map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => ALL_TARGET_STAKINGS.includes(n))
+      : ALL_TARGET_STAKINGS
 
     // 사전 검증: 대상 staking 정보 + 이미 지급 여부 + 중복 ref_id 가드
     const preview: any[] = []
