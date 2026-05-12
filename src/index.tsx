@@ -21954,4 +21954,97 @@ app.get('/api/diag/audit-may8-matching-missing', async (c) => {
   }
 })
 
+// ========================================================================
+// /api/diag/audit-tx-double-kst
+// ------------------------------------------------------------------------
+// 목적: transactions.created_at 이중 KST 변환 의심 행 read-only 식별
+//
+// 배경:
+//   - 어드민 user-detail 쿼리는 datetime(created_at,'+9 hours') 로 일괄 변환
+//   - 그런데 일부 INSERT 코드 (L7323, L7417) 가 created_at 에
+//     `${paid_date} 00:00:00` (= KST 00:00 으로 추정) 또는 KST 시각 그대로 박음
+//   - 결과: 어드민에서 +9h 한 번 더 적용 → 미래 일자 (5/13 03:05 등) 표시
+//
+// 식별 로직 (read-only, 추측 산식 0건):
+//   1. 정상 UTC 저장 행: cron 실행 시 datetime('now') 결과 → 일반적으로 22:xx UTC 또는 21:xx UTC
+//      → +9h 적용 시 자연스러운 KST 시각 (06:xx ~ 08:xx 등)
+//   2. KST 시각 그대로 저장된 의심 행:
+//      - created_at 이 정확히 YYYY-MM-DD 00:00:00 (Phase 4 안전 재실행 INSERT 패턴)
+//      - 또는 created_at 이 미래 KST 일자에 너무 가까운 경우 (현재 2026-05-12 KST 후반)
+//
+// gate: key=ADMIN_PW (read-only)
+// ========================================================================
+app.get('/api/diag/audit-tx-double-kst', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // STEP 1: created_at 이 정확히 'YYYY-MM-DD 00:00:00' 패턴 (KST 자정 그대로 박힌 의심 행)
+    const pattern00 = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, created_at,
+             datetime(created_at,'+9 hours') AS admin_displayed_kst
+      FROM transactions
+      WHERE substr(created_at, 12, 8) = '00:00:00'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 50
+    `).all()
+
+    // STEP 2: ref_id 가 referral_rewards 의 5/11 reward_date 행을 가리키는 의심 tx
+    //   (Phase 4 안전 재실행 시 L7323/L7417 패턴으로 INSERT 된 행)
+    const phase4Susp = await db.prepare(`
+      SELECT t.id, t.user_id, t.type, t.amount, t.description, t.ref_id, t.created_at,
+             datetime(t.created_at,'+9 hours') AS admin_displayed_kst,
+             r.reward_date AS rr_reward_date, r.paid_date AS rr_paid_date, r.level AS rr_level
+      FROM transactions t
+      LEFT JOIN referral_rewards r ON t.ref_id = r.id
+      WHERE t.type = 'referral_reward'
+        AND t.created_at >= '2026-05-11 00:00:00'
+        AND substr(t.created_at, 12, 8) = '00:00:00'
+      ORDER BY t.id DESC
+      LIMIT 200
+    `).all()
+
+    // STEP 3: 어드민 표시 일자 기준 미래 일자 행 (2026-05-13 이후)
+    const futureRows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at,
+             datetime(created_at,'+9 hours') AS admin_displayed_kst
+      FROM transactions
+      WHERE datetime(created_at,'+9 hours') >= '2026-05-13 00:00:00'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 100
+    `).all()
+
+    // STEP 4: 통계
+    const stat = await db.prepare(`
+      SELECT
+        COUNT(*) AS total_tx,
+        SUM(CASE WHEN substr(created_at,12,8) = '00:00:00' THEN 1 ELSE 0 END) AS midnight_kst_susp,
+        SUM(CASE WHEN datetime(created_at,'+9 hours') >= '2026-05-13 00:00:00' THEN 1 ELSE 0 END) AS future_display
+      FROM transactions
+    `).first() as any
+
+    return c.json({
+      success: true,
+      stats: stat,
+      pattern_00_00_00: {
+        count: (pattern00.results || []).length,
+        rows: pattern00.results || []
+      },
+      phase4_suspect: {
+        count: (phase4Susp.results || []).length,
+        rows: phase4Susp.results || []
+      },
+      future_display_after_5_13: {
+        count: (futureRows.results || []).length,
+        rows: futureRows.results || []
+      },
+      note: 'KST 시각으로 저장된 의심 행: +9h 어드민 쿼리 거치면 미래 일자 표시. 정답은 UTC 저장 + 어드민 +9h 변환 일관성.'
+    })
+  } catch (error: any) {
+    console.error('audit-tx-double-kst error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
