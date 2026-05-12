@@ -6426,10 +6426,10 @@ app.get('/api/diag/solbat-downline-audit', async (c) => {
     `).bind(...allIds).all()
 
     // 3) daily_rewards 원장 vs tx 미러 정합성
-    //    daily_rewards 1행 ↔ transactions 1행 (type='daily_reward')
-    //    description 패턴이 일정하지 않을 수 있으므로 (user_id, reward_date, amount) 3중 매칭
+    //    daily_rewards 컬럼: user_id, staking_id, usdt_amount, reward_date, paid_date (QKEY 컬럼 없음)
+    //    tx 'daily_reward' QKEY 행과 1:1 매칭 (건수 기준) — 원장 1행 ↔ tx 1행
     const dailyLedgerCount = await db.prepare(`
-      SELECT user_id, COUNT(*) AS cnt, SUM(qkey_amount) AS sum_qkey
+      SELECT user_id, COUNT(*) AS cnt, SUM(usdt_amount) AS sum_usdt
       FROM daily_rewards
       WHERE user_id IN (${idPlaceholders})
       GROUP BY user_id
@@ -6455,12 +6455,12 @@ app.get('/api/diag/solbat-downline-audit', async (c) => {
     const dailyLedgerMap: Record<number, any> = {}
     for (const r of (dailyLedgerCount.results || [])) {
       const rr: any = r
-      dailyLedgerMap[rr.user_id] = { cnt: rr.cnt, sum: rr.sum_qkey }
+      dailyLedgerMap[rr.user_id] = { cnt: rr.cnt, sum_usdt: rr.sum_usdt }
     }
     const dailyTxMap: Record<number, any> = {}
     for (const r of (dailyTxCount.results || [])) {
       const rr: any = r
-      dailyTxMap[rr.user_id] = { cnt: rr.cnt, sum: rr.sum_qkey }
+      dailyTxMap[rr.user_id] = { cnt: rr.cnt, sum_qkey: rr.sum_qkey }
     }
     const rrMissingMap: Record<number, any[]> = {}
     for (const r of (rrMissingTx.results || [])) {
@@ -6498,12 +6498,12 @@ app.get('/api/diag/solbat-downline-audit', async (c) => {
       const ghostBadCnt = (txGhostBadRefMap[uid] || []).length
       const ghostBadSum = (txGhostBadRefMap[uid] || []).reduce((a, r) => a + Number(r.amount), 0)
 
-      const dailyDiff = Number(dailyT.sum || 0) - Number(dailyL.sum || 0)
+      const dailyCntDiff = Number(dailyT.cnt || 0) - Number(dailyL.cnt || 0)
       const issues: string[] = []
       if (rrMissCnt > 0) issues.push(`referral_rewards 원장 ${rrMissCnt}건/${rrMissSum} QKEY tx 미러 누락`)
       if (ghostNullCnt > 0) issues.push(`tx ref_id NULL 유령 ${ghostNullCnt}건/${ghostNullSum} QKEY`)
       if (ghostBadCnt > 0) issues.push(`tx ref_id 원장 매칭 실패 ${ghostBadCnt}건/${ghostBadSum} QKEY`)
-      if (dailyDiff !== 0) issues.push(`daily_rewards 합계 불일치: tx ${dailyT.sum} vs 원장 ${dailyL.sum} (diff=${dailyDiff})`)
+      if (dailyCntDiff !== 0) issues.push(`daily_rewards 건수 불일치: tx ${dailyT.cnt}건 vs 원장 ${dailyL.cnt}건 (diff=${dailyCntDiff})`)
 
       userSummary.push({
         id: uid,
@@ -6511,7 +6511,7 @@ app.get('/api/diag/solbat-downline-audit', async (c) => {
         email: uu.email,
         level,
         qkey_balance: uu.qkey_balance,
-        daily: { ledger: dailyL, tx: dailyT, diff: dailyDiff },
+        daily: { ledger: dailyL, tx: dailyT, count_diff: dailyCntDiff },
         referral_missing_tx: { count: rrMissCnt, sum: rrMissSum, rows: rrMissingMap[uid] || [] },
         tx_ghost_null_ref: { count: ghostNullCnt, sum: ghostNullSum, rows: txGhostNullMap[uid] || [] },
         tx_ghost_bad_ref: { count: ghostBadCnt, sum: ghostBadSum, rows: txGhostBadRefMap[uid] || [] },
@@ -6531,7 +6531,7 @@ app.get('/api/diag/solbat-downline-audit', async (c) => {
       total_ghost_null_sum: userSummary.reduce((a, u) => a + u.tx_ghost_null_ref.sum, 0),
       total_ghost_bad_count: userSummary.reduce((a, u) => a + u.tx_ghost_bad_ref.count, 0),
       total_ghost_bad_sum: userSummary.reduce((a, u) => a + u.tx_ghost_bad_ref.sum, 0),
-      total_daily_diff: userSummary.reduce((a, u) => a + u.daily.diff, 0),
+      total_daily_count_diff: userSummary.reduce((a, u) => a + u.daily.count_diff, 0),
     }
 
     // 8) 레벨별 분포
