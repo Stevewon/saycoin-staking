@@ -240,6 +240,18 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.reward_section': '보상 정보',
     'admin.tx_section': '거래 내역',
     'admin.withdrawal_section': '출금 내역',
+    'admin.tx_type_daily_qkey': '일일 배당',
+    'admin.tx_type_daily_reward': '일일 배당',
+    'admin.tx_type_daily_reward_rollback': '일일 배당 회수',
+    'admin.tx_type_referral_reward': '추천 보너스',
+    'admin.tx_type_referral_reward_rollback': '추천 보너스 회수',
+    'admin.tx_type_direct_referral': '직판 수당',
+    'admin.tx_type_three_set_supplement': '3종 세트 보충',
+    'admin.tx_type_swap_in': '스왑 입금',
+    'admin.tx_type_swap_out': '스왑 출금',
+    'admin.tx_type_admin_adjustment': '관리자 조정',
+    'admin.tx_type_rollback_restore': '롤백 복원',
+    'admin.tx_type_shop_purchase': '상점 구매',
     'admin.referral_code_label': '추천코드',
     'admin.referral_code_short': '추천코드: ',
     'admin.referrer_label': '추천인',
@@ -14608,7 +14620,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260512c"></script>
+        <script src="/static/i18n.js?v=20260512d"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -15591,7 +15603,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260512c"></script>
+        <script src="/static/i18n.js?v=20260512d"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -17684,7 +17696,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260512c"></script>
+        <script src="/static/i18n.js?v=20260512d"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -18644,7 +18656,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260512c"></script>
+        <script src="/static/i18n.js?v=20260512d"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
@@ -19478,22 +19490,22 @@ app.get('/admin/dashboard', (c) => {
                         '<h4 class="font-bold text-gray-700 mb-2 text-sm"><i class="fas fa-exchange-alt mr-1 text-blue-600"></i>' + I18N.t('admin.tx_section') + ' (' + transactions.length + I18N.t('admin.cases_unit') + ')</h4>' +
                         (transactions.length > 0 ? '<div class="overflow-x-auto"><table class="w-full text-xs"><thead class="bg-gray-100"><tr><th class="px-2 py-1 text-left">' + I18N.t('admin.date_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.type_label') + '</th><th class="px-2 py-1">' + I18N.t('admin.coin_label') + '</th><th class="px-2 py-1 text-right">' + I18N.t('admin.qty_label') + '</th><th class="px-2 py-1 text-left">' + I18N.t('admin.desc_label') + '</th></tr></thead><tbody class="divide-y">' +
                             transactions.slice(0, 20).map(function(t) {
-                                // ★ KST(Asia/Seoul) 강제 — 사용자 화면과 동일하게 표시 (UTC 보임 버그 수정)
-                                //   기존: new Date(t.created_at).toLocaleDateString() → 브라우저 로케일 의존, UTC 22:54 → 5/6 으로 잘못 표시
-                                //   수정: 'YYYY-MM-DD HH:mm' KST 24h 풀표기 → 5/6 04:00 vs 5/7 07:54 명확 구분
+                                // ★★ 2026-05-12 이중 KST 변환 버그 FIX (사장님 지시)
+                                //   서버는 이미 datetime(created_at,'+9 hours') 적용해서 KST 로 보냄 (src/index.tsx L2913)
+                                //   여기서 'Z' 붙여 UTC 로 가정 후 다시 Asia/Seoul 변환 = +9h 이중 적용 → 5/13 표시 버그
+                                //   수정: 서버가 보낸 'YYYY-MM-DD HH:mm:ss' 문자열을 KST 그대로 표시 (추가 변환 금지)
                                 var tRaw = t.created_at;
-                                var tIso = (typeof tRaw === 'string' && tRaw.indexOf('T') === -1) ? (tRaw.replace(' ', 'T') + 'Z') : tRaw;
-                                var tDate = new Date(tIso);
                                 var tDateStr;
-                                if (isNaN(tDate.getTime())) {
-                                    tDateStr = (tRaw || '-');
+                                if (typeof tRaw === 'string' && tRaw.length >= 16) {
+                                    // 'YYYY-MM-DD HH:mm:ss' → 'YYYY-MM-DD HH:mm' (KST, 서버 변환값 그대로)
+                                    tDateStr = tRaw.substring(0, 10) + ' ' + tRaw.substring(11, 16);
                                 } else {
-                                    var parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(tDate);
-                                    var p = {};
-                                    for (var i = 0; i < parts.length; i++) { p[parts[i].type] = parts[i].value; }
-                                    tDateStr = p.year + '-' + p.month + '-' + p.day + ' ' + (p.hour === '24' ? '00' : p.hour) + ':' + p.minute;
+                                    tDateStr = tRaw || '-';
                                 }
-                                return '<tr><td class="px-2 py-1 whitespace-nowrap">' + tDateStr + '</td><td class="px-2 py-1 text-center">' + t.type + '</td><td class="px-2 py-1 text-center font-bold">' + t.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(t.amount).toLocaleString() + '</td><td class="px-2 py-1 truncate max-w-[150px]" title="' + esc(t.description || '') + '">' + esc(t.description || '-') + '</td></tr>';
+                                // ★★ 카테고리(type) 한국어 i18n 변환 — raw enum 노출 차단
+                                var typeText = I18N.t('admin.tx_type_' + (t.type || 'unknown'));
+                                if (typeText === 'admin.tx_type_' + (t.type || 'unknown')) typeText = (t.type || '-');
+                                return '<tr><td class="px-2 py-1 whitespace-nowrap">' + tDateStr + '</td><td class="px-2 py-1 text-center">' + esc(typeText) + '</td><td class="px-2 py-1 text-center font-bold">' + t.coin_type + '</td><td class="px-2 py-1 text-right">' + parseFloat(t.amount).toLocaleString() + '</td><td class="px-2 py-1 truncate max-w-[150px]" title="' + esc(t.description || '') + '">' + esc(t.description || '-') + '</td></tr>';
                             }).join('') +
                         '</tbody></table></div>' : '<p class="text-xs text-gray-500">' + I18N.t('admin.no_tx') + '</p>');
 

@@ -622,6 +622,20 @@ I18N._translations['ko'] = {
   'admin.wd_reject_confirm': '출금을 거절하시겠습니까?',
   'admin.wd_reject_fail': '출금 거절 실패',
   'admin.no_search_result': '검색 결과 없음',
+  // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
+  'admin.tx_type_daily_qkey': '일일 배당',
+  'admin.tx_type_daily_reward': '일일 배당',
+  'admin.tx_type_daily_reward_rollback': '일일 배당 회수',
+  'admin.tx_type_referral_reward': '추천 보너스',
+  'admin.tx_type_referral_reward_rollback': '추천 보너스 회수',
+  'admin.tx_type_direct_referral': '직판 수당',
+  'admin.tx_type_three_set_supplement': '3종 세트 보충',
+  'admin.tx_type_swap_in': '스왑 입금',
+  'admin.tx_type_swap_out': '스왑 출금',
+  'admin.tx_type_admin_adjustment': '관리자 조정',
+  'admin.tx_type_rollback_restore': '롤백 복원',
+  'admin.tx_type_shop_purchase': '상점 구매',
+
 };
 
 I18N._translations['en'] = {
@@ -919,6 +933,20 @@ I18N._translations['en'] = {
   'admin.password_placeholder': 'Enter password',
   'admin.search_email_name': 'Search by email or name',
   'admin.downline_search_placeholder': 'Enter name or email'
+  // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
+  'admin.tx_type_daily_qkey': 'Daily Reward',
+  'admin.tx_type_daily_reward': 'Daily Reward',
+  'admin.tx_type_daily_reward_rollback': 'Daily Reward Rollback',
+  'admin.tx_type_referral_reward': 'Referral Bonus',
+  'admin.tx_type_referral_reward_rollback': 'Referral Bonus Rollback',
+  'admin.tx_type_direct_referral': 'Direct Sales',
+  'admin.tx_type_three_set_supplement': '3-Set Supplement',
+  'admin.tx_type_swap_in': 'Swap In',
+  'admin.tx_type_swap_out': 'Swap Out',
+  'admin.tx_type_admin_adjustment': 'Admin Adjustment',
+  'admin.tx_type_rollback_restore': 'Rollback Restore',
+  'admin.tx_type_shop_purchase': 'Shop Purchase',
+
 };
 
 I18N._translations['ja'] = {
@@ -1216,6 +1244,20 @@ I18N._translations['ja'] = {
   'admin.password_placeholder': 'パスワードを入力',
   'admin.search_email_name': 'メールまたは名前で検索',
   'admin.downline_search_placeholder': '名前またはメールを入力'
+  // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
+  'admin.tx_type_daily_qkey': '日次配当',
+  'admin.tx_type_daily_reward': '日次配当',
+  'admin.tx_type_daily_reward_rollback': '日次配当ロールバック',
+  'admin.tx_type_referral_reward': '紹介ボーナス',
+  'admin.tx_type_referral_reward_rollback': '紹介ボーナスロールバック',
+  'admin.tx_type_direct_referral': '直販手当',
+  'admin.tx_type_three_set_supplement': '3点セット補充',
+  'admin.tx_type_swap_in': 'スワップ入金',
+  'admin.tx_type_swap_out': 'スワップ出金',
+  'admin.tx_type_admin_adjustment': '管理者調整',
+  'admin.tx_type_rollback_restore': 'ロールバック復元',
+  'admin.tx_type_shop_purchase': 'ショップ購入',
+
 };
 
 I18N._translations['zh'] = {
@@ -1513,6 +1555,20 @@ I18N._translations['zh'] = {
   'admin.password_placeholder': '输入密码',
   'admin.search_email_name': '按邮箱或姓名搜索',
   'admin.downline_search_placeholder': '输入姓名或邮箱'
+  // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
+  'admin.tx_type_daily_qkey': '每日分红',
+  'admin.tx_type_daily_reward': '每日分红',
+  'admin.tx_type_daily_reward_rollback': '每日分红回滚',
+  'admin.tx_type_referral_reward': '推荐奖金',
+  'admin.tx_type_referral_reward_rollback': '推荐奖金回滚',
+  'admin.tx_type_direct_referral': '直销奖',
+  'admin.tx_type_three_set_supplement': '三件套补充',
+  'admin.tx_type_swap_in': '兑换收入',
+  'admin.tx_type_swap_out': '兑换支出',
+  'admin.tx_type_admin_adjustment': '管理员调整',
+  'admin.tx_type_rollback_restore': '回滚恢复',
+  'admin.tx_type_shop_purchase': '商城购买',
+
 };
 
 I18N._translations['vi'] = {
@@ -1810,6 +1866,20 @@ I18N._translations['vi'] = {
   'admin.password_placeholder': 'Nhập mật khẩu',
   'admin.search_email_name': 'Tìm theo email hoặc tên',
   'admin.downline_search_placeholder': 'Nhập tên hoặc email'
+  // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
+  'admin.tx_type_daily_qkey': 'Thưởng hàng ngày',
+  'admin.tx_type_daily_reward': 'Thưởng hàng ngày',
+  'admin.tx_type_daily_reward_rollback': 'Hoàn thưởng hàng ngày',
+  'admin.tx_type_referral_reward': 'Thưởng giới thiệu',
+  'admin.tx_type_referral_reward_rollback': 'Hoàn thưởng giới thiệu',
+  'admin.tx_type_direct_referral': 'Hoa hồng trực tiếp',
+  'admin.tx_type_three_set_supplement': 'Bổ sung 3 bộ',
+  'admin.tx_type_swap_in': 'Hoán đổi vào',
+  'admin.tx_type_swap_out': 'Hoán đổi ra',
+  'admin.tx_type_admin_adjustment': 'Điều chỉnh quản trị',
+  'admin.tx_type_rollback_restore': 'Khôi phục',
+  'admin.tx_type_shop_purchase': 'Mua tại cửa hàng',
+
 };
 
 I18N._translations['th'] = {
@@ -2107,5 +2177,19 @@ I18N._translations['th'] = {
   'admin.password_placeholder': 'กรอกรหัสผ่าน',
   'admin.search_email_name': 'ค้นหาตามอีเมลหรือชื่อ',
   'admin.downline_search_placeholder': 'กรอกชื่อหรืออีเมล'
+  // === transactions.type i18n (admin user-detail) auto-merged 2026-05-12 ===
+  'admin.tx_type_daily_qkey': 'รางวัลรายวัน',
+  'admin.tx_type_daily_reward': 'รางวัลรายวัน',
+  'admin.tx_type_daily_reward_rollback': 'ย้อนรางวัลรายวัน',
+  'admin.tx_type_referral_reward': 'โบนัสแนะนำ',
+  'admin.tx_type_referral_reward_rollback': 'ย้อนโบนัสแนะนำ',
+  'admin.tx_type_direct_referral': 'ค่าคอมมิชชั่นตรง',
+  'admin.tx_type_three_set_supplement': 'เสริม 3 ชุด',
+  'admin.tx_type_swap_in': 'สวอปเข้า',
+  'admin.tx_type_swap_out': 'สวอปออก',
+  'admin.tx_type_admin_adjustment': 'ปรับโดยผู้ดูแล',
+  'admin.tx_type_rollback_restore': 'คืนค่า',
+  'admin.tx_type_shop_purchase': 'ซื้อจากร้านค้า',
+
 };
 
