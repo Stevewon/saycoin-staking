@@ -23116,4 +23116,161 @@ app.get('/api/diag/fix-512-s97-self-orphan', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/audit-511-referral-duplicate
+// ----------------------------------------------------
+// 사장님 명령 (2026-05-12): 김용선 5/11 추천보너스 2회 표시됨 → 1회만 정상
+// 전수조사: 5/11 같은 user_id+level+from_user_id 중복 transactions 또는 referral_rewards
+// ============================================================
+app.get('/api/diag/audit-511-referral-duplicate', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+
+  try {
+    const db = c.env.DB
+    const TARGET_DATE = '2026-05-11'
+
+    // 5/11 referral_reward transactions 전수
+    const txs = await db.prepare(`
+      SELECT t.id, t.user_id, t.type, t.amount, t.description, t.ref_id, t.created_at,
+             date(datetime(t.created_at, '+9 hours')) AS kst_date,
+             u.name AS user_name, u.email AS user_email
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      WHERE t.type IN ('referral_reward','direct_referral')
+        AND date(datetime(t.created_at, '+9 hours')) = ?
+      ORDER BY t.user_id, t.id
+    `).bind(TARGET_DATE).all()
+
+    // user_id + amount 동일 중복 그룹
+    const groups: Record<string, any[]> = {}
+    for (const t of (txs.results || []) as any[]) {
+      const k = `u${t.user_id}_amt${t.amount}_desc${t.description}`
+      if (!groups[k]) groups[k] = []
+      groups[k].push(t)
+    }
+
+    const duplicates: any[] = []
+    for (const k of Object.keys(groups)) {
+      if (groups[k].length >= 2) duplicates.push({ key: k, count: groups[k].length, rows: groups[k] })
+    }
+
+    // referral_rewards 테이블도 점검
+    let rrRows: any[] = []
+    try {
+      const rr = await db.prepare(`
+        SELECT id, user_id, from_user_id, level, amount, coin_type, reward_date, paid_date, ref_id, created_at
+        FROM referral_rewards
+        WHERE reward_date = ? OR paid_date = ? OR date(datetime(created_at, '+9 hours')) = ?
+        ORDER BY user_id, id
+      `).bind(TARGET_DATE, TARGET_DATE, TARGET_DATE).all()
+      rrRows = (rr.results || []) as any[]
+    } catch(e) {}
+
+    const rrGroups: Record<string, any[]> = {}
+    for (const r of rrRows) {
+      const k = `u${r.user_id}_from${r.from_user_id}_lvl${r.level}_amt${r.amount}`
+      if (!rrGroups[k]) rrGroups[k] = []
+      rrGroups[k].push(r)
+    }
+    const rrDuplicates: any[] = []
+    for (const k of Object.keys(rrGroups)) {
+      if (rrGroups[k].length >= 2) rrDuplicates.push({ key: k, count: rrGroups[k].length, rows: rrGroups[k] })
+    }
+
+    return c.json({
+      success: true,
+      target_date: TARGET_DATE,
+      transactions_total: (txs.results || []).length,
+      transactions_duplicate_groups: duplicates.length,
+      transactions_duplicates: duplicates,
+      referral_rewards_total: rrRows.length,
+      referral_rewards_duplicate_groups: rrDuplicates.length,
+      referral_rewards_duplicates: rrDuplicates,
+    })
+  } catch (error: any) {
+    console.error('audit-511-referral-duplicate error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
+// /api/diag/audit-balance-vs-tx-mismatch
+// ----------------------------------------------------
+// 사장님 명령 (2026-05-12): 정분 등 스왑 후 잔액 불일치 전수조사
+// 전수: 모든 user의 거래내역 합산 vs users.qkey_balance / qx_balance / qta_balance / usdt_balance
+// ============================================================
+app.get('/api/diag/audit-balance-vs-tx-mismatch', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+
+  try {
+    const db = c.env.DB
+    const userIdParam = c.req.query('user_id') || ''
+    const nameParam = c.req.query('name') || ''
+
+    let users: any[] = []
+    if (userIdParam) {
+      const u = await db.prepare(`SELECT id, name, email, qkey_balance, qx_balance, qta_balance, usdt_balance FROM users WHERE id = ?`).bind(parseInt(userIdParam,10)).all()
+      users = (u.results || []) as any[]
+    } else if (nameParam) {
+      const u = await db.prepare(`SELECT id, name, email, qkey_balance, qx_balance, qta_balance, usdt_balance FROM users WHERE name LIKE ? OR email LIKE ?`).bind(`%${nameParam}%`, `%${nameParam}%`).all()
+      users = (u.results || []) as any[]
+    } else {
+      const u = await db.prepare(`SELECT id, name, email, qkey_balance, qx_balance, qta_balance, usdt_balance FROM users ORDER BY id`).all()
+      users = (u.results || []) as any[]
+    }
+
+    const mismatches: any[] = []
+    const ok: any[] = []
+
+    for (const u of users) {
+      // 각 코인별 거래내역 합 계산
+      const sumByCoin = await db.prepare(`
+        SELECT coin_type, SUM(amount) AS total
+        FROM transactions
+        WHERE user_id = ?
+        GROUP BY coin_type
+      `).bind(u.id).all()
+
+      const sums: Record<string, number> = { QKEY: 0, QX: 0, QTA: 0, USDT: 0 }
+      for (const r of (sumByCoin.results || []) as any[]) {
+        if (r.coin_type) sums[r.coin_type] = Number(r.total) || 0
+      }
+
+      const diff = {
+        qkey: { balance: Number(u.qkey_balance)||0, tx_sum: sums.QKEY, diff: (Number(u.qkey_balance)||0) - sums.QKEY },
+        qx: { balance: Number(u.qx_balance)||0, tx_sum: sums.QX, diff: (Number(u.qx_balance)||0) - sums.QX },
+        qta: { balance: Number(u.qta_balance)||0, tx_sum: sums.QTA, diff: (Number(u.qta_balance)||0) - sums.QTA },
+        usdt: { balance: Number(u.usdt_balance)||0, tx_sum: sums.USDT, diff: (Number(u.usdt_balance)||0) - sums.USDT },
+      }
+
+      const hasMismatch = Math.abs(diff.qkey.diff) > 0.01 || Math.abs(diff.qx.diff) > 0.01 || Math.abs(diff.qta.diff) > 0.01 || Math.abs(diff.usdt.diff) > 0.01
+
+      const rec = { user_id: u.id, user_name: u.name, user_email: u.email, ...diff }
+      if (hasMismatch) mismatches.push(rec)
+      else ok.push({ user_id: u.id, user_name: u.name })
+    }
+
+    // 절대값 큰 순으로 정렬
+    mismatches.sort((a: any, b: any) => {
+      const ma = Math.abs(a.qkey.diff) + Math.abs(a.qx.diff) + Math.abs(a.qta.diff) + Math.abs(a.usdt.diff)
+      const mb = Math.abs(b.qkey.diff) + Math.abs(b.qx.diff) + Math.abs(b.qta.diff) + Math.abs(b.usdt.diff)
+      return mb - ma
+    })
+
+    return c.json({
+      success: true,
+      filter: { user_id: userIdParam || null, name: nameParam || null },
+      total_users_checked: users.length,
+      ok_count: ok.length,
+      mismatch_count: mismatches.length,
+      mismatches,
+    })
+  } catch (error: any) {
+    console.error('audit-balance-vs-tx-mismatch error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
