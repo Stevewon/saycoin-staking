@@ -6670,6 +6670,152 @@ app.get('/api/diag/dryrun-cleanup-solbat-dups', async (c) => {
   }
 })
 
+// ★★★ 5/11 23:59:59 KST 원장 복귀 dump — 사장님 명시 지시 (2026-05-12, read-only) ★★★
+//   경로: GET /api/diag/dump-after-may11-cutoff?key=ADMIN_PW
+//   목적: cutoff (KST 2026-05-11 23:59:59 = UTC 2026-05-11 14:59:59) 이후 D1 에 변경된 모든 행 식별
+//   - transactions: created_at > cutoff 인 행 전체 (DELETE 대상)
+//   - daily_rewards: created_at > cutoff (스키마에 created_at 없으면 reward_date >= '2026-05-12' 보조)
+//   - referral_rewards: created_at > cutoff
+//   - 회원별 영향 잔액 합계: sum(amount) by user_id, coin_type
+//   - DB UPDATE 0건 — 순수 SELECT
+app.get('/api/diag/dump-after-may11-cutoff', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    // UTC cutoff = KST 5/11 23:59:59 - 9h = 5/11 14:59:59 UTC
+    const CUTOFF_UTC = '2026-05-11 14:59:59'
+
+    // 1) transactions: cutoff 이후 INSERT 된 행 (created_at > cutoff)
+    const txAfter: any = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id,
+             created_at AS created_utc,
+             datetime(created_at, '+9 hours') AS created_kst
+      FROM transactions
+      WHERE created_at > ?
+      ORDER BY created_at ASC, id ASC
+    `).bind(CUTOFF_UTC).all()
+    const txRows = (txAfter.results || []) as any[]
+
+    // 2) daily_rewards: cutoff 이후 (created_at 컬럼 우선, 없으면 reward_date)
+    //    먼저 schema 확인
+    let dailyAfter: any = { results: [] }
+    try {
+      dailyAfter = await db.prepare(`
+        SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+        FROM daily_rewards
+        WHERE reward_date >= '2026-05-12'
+           OR paid_date >= '2026-05-12'
+        ORDER BY id ASC
+      `).all()
+    } catch (e) {
+      dailyAfter = { results: [], error: String(e) }
+    }
+    const dailyRows = (dailyAfter.results || []) as any[]
+
+    // 3) referral_rewards: cutoff 이후
+    let rrAfter: any = { results: [] }
+    try {
+      rrAfter = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+               reward_date, paid_date, created_at AS created_utc,
+               datetime(created_at, '+9 hours') AS created_kst
+        FROM referral_rewards
+        WHERE created_at > ?
+           OR reward_date >= '2026-05-12'
+           OR paid_date >= '2026-05-12'
+        ORDER BY id ASC
+      `).bind(CUTOFF_UTC).all()
+    } catch (e) {
+      rrAfter = { results: [], error: String(e) }
+    }
+    const rrRows = (rrAfter.results || []) as any[]
+
+    // 4) 회원별 잔액 영향 합산 (transactions 기준 — 실제 qkey_balance 영향 = QKEY tx 합)
+    const balByUser = new Map<number, { qkey: number, qta: number, qx: number, usdt: number, tx_count: number }>()
+    for (const t of txRows) {
+      const uid = Number(t.user_id)
+      const cur = balByUser.get(uid) || { qkey: 0, qta: 0, qx: 0, usdt: 0, tx_count: 0 }
+      const amt = Number(t.amount) || 0
+      const coin = String(t.coin_type || '').toUpperCase()
+      if (coin === 'QKEY') cur.qkey += amt
+      else if (coin === 'QTA') cur.qta += amt
+      else if (coin === 'QX') cur.qx += amt
+      else if (coin === 'USDT') cur.usdt += amt
+      cur.tx_count += 1
+      balByUser.set(uid, cur)
+    }
+    const balanceImpact: any[] = []
+    for (const [uid, v] of balByUser.entries()) {
+      const u: any = await db.prepare(`SELECT id, name, email, qkey_balance, qta_balance, qx_balance FROM users WHERE id = ?`).bind(uid).first()
+      balanceImpact.push({
+        user_id: uid,
+        name: u?.name || `u#${uid}`,
+        email: u?.email,
+        current_balance: {
+          qkey: u?.qkey_balance,
+          qta: u?.qta_balance,
+          qx: u?.qx_balance,
+        },
+        tx_count_after_cutoff: v.tx_count,
+        delta_to_revert: {
+          qkey: -v.qkey,
+          qta: -v.qta,
+          qx: -v.qx,
+          usdt: -v.usdt,
+        },
+        preview_balance_after_revert: {
+          qkey: (Number(u?.qkey_balance) || 0) - v.qkey,
+          qta: (Number(u?.qta_balance) || 0) - v.qta,
+          qx: (Number(u?.qx_balance) || 0) - v.qx,
+        },
+      })
+    }
+    balanceImpact.sort((a, b) => a.user_id - b.user_id)
+
+    // 5) tx type 별 분포 요약
+    const typeBreakdown = new Map<string, { count: number, sum_qkey: number }>()
+    for (const t of txRows) {
+      const k = `${t.type}|${t.coin_type}`
+      const cur = typeBreakdown.get(k) || { count: 0, sum_qkey: 0 }
+      cur.count += 1
+      if (String(t.coin_type).toUpperCase() === 'QKEY') cur.sum_qkey += Number(t.amount) || 0
+      typeBreakdown.set(k, cur)
+    }
+    const typeSummary: any[] = []
+    for (const [k, v] of typeBreakdown.entries()) {
+      typeSummary.push({ key: k, count: v.count, sum_qkey: v.sum_qkey })
+    }
+    typeSummary.sort((a, b) => b.count - a.count)
+
+    return c.json({
+      success: true,
+      mode: 'dry_run_dump',
+      cutoff: { kst: '2026-05-11 23:59:59', utc: CUTOFF_UTC },
+      summary: {
+        tx_count_after_cutoff: txRows.length,
+        tx_sum_qkey: txRows.filter(t => String(t.coin_type).toUpperCase() === 'QKEY').reduce((a, t) => a + Number(t.amount), 0),
+        daily_rewards_count_after_cutoff: dailyRows.length,
+        daily_rewards_sum_usdt: dailyRows.reduce((a, r) => a + Number(r.usdt_amount || 0), 0),
+        referral_rewards_count_after_cutoff: rrRows.length,
+        referral_rewards_sum: rrRows.reduce((a, r) => a + Number(r.reward_amount || 0), 0),
+        affected_user_count: balanceImpact.length,
+      },
+      tx_type_breakdown: typeSummary,
+      balance_impact_by_user: balanceImpact,
+      raw: {
+        transactions: txRows,
+        daily_rewards: dailyRows,
+        referral_rewards: rrRows,
+      },
+      note: 'read-only — DB 변경 0건. 사장님 결재 후 exec endpoint 에서 cutoff 이후 행 전부 DELETE + qkey/qta/qx/usdt 잔액 환원',
+    })
+  } catch (error) {
+    console.error('dump-after-may11-cutoff error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧 L2 referee 6건 staking 금액 정밀 확인 — 사장님 지시 (2026-05-12, read-only) ★★★
 //   경로: GET /api/diag/solbat-l2-referee-stakes?key=ADMIN_PW
 //   목적: ref_id 688,698,725,729,731,773 의 referee 각자 staking 진입 금액 확인
