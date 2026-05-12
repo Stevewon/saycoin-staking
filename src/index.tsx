@@ -5858,7 +5858,8 @@ app.get('/api/diag/solbat-l2-trace', async (c) => {
     for (const row of phase3Rows) {
       const r: any = row
       const rr = await db.prepare(`
-        SELECT id AS ref_id, referrer_id, referee_id, level, amount,
+        SELECT id AS ref_id, referrer_id, referee_id, level,
+               original_amount, reward_amount,
                reward_date, paid_date,
                datetime(created_at, '+9 hours') AS rr_created_kst
         FROM referral_rewards
@@ -5876,17 +5877,17 @@ app.get('/api/diag/solbat-l2-trace', async (c) => {
       })
     }
 
-    // 3) NULL ref 행의 referee 후보 추정 — 같은 amount + created_at 인접 referral_rewards (referrer_id=44 AND level=2)
+    // 3) NULL ref 행의 referee 후보 추정 — 같은 reward_amount + created_at 인접 referral_rewards (referrer_id=44 AND level=2)
     const nullRefDetailed: any[] = []
     for (const row of nullRefRows) {
       const r: any = row
-      // 후보 1: 같은 amount AND referrer=44 AND level=2 인 모든 referral_rewards 행
+      // 후보 1: 같은 reward_amount AND referrer=44 AND level=2 인 모든 referral_rewards 행
       const candidates = await db.prepare(`
-        SELECT id AS ref_id, referee_id, amount, reward_date, paid_date,
+        SELECT id AS ref_id, referee_id, original_amount, reward_amount, reward_date, paid_date,
                datetime(created_at, '+9 hours') AS rr_created_kst,
                ABS(strftime('%s', created_at) - strftime('%s', ?)) AS sec_diff
         FROM referral_rewards
-        WHERE referrer_id = ? AND level = 2 AND amount = ?
+        WHERE referrer_id = ? AND level = 2 AND reward_amount = ?
         ORDER BY sec_diff ASC
         LIMIT 5
       `).bind(r.created_at_utc, SOLBAT_ID, r.amount).all()
