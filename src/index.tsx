@@ -5424,6 +5424,175 @@ app.post('/api/diag/exec-delete-may11-phase4-only', async (c) => {
 })
 
 
+// ★★★★★ 5/8 reward_date AND paid_date=2026-05-11 중복 47건 정밀 삭제 — 옵션 A (2026-05-12) ★★★★★
+//   배경: 5/11 cron 실행 시 5/8 적립분이 재INSERT 되어 (staking_id, reward_date)='5/8' 동일 행이
+//         paid_date=2026-05-08 + paid_date=2026-05-11 두 번 들어감 (47 staking 영향)
+//   삭제 대상:
+//     1. daily_rewards WHERE reward_date='2026-05-08' AND paid_date='2026-05-11'  (47건)
+//     2. transactions (ref_id IN 위 dr_ids, type='daily_qkey')
+//     3. referral_rewards WHERE reward_date='2026-05-08' AND paid_date='2026-05-11'  (매칭 보너스 중복분, 있을 경우)
+//     4. transactions (ref_id IN 위 rr_ids, type='referral_reward')
+//     5. qkey_balance MAX(0, balance - amt) 환원
+//   보존 (절대 보존):
+//     - daily_rewards WHERE reward_date='2026-05-08' AND paid_date='2026-05-08' (47건 — 5/8 당일 정산 정상분)
+//     - referral_rewards WHERE reward_date='2026-05-08' AND paid_date='2026-05-08' (정상분)
+//   gate: key=ADMIN_PW + dryRun 기본 / confirm=GO 시 실행
+app.post('/api/diag/exec-delete-may8-dup-paid-may11', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const dryRun = confirm !== 'GO'
+    const db = c.env.DB
+    const REWARD_DATE = '2026-05-08'
+    const PAID_DATE_DUP = '2026-05-11'
+
+    // STEP A: 삭제 대상 daily_rewards 식별
+    const drRows = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards
+      WHERE reward_date = ? AND paid_date = ?
+      ORDER BY id
+    `).bind(REWARD_DATE, PAID_DATE_DUP).all()
+    const drList = (drRows.results || []) as any[]
+    const drIds = drList.map(r => Number(r.id))
+
+    // STEP B: 매칭 referral_rewards 식별 (reward_date=5/8 + paid_date=5/11)
+    const rrRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards
+      WHERE reward_date = ? AND paid_date = ?
+      ORDER BY id
+    `).bind(REWARD_DATE, PAID_DATE_DUP).all()
+    const rrList = (rrRows.results || []) as any[]
+    const rrIds = rrList.map(r => Number(r.id))
+
+    // STEP C: 매칭 transactions 식별 (ref_id IN drIds OR rrIds)
+    const dqTxRows = drIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount, ref_id FROM transactions
+          WHERE type = 'daily_qkey' AND ref_id IN (${drIds.map(()=>'?').join(',')})
+        `).bind(...drIds).all()
+      : { results: [] as any[] }
+    const dqTxList = ((dqTxRows as any).results || []) as any[]
+
+    const rrTxRows = rrIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount, ref_id FROM transactions
+          WHERE type = 'referral_reward' AND ref_id IN (${rrIds.map(()=>'?').join(',')})
+        `).bind(...rrIds).all()
+      : { results: [] as any[] }
+    const rrTxList = ((rrTxRows as any).results || []) as any[]
+
+    // 모든 tx id 집합 (중복 제거)
+    const allTxIdsSet = new Set<number>()
+    for (const t of dqTxList) allTxIdsSet.add(Number(t.id))
+    for (const t of rrTxList) allTxIdsSet.add(Number(t.id))
+    const allTxIds = Array.from(allTxIdsSet)
+
+    // STEP D: 사용자별 환원 금액 집계
+    const refundByUser = new Map<number, number>()
+    const txDetailRows = allTxIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount FROM transactions
+          WHERE id IN (${allTxIds.map(()=>'?').join(',')})
+        `).bind(...allTxIds).all()
+      : { results: [] as any[] }
+    for (const t of ((txDetailRows as any).results || [])) {
+      const uid = Number(t.user_id)
+      refundByUser.set(uid, (refundByUser.get(uid) || 0) + Number(t.amount || 0))
+    }
+
+    const drSum = drList.reduce((s, r) => s + Number(r.usdt_amount || 0), 0)
+    const rrSum = rrList.reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'dry_run',
+        note: 'DB 무변경. confirm=GO 추가 시 삭제 + 잔액 환원. 5/8 paid_date=5/8 정상분은 절대 보존',
+        target: { reward_date: REWARD_DATE, paid_date_dup: PAID_DATE_DUP },
+        preserved: {
+          message: 'reward_date=2026-05-08 AND paid_date=2026-05-08 (5/8 당일 정상분) 보존',
+        },
+        delete_plan: {
+          daily_rewards_count: drList.length,
+          daily_rewards_sum_qkey: drSum,
+          daily_rewards_ids: drIds,
+          referral_rewards_count: rrList.length,
+          referral_rewards_sum_qkey: rrSum,
+          referral_rewards_ids: rrIds,
+          dq_tx_count: dqTxList.length,
+          rr_tx_count: rrTxList.length,
+          total_tx_count: allTxIds.length,
+          total_tx_ids: allTxIds,
+          refund_by_user: Object.fromEntries(refundByUser),
+          total_refund_qkey: Array.from(refundByUser.values()).reduce((s,v)=>s+v,0),
+        }
+      })
+    }
+
+    // STEP E: 실제 삭제 (confirm=GO)
+    let deletedTxCount = 0, deletedDrCount = 0, deletedRrCount = 0
+    let balanceUpdatedCount = 0
+
+    // 1. transactions 삭제 (chunks of 50)
+    for (let i = 0; i < allTxIds.length; i += 50) {
+      const chunk = allTxIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM transactions WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedTxCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 2. daily_rewards 삭제 (reward_date=5/8 AND paid_date=5/11 만)
+    for (let i = 0; i < drIds.length; i += 50) {
+      const chunk = drIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM daily_rewards WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedDrCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 3. referral_rewards 삭제 (reward_date=5/8 AND paid_date=5/11 만)
+    for (let i = 0; i < rrIds.length; i += 50) {
+      const chunk = rrIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM referral_rewards WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedRrCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 4. 사용자별 잔액 차감 환원
+    for (const [uid, amt] of refundByUser.entries()) {
+      const res = await db.prepare(`
+        UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+      `).bind(amt, uid).run()
+      balanceUpdatedCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    return c.json({
+      success: true,
+      mode: 'exec',
+      target: { reward_date: REWARD_DATE, paid_date_dup: PAID_DATE_DUP },
+      preserved: 'reward_date=2026-05-08 AND paid_date=2026-05-08 (5/8 당일 정상분) 보존됨',
+      result: {
+        deleted_transactions: deletedTxCount,
+        deleted_daily_rewards: deletedDrCount,
+        deleted_referral_rewards: deletedRrCount,
+        users_balance_refunded: balanceUpdatedCount,
+        total_refund_qkey: Array.from(refundByUser.values()).reduce((s,v)=>s+v,0),
+        refund_by_user: Object.fromEntries(refundByUser),
+      },
+      note: '5/8 reward_date 의 paid_date=2026-05-11 중복 INSERT 분 삭제 완료. 5/8 당일 정상분 47건 / 5/11 reward_date 142건 보존.'
+    })
+  } catch (error) {
+    console.error('exec-delete-may8-dup-paid-may11 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+
 // ★★★★★ 5/11 Phase 4 매칭 보너스 안전 재실행 (L1 20% / L2 10%) — 사장님 영구 룰 준수 (2026-05-12) ★★★★★
 //   사장님 영구 룰 #3 ★★★ 0순위 — bottom-up traversal:
 //     "무조건 당일 데일리 배당을 실시할 경우에는 배당에 해당하는 맨 아래 데일리 정산된
