@@ -23045,4 +23045,75 @@ app.get('/api/diag/fix-holiday-entrant-512-daily', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/fix-512-s97-self-orphan
+// ----------------------------------------------------
+// s#97 방승훈 (u#33) 5/12 self 데일리 부분 INSERT 보정:
+//   - daily_rewards: 5/12 3,000 QKEY 행 존재 (id=확인됨, 첫 timeout 시 INSERT 성공)
+//   - transactions: 누락 (status 컬럼 에러로 실패)
+//   - users.qkey_balance: 미반영 (현재 4,500 그대로)
+// 보정: transactions INSERT (영구룰 #112 한국어) + 잔액 +3,000 UPDATE
+// dedupe: ref_id 'fix_512_s97_self' UNIQUE
+// ============================================================
+app.get('/api/diag/fix-512-s97-self-orphan', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const UID = 33
+    const SID = 97
+    const QKEY = 3000
+    const REF_ID = 'fix_512_s97_self'
+    const TARGET_DATE = '2026-05-12'
+
+    // 사전 검증
+    const dr = await db.prepare(`SELECT id, usdt_amount FROM daily_rewards WHERE staking_id = ? AND reward_date = ?`).bind(SID, TARGET_DATE).first() as any
+    const txExists = await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(REF_ID).first() as any
+    const u = await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id = ?`).bind(UID).first() as any
+
+    const preview = {
+      user: u,
+      daily_rewards_row: dr,
+      tx_already_inserted: txExists ? true : false,
+      qkey_balance_before: u?.qkey_balance,
+      qkey_to_add: QKEY,
+      qkey_balance_after_expected: (u?.qkey_balance || 0) + QKEY,
+    }
+
+    if (!isExec) {
+      return c.json({ success: true, mode: 'DRY_RUN', preview, next: '?confirm=GO' })
+    }
+
+    if (txExists) {
+      return c.json({ success: true, mode: 'SKIP', reason: 'ref_id 이미 INSERT 됨', preview })
+    }
+    if (!dr) {
+      return c.json({ success: false, error: 'daily_rewards 행 없음 — s#97 5/12 행 누락', preview }, 400)
+    }
+
+    // 실행
+    await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+      VALUES (?, 'daily_reward', 'QKEY', ?, ?, ?)
+    `).bind(UID, QKEY, '일일 배당 (QKEY)', REF_ID).run()
+
+    await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(QKEY, UID).run()
+
+    const after = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(UID).first() as any
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      inserted: { tx_ref_id: REF_ID, amount: QKEY },
+      qkey_balance_before: u?.qkey_balance,
+      qkey_balance_after: after?.qkey_balance,
+    })
+  } catch (error: any) {
+    console.error('fix-512-s97-self-orphan error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
