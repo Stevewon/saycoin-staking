@@ -6126,6 +6126,110 @@ app.get('/api/diag/solbat-l2-may04-verify', async (c) => {
   }
 })
 
+// ★★★ 솔밧 L2 5/11 Phase 3 중복 6건 삭제 dry_run preview — D안-2 결재 (2026-05-12) ★★★
+//   경로: GET /api/diag/dryrun-delete-solbat-phase3?key=ADMIN_PW
+//   목적: 09시대 Phase 3 백필 6건 (사장님 엑셀 1,950 검증 후 중복 확정분) 삭제 preview
+//   - 삭제 대상 6건 tx 상세 + 짝지어진 referral_rewards 원장 행 preview
+//   - 솔밧 qkey_balance 현재값 + 정정 후 예상값 preview
+//   - 실제 DELETE / UPDATE 0건 — 순수 read-only SELECT 만 (사장님 GO 후 별도 endpoint 에서 실제 실행)
+app.get('/api/diag/dryrun-delete-solbat-phase3', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+
+    // 삭제 대상 6건 (09시 KST Phase 3 백필 행)
+    const TARGET_TX_IDS = [2667, 2676, 2703, 2707, 2709, 2750]
+    const TARGET_REF_IDS = [688, 698, 725, 729, 731, 773]
+
+    // 1) 삭제 대상 tx 상세
+    const placeholders = TARGET_TX_IDS.map(() => '?').join(',')
+    const txRows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id,
+             created_at AS created_at_utc,
+             datetime(created_at, '+9 hours') AS created_at_kst
+      FROM transactions
+      WHERE id IN (${placeholders})
+      ORDER BY id ASC
+    `).bind(...TARGET_TX_IDS).all()
+
+    // 2) 짝지어진 referral_rewards 원장 행 상세 (참고용, 삭제 대상 아님)
+    const rrRows = await db.prepare(`
+      SELECT rr.id AS ref_id, rr.referrer_id, rr.referee_id, rr.level,
+             rr.original_amount, rr.reward_amount, rr.reward_date, rr.paid_date,
+             datetime(rr.created_at, '+9 hours') AS rr_created_kst,
+             u.name AS referee_name, u.email AS referee_email
+      FROM referral_rewards rr
+      JOIN users u ON rr.referee_id = u.id
+      WHERE rr.id IN (${TARGET_REF_IDS.map(() => '?').join(',')})
+      ORDER BY rr.id ASC
+    `).bind(...TARGET_REF_IDS).all()
+
+    // 3) 솔밧 현재 잔액
+    const solbat: any = await db.prepare(`
+      SELECT id, name, email, qkey_balance, qta_balance, qx_balance, usdt_balance
+      FROM users WHERE id = ?
+    `).bind(SOLBAT_ID).first()
+
+    // 4) 검증: 실제로 존재하는 tx 만 (이미 누군가 지웠을 가능성 사전 확인)
+    const existing = (txRows.results || []).map((r: any) => r.id)
+    const missing = TARGET_TX_IDS.filter(id => !existing.includes(id))
+
+    // 5) 삭제 시 잔액 정정 금액 계산
+    const totalToRevert = (txRows.results || []).reduce((a: number, r: any) => a + Number(r.amount), 0)
+    const newQkeyBalance = Number(solbat.qkey_balance) - totalToRevert
+
+    // 6) 안전 검증
+    const safetyChecks = {
+      target_tx_count_expected: 6,
+      target_tx_count_found: (txRows.results || []).length,
+      missing_tx_ids: missing,
+      all_targets_are_solbat: (txRows.results || []).every((r: any) => r.user_id === SOLBAT_ID),
+      all_targets_are_referral_reward: (txRows.results || []).every((r: any) => r.type === 'referral_reward'),
+      all_targets_are_level2: (txRows.results || []).every((r: any) => (r.description || '').indexOf('Level 2') !== -1),
+      total_revert_amount: totalToRevert,
+      expected_revert_amount: 1875,
+      revert_amount_matches: totalToRevert === 1875,
+    }
+
+    return c.json({
+      success: true,
+      target: { user_id: SOLBAT_ID, name: solbat.name, email: solbat.email },
+      target_tx_ids: TARGET_TX_IDS,
+      target_ref_ids: TARGET_REF_IDS,
+      delete_preview: {
+        tx_rows_to_delete: txRows.results,
+        ref_id_count: TARGET_REF_IDS.length,
+        total_qkey_amount_to_revert: totalToRevert,
+      },
+      ledger_for_reference: {
+        note: 'referral_rewards 원장은 삭제하지 않음 (참고용 — 사장님 추가 결재 시에만)',
+        rows: rrRows.results,
+      },
+      balance_preview: {
+        current_qkey_balance: Number(solbat.qkey_balance),
+        revert_amount: totalToRevert,
+        new_qkey_balance_after_fix: newQkeyBalance,
+      },
+      safety_checks: safetyChecks,
+      summary: {
+        will_delete: 'transactions 6행 (Phase 3 중복 미러)',
+        will_update: `users.qkey_balance: ${solbat.qkey_balance} → ${newQkeyBalance} (-${totalToRevert})`,
+        will_keep: 'referral_rewards 원장 6행 (참고용, 추가 결재 시에만 처리)',
+      },
+      next_step: {
+        message: '사장님 GO 결재 받은 후 별도 endpoint POST /api/diag/exec-delete-solbat-phase3 작성 + 실행',
+        boss_decision_required: true,
+      },
+      note: 'read-only — DB UPDATE / DELETE 0건 보장. 본 endpoint 는 오직 preview 만.',
+    })
+  } catch (error) {
+    console.error('dryrun-delete-solbat-phase3 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
 //   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
 app.get('/api/diag/search-user', async (c) => {
