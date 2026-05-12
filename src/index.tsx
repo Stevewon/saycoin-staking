@@ -14576,6 +14576,13 @@ app.get('/admin/dashboard', (c) => {
                             <p class="text-lg font-bold text-yellow-600" id="swapStatQkeyOut">0</p>
                         </div>
                     </div>
+                    <!-- 회원 검색 -->
+                    <div class="mb-3 flex gap-2 items-center">
+                        <input type="text" id="swapSearchInput" placeholder="회원명 또는 이메일로 검색..."
+                            class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-indigo-500"
+                            oninput="filterSwaps()">
+                        <span id="swapFilterStatus" class="text-xs text-gray-500 whitespace-nowrap"></span>
+                    </div>
                     <!-- 스왑 테이블 -->
                     <div class="overflow-x-auto">
                         <table class="w-full text-sm">
@@ -16152,13 +16159,19 @@ app.get('/admin/dashboard', (c) => {
             // ============================================
             // 스왑 내역 로드
             // ============================================
+            // 스왑 원본 데이터 캐시 (검색 필터용)
+            var __swapsCache = [];
+
             async function loadSwaps() {
                 try {
                     const response = await axios.get('/api/admin/swaps');
                     if (response.data.success) {
                         var swaps = response.data.swaps || [];
                         var stats = response.data.stats || {};
-                        
+
+                        // 원본 데이터 캐싱
+                        __swapsCache = swaps;
+
                         // 통계 업데이트
                         document.getElementById('swapStatCount').textContent = Math.floor((stats.total_count || 0) / 2);
                         document.getElementById('swapStatQkeyUsed').textContent = (stats.total_qkey_used || 0).toLocaleString();
@@ -16168,32 +16181,59 @@ app.get('/admin/dashboard', (c) => {
                         document.getElementById('swapStatQxOut').textContent = (stats.total_qx_received || 0).toLocaleString();
                         document.getElementById('swapStatUsdtOut').textContent = (stats.total_usdt_received || 0).toLocaleString();
                         document.getElementById('swapStatQkeyOut').textContent = (stats.total_qkey_received || 0).toLocaleString();
-                        
-                        // 테이블 렌더링 (swap_in만 표시 - swap_out과 쌍이므로)
-                        var tbody = document.getElementById('swapTableBody');
-                        if (swaps.length === 0) {
-                            tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-gray-500">스왑 내역이 없습니다</td></tr>';
-                            return;
-                        }
-                        
-                        tbody.innerHTML = swaps.map(function(s) {
-                            var typeLabel = s.type === 'swap_in' ? '<span class="text-green-600 font-medium">입금</span>' : '<span class="text-red-600 font-medium">출금</span>';
-                            var coinColor = s.coin_type === 'QTA' ? 'blue' : s.coin_type === 'QX' ? 'purple' : s.coin_type === 'QKEY' ? 'yellow' : 'green';
-                            var date = new Date(s.created_at).toLocaleString('ko-KR', {timeZone:'Asia/Seoul'});
-                            return '<tr class="hover:bg-gray-50">' +
-                                '<td class="px-3 py-2">' + escapeHtml(s.name) + '<br><span class="text-xs text-gray-400">' + escapeHtml(s.email) + '</span></td>' +
-                                '<td class="px-3 py-2">' + typeLabel + '</td>' +
-                                '<td class="px-3 py-2 text-right font-bold">' + s.amount.toLocaleString() + '</td>' +
-                                '<td class="px-3 py-2"><span class="px-2 py-1 bg-' + coinColor + '-100 text-' + coinColor + '-700 rounded text-xs font-bold">' + s.coin_type + '</span></td>' +
-                                '<td class="px-3 py-2 text-xs text-gray-500 max-w-[200px] truncate">' + escapeHtml(s.description || '') + '</td>' +
-                                '<td class="px-3 py-2 text-xs text-gray-500 whitespace-nowrap">' + date + '</td>' +
-                            '</tr>';
-                        }).join('');
+
+                        // 현재 검색어 적용해서 렌더링
+                        renderSwapsTable();
                     }
                 } catch (error) {
                     console.error('Failed to load swaps:', error);
                     document.getElementById('swapTableBody').innerHTML = '<tr><td colspan="6" class="text-center py-8 text-red-500">로드 실패</td></tr>';
                 }
+            }
+
+            // 회원명/이메일 검색 필터 (사장님 결재 A안)
+            function filterSwaps() {
+                renderSwapsTable();
+            }
+
+            function renderSwapsTable() {
+                var tbody = document.getElementById('swapTableBody');
+                var statusEl = document.getElementById('swapFilterStatus');
+                var input = document.getElementById('swapSearchInput');
+                var q = (input && input.value || '').trim().toLowerCase();
+                var rows = __swapsCache;
+                if (q) {
+                    rows = __swapsCache.filter(function(s) {
+                        var nm = (s.name || '').toLowerCase();
+                        var em = (s.email || '').toLowerCase();
+                        return nm.indexOf(q) !== -1 || em.indexOf(q) !== -1;
+                    });
+                }
+                // 상태 표시
+                if (statusEl) {
+                    if (q) {
+                        statusEl.textContent = '검색: "' + q + '" — ' + rows.length + '건 / 전체 ' + __swapsCache.length + '건';
+                    } else {
+                        statusEl.textContent = '전체 ' + __swapsCache.length + '건';
+                    }
+                }
+                if (!rows.length) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-gray-500">' + (q ? '검색 결과 없음' : '스왑 내역이 없습니다') + '</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = rows.map(function(s) {
+                    var typeLabel = s.type === 'swap_in' ? '<span class="text-green-600 font-medium">입금</span>' : '<span class="text-red-600 font-medium">출금</span>';
+                    var coinColor = s.coin_type === 'QTA' ? 'blue' : s.coin_type === 'QX' ? 'purple' : s.coin_type === 'QKEY' ? 'yellow' : 'green';
+                    var date = new Date(s.created_at).toLocaleString('ko-KR', {timeZone:'Asia/Seoul'});
+                    return '<tr class="hover:bg-gray-50">' +
+                        '<td class="px-3 py-2">' + escapeHtml(s.name) + '<br><span class="text-xs text-gray-400">' + escapeHtml(s.email) + '</span></td>' +
+                        '<td class="px-3 py-2">' + typeLabel + '</td>' +
+                        '<td class="px-3 py-2 text-right font-bold">' + s.amount.toLocaleString() + '</td>' +
+                        '<td class="px-3 py-2"><span class="px-2 py-1 bg-' + coinColor + '-100 text-' + coinColor + '-700 rounded text-xs font-bold">' + s.coin_type + '</span></td>' +
+                        '<td class="px-3 py-2 text-xs text-gray-500 max-w-[200px] truncate">' + escapeHtml(s.description || '') + '</td>' +
+                        '<td class="px-3 py-2 text-xs text-gray-500 whitespace-nowrap">' + date + '</td>' +
+                    '</tr>';
+                }).join('');
             }
 
             // 수당 체크 로드
