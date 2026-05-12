@@ -9430,22 +9430,25 @@ app.get('/api/transactions/:userId', async (c) => {
     // - 어드민 화면(/api/admin/diag/transactions, /api/admin/user/:userId) 은 별도 raw 그대로 노출
     // - 모든 표시는 KST(+9h) 기준: GROUP BY 도 KST 일자, created_at 응답값도 KST 시각으로 변환
     // - 같은 KST 일자/type 거래는 SUM(amount) 으로 1줄 합산 표시
+    // ★ 2026-05-12 사장님 옵션 A: swap 누락 보정 ★
+    // - 모든 coin_type 노출 (QTA/QX/QKEY/USDT) — swap_in QX 등 사용자 본인 거래 모두 표시
+    // - 어드민 내부 보정 marker 만 숨김 (_purge_internal / balance_sync / admin_adjust / admin_adjustment)
+    // - GROUP BY 제거 — swap 여러 건이 1줄로 합쳐지지 않도록 raw 행별 표시
+    // - LIMIT 100 — swap 많은 사용자 잘림 방지
     const transactions = await db.prepare(`
       SELECT
-        MAX(id) AS id,
+        id,
         type,
         coin_type,
-        SUM(amount) AS amount,
-        MIN(description) AS description,
-        datetime(MAX(created_at), '+9 hours') AS created_at,
-        date(MAX(created_at), '+9 hours') AS kst_date
+        amount,
+        description,
+        datetime(created_at, '+9 hours') AS created_at,
+        date(created_at, '+9 hours') AS kst_date
       FROM transactions
       WHERE user_id = ?
-        AND coin_type = 'QKEY'
-        AND type NOT IN ('_purge_internal', 'balance_sync', 'admin_adjust')
-      GROUP BY date(created_at, '+9 hours'), type
-      ORDER BY MAX(created_at) DESC
-      LIMIT 50
+        AND type NOT IN ('_purge_internal', 'balance_sync', 'admin_adjust', 'admin_adjustment')
+      ORDER BY datetime(created_at, '+9 hours') DESC, id DESC
+      LIMIT 100
     `).bind(userId).all()
 
     return c.json({ 
