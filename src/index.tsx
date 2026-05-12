@@ -6343,6 +6343,223 @@ app.post('/api/diag/exec-delete-solbat-phase3', async (c) => {
   }
 })
 
+// ★★★ 솔밧 산하 조직원 데일리 + L1/L2 매칭 배당 정합성 일괄 분석 — 사장님 GO 결재 (2026-05-12, read-only) ★★★
+//   경로: GET /api/diag/solbat-downline-audit?key=ADMIN_PW
+//   목적: 솔밧(u#44) 산하 전체 조직원(L1/L2/L3+ 모두) 의 배당 정합성 정밀 진단
+//   - 각 조직원 별 daily_reward / referral_reward(L1) / referral_reward(L2) 원장 vs tx 미러 일치 검증
+//   - referral_rewards 원장 행 vs transactions 미러 LEFT JOIN + IS NULL 누락 추출
+//   - tx 행 vs 원장 LEFT JOIN + IS NULL 유령(원장 없는 tx) 추출
+//   - daily_rewards 원장 vs tx ('daily_reward' type) 미러 정합성
+//   - 각 조직원 qkey_balance vs sum(tx.amount) 합산 일치 검증
+//   - 잔액(qkey_balance) / DB UPDATE 0건 — 순수 SELECT 만
+app.get('/api/diag/solbat-downline-audit', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+
+    // 1) 솔밧 산하 전체 조직원 명단 (재귀: L1 + L2 + L3+ 모두)
+    //    SQLite CTE 사용
+    const downline = await db.prepare(`
+      WITH RECURSIVE tree(id, name, email, referrer_id, level, root_referrer) AS (
+        SELECT id, name, email, referrer_id, 1 AS level, referrer_id AS root_referrer
+        FROM users WHERE referrer_id = ?
+        UNION ALL
+        SELECT u.id, u.name, u.email, u.referrer_id, t.level + 1, t.root_referrer
+        FROM users u JOIN tree t ON u.referrer_id = t.id
+        WHERE t.level < 10
+      )
+      SELECT id, name, email, referrer_id, level FROM tree ORDER BY level ASC, id ASC
+    `).bind(SOLBAT_ID).all()
+    const downlineUsers = (downline.results || []) as any[]
+    const allIds = [SOLBAT_ID, ...downlineUsers.map(u => u.id)]
+
+    if (allIds.length === 0) {
+      return c.json({ success: true, message: '솔밧 산하 조직원 0명', downline: [] })
+    }
+
+    const idPlaceholders = allIds.map(() => '?').join(',')
+
+    // 2) 각 회원별 referral_rewards 원장 vs transactions 미러 정합성
+    //    referral_rewards 1행 ↔ transactions 1행 (type='referral_reward' AND ref_id=rr.id) 매칭
+    //    누락(원장 있는데 미러 없음) + 유령(미러 있는데 원장 없음) 추출
+
+    // 2-a) 원장 있는데 미러 없음 (누락)
+    const rrMissingTx = await db.prepare(`
+      SELECT rr.id AS ref_id, rr.referrer_id, rr.referee_id, rr.level,
+             rr.original_amount, rr.reward_amount, rr.reward_date, rr.paid_date,
+             u.name AS referrer_name
+      FROM referral_rewards rr
+      JOIN users u ON rr.referrer_id = u.id
+      LEFT JOIN transactions t ON t.ref_id = rr.id AND t.type = 'referral_reward' AND t.user_id = rr.referrer_id
+      WHERE rr.referrer_id IN (${idPlaceholders})
+        AND t.id IS NULL
+      ORDER BY rr.referrer_id ASC, rr.id ASC
+    `).bind(...allIds).all()
+
+    // 2-b) 미러 있는데 원장 없음 (유령 = ref_id NULL 또는 ref_id 존재 안 함)
+    const txGhostNull = await db.prepare(`
+      SELECT t.id AS tx_id, t.user_id, t.amount, t.description,
+             datetime(t.created_at, '+9 hours') AS created_kst,
+             u.name
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      WHERE t.user_id IN (${idPlaceholders})
+        AND t.type = 'referral_reward'
+        AND t.ref_id IS NULL
+      ORDER BY t.user_id ASC, t.id ASC
+    `).bind(...allIds).all()
+
+    const txGhostBadRef = await db.prepare(`
+      SELECT t.id AS tx_id, t.user_id, t.ref_id, t.amount, t.description,
+             datetime(t.created_at, '+9 hours') AS created_kst,
+             u.name
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      LEFT JOIN referral_rewards rr ON rr.id = t.ref_id
+      WHERE t.user_id IN (${idPlaceholders})
+        AND t.type = 'referral_reward'
+        AND t.ref_id IS NOT NULL
+        AND rr.id IS NULL
+      ORDER BY t.user_id ASC, t.id ASC
+    `).bind(...allIds).all()
+
+    // 3) daily_rewards 원장 vs tx 미러 정합성
+    //    daily_rewards 1행 ↔ transactions 1행 (type='daily_reward')
+    //    description 패턴이 일정하지 않을 수 있으므로 (user_id, reward_date, amount) 3중 매칭
+    const dailyLedgerCount = await db.prepare(`
+      SELECT user_id, COUNT(*) AS cnt, SUM(qkey_amount) AS sum_qkey
+      FROM daily_rewards
+      WHERE user_id IN (${idPlaceholders})
+      GROUP BY user_id
+    `).bind(...allIds).all()
+
+    const dailyTxCount = await db.prepare(`
+      SELECT user_id, COUNT(*) AS cnt, SUM(amount) AS sum_qkey
+      FROM transactions
+      WHERE user_id IN (${idPlaceholders})
+        AND type = 'daily_reward' AND coin_type = 'QKEY'
+      GROUP BY user_id
+    `).bind(...allIds).all()
+
+    // 4) 각 회원별 잔액 vs tx 합산
+    const balances = await db.prepare(`
+      SELECT id, name, email, qkey_balance, qta_balance, qx_balance, usdt_balance
+      FROM users
+      WHERE id IN (${idPlaceholders})
+      ORDER BY id ASC
+    `).bind(...allIds).all()
+
+    // 5) 회원별 종합 요약 (data join in JS)
+    const dailyLedgerMap: Record<number, any> = {}
+    for (const r of (dailyLedgerCount.results || [])) {
+      const rr: any = r
+      dailyLedgerMap[rr.user_id] = { cnt: rr.cnt, sum: rr.sum_qkey }
+    }
+    const dailyTxMap: Record<number, any> = {}
+    for (const r of (dailyTxCount.results || [])) {
+      const rr: any = r
+      dailyTxMap[rr.user_id] = { cnt: rr.cnt, sum: rr.sum_qkey }
+    }
+    const rrMissingMap: Record<number, any[]> = {}
+    for (const r of (rrMissingTx.results || [])) {
+      const rr: any = r
+      if (!rrMissingMap[rr.referrer_id]) rrMissingMap[rr.referrer_id] = []
+      rrMissingMap[rr.referrer_id].push(rr)
+    }
+    const txGhostNullMap: Record<number, any[]> = {}
+    for (const r of (txGhostNull.results || [])) {
+      const rr: any = r
+      if (!txGhostNullMap[rr.user_id]) txGhostNullMap[rr.user_id] = []
+      txGhostNullMap[rr.user_id].push(rr)
+    }
+    const txGhostBadRefMap: Record<number, any[]> = {}
+    for (const r of (txGhostBadRef.results || [])) {
+      const rr: any = r
+      if (!txGhostBadRefMap[rr.user_id]) txGhostBadRefMap[rr.user_id] = []
+      txGhostBadRefMap[rr.user_id].push(rr)
+    }
+
+    // 6) 각 사용자 요약
+    const userSummary: any[] = []
+    for (const u of (balances.results || [])) {
+      const uu: any = u
+      const uid = uu.id
+      const dailyL = dailyLedgerMap[uid] || { cnt: 0, sum: 0 }
+      const dailyT = dailyTxMap[uid] || { cnt: 0, sum: 0 }
+      const downlineEntry = downlineUsers.find(d => d.id === uid)
+      const level = uid === SOLBAT_ID ? 0 : (downlineEntry ? downlineEntry.level : null)
+
+      const rrMissCnt = (rrMissingMap[uid] || []).length
+      const rrMissSum = (rrMissingMap[uid] || []).reduce((a, r) => a + Number(r.reward_amount), 0)
+      const ghostNullCnt = (txGhostNullMap[uid] || []).length
+      const ghostNullSum = (txGhostNullMap[uid] || []).reduce((a, r) => a + Number(r.amount), 0)
+      const ghostBadCnt = (txGhostBadRefMap[uid] || []).length
+      const ghostBadSum = (txGhostBadRefMap[uid] || []).reduce((a, r) => a + Number(r.amount), 0)
+
+      const dailyDiff = Number(dailyT.sum || 0) - Number(dailyL.sum || 0)
+      const issues: string[] = []
+      if (rrMissCnt > 0) issues.push(`referral_rewards 원장 ${rrMissCnt}건/${rrMissSum} QKEY tx 미러 누락`)
+      if (ghostNullCnt > 0) issues.push(`tx ref_id NULL 유령 ${ghostNullCnt}건/${ghostNullSum} QKEY`)
+      if (ghostBadCnt > 0) issues.push(`tx ref_id 원장 매칭 실패 ${ghostBadCnt}건/${ghostBadSum} QKEY`)
+      if (dailyDiff !== 0) issues.push(`daily_rewards 합계 불일치: tx ${dailyT.sum} vs 원장 ${dailyL.sum} (diff=${dailyDiff})`)
+
+      userSummary.push({
+        id: uid,
+        name: uu.name,
+        email: uu.email,
+        level,
+        qkey_balance: uu.qkey_balance,
+        daily: { ledger: dailyL, tx: dailyT, diff: dailyDiff },
+        referral_missing_tx: { count: rrMissCnt, sum: rrMissSum, rows: rrMissingMap[uid] || [] },
+        tx_ghost_null_ref: { count: ghostNullCnt, sum: ghostNullSum, rows: txGhostNullMap[uid] || [] },
+        tx_ghost_bad_ref: { count: ghostBadCnt, sum: ghostBadSum, rows: txGhostBadRefMap[uid] || [] },
+        is_clean: issues.length === 0,
+        issues,
+      })
+    }
+
+    // 7) 전체 합산
+    const grandTotal = {
+      total_users: userSummary.length,
+      clean_users: userSummary.filter(u => u.is_clean).length,
+      problem_users: userSummary.filter(u => !u.is_clean).length,
+      total_rr_missing_count: userSummary.reduce((a, u) => a + u.referral_missing_tx.count, 0),
+      total_rr_missing_sum: userSummary.reduce((a, u) => a + u.referral_missing_tx.sum, 0),
+      total_ghost_null_count: userSummary.reduce((a, u) => a + u.tx_ghost_null_ref.count, 0),
+      total_ghost_null_sum: userSummary.reduce((a, u) => a + u.tx_ghost_null_ref.sum, 0),
+      total_ghost_bad_count: userSummary.reduce((a, u) => a + u.tx_ghost_bad_ref.count, 0),
+      total_ghost_bad_sum: userSummary.reduce((a, u) => a + u.tx_ghost_bad_ref.sum, 0),
+      total_daily_diff: userSummary.reduce((a, u) => a + u.daily.diff, 0),
+    }
+
+    // 8) 레벨별 분포
+    const byLevel: Record<string, any> = {}
+    for (const u of userSummary) {
+      const lv = String(u.level)
+      if (!byLevel[lv]) byLevel[lv] = { count: 0, clean: 0, problem: 0 }
+      byLevel[lv].count += 1
+      if (u.is_clean) byLevel[lv].clean += 1
+      else byLevel[lv].problem += 1
+    }
+
+    return c.json({
+      success: true,
+      root: { id: SOLBAT_ID, included: true },
+      grand_total: grandTotal,
+      by_level: byLevel,
+      problem_users: userSummary.filter(u => !u.is_clean),
+      clean_users_count: userSummary.filter(u => u.is_clean).length,
+      all_users_detail: userSummary,
+      note: 'read-only — DB/잔액 무변경. solbat 본인 + 산하 모든 레벨 포함',
+    })
+  } catch (error) {
+    console.error('solbat-downline-audit error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 회원 검색 (이름/이메일/추천코드 LIKE) — 사실 확인용 영구 진단 ★★★
 //   경로: /api/diag/search-user?q=검색어&key=ADMIN_PW
 app.get('/api/diag/search-user', async (c) => {
