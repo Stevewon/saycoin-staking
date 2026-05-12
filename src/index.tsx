@@ -5266,6 +5266,164 @@ app.post('/api/diag/exec-delete-may12-v2-pollution', async (c) => {
 })
 
 
+// ★★★★★ 5/11 Phase 4 referral_rewards 만 정밀 삭제 — 옵션 A (2026-05-12, 중복지급 사고 대응) ★★★★★
+//   배경: exec-may11-rewards-safe phase4 호출이 curl timeout 후 다중 재호출되며
+//         referral_rewards 75건 삽입 (preview 예측 48건 대비 27건 초과, 15 그룹 중복 확인)
+//   대상: paid_date='2026-05-12' AND reward_date='2026-05-11' 의 referral_rewards 전부 + 매칭 tx
+//   보존: paid_date='2026-05-12' 의 daily_rewards 50건 (Phase 3 own_daily, 정상) — 절대 보존
+//   처리:
+//     1. referral_rewards (paid_date='2026-05-12', reward_date='2026-05-11') 식별
+//     2. transactions (type='referral_reward', ref_id IN 위 목록) 식별
+//     3. 추가: created_at KST=2026-05-12 인 type='referral_reward' orphan tx (ref_id null/dangling) 식별
+//     4. transactions 삭제 → referral_rewards 삭제 → qkey_balance 차감
+//   gate: key=ADMIN_PW + (dryRun 기본) / confirm=GO 시 실행
+app.post('/api/diag/exec-delete-may11-phase4-only', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const dryRun = confirm !== 'GO'
+    const db = c.env.DB
+    const PAID_DATE = '2026-05-12'
+    const REWARD_DATE = '2026-05-11'
+
+    // STEP A: 삭제 대상 referral_rewards 식별 (paid + reward 둘 다 일치)
+    const rrRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards
+      WHERE paid_date = ? AND reward_date = ?
+    `).bind(PAID_DATE, REWARD_DATE).all()
+    const rrList = (rrRows.results || []) as any[]
+    const rrIds = rrList.map(r => Number(r.id))
+
+    // STEP B: 매칭 transactions 식별 (ref_id IN rrIds)
+    const rrTxRows = rrIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount, ref_id FROM transactions
+          WHERE type = 'referral_reward' AND ref_id IN (${rrIds.map(()=>'?').join(',')})
+        `).bind(...rrIds).all()
+      : { results: [] as any[] }
+    const rrTxList = ((rrTxRows as any).results || []) as any[]
+
+    // STEP C: orphan tx (5/12 created + referral_reward + ref_id NULL OR ref_id 가 rrIds 와 무관)
+    //   — Phase 4 중복 실행 시 일부 tx 가 ref_id 매칭 안 될 수 있음
+    const orphanRows = await db.prepare(`
+      SELECT id, user_id, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE type = 'referral_reward'
+        AND date(created_at, '+9 hours') = ?
+        AND (
+          ref_id IS NULL
+          OR ref_id NOT IN (SELECT id FROM referral_rewards)
+        )
+    `).bind(PAID_DATE).all()
+    const orphanList = (orphanRows.results || []) as any[]
+
+    // 모든 tx id 집합 (중복 제거)
+    const allTxIdsSet = new Set<number>()
+    for (const t of rrTxList) allTxIdsSet.add(Number(t.id))
+    for (const t of orphanList) allTxIdsSet.add(Number(t.id))
+    const allTxIds = Array.from(allTxIdsSet)
+
+    // STEP D: 사용자별 환원 금액 집계
+    const refundByUser = new Map<number, number>()
+    const txDetailRows = allTxIds.length > 0
+      ? await db.prepare(`
+          SELECT id, user_id, amount FROM transactions
+          WHERE id IN (${allTxIds.map(()=>'?').join(',')})
+        `).bind(...allTxIds).all()
+      : { results: [] as any[] }
+    for (const t of ((txDetailRows as any).results || [])) {
+      const uid = Number(t.user_id)
+      refundByUser.set(uid, (refundByUser.get(uid) || 0) + Number(t.amount || 0))
+    }
+
+    // 중복 그룹 분석 (보고용)
+    const dupKey = new Map<string, number>()
+    for (const t of rrTxList) {
+      const k = `u${t.user_id}_a${t.amount}`
+      dupKey.set(k, (dupKey.get(k) || 0) + 1)
+    }
+    const dupGroups = Array.from(dupKey.entries()).filter(([_, v]) => v > 1)
+      .map(([k, v]) => ({ key: k, count: v }))
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'dry_run',
+        note: 'DB 무변경. Phase 3 daily 50건은 보존. confirm=GO 추가 시 referral_rewards 만 삭제 + 잔액 환원',
+        target: { paid_date: PAID_DATE, reward_date: REWARD_DATE },
+        preserved: {
+          phase3_daily_rewards_paid_2026_05_12: '50건 / 162,150 QKEY (Phase 3 정상분, 절대 보존)',
+        },
+        delete_plan: {
+          referral_rewards_count: rrList.length,
+          referral_rewards_ids: rrIds,
+          ref_id_matched_tx_count: rrTxList.length,
+          orphan_tx_count: orphanList.length,
+          total_tx_count: allTxIds.length,
+          total_tx_ids: allTxIds,
+          dup_groups: dupGroups,
+          refund_by_user: Object.fromEntries(refundByUser),
+          total_refund_qkey: Array.from(refundByUser.values()).reduce((s,v)=>s+v,0),
+        },
+        next_step: 'confirm=GO 추가 호출 시 실제 삭제 진행 → 이후 phase4 EXISTS guard 검증 후 재실행 결재 요청',
+      })
+    }
+
+    // STEP E: 실제 삭제 (confirm=GO)
+    let deletedTxCount = 0
+    let deletedRrCount = 0
+    let balanceUpdatedCount = 0
+
+    // 1. transactions 삭제 (chunks of 50)
+    for (let i = 0; i < allTxIds.length; i += 50) {
+      const chunk = allTxIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM transactions WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedTxCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 2. referral_rewards 삭제
+    for (let i = 0; i < rrIds.length; i += 50) {
+      const chunk = rrIds.slice(i, i + 50)
+      const res = await db.prepare(`
+        DELETE FROM referral_rewards WHERE id IN (${chunk.map(()=>'?').join(',')})
+      `).bind(...chunk).run()
+      deletedRrCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    // 3. 사용자별 잔액 차감 환원 (MAX(0, balance - amt))
+    for (const [uid, amt] of refundByUser.entries()) {
+      const res = await db.prepare(`
+        UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+      `).bind(amt, uid).run()
+      balanceUpdatedCount += Number((res as any)?.meta?.changes || 0)
+    }
+
+    return c.json({
+      success: true,
+      mode: 'exec',
+      target: { paid_date: PAID_DATE, reward_date: REWARD_DATE },
+      preserved: 'Phase 3 daily_rewards 50건 (paid_date=2026-05-12) 보존됨',
+      result: {
+        deleted_transactions: deletedTxCount,
+        deleted_referral_rewards: deletedRrCount,
+        users_balance_refunded: balanceUpdatedCount,
+        total_refund_qkey: Array.from(refundByUser.values()).reduce((s,v)=>s+v,0),
+        refund_by_user: Object.fromEntries(refundByUser),
+        dup_groups_detected: dupGroups,
+      },
+      next_step: 'Phase 4 EXISTS guard 정밀 검증 후 사장님 결재 받아 재실행 (또는 abandon)'
+    })
+  } catch (error) {
+    console.error('exec-delete-may11-phase4-only error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+
 // ★ 200% Cap 진행률 조회 API (사용자/UI용) ★
 //   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)을
 //   사용자 진입금액 합계 × 2 × 150 (target) 과 비교한 진행률 반환.
