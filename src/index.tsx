@@ -3997,7 +3997,10 @@ app.post('/api/rewards/daily', async (c) => {
     const cronTrigger = c.req.header('X-Cron-Trigger') || ''
     const userAgent = c.req.header('User-Agent') || ''
     const isCronCall = cronTrigger === 'github-actions' || /node|github-actions/i.test(userAgent)
-    if (!isCronCall) {
+    // ★ 사장님 2026-05-12 영구 룰 ★ 내부 manual-trigger 우회 헤더
+    //   manual-daily-trigger 가 자기 자신을 호출할 때만 통과 (request body 의 internalSecret 으로 식별)
+    const internalManualCall = cronTrigger === 'manual-admin'
+    if (!isCronCall && !internalManualCall) {
       return c.json({
         success: false,
         error: '강제 일괄 배당은 비활성화되었습니다. 매 평일 KST 07:00 cron 자동 실행 전용입니다. 개별 보정은 /api/admin/rewards/manual-adjust 를 사용하세요.',
@@ -4007,6 +4010,61 @@ app.post('/api/rewards/daily', async (c) => {
 
     const db = c.env.DB
     const now = new Date()
+    const todayKstForLock = kstDateStr(now)
+
+    // ★★★★★★★★★★★★★★★★★★★★ 영구 룰 — daily_cron_lock (2026-05-12 사장님 명령) ★★★★★★★★★★★★★★★★★★★★
+    //   사장님 .md 원문 (2026-05-12):
+    //     "그시간뒤에 실행버튼을 사람이 수동으로 클릭했을때는 무조건 별도의 자동클론이
+    //      당일에는 내 별도의 명령없이 작동하면 안된다"
+    //
+    //   동작 원리:
+    //   1) daily_cron_lock 테이블에 (lock_date, source) 기록
+    //   2) source = 'manual_admin' 이 같은 날짜에 이미 있으면 → 모든 자동 cron 호출 차단 (403)
+    //   3) source = 'cron_auto'    가 같은 날짜에 이미 있으면 → 중복 cron 차단 (이중 배당 방지)
+    //   4) 사장님 별도 명령 (force=GO + ADMIN_PW key) 으로만 lock 해제 가능
+    //   5) lock 은 batch 페이지네이션을 방해하지 않음 — 같은 날 같은 source 의 batch 호출은 통과
+    try {
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS daily_cron_lock (
+          lock_date TEXT PRIMARY KEY,
+          source    TEXT NOT NULL,
+          locked_at TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by TEXT,
+          note      TEXT
+        )
+      `).run()
+    } catch(e) {}
+
+    // 기존 lock 확인 — 같은 날 다른 source 가 이미 실행했으면 차단
+    const existingLock = await db.prepare(`
+      SELECT source, locked_at, locked_by FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(todayKstForLock).first() as any
+    if (existingLock) {
+      const incomingSource = internalManualCall ? 'manual_admin' : 'cron_auto'
+      if (existingLock.source !== incomingSource) {
+        // source 불일치 = 다른 경로(수동/자동)가 이미 같은 날 처리 완료 → 차단
+        return c.json({
+          success: false,
+          error: `오늘(${todayKstForLock}) 데일리 배당은 이미 [${existingLock.source}] 에 의해 ${existingLock.locked_at} 에 실행되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰).`,
+          blocked: true,
+          lock: existingLock
+        }, 423) // 423 Locked
+      }
+      // 같은 source 의 batch 페이지네이션 재호출은 통과
+    } else {
+      // 신규 lock INSERT (cron_auto 또는 manual_admin)
+      try {
+        await db.prepare(`
+          INSERT INTO daily_cron_lock (lock_date, source, locked_by, note)
+          VALUES (?, ?, ?, ?)
+        `).bind(
+          todayKstForLock,
+          internalManualCall ? 'manual_admin' : 'cron_auto',
+          internalManualCall ? 'admin-manual-button' : 'github-actions',
+          internalManualCall ? '어드민 수동 실행 버튼' : 'GitHub Actions cron (KST 07:00)'
+        ).run()
+      } catch(e) {}
+    }
     // ★ 사장님 2026-05-07 명확화 ★
     //   "한국시간으로 익일 01시 정도에 cron 이 돌면서 전날 24시간동안 매출을 점검해서
     //    아침 7시에 뿌려주라는 의미" — 즉, 기준일 = 어제 (KST 00:00:00 ~ 23:59:59)
@@ -4442,6 +4500,218 @@ app.post('/api/rewards/daily', async (c) => {
   } catch (error) {
     console.error('Daily reward error:', error)
     return c.json({ error: t(c, 'rewards.daily_error') }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★ 어드민 수동 데일리 실행 (사장님 2026-05-12 영구 룰) ★★★★★★★★★★★★★★★★★★★★
+//   사장님 .md 원문 (2026-05-12):
+//     "만약 니가 아침 09시까지 자동크론이 실패해서 못돌릴때를 대비해서 어드민에 수동으로 실행할수 있는 버튼을 만들어줘!
+//      그시간뒤에 실행버튼을 사람이 수동으로 클릭했을때는 무조건 별도의 자동클론이 당일에는 내 별도의 명령없이 작동하면 안된다"
+//
+//   동작:
+//   1) Bearer 토큰 어드민 인증 필수
+//   2) 같은 날 cron_auto 가 이미 처리했으면 423 (이중 배당 차단)
+//   3) 같은 날 manual_admin 이 이미 실행했으면 423 (이중 배당 차단)
+//   4) 첫 실행 시 daily_cron_lock 에 source='manual_admin' INSERT → 당일 자동 cron 영구 차단
+//   5) 내부적으로 batch 페이지네이션 호출 (X-Cron-Trigger: manual-admin 헤더)
+//   6) confirm=GO 게이트 (실수 클릭 방지)
+//   7) 사장님 별도 명령 (?force=GO&unlock=GO) 으로만 lock 강제 해제 가능
+//
+//   영구 룰 #일일 배당 cron 단일화 준수: 1일 1회만 실행 (이중 배당 금지)
+//   영구 룰 #신규 (2026-05-12): 수동 버튼 클릭 후 자동 cron 같은 날 작동 금지
+app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
+  try {
+    // 어드민 Bearer 토큰 인증
+    const authHeader = c.req.header('Authorization') || ''
+    if (!authHeader.startsWith('Bearer ')) {
+      return c.json({ success: false, error: '어드민 인증 필요 (Bearer 토큰)' }, 401)
+    }
+    const token = authHeader.substring(7)
+    if (!verifyAdminToken(token)) {
+      return c.json({ success: false, error: '어드민 토큰 검증 실패' }, 401)
+    }
+
+    const confirm = c.req.query('confirm') || ''
+    if (confirm !== 'GO') {
+      return c.json({
+        success: false,
+        error: '수동 데일리 실행은 confirm=GO 필수입니다. (실수 클릭 방지)',
+        usage: 'POST /api/admin/rewards/manual-daily-trigger?confirm=GO'
+      }, 400)
+    }
+
+    const db = c.env.DB
+    const now = new Date()
+    const todayKst = kstDateStr(now)
+
+    // daily_cron_lock 테이블 보장
+    try {
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS daily_cron_lock (
+          lock_date TEXT PRIMARY KEY,
+          source    TEXT NOT NULL,
+          locked_at TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by TEXT,
+          note      TEXT
+        )
+      `).run()
+    } catch(e) {}
+
+    // 사장님 강제 해제 옵션 (영구 룰 위반 아님 — 사장님 별도 명령으로만 해제)
+    const force = c.req.query('force') || ''
+    const unlock = c.req.query('unlock') || ''
+    if (force === 'GO' && unlock === 'GO') {
+      await db.prepare(`DELETE FROM daily_cron_lock WHERE lock_date = ?`).bind(todayKst).run()
+      return c.json({
+        success: true,
+        message: `[사장님 명령] ${todayKst} daily_cron_lock 강제 해제 완료. 이제 다시 cron 또는 manual 트리거 가능.`,
+        unlocked_date: todayKst
+      })
+    }
+
+    // 기존 lock 체크 — 같은 날 이미 실행되었으면 차단
+    const existingLock = await db.prepare(`
+      SELECT source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(todayKst).first() as any
+    if (existingLock) {
+      const srcLabel = existingLock.source === 'cron_auto' ? '자동 cron (KST 07:00)' : '어드민 수동 버튼'
+      return c.json({
+        success: false,
+        error: `오늘(${todayKst}) 데일리 배당은 이미 [${srcLabel}] 에 의해 ${existingLock.locked_at} 에 실행되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
+        blocked: true,
+        lock: existingLock,
+        unlock_hint: '강제 해제: POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 명령)'
+      }, 423)
+    }
+
+    // 내부적으로 /api/rewards/daily 를 batch 페이지네이션으로 호출
+    // X-Cron-Trigger: manual-admin 헤더로 식별
+    const BATCH_SIZE = 10
+    const MAX_ITER = 50
+    let offset = 0
+    let iter = 0
+    let totalRewarded = 0
+    let totalQkey = 0
+    const batchLogs: any[] = []
+
+    // 자기 자신을 fetch 호출 (Cloudflare Workers 내부 라우팅)
+    // c.req.url 에서 origin 추출
+    const reqUrl = new URL(c.req.url)
+    const origin = `${reqUrl.protocol}//${reqUrl.host}`
+
+    while (iter < MAX_ITER) {
+      iter++
+      const targetUrl = `${origin}/api/rewards/daily?batchSize=${BATCH_SIZE}&offset=${offset}`
+      const res = await fetch(targetUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': authHeader,
+          'X-Cron-Trigger': 'manual-admin',
+          'User-Agent': 'manual-admin-button/1.0'
+        },
+        body: JSON.stringify({})
+      })
+      const bodyText = await res.text()
+      let bodyJson: any = null
+      try { bodyJson = JSON.parse(bodyText) } catch(e) { bodyJson = { raw: bodyText } }
+
+      batchLogs.push({
+        iter,
+        offset,
+        status: res.status,
+        rewarded: bodyJson?.rewarded || 0,
+        totalQkey: bodyJson?.totalQkey || 0,
+        batch_processed: bodyJson?.batch_processed || 0,
+        has_more: bodyJson?.has_more || false,
+        message: bodyJson?.message || null
+      })
+
+      if (res.status !== 200) {
+        return c.json({
+          success: false,
+          error: `batch #${iter} 실패 (HTTP ${res.status})`,
+          batchLogs,
+          totalRewarded,
+          totalQkey
+        }, 500)
+      }
+      if (!bodyJson?.success) {
+        return c.json({
+          success: false,
+          error: `batch #${iter} 응답 success=false: ${bodyJson?.error || bodyJson?.message || 'unknown'}`,
+          batchLogs,
+          totalRewarded,
+          totalQkey
+        }, 500)
+      }
+      totalRewarded += (bodyJson.rewarded || 0)
+      totalQkey += (bodyJson.totalQkey || 0)
+      if (!bodyJson.has_more) break
+      offset = bodyJson.next_offset
+    }
+
+    return c.json({
+      success: true,
+      message: `[어드민 수동 실행] ${todayKst} 데일리 배당 완료. 오늘은 자동 cron 영구 차단됨 (사장님 별도 명령 필요).`,
+      todayKst,
+      totalRewarded,
+      totalQkey,
+      iterations: iter,
+      batchLogs,
+      lock_policy: '영구 룰 #신규 (2026-05-12): 수동 버튼 클릭 후 같은 날 자동 cron 작동 금지',
+      unlock_command: 'POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 별도 명령 필요)'
+    })
+  } catch (error: any) {
+    console.error('Manual daily trigger error:', error)
+    return c.json({ success: false, error: error?.message || 'unknown error' }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★ daily_cron_lock 상태 조회 (어드민 UI 표시용) ★★★★★★★★★★★★★★★★★★★★
+app.get('/api/admin/rewards/cron-lock-status', async (c) => {
+  try {
+    const authHeader = c.req.header('Authorization') || ''
+    if (!authHeader.startsWith('Bearer ')) {
+      return c.json({ success: false, error: '어드민 인증 필요' }, 401)
+    }
+    const token = authHeader.substring(7)
+    if (!verifyAdminToken(token)) {
+      return c.json({ success: false, error: '어드민 토큰 검증 실패' }, 401)
+    }
+
+    const db = c.env.DB
+    try {
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS daily_cron_lock (
+          lock_date TEXT PRIMARY KEY,
+          source    TEXT NOT NULL,
+          locked_at TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by TEXT,
+          note      TEXT
+        )
+      `).run()
+    } catch(e) {}
+
+    const todayKst = kstDateStr(new Date())
+    const todayLock = await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(todayKst).first() as any
+    const recentLocks = await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note
+      FROM daily_cron_lock
+      ORDER BY lock_date DESC LIMIT 14
+    `).all()
+
+    return c.json({
+      success: true,
+      todayKst,
+      todayLock: todayLock || null,
+      isLockedToday: !!todayLock,
+      recentLocks: recentLocks.results
+    })
+  } catch (error: any) {
+    return c.json({ success: false, error: error?.message || 'unknown' }, 500)
   }
 })
 
@@ -17879,19 +18149,30 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
-                <!-- 일일 배당 자동화 안내 (강제 일괄 지급 버튼 비활성화 — 사장님 2026-05-07 지시) -->
+                <!-- 일일 배당 자동화 안내 + 수동 실행 비상 버튼 (사장님 2026-05-12 영구 룰) -->
                 <div class="bg-white rounded-lg shadow-md p-4 sm:p-6 mb-4 sm:mb-6">
                     <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-                        <div>
+                        <div class="flex-1">
                             <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clock text-blue-600 mr-2"></i>일일 배당 자동화 (KST 07:00)</h3>
                             <p class="text-sm text-gray-600 mt-1">매 평일 한국시간 오전 7시에 GitHub Actions cron 으로 자동 지급됩니다 (월~금)</p>
                             <p class="text-xs text-gray-500 mt-1">개별 회원 보정은 아래 회원관리 → '잔액 조정' 또는 '/api/admin/rewards/manual-adjust' 사용</p>
+                            <!-- 오늘자 락 상태 -->
+                            <div id="cronLockStatus" class="mt-2 text-xs"></div>
                         </div>
-                        <button disabled
-                            class="px-6 py-3 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed text-sm sm:text-base whitespace-nowrap"
-                            title="강제 일괄 배당은 비활성화됨 (cron 자동 실행 전용)">
-                            <i class="fas fa-lock mr-2"></i>자동 실행 전용
-                        </button>
+                        <div class="flex flex-col gap-2">
+                            <!-- 정상 cron 안내 (회색) -->
+                            <button disabled
+                                class="px-4 py-2 bg-gray-200 text-gray-500 rounded-lg font-medium cursor-not-allowed text-xs sm:text-sm whitespace-nowrap"
+                                title="평상시는 cron 자동 실행">
+                                <i class="fas fa-robot mr-1"></i>자동 cron (KST 07:00)
+                            </button>
+                            <!-- 수동 실행 비상 버튼 (사장님 2026-05-12 영구 룰) -->
+                            <button onclick="executeManualDailyTrigger()"
+                                class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold text-xs sm:text-sm whitespace-nowrap"
+                                title="자동 cron 실패 시(09:00 KST 미실행) 사장님 수동 실행. 누르면 같은 날 자동 cron 영구 차단.">
+                                <i class="fas fa-bolt mr-1"></i>긴급 수동 실행 (09:00 후)
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -19462,6 +19743,78 @@ app.get('/admin/dashboard', (c) => {
                 alert('일일 배당은 매 평일 KST 07:00 cron 자동 실행 전용입니다. 개별 회원 보정은 회원관리 → 잔액 조정 또는 /api/admin/rewards/manual-adjust 를 사용해 주세요.');
                 return;
             }
+
+            // ============================================
+            // ★ 사장님 2026-05-12 영구 룰 ★
+            // 어드민 수동 데일리 실행 (09:00 KST 까지 cron 미실행 시 비상 버튼)
+            // 누르면 daily_cron_lock 에 manual_admin 기록 → 같은 날 자동 cron 영구 차단
+            // ============================================
+            async function executeManualDailyTrigger() {
+                var confirmMsg = '⚠️ 긴급 수동 데일리 배당 실행\\n\\n'
+                    + '이 버튼은 자동 cron 이 KST 09:00까지 실행되지 않은 비상 상황 전용입니다.\\n\\n'
+                    + '【영구 룰】 한 번 누르면 같은 날 자동 cron 은 사장님 별도 명령 없이 작동하지 않습니다.\\n\\n'
+                    + '진짜 실행하시겠습니까?';
+                if (!confirm(confirmMsg)) return;
+                var confirmMsg2 = '⚠️⚠️ 최종 확인 ⚠️⚠️\\n\\n오늘 데일리 배당을 수동으로 실행합니다.\\n실수 클릭이 아니라면 [확인]을 눌러주세요.';
+                if (!confirm(confirmMsg2)) return;
+
+                try {
+                    var token = localStorage.getItem('adminToken') || '';
+                    if (!token) { alert('어드민 로그인 필요'); return; }
+                    var btn = event && event.target ? event.target : null;
+                    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>실행 중...'; }
+
+                    var res = await axios.post('/api/admin/rewards/manual-daily-trigger?confirm=GO', {}, {
+                        headers: { 'Authorization': 'Bearer ' + token },
+                        validateStatus: function() { return true; }
+                    });
+                    var data = res.data || {};
+                    if (data.success) {
+                        var msg = '✅ 수동 데일리 배당 완료\\n\\n'
+                            + '기준일: ' + (data.todayKst || '-') + '\\n'
+                            + '배당 처리: ' + (data.totalRewarded || 0) + ' 건\\n'
+                            + '총 QKEY: ' + (data.totalQkey || 0).toLocaleString() + '\\n'
+                            + '배치 반복: ' + (data.iterations || 0) + ' 회\\n\\n'
+                            + '【영구 룰】 오늘은 자동 cron 영구 차단됨.';
+                        alert(msg);
+                    } else if (res.status === 423) {
+                        alert('🔒 이미 처리됨\\n\\n' + (data.error || '오늘 데일리는 이미 처리되었습니다.'));
+                    } else {
+                        alert('❌ 실패: ' + (data.error || ('HTTP ' + res.status)));
+                    }
+                    loadCronLockStatus();
+                } catch (err) {
+                    alert('❌ 오류: ' + (err.message || err));
+                } finally {
+                    var btn2 = document.querySelector('button[onclick="executeManualDailyTrigger()"]');
+                    if (btn2) { btn2.disabled = false; btn2.innerHTML = '<i class="fas fa-bolt mr-1"></i>긴급 수동 실행 (09:00 후)'; }
+                }
+            }
+
+            // 오늘자 cron lock 상태 표시
+            async function loadCronLockStatus() {
+                try {
+                    var token = localStorage.getItem('adminToken') || '';
+                    if (!token) return;
+                    var res = await axios.get('/api/admin/rewards/cron-lock-status', {
+                        headers: { 'Authorization': 'Bearer ' + token },
+                        validateStatus: function() { return true; }
+                    });
+                    var el = document.getElementById('cronLockStatus');
+                    if (!el) return;
+                    var data = res.data || {};
+                    if (data.success && data.isLockedToday && data.todayLock) {
+                        var src = data.todayLock.source === 'cron_auto' ? '🤖 자동 cron' : '👤 어드민 수동';
+                        el.innerHTML = '<span class="inline-block px-2 py-1 bg-green-100 text-green-800 rounded font-medium">'
+                            + '✅ ' + data.todayKst + ' 처리 완료 [' + src + '] @ ' + data.todayLock.locked_at + '</span>';
+                    } else if (data.success) {
+                        el.innerHTML = '<span class="inline-block px-2 py-1 bg-yellow-100 text-yellow-800 rounded font-medium">'
+                            + '⏳ ' + (data.todayKst || '-') + ' 미처리 (대기 중)</span>';
+                    }
+                } catch(e) {}
+            }
+            // 어드민 페이지 로드 시 자동 실행
+            try { setTimeout(loadCronLockStatus, 1500); setInterval(loadCronLockStatus, 60000); } catch(e) {}
 
             // ============================================
             // 회원 상세 보기
