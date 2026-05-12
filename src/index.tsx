@@ -5026,6 +5026,90 @@ app.get('/api/diag/missing-rewards', async (c) => {
   }
 })
 
+// ★★★ 휴일 진입자 전수 조사 (5/9, 5/10 등 토/일/공휴일 진입자) ★★★
+//   경로: /api/diag/holiday-entrants?from=YYYY-MM-DD&to=YYYY-MM-DD&check_date=YYYY-MM-DD&key=ADMIN_PW
+//   읽기 전용:
+//     1) start_date_kst BETWEEN from AND to AND 그 날짜가 토/일/공휴일인 staking 전수
+//     2) 각 staking 의 last_reward_date + daily_rewards 행수
+//     3) check_date 의 reward_date 가 있는지 (= 그날 일일배당 지급됐는지)
+app.get('/api/diag/holiday-entrants', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    const from = c.req.query('from') || ''
+    const to = c.req.query('to') || ''
+    const checkDate = c.req.query('check_date') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || !/^\d{4}-\d{2}-\d{2}$/.test(checkDate)) {
+      return c.json({ error: 'from, to, check_date 모두 YYYY-MM-DD 필요' }, 400)
+    }
+
+    // start_date_kst BETWEEN from AND to 의 모든 staking 조회
+    const stakings = await db.prepare(`
+      SELECT
+        s.id as staking_id, s.user_id, u.email,
+        s.amount, s.status,
+        date(s.start_date, '+9 hours') as start_date_kst,
+        date(s.end_date, '+9 hours') as end_date_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date,
+        (SELECT id FROM daily_rewards WHERE staking_id = s.id AND reward_date = ?) as reward_on_check_date
+      FROM staking s
+      LEFT JOIN users u ON u.id = s.user_id
+      WHERE date(s.start_date, '+9 hours') BETWEEN ? AND ?
+        AND s.status IN ('active','completed','capped')
+      ORDER BY s.user_id ASC, s.id ASC
+    `).bind(checkDate, from, to).all()
+
+    // 휴일 판정 + 결과 정리
+    const list: any[] = []
+    let holidayCount = 0
+    let missingOnCheckDate = 0
+    let paidOnCheckDate = 0
+    for (const st of stakings.results as any[]) {
+      const startKst = st.start_date_kst as string
+      const startObj = new Date(startKst + 'T00:00:00Z')
+      const startCheck = new Date(startObj.getTime() - 9 * 60 * 60 * 1000)
+      const { isBusinessDay: isStartBiz, reason: startReason } = isKoreanBusinessDay(startCheck)
+      const isHolidayEntry = !isStartBiz
+      if (!isHolidayEntry) continue
+      holidayCount++
+      const hasRewardOnCheckDate = !!st.reward_on_check_date
+      if (hasRewardOnCheckDate) paidOnCheckDate++
+      else missingOnCheckDate++
+      list.push({
+        staking_id: st.staking_id,
+        user_id: st.user_id,
+        email: st.email,
+        amount: st.amount,
+        status: st.status,
+        start_date_kst: startKst,
+        start_reason: startReason,  // saturday / sunday / holiday
+        end_date_kst: st.end_date_kst,
+        rewarded_count: st.rewarded_count,
+        last_reward_date: st.last_reward_date,
+        check_date: checkDate,
+        paid_on_check_date: hasRewardOnCheckDate
+      })
+    }
+
+    return c.json({
+      success: true,
+      from, to, check_date: checkDate,
+      summary: {
+        total_holiday_entrants: holidayCount,
+        paid_on_check_date: paidOnCheckDate,
+        missing_on_check_date: missingOnCheckDate
+      },
+      entrants: list
+    })
+  } catch (error) {
+    console.error('holiday-entrants diag error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 특정 사용자 다운라인 명단 + 기간 내 매출/배당 추적 (사실 확인용 영구 진단) ★★★
 //   경로: /api/diag/downline-trace?user_id=N&from=YYYY-MM-DD&to=YYYY-MM-DD&key=ADMIN_PW
 //   읽기 전용:
