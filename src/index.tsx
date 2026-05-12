@@ -5133,7 +5133,12 @@ app.post('/api/diag/backfill-may12-missing', async (c) => {
     const db = c.env.DB
 
     // 하드코드 대상 staking_id 5건 (X-A 사실 검증 완료)
-    const TARGET_STAKING_IDS = [94, 95, 96, 97, 98]
+    // ★ D1 timeout 방지: ?only=N 으로 1건씩 실행 가능 (없으면 5건 전체)
+    const ALL_TARGET_STAKING_IDS = [94, 95, 96, 97, 98]
+    const onlyParam = c.req.query('only')
+    const TARGET_STAKING_IDS = onlyParam
+      ? ALL_TARGET_STAKING_IDS.filter(id => id === Number(onlyParam))
+      : ALL_TARGET_STAKING_IDS
     const REWARD_DATE = '2026-05-12'
     const PAID_DATE = '2026-05-12'
     const USD_TO_QKEY = 150
