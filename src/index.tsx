@@ -5026,6 +5026,119 @@ app.get('/api/diag/missing-rewards', async (c) => {
   }
 })
 
+// ★★★ 특정 사용자 다운라인 명단 + 기간 내 매출/배당 추적 (사실 확인용 영구 진단) ★★★
+//   경로: /api/diag/downline-trace?user_id=N&from=YYYY-MM-DD&to=YYYY-MM-DD&key=ADMIN_PW
+//   읽기 전용:
+//     1) target user 정보 + 직계(L1)/2단계(L2) 다운라인 user_id 명단
+//     2) 다운라인 각자의 staking 명단 (start_date, status, amount)
+//     3) 다운라인 각자의 daily_rewards (reward_date BETWEEN from AND to)
+//     4) target user 의 referral_reward transactions (date BETWEEN from AND to)
+app.get('/api/diag/downline-trace', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const from = c.req.query('from') || ''
+    const to = c.req.query('to') || ''
+    if (!userId || !/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return c.json({ error: 'user_id, from=YYYY-MM-DD, to=YYYY-MM-DD 필요' }, 400)
+    }
+
+    // 1) target user
+    const target = await db.prepare(`SELECT id, email, referrer_id FROM users WHERE id = ?`).bind(userId).first() as any
+    if (!target) return c.json({ error: 'user not found' }, 404)
+
+    // 2) L1 직계 다운라인 (target 의 referrer_id = userId)
+    const l1Rows = await db.prepare(`
+      SELECT id, email, referrer_id, created_at
+      FROM users WHERE referrer_id = ?
+      ORDER BY id ASC
+    `).bind(userId).all()
+    const l1Ids = (l1Rows.results as any[]).map(r => r.id)
+
+    // 3) L2 다운라인 (L1 의 다운라인)
+    let l2Rows: any = { results: [] }
+    if (l1Ids.length > 0) {
+      const placeholders = l1Ids.map(() => '?').join(',')
+      l2Rows = await db.prepare(`
+        SELECT id, email, referrer_id, created_at
+        FROM users WHERE referrer_id IN (${placeholders})
+        ORDER BY id ASC
+      `).bind(...l1Ids).all()
+    }
+    const l2Ids = (l2Rows.results as any[]).map(r => r.id)
+    const allDownlineIds = [...l1Ids, ...l2Ids]
+
+    // 4) 다운라인 staking 명단
+    let stakings: any[] = []
+    if (allDownlineIds.length > 0) {
+      const placeholders = allDownlineIds.map(() => '?').join(',')
+      const stRows = await db.prepare(`
+        SELECT id as staking_id, user_id, amount, status,
+               date(start_date, '+9 hours') as start_date_kst,
+               date(end_date, '+9 hours') as end_date_kst
+        FROM staking WHERE user_id IN (${placeholders})
+        ORDER BY user_id ASC, id ASC
+      `).bind(...allDownlineIds).all()
+      stakings = stRows.results as any[]
+    }
+
+    // 5) 다운라인 daily_rewards (reward_date BETWEEN from AND to)
+    let downlineRewards: any[] = []
+    if (allDownlineIds.length > 0) {
+      const placeholders = allDownlineIds.map(() => '?').join(',')
+      const drRows = await db.prepare(`
+        SELECT dr.id, dr.staking_id, dr.user_id, u.email,
+               dr.reward_date, dr.paid_date, dr.usdt_amount
+        FROM daily_rewards dr
+        LEFT JOIN users u ON u.id = dr.user_id
+        WHERE dr.user_id IN (${placeholders})
+          AND dr.reward_date BETWEEN ? AND ?
+        ORDER BY dr.user_id ASC, dr.reward_date ASC, dr.id ASC
+      `).bind(...allDownlineIds, from, to).all()
+      downlineRewards = drRows.results as any[]
+    }
+
+    // 6) target user 의 referral_reward transactions (KST 기준)
+    const targetTxRows = await db.prepare(`
+      SELECT id, type, coin_type, amount, description, created_at,
+             date(created_at, '+9 hours') as paid_date_kst
+      FROM transactions
+      WHERE user_id = ? AND type = 'referral_reward'
+        AND date(created_at, '+9 hours') BETWEEN ? AND ?
+      ORDER BY id ASC
+    `).bind(userId, from, to).all()
+
+    // 사용자 → level 매핑
+    const levelMap = new Map<number, 1 | 2>()
+    for (const id of l1Ids) levelMap.set(id, 1)
+    for (const id of l2Ids) levelMap.set(id, 2)
+
+    // 다운라인 reward 를 staking_id → user_id 로 정리 (level 정보 추가)
+    const enrichedRewards = downlineRewards.map(r => ({
+      ...r,
+      level: levelMap.get(r.user_id as number) || 0
+    }))
+
+    return c.json({
+      success: true,
+      target_user: target,
+      l1_count: l1Ids.length,
+      l2_count: l2Ids.length,
+      l1_downline: l1Rows.results,
+      l2_downline: l2Rows.results,
+      downline_stakings: stakings,
+      downline_rewards_in_range: enrichedRewards,
+      target_referral_transactions_in_range: targetTxRows.results
+    })
+  } catch (error) {
+    console.error('downline-trace diag error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 특정 날짜 daily_rewards 실제 D1 row 조회 (사실 확인용) ★★★
 //   경로: /api/diag/rewards-by-date?date=YYYY-MM-DD&key=ADMIN_PW
 //   읽기 전용 — 그 날짜의 daily_rewards 테이블 전체 row + transactions 5/12 daily_qkey/referral_reward 행 모두 노출
