@@ -18088,12 +18088,12 @@ app.get('/admin/dashboard', (c) => {
 
                 <!-- 회원 상세 모달 (숨김) -->
                 <div id="userDetailModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
-                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-4 sm:p-6">
-                        <div class="flex justify-between items-center mb-4">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+                        <div class="flex justify-between items-center p-4 sm:p-6 pb-3 border-b border-gray-200 flex-shrink-0">
                             <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-user-circle text-purple-600 mr-2"></i><span data-i18n="admin.user_detail">회원 상세 정보</span></h3>
                             <button onclick="closeUserDetail()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
                         </div>
-                        <div id="userDetailContent">
+                        <div id="userDetailContent" class="overflow-y-auto overflow-x-hidden flex-1 p-4 sm:p-6 pt-3" style="-webkit-overflow-scrolling: touch;">
                             <p class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</p>
                         </div>
                     </div>
