@@ -5668,6 +5668,87 @@ app.post('/api/diag/backfill-referral-mirror-all', async (c) => {
   }
 })
 
+// ★★★ 솔밧 5/12 L2 tx created_at 정정 — A안 결재 (2026-05-12) ★★★
+//   경로: POST /api/diag/fix-solbat-l2-may12-createdat?key=ADMIN_PW&dry_run=1|0
+//   목적: 솔밧(u#44) L2 4건(ref_id 810,814,836,838)의 transactions.created_at 을
+//         원장 reward_date(2026-05-12) 기준으로 정정하여 화면 일자별 집계 정상화
+//   불변: amount/description/ref_id/잔액 모두 변경 없음 — created_at만 UPDATE
+//   기대: 5/12 L2 화면 합계 150 → 1,950 (원장과 일치)
+app.post('/api/diag/fix-solbat-l2-may12-createdat', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') !== '0'
+
+    const TARGET_REF_IDS = [810, 814, 836, 838]
+    const TARGET_USER_ID = 44
+    const NEW_CREATED_AT = '2026-05-12'
+
+    const db = c.env.DB
+    const before: any[] = []
+    const after: any[] = []
+
+    // 사전 raw 조회
+    for (const rid of TARGET_REF_IDS) {
+      const row = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+        FROM transactions
+        WHERE type='referral_reward' AND ref_id = ? AND user_id = ?
+      `).bind(rid, TARGET_USER_ID).first()
+      if (row) before.push(row)
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'dry_run',
+        target_ref_ids: TARGET_REF_IDS,
+        target_user_id: TARGET_USER_ID,
+        new_created_at_date: NEW_CREATED_AT,
+        before,
+        would_update_count: before.length,
+        note: '잔액 절대 미수정 — created_at 컬럼만 UPDATE',
+      })
+    }
+
+    // 실 적용: created_at 만 UPDATE (시각은 정오 KST = 03:00 UTC 로 고정)
+    let updated = 0
+    for (const rid of TARGET_REF_IDS) {
+      const res = await db.prepare(`
+        UPDATE transactions
+        SET created_at = ?
+        WHERE type='referral_reward' AND ref_id = ? AND user_id = ?
+      `).bind(`${NEW_CREATED_AT} 03:00:00`, rid, TARGET_USER_ID).run()
+      if (res.meta?.changes && res.meta.changes > 0) updated += res.meta.changes
+    }
+
+    // 사후 raw 조회
+    for (const rid of TARGET_REF_IDS) {
+      const row = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+        FROM transactions
+        WHERE type='referral_reward' AND ref_id = ? AND user_id = ?
+      `).bind(rid, TARGET_USER_ID).first()
+      if (row) after.push(row)
+    }
+
+    return c.json({
+      success: true,
+      mode: 'real',
+      target_ref_ids: TARGET_REF_IDS,
+      target_user_id: TARGET_USER_ID,
+      new_created_at: `${NEW_CREATED_AT} 03:00:00`,
+      updated_count: updated,
+      before,
+      after,
+      note: '잔액 미수정 — created_at만 변경. amount/description/ref_id 불변.',
+    })
+  } catch (error) {
+    console.error('fix-solbat-l2-may12-createdat error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 전체 스왑 내역 dump — 사실 확인용 영구 진단 (read-only) ★★★
 //   경로: /api/diag/all-swaps?key=ADMIN_PW&user_id=N(옵션)&limit=N(옵션)
 //   목적: 어드민 "스왑 내역 관리" 화면에 노출되는 28건 raw dump
