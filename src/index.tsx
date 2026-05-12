@@ -22645,4 +22645,163 @@ app.get('/api/diag/audit-holiday-entrant-weekday-gap', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/audit-weekday-daily-gap
+// ----------------------------------------------------
+// 사장님 영구룰 #휴일진입자 정확 해석 (2026-05-12 사장님 격분 후 확정):
+//   휴일진입자도 첫 평일 데일리 시작 후 그 이후 평일이면 계속 데일리 지급
+//   (휴일 스킵, 평일=무조건 지급)
+//
+// 이번 진단 목적:
+//   임의 평일(?target_date=YYYY-MM-DD) 데일리 미지급 active staking 전수 추출
+//   default target_date = 2026-05-12 (화)
+//
+// 조건:
+//   - status='active' 인 모든 staking
+//   - kst_start_date <= (target_date - 1일) (즉, 진입 다음날부터 적립 가능)
+//     단, 휴일진입자는 첫 평일이 target_date 이거나 그 이전이어야 함
+//   - daily_rewards 에 (staking_id, reward_date=target_date) 행 NOT EXISTS
+//
+// 검증 로직 (read-only):
+//   - kst_start_date 가 target_date 이전 (적립 시작 가능)
+//   - 영구룰 #1: amount × daily_rate × 150 = QKEY/일
+// ============================================================
+app.get('/api/diag/audit-weekday-daily-gap', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+
+  try {
+    const db = c.env.DB
+    const targetDate = c.req.query('target_date') || '2026-05-12'
+
+    // STEP 1: target_date 이전 진입한 active staking 전수
+    // (kst_start_date < target_date — target_date 당일 진입은 제외)
+    const allActive = await db.prepare(`
+      SELECT
+        s.id AS staking_id,
+        s.user_id,
+        s.amount,
+        s.daily_rate,
+        s.status,
+        s.start_date,
+        date(datetime(s.start_date, '+9 hours')) AS kst_start_date,
+        u.name AS user_name,
+        u.email AS user_email,
+        u.qkey_balance,
+        u.referrer_id
+      FROM staking s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.status = 'active'
+        AND date(datetime(s.start_date, '+9 hours')) < ?
+      ORDER BY s.user_id, s.id
+    `).bind(targetDate).all()
+
+    const entrants = allActive.results || []
+
+    const missing: any[] = []
+    const paid: any[] = []
+    let missingSumQkey = 0
+    let paidSumQkey = 0
+
+    for (const s of entrants as any[]) {
+      const expectedQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+      const row = await db.prepare(`
+        SELECT id, usdt_amount, reward_date, created_at
+        FROM daily_rewards
+        WHERE staking_id = ? AND reward_date = ?
+        LIMIT 1
+      `).bind(s.staking_id, targetDate).first()
+
+      const kstStart = s.kst_start_date as string
+      const startDow = new Date(kstStart + 'T00:00:00+09:00').getDay() // 0=일, 6=토
+      const weekdayLabel = ['일(휴일)', '월', '화', '수', '목', '금', '토(휴일)'][startDow]
+
+      const detail = {
+        user_id: s.user_id,
+        user_name: s.user_name,
+        user_email: s.user_email,
+        staking_id: s.staking_id,
+        amount: s.amount,
+        daily_rate: s.daily_rate,
+        kst_start_date: kstStart,
+        start_weekday: weekdayLabel,
+        expected_qkey_per_day: expectedQkey,
+        qkey_balance: s.qkey_balance,
+        referrer_id: s.referrer_id,
+      }
+
+      if (row) {
+        paid.push({ ...detail, status_target: 'PAID', paid_reward_id: row.id, paid_qkey: row.usdt_amount, paid_created_at: row.created_at })
+        paidSumQkey += Number(row.usdt_amount) || 0
+      } else {
+        missing.push({ ...detail, status_target: 'MISSING' })
+        missingSumQkey += expectedQkey
+      }
+    }
+
+    // by_user 집계
+    const byUserMap: Record<string, any> = {}
+    for (const m of missing) {
+      const uid = String(m.user_id)
+      if (!byUserMap[uid]) {
+        byUserMap[uid] = {
+          user_id: m.user_id,
+          user_name: m.user_name,
+          user_email: m.user_email,
+          referrer_id: m.referrer_id,
+          qkey_balance: m.qkey_balance,
+          missing_count: 0,
+          missing_qkey_total: 0,
+          stakings: []
+        }
+      }
+      byUserMap[uid].missing_count += 1
+      byUserMap[uid].missing_qkey_total += m.expected_qkey_per_day
+      byUserMap[uid].stakings.push({
+        staking_id: m.staking_id,
+        amount: m.amount,
+        daily_rate: m.daily_rate,
+        kst_start_date: m.kst_start_date,
+        start_weekday: m.start_weekday,
+        expected_qkey: m.expected_qkey_per_day,
+      })
+    }
+    const byUser = Object.values(byUserMap).sort((a: any, b: any) => b.missing_qkey_total - a.missing_qkey_total)
+
+    // by_kst_start_date 집계
+    const byDateMap: Record<string, any> = {}
+    for (const m of missing) {
+      const d = m.kst_start_date
+      if (!byDateMap[d]) byDateMap[d] = { kst_start_date: d, start_weekday: m.start_weekday, count: 0, qkey_total: 0 }
+      byDateMap[d].count += 1
+      byDateMap[d].qkey_total += m.expected_qkey_per_day
+    }
+
+    return c.json({
+      success: true,
+      target_date: targetDate,
+      audit_target: `${targetDate} 평일 데일리 미지급 active staking 전수`,
+      policy_ref: '영구룰 #휴일진입자: 휴일진입자도 첫 평일 데일리 시작 후 그 이후 평일이면 계속 데일리 지급',
+      counts: {
+        total_eligible_stakings: entrants.length,
+        paid: paid.length,
+        missing: missing.length,
+      },
+      sums: {
+        missing_qkey_total: missingSumQkey,
+        paid_qkey_total: paidSumQkey,
+        expected_total_qkey: missingSumQkey + paidSumQkey,
+      },
+      missing_by_kst_start_date: byDateMap,
+      missing_by_user: byUser,
+      missing_detail: missing,
+      paid_detail_sample: paid.slice(0, 10),
+      note: 'read-only. 보정 진행 시 별도 INSERT endpoint 필요 (ref_id dedupe 가드 + description 한국어 안전 룰 #112 준수). target_date 미지정 시 기본 2026-05-12.'
+    })
+  } catch (error: any) {
+    console.error('audit-weekday-daily-gap error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
