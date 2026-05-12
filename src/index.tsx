@@ -22288,4 +22288,183 @@ app.get('/api/diag/downline-daily-by-date', async (c) => {
   }
 })
 
+// ========================================================================
+// /api/diag/audit-user-referral-tx-gap
+// ------------------------------------------------------------------------
+// 목적 (C안 Phase 1, 사장님 결재 2026-05-12):
+//   referral_rewards 합 vs transactions(type=referral_reward, coin_type=QKEY) 합 차이 정밀 식별
+//   각 referral_rewards.id 별로 transactions 에 해당 ref_id 행이 있는지 매핑
+//   → 누락 rr.id 식별 → Phase 2 INSERT 대상 확정
+//
+// 영구 룰 준수:
+//   - 룰 #6: reward_date 기준 정상치 vs 실제치 정확 비교 (혼동 방지)
+//   - 룰 #7: daily_rewards.usdt_amount = QKEY (이 endpoint 는 referral_rewards 전용)
+//   - 추측 0건: D1 직접 조회
+//
+// gate: key=ADMIN_PW (read-only)
+// ========================================================================
+app.get('/api/diag/audit-user-referral-tx-gap', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '44', 10)
+
+    // 사용자 기본
+    const user = await db.prepare(`
+      SELECT id, email, name, qkey_balance FROM users WHERE id = ?
+    `).bind(userId).first() as any
+    if (!user) return c.json({ error: `user ${userId} not found` }, 404)
+
+    // referral_rewards (이 사용자가 받아야 할 모든 매칭)
+    const rrRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE referrer_id = ?
+      ORDER BY reward_date ASC, level ASC, id ASC
+    `).bind(userId).all()
+    const rrList = (rrRows.results || []) as any[]
+
+    // transactions (type=referral_reward, coin_type=QKEY) — 이 사용자가 실제 받은 거래내역
+    const txRows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+      FROM transactions
+      WHERE user_id = ?
+        AND type = 'referral_reward'
+        AND coin_type = 'QKEY'
+      ORDER BY id ASC
+    `).bind(userId).all()
+    const txList = (txRows.results || []) as any[]
+
+    // ref_id 기준 매핑 (1:N 가능성도 체크, 즉 같은 rr.id 에 tx 가 2개면 중복)
+    const txByRefId: Record<string, any[]> = {}
+    for (const t of txList) {
+      const k = String(t.ref_id ?? 'NULL')
+      if (!txByRefId[k]) txByRefId[k] = []
+      txByRefId[k].push(t)
+    }
+
+    // rr 별 매핑 상태
+    const matched: any[] = []
+    const missingTx: any[] = []      // referral_rewards 에는 있지만 transactions 에 없음 (Phase 2 INSERT 대상)
+    const duplicateTx: any[] = []    // 같은 rr.id 에 transactions 2개 이상 (중복 의심)
+    const orphanTx: any[] = []       // transactions 에는 있지만 ref_id 가 referral_rewards 에 없음
+
+    const rrIdSet = new Set(rrList.map(r => String(r.id)))
+
+    for (const rr of rrList) {
+      const txs = txByRefId[String(rr.id)] || []
+      if (txs.length === 0) {
+        missingTx.push({
+          rr_id: rr.id, level: rr.level, referee_id: rr.referee_id,
+          reward_amount: Math.round(Number(rr.reward_amount || 0)),
+          reward_date: rr.reward_date, paid_date: rr.paid_date,
+          created_at: rr.created_at
+        })
+      } else if (txs.length === 1) {
+        matched.push({
+          rr_id: rr.id, tx_id: txs[0].id, level: rr.level,
+          referee_id: rr.referee_id,
+          rr_amount: Math.round(Number(rr.reward_amount || 0)),
+          tx_amount: Math.round(Number(txs[0].amount || 0)),
+          reward_date: rr.reward_date,
+          amount_match: Math.round(Number(rr.reward_amount || 0)) === Math.round(Number(txs[0].amount || 0))
+        })
+      } else {
+        duplicateTx.push({
+          rr_id: rr.id, level: rr.level, referee_id: rr.referee_id,
+          reward_amount: Math.round(Number(rr.reward_amount || 0)),
+          reward_date: rr.reward_date,
+          tx_count: txs.length,
+          tx_ids: txs.map(t => t.id),
+          tx_amounts: txs.map(t => Math.round(Number(t.amount || 0)))
+        })
+      }
+    }
+
+    // orphan tx: tx.ref_id 가 referral_rewards 에 없는 경우 (잘못된 INSERT)
+    for (const t of txList) {
+      const refKey = String(t.ref_id ?? 'NULL')
+      if (refKey === 'NULL') {
+        orphanTx.push({
+          tx_id: t.id, amount: Math.round(Number(t.amount || 0)),
+          description: t.description, created_at: t.created_at,
+          reason: 'ref_id NULL'
+        })
+      } else if (!rrIdSet.has(refKey)) {
+        orphanTx.push({
+          tx_id: t.id, ref_id: t.ref_id, amount: Math.round(Number(t.amount || 0)),
+          description: t.description, created_at: t.created_at,
+          reason: 'ref_id not in referral_rewards'
+        })
+      }
+    }
+
+    // 합계 검증
+    const rrSum = rrList.reduce((s, r) => s + Math.round(Number(r.reward_amount || 0)), 0)
+    const txSum = txList.reduce((s, t) => s + Math.round(Number(t.amount || 0)), 0)
+    const missingSum = missingTx.reduce((s, m) => s + m.reward_amount, 0)
+
+    // 누락분 일자별 + level 별 집계 (Phase 2 INSERT 시 명세서)
+    const missingByDate: Record<string, any> = {}
+    for (const m of missingTx) {
+      const k = `${m.reward_date}_L${m.level}`
+      if (!missingByDate[k]) {
+        missingByDate[k] = { reward_date: m.reward_date, level: m.level, count: 0, sum_qkey: 0, rr_ids: [] }
+      }
+      missingByDate[k].count += 1
+      missingByDate[k].sum_qkey += m.reward_amount
+      missingByDate[k].rr_ids.push(m.rr_id)
+    }
+    const missingByDateList = Object.values(missingByDate).sort((a: any, b: any) => {
+      if (a.reward_date !== b.reward_date) return a.reward_date.localeCompare(b.reward_date)
+      return a.level - b.level
+    })
+
+    // qkey_balance 정합성 추적: transactions(QKEY) type 별 합 vs qkey_balance
+    const qkeyTypeRows = await db.prepare(`
+      SELECT type, COUNT(*) AS cnt, SUM(amount) AS total
+      FROM transactions
+      WHERE user_id = ? AND coin_type = 'QKEY'
+      GROUP BY type
+    `).bind(userId).all()
+    const qkeyByType = (qkeyTypeRows.results || []) as any[]
+    const qkeyTxTotal = qkeyByType.reduce((s, r: any) => s + Number(r.total || 0), 0)
+
+    return c.json({
+      success: true,
+      user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance },
+      counts: {
+        referral_rewards_total: rrList.length,
+        transactions_referral_reward_total: txList.length,
+        matched: matched.length,
+        missing_tx: missingTx.length,
+        duplicate_tx: duplicateTx.length,
+        orphan_tx: orphanTx.length,
+      },
+      sums: {
+        referral_rewards_sum_qkey: rrSum,
+        transactions_referral_reward_sum_qkey: txSum,
+        gap_qkey: rrSum - txSum,
+        missing_sum_qkey: missingSum,
+      },
+      qkey_balance_audit: {
+        qkey_balance: user.qkey_balance,
+        all_transactions_qkey_sum: qkeyTxTotal,
+        gap_qkey: qkeyTxTotal - Number(user.qkey_balance || 0),
+        by_type: qkeyByType,
+      },
+      missing_tx_by_date_level: missingByDateList,
+      missing_tx_detail: missingTx,
+      duplicate_tx: duplicateTx,
+      orphan_tx: orphanTx,
+      matched_sample: matched.slice(0, 10),
+      note: 'Phase 1 read-only. missing_tx_detail 의 rr_id 별로 Phase 2 INSERT 진행 (ref_id dedupe 가드 적용). 추측 0건, D1 직접.'
+    })
+  } catch (error: any) {
+    console.error('audit-user-referral-tx-gap error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
