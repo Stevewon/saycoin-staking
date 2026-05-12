@@ -14608,7 +14608,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260511a"></script>
+        <script src="/static/i18n.js?v=20260512c"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -15591,7 +15591,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260511a"></script>
+        <script src="/static/i18n.js?v=20260512c"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -17684,7 +17684,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260511a"></script>
+        <script src="/static/i18n.js?v=20260512c"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -18644,7 +18644,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260511a"></script>
+        <script src="/static/i18n.js?v=20260512c"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
@@ -22005,14 +22005,18 @@ app.get('/api/diag/audit-tx-double-kst', async (c) => {
       LIMIT 200
     `).all()
 
-    // STEP 3: 어드민 표시 일자 기준 미래 일자 행 (2026-05-13 이후)
+    // STEP 3: 어드민 표시 일자 기준 미래 일자 행 (KST 5/13 00:00 이후)
+    //   비교 정확화: created_at 은 D1 에 'YYYY-MM-DD HH:MM:SS' 문자열로 저장 (UTC TZ 가정)
+    //   + 9 hours 결과가 '2026-05-13 00:00:00' 이상 = 사장님 화면 5/13+ 표시 행
+    //   raw 비교도 병행: created_at >= '2026-05-12 15:00:00' (UTC) 이면 +9h 시 5/13+ KST
     const futureRows = await db.prepare(`
       SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at,
              datetime(created_at,'+9 hours') AS admin_displayed_kst
       FROM transactions
-      WHERE datetime(created_at,'+9 hours') >= '2026-05-13 00:00:00'
+      WHERE created_at >= '2026-05-12 15:00:00'
+         OR datetime(created_at,'+9 hours') >= '2026-05-13 00:00:00'
       ORDER BY created_at DESC, id DESC
-      LIMIT 100
+      LIMIT 200
     `).all()
 
     // STEP 4: 통계
