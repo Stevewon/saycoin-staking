@@ -24796,6 +24796,76 @@ app.get('/api/diag/cleanup-my-bf-holiday-512-mistakes', async (c) => {
 })
 
 // ============================================================
+// /api/diag/check-513-user-full-tx (SELECT only — 데이터 변경 0건)
+// ----------------------------------------------------
+// 특정 user_id 의 5/13 KST 전체 transactions 조회 (모든 type, 모든 ref_id 패턴)
+// + (user_id, amount, type) GROUP BY 중복 분석
+// ----------------------------------------------------
+app.get('/api/diag/check-513-user-full-tx', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const uidParam = c.req.query('user_id') || ''
+  const uid = parseInt(uidParam, 10)
+  if (!uid) return c.json({ error: 'user_id required' }, 400)
+
+  try {
+    const db = c.env.DB
+    const TARGET_DATE = '2026-05-13'
+
+    const u = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id = ?`).bind(uid).first() as any
+
+    // 5/13 KST 전체 transactions
+    const allTx = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at,
+             date(datetime(created_at, '+9 hours')) AS kst_date,
+             time(datetime(created_at, '+9 hours')) AS kst_time
+      FROM transactions
+      WHERE user_id = ?
+        AND date(datetime(created_at, '+9 hours')) = ?
+      ORDER BY created_at ASC, id ASC
+    `).bind(uid, TARGET_DATE).all()
+
+    // (amount, type, description) GROUP BY 중복 카운트
+    const dupGroups = await db.prepare(`
+      SELECT type, amount, description, COUNT(*) AS cnt,
+             GROUP_CONCAT(id, ',') AS ids,
+             GROUP_CONCAT(ref_id, '|||') AS ref_ids,
+             GROUP_CONCAT(created_at, ',') AS times
+      FROM transactions
+      WHERE user_id = ?
+        AND date(datetime(created_at, '+9 hours')) = ?
+      GROUP BY type, amount, description
+      HAVING COUNT(*) >= 2
+      ORDER BY type, amount
+    `).bind(uid, TARGET_DATE).all()
+
+    // 5/13 KST type별 합계
+    const typeSums = await db.prepare(`
+      SELECT type, coin_type, SUM(amount) AS total, COUNT(*) AS cnt
+      FROM transactions
+      WHERE user_id = ?
+        AND date(datetime(created_at, '+9 hours')) = ?
+      GROUP BY type, coin_type
+      ORDER BY type
+    `).bind(uid, TARGET_DATE).all()
+
+    return c.json({
+      success: true,
+      user: u,
+      target_date: TARGET_DATE,
+      total_tx_count: (allTx.results || []).length,
+      type_sums: typeSums.results || [],
+      duplicate_groups_count: (dupGroups.results || []).length,
+      duplicate_groups: dupGroups.results || [],
+      all_tx: allTx.results || [],
+    })
+  } catch (error: any) {
+    console.error('check-513-user-full-tx error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/fix-512-s97-self-orphan
 // ----------------------------------------------------
 // s#97 방승훈 (u#33) 5/12 self 데일리 부분 INSERT 보정:
