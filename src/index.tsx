@@ -4715,6 +4715,105 @@ app.get('/api/admin/rewards/cron-lock-status', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★ 계정별 일일 배당 집계 (사장님 보고용) ★★★★★★★★★★★★★★★★★★★★
+//   경로: GET /api/diag/daily-by-paid-date?key=ADMIN_PW&paid_date=YYYY-MM-DD
+//   - paid_date 미지정 시 오늘 KST
+//   - 응답: 계정별 본인 daily + L1 매칭 + L2 매칭 + 합계
+//   - reward_date 기준 + paid_date 기준 모두 집계 (cron 호출 시 paid_date=오늘, reward_date=어제)
+app.get('/api/diag/daily-by-paid-date', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const paidDate = c.req.query('paid_date') || kstDateStr(new Date())
+
+    // 본인 daily 집계 (paid_date 기준)
+    const dailyByUser = await db.prepare(`
+      SELECT
+        dr.user_id,
+        u.email,
+        u.name,
+        COUNT(*) as daily_count,
+        SUM(dr.usdt_amount) as daily_qkey,
+        GROUP_CONCAT(DISTINCT dr.reward_date) as reward_dates
+      FROM daily_rewards dr
+      LEFT JOIN users u ON u.id = dr.user_id
+      WHERE dr.paid_date = ?
+      GROUP BY dr.user_id
+    `).bind(paidDate).all()
+
+    // L1/L2 매칭 보너스 집계 (paid_date 기준)
+    const refByUser = await db.prepare(`
+      SELECT
+        rr.referrer_id as user_id,
+        u.email,
+        u.name,
+        rr.level,
+        COUNT(*) as cnt,
+        SUM(rr.reward_amount) as ref_qkey
+      FROM referral_rewards rr
+      LEFT JOIN users u ON u.id = rr.referrer_id
+      WHERE rr.paid_date = ?
+      GROUP BY rr.referrer_id, rr.level
+    `).bind(paidDate).all()
+
+    // 집계 병합
+    const acct: Record<number, any> = {}
+    for (const r of dailyByUser.results as any[]) {
+      acct[r.user_id] = {
+        user_id: r.user_id,
+        email: r.email,
+        name: r.name,
+        own_daily_count: r.daily_count,
+        own_daily_qkey: Number(r.daily_qkey || 0),
+        reward_dates: r.reward_dates,
+        l1_count: 0, l1_qkey: 0,
+        l2_count: 0, l2_qkey: 0,
+        total_qkey: 0
+      }
+    }
+    for (const r of refByUser.results as any[]) {
+      if (!acct[r.user_id]) {
+        acct[r.user_id] = {
+          user_id: r.user_id, email: r.email, name: r.name,
+          own_daily_count: 0, own_daily_qkey: 0, reward_dates: null,
+          l1_count: 0, l1_qkey: 0, l2_count: 0, l2_qkey: 0, total_qkey: 0
+        }
+      }
+      if (r.level === 1) {
+        acct[r.user_id].l1_count = r.cnt
+        acct[r.user_id].l1_qkey = Number(r.ref_qkey || 0)
+      } else if (r.level === 2) {
+        acct[r.user_id].l2_count = r.cnt
+        acct[r.user_id].l2_qkey = Number(r.ref_qkey || 0)
+      }
+    }
+    for (const k of Object.keys(acct)) {
+      const a = acct[k as any]
+      a.total_qkey = a.own_daily_qkey + a.l1_qkey + a.l2_qkey
+    }
+
+    const list = Object.values(acct).sort((a: any, b: any) => b.total_qkey - a.total_qkey)
+    const grandTotal = list.reduce((s: number, a: any) => s + a.total_qkey, 0)
+    const grandOwn = list.reduce((s: number, a: any) => s + a.own_daily_qkey, 0)
+    const grandL1 = list.reduce((s: number, a: any) => s + a.l1_qkey, 0)
+    const grandL2 = list.reduce((s: number, a: any) => s + a.l2_qkey, 0)
+
+    return c.json({
+      success: true,
+      paid_date: paidDate,
+      account_count: list.length,
+      grand_total_qkey: grandTotal,
+      grand_own_daily_qkey: grandOwn,
+      grand_l1_qkey: grandL1,
+      grand_l2_qkey: grandL2,
+      accounts: list
+    })
+  } catch (error: any) {
+    return c.json({ error: error?.message || 'unknown' }, 500)
+  }
+})
+
 // ★★★★★★★★★★★★★★★★★★★★ 일일 배당 v2 — bottom-up 순회 (사장님 영구 룰 2026-05-12) ★★★★★★★★★★★★★★★★★★★★
 //   사장님 .md 원문 (2026-05-12):
 //     "무조건 당일 데일리 배당을 실시할 경우에는 배당에 해당하는 맨 아래 데일리 정산된
