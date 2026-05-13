@@ -24866,6 +24866,327 @@ app.get('/api/diag/check-513-user-full-tx', async (c) => {
 })
 
 // ============================================================
+// /api/diag/exec-513-bidirectional-matching
+// ----------------------------------------------------
+// 사장님 명령 (2026-05-13): 5/9·5/10 휴일진입자 5명에 대해 양방향 매칭 보너스 정산
+//   영구룰 #bottom-up: leaf 5명 self 데일리 완료 후 매칭 산출
+//   영구룰 #휴일진입자: L1/L2 매칭 보너스도 본인 첫 데일리 발생일에 함께 지급
+//   영구룰 #2: L1=20%, L2=10%
+//   영구룰 #112: description 한국어 안전
+//
+// 양방향 정산:
+//   A) UPSTREAM (위로): 5명의 referrer(L1), referrer_of_referrer(L2)에게 매칭 지급
+//      대상 5/13 self 데일리:
+//        s#94 김용선(u#38) 2,250 → L1 유호웅(u#34) 450 / L2 연이(u#2) 225
+//        s#95 이정옥(u#40) 5,250 → L1 김용선(u#38) 1,050 / L2 유호웅(u#34) 525
+//        s#96 김주성(u#91) 7,350 → L1 유호웅(u#34) 1,470 / L2 연이(u#2) 735
+//        s#97 방승훈(u#33) 3,000 → L1 연이(u#2) 600 / L2 QTA엔젤(u#1) 300
+//        s#98 이현우(u#93) 750 → L1 신운호(u#54) 150 / L2 강인팔(u#44 솔밧) 75
+//
+//   B) DOWNSTREAM (아래로): 5명 각자가 자기 하부 회원의 5/13 데일리에서 매칭 수령
+//      5명 user_id IN (38,40,91,33,93) 를 referrer 로 두는 하부 회원 트리 탐색
+//      그들의 staking 5/13 daily_rewards 행 SUM → × 20% (L1) / × 10% (L2) → 5명 본인에게 INSERT
+//
+// 안전장치 (이중지급 절대 금지):
+//   - 신규 ref_id 패턴: bf_513_up_s<sid>_l1|l2 (UPSTREAM), bf_513_down_u<uid>_l1|l2 (DOWNSTREAM)
+//   - 3중 EXISTS 가드: ref_id + (user_id, type, amount, KST date) + referral_rewards
+//   - 5/13 KST 같은 user_id+amount+type 의 transactions 가 이미 있으면 SKIP (cron/다른 백필이 박은 경우 대비)
+// ============================================================
+app.get('/api/diag/exec-513-bidirectional-matching', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const TARGET_DATE = '2026-05-13'
+    const PAID_DATE = '2026-05-13'
+    const HOLIDAY_910_STAKINGS = [94, 95, 96, 97, 98]
+
+    // ============================================================
+    // PART A — UPSTREAM (위로): 5명의 self 데일리로 인한 상위 매칭
+    // ============================================================
+    const upstreamPreview: any[] = []
+    let upstreamTotalL1 = 0
+    let upstreamTotalL2 = 0
+
+    for (const sid of HOLIDAY_910_STAKINGS) {
+      const s = await db.prepare(`
+        SELECT s.id, s.user_id, s.amount, s.daily_rate,
+               u.name AS user_name, u.email AS user_email, u.referrer_id
+        FROM staking s JOIN users u ON s.user_id = u.id
+        WHERE s.id = ? AND s.status = 'active'
+      `).bind(sid).first() as any
+      if (!s) continue
+
+      const selfQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+
+      let l1UserId: number | null = null, l2UserId: number | null = null
+      let l1Name = '', l2Name = ''
+      if (s.referrer_id) {
+        const l1u = await db.prepare(`SELECT id, name, referrer_id FROM users WHERE id = ?`).bind(s.referrer_id).first() as any
+        if (l1u) {
+          l1UserId = l1u.id; l1Name = l1u.name
+          if (l1u.referrer_id) {
+            const l2u = await db.prepare(`SELECT id, name FROM users WHERE id = ?`).bind(l1u.referrer_id).first() as any
+            if (l2u) { l2UserId = l2u.id; l2Name = l2u.name }
+          }
+        }
+      }
+      const l1Qkey = l1UserId ? Math.round(selfQkey * 0.20) : 0
+      const l2Qkey = l2UserId ? Math.round(selfQkey * 0.10) : 0
+
+      // 안전 체크
+      const refIdL1 = `bf_513_up_s${sid}_l1`
+      const refIdL2 = `bf_513_up_s${sid}_l2`
+      const exRefL1 = l1UserId ? await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdL1).first() : null
+      const exRefL2 = l2UserId ? await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdL2).first() : null
+      const exSameL1 = l1UserId ? await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY' AND amount = ?
+          AND date(datetime(created_at, '+9 hours')) = ?
+        LIMIT 1
+      `).bind(l1UserId, l1Qkey, TARGET_DATE).first() : null
+      const exSameL2 = l2UserId ? await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY' AND amount = ?
+          AND date(datetime(created_at, '+9 hours')) = ?
+        LIMIT 1
+      `).bind(l2UserId, l2Qkey, TARGET_DATE).first() : null
+
+      upstreamPreview.push({
+        from_staking: sid, from_user_id: s.user_id, from_user_name: s.user_name,
+        self_qkey: selfQkey,
+        l1: l1UserId ? { user_id: l1UserId, name: l1Name, qkey: l1Qkey,
+          ref_exists: !!exRefL1, same_amount_513_exists: !!exSameL1,
+          will_insert: !exRefL1 && !exSameL1 } : null,
+        l2: l2UserId ? { user_id: l2UserId, name: l2Name, qkey: l2Qkey,
+          ref_exists: !!exRefL2, same_amount_513_exists: !!exSameL2,
+          will_insert: !exRefL2 && !exSameL2 } : null,
+      })
+
+      if (l1UserId && !exRefL1 && !exSameL1) upstreamTotalL1 += l1Qkey
+      if (l2UserId && !exRefL2 && !exSameL2) upstreamTotalL2 += l2Qkey
+    }
+
+    // ============================================================
+    // PART B — DOWNSTREAM (아래로): 5명 본인이 받는 매칭
+    //   5명 user_id IN (38,40,91,33,93) 를 referrer 로 두는 회원 트리
+    //   - 직접 하부(L1): WHERE users.referrer_id IN (5명)
+    //   - 2단 하부(L2): WHERE users.referrer_id IN (L1 회원 list)
+    //   - 각 하부 회원의 5/13 daily_rewards SUM → × 20% (L1) / × 10% (L2)
+    // ============================================================
+    const HOLIDAY_910_USERS = [38, 40, 91, 33, 93]
+    const downstreamPreview: any[] = []
+    let downstreamTotalL1 = 0
+    let downstreamTotalL2 = 0
+
+    for (const uid of HOLIDAY_910_USERS) {
+      const u = await db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).bind(uid).first() as any
+
+      // L1 하부 (uid 의 직접 추천)
+      const l1Children = await db.prepare(`SELECT id, name FROM users WHERE referrer_id = ?`).bind(uid).all()
+      const l1ChildIds: number[] = (l1Children.results || []).map((x: any) => Number(x.id))
+
+      // L2 하부 (L1 회원들의 추천)
+      let l2ChildIds: number[] = []
+      if (l1ChildIds.length > 0) {
+        const placeholders = l1ChildIds.map(() => '?').join(',')
+        const l2Children = await db.prepare(`SELECT id FROM users WHERE referrer_id IN (${placeholders})`).bind(...l1ChildIds).all()
+        l2ChildIds = (l2Children.results || []).map((x: any) => Number(x.id))
+      }
+
+      // L1 하부 5/13 daily_rewards SUM
+      let l1DailySum = 0
+      const l1Details: any[] = []
+      if (l1ChildIds.length > 0) {
+        const placeholders = l1ChildIds.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT user_id, staking_id, usdt_amount
+          FROM daily_rewards
+          WHERE user_id IN (${placeholders}) AND reward_date = ?
+        `).bind(...l1ChildIds, TARGET_DATE).all()
+        for (const r of (rows.results || []) as any[]) {
+          l1DailySum += Number(r.usdt_amount)
+          l1Details.push({ user_id: r.user_id, staking_id: r.staking_id, daily_qkey: r.usdt_amount })
+        }
+      }
+
+      // L2 하부 5/13 daily_rewards SUM
+      let l2DailySum = 0
+      const l2Details: any[] = []
+      if (l2ChildIds.length > 0) {
+        const placeholders = l2ChildIds.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT user_id, staking_id, usdt_amount
+          FROM daily_rewards
+          WHERE user_id IN (${placeholders}) AND reward_date = ?
+        `).bind(...l2ChildIds, TARGET_DATE).all()
+        for (const r of (rows.results || []) as any[]) {
+          l2DailySum += Number(r.usdt_amount)
+          l2Details.push({ user_id: r.user_id, staking_id: r.staking_id, daily_qkey: r.usdt_amount })
+        }
+      }
+
+      const myL1Bonus = Math.round(l1DailySum * 0.20)
+      const myL2Bonus = Math.round(l2DailySum * 0.10)
+
+      // 안전 체크
+      const refIdL1 = `bf_513_down_u${uid}_l1`
+      const refIdL2 = `bf_513_down_u${uid}_l2`
+      const exRefL1 = myL1Bonus > 0 ? await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdL1).first() : null
+      const exRefL2 = myL2Bonus > 0 ? await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdL2).first() : null
+      const exSameL1 = myL1Bonus > 0 ? await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY' AND amount = ?
+          AND date(datetime(created_at, '+9 hours')) = ?
+        LIMIT 1
+      `).bind(uid, myL1Bonus, TARGET_DATE).first() : null
+      const exSameL2 = myL2Bonus > 0 ? await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY' AND amount = ?
+          AND date(datetime(created_at, '+9 hours')) = ?
+        LIMIT 1
+      `).bind(uid, myL2Bonus, TARGET_DATE).first() : null
+
+      downstreamPreview.push({
+        user_id: uid, user_name: u?.name, user_email: u?.email,
+        l1_child_count: l1ChildIds.length, l1_child_ids: l1ChildIds,
+        l2_child_count: l2ChildIds.length, l2_child_ids: l2ChildIds,
+        l1_downstream_daily_sum: l1DailySum, l1_details: l1Details,
+        l2_downstream_daily_sum: l2DailySum, l2_details: l2Details,
+        my_l1_bonus_qkey: myL1Bonus,
+        my_l2_bonus_qkey: myL2Bonus,
+        l1_ref_exists: !!exRefL1, l1_same_amount_513_exists: !!exSameL1,
+        l1_will_insert: myL1Bonus > 0 && !exRefL1 && !exSameL1,
+        l2_ref_exists: !!exRefL2, l2_same_amount_513_exists: !!exSameL2,
+        l2_will_insert: myL2Bonus > 0 && !exRefL2 && !exSameL2,
+      })
+
+      if (myL1Bonus > 0 && !exRefL1 && !exSameL1) downstreamTotalL1 += myL1Bonus
+      if (myL2Bonus > 0 && !exRefL2 && !exSameL2) downstreamTotalL2 += myL2Bonus
+    }
+
+    if (!isExec) {
+      return c.json({
+        success: true, mode: 'DRY_RUN', target_date: TARGET_DATE,
+        upstream: {
+          target_stakings: HOLIDAY_910_STAKINGS,
+          preview: upstreamPreview,
+          total_l1_to_insert: upstreamTotalL1,
+          total_l2_to_insert: upstreamTotalL2,
+        },
+        downstream: {
+          target_users: HOLIDAY_910_USERS,
+          preview: downstreamPreview,
+          total_l1_to_insert: downstreamTotalL1,
+          total_l2_to_insert: downstreamTotalL2,
+        },
+        grand_total_to_insert: upstreamTotalL1 + upstreamTotalL2 + downstreamTotalL1 + downstreamTotalL2,
+        next: '실행하려면 ?confirm=GO 추가',
+      })
+    }
+
+    // ====================== EXEC ======================
+    const inserted: any[] = []
+    const skipped: any[] = []
+    let actualUpL1 = 0, actualUpL2 = 0, actualDownL1 = 0, actualDownL2 = 0
+
+    // UPSTREAM INSERT
+    for (const p of upstreamPreview as any[]) {
+      const sid = p.from_staking
+      const fromUid = p.from_user_id
+
+      if (p.l1 && p.l1.will_insert) {
+        const refIdL1 = `bf_513_up_s${sid}_l1`
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(p.l1.user_id, p.l1.qkey, '추천 보너스 (Level 1)', refIdL1).run()
+        await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.l1.qkey, p.l1.user_id).run()
+        try {
+          await db.prepare(`
+            INSERT INTO referral_rewards (user_id, from_user_id, level, amount, coin_type, reward_date, paid_date, ref_id, created_at)
+            VALUES (?, ?, 1, ?, 'QKEY', ?, ?, ?, datetime('now'))
+          `).bind(p.l1.user_id, fromUid, p.l1.qkey, TARGET_DATE, PAID_DATE, refIdL1).run()
+        } catch(e) {}
+        actualUpL1 += p.l1.qkey
+        inserted.push({ direction: 'UPSTREAM', from_staking: sid, user_id: p.l1.user_id, name: p.l1.name, level: 1, qkey: p.l1.qkey })
+      } else if (p.l1) {
+        skipped.push({ direction: 'UPSTREAM', from_staking: sid, user_id: p.l1.user_id, level: 1, reason: p.l1.ref_exists ? 'ref_exists' : 'same_amount_513_exists' })
+      }
+
+      if (p.l2 && p.l2.will_insert) {
+        const refIdL2 = `bf_513_up_s${sid}_l2`
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(p.l2.user_id, p.l2.qkey, '추천 보너스 (Level 2)', refIdL2).run()
+        await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.l2.qkey, p.l2.user_id).run()
+        try {
+          await db.prepare(`
+            INSERT INTO referral_rewards (user_id, from_user_id, level, amount, coin_type, reward_date, paid_date, ref_id, created_at)
+            VALUES (?, ?, 2, ?, 'QKEY', ?, ?, ?, datetime('now'))
+          `).bind(p.l2.user_id, fromUid, p.l2.qkey, TARGET_DATE, PAID_DATE, refIdL2).run()
+        } catch(e) {}
+        actualUpL2 += p.l2.qkey
+        inserted.push({ direction: 'UPSTREAM', from_staking: sid, user_id: p.l2.user_id, name: p.l2.name, level: 2, qkey: p.l2.qkey })
+      } else if (p.l2) {
+        skipped.push({ direction: 'UPSTREAM', from_staking: sid, user_id: p.l2.user_id, level: 2, reason: p.l2.ref_exists ? 'ref_exists' : 'same_amount_513_exists' })
+      }
+    }
+
+    // DOWNSTREAM INSERT (5명 본인이 받는 매칭)
+    for (const p of downstreamPreview as any[]) {
+      const uid = p.user_id
+
+      if (p.l1_will_insert) {
+        const refIdL1 = `bf_513_down_u${uid}_l1`
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(uid, p.my_l1_bonus_qkey, '추천 보너스 (Level 1)', refIdL1).run()
+        await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.my_l1_bonus_qkey, uid).run()
+        actualDownL1 += p.my_l1_bonus_qkey
+        inserted.push({ direction: 'DOWNSTREAM', user_id: uid, name: p.user_name, level: 1, qkey: p.my_l1_bonus_qkey })
+      } else if (p.my_l1_bonus_qkey > 0) {
+        skipped.push({ direction: 'DOWNSTREAM', user_id: uid, level: 1, reason: p.l1_ref_exists ? 'ref_exists' : 'same_amount_513_exists' })
+      }
+
+      if (p.l2_will_insert) {
+        const refIdL2 = `bf_513_down_u${uid}_l2`
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(uid, p.my_l2_bonus_qkey, '추천 보너스 (Level 2)', refIdL2).run()
+        await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.my_l2_bonus_qkey, uid).run()
+        actualDownL2 += p.my_l2_bonus_qkey
+        inserted.push({ direction: 'DOWNSTREAM', user_id: uid, name: p.user_name, level: 2, qkey: p.my_l2_bonus_qkey })
+      } else if (p.my_l2_bonus_qkey > 0) {
+        skipped.push({ direction: 'DOWNSTREAM', user_id: uid, level: 2, reason: p.l2_ref_exists ? 'ref_exists' : 'same_amount_513_exists' })
+      }
+    }
+
+    return c.json({
+      success: true, mode: 'EXEC', target_date: TARGET_DATE,
+      inserted_count: inserted.length, skipped_count: skipped.length,
+      sums: {
+        upstream_l1_inserted: actualUpL1,
+        upstream_l2_inserted: actualUpL2,
+        downstream_l1_inserted: actualDownL1,
+        downstream_l2_inserted: actualDownL2,
+        grand_total: actualUpL1 + actualUpL2 + actualDownL1 + actualDownL2,
+      },
+      inserted, skipped,
+    })
+  } catch (error: any) {
+    console.error('exec-513-bidirectional-matching error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/fix-512-s97-self-orphan
 // ----------------------------------------------------
 // s#97 방승훈 (u#33) 5/12 self 데일리 부분 INSERT 보정:
