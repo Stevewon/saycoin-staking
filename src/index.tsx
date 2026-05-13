@@ -340,6 +340,36 @@ async function assertNoExistingDailyReward(
 }
 
 /**
+ * P0 Stage 1 (2026-05-13) — 레거시 backfill/fix/exec endpoint deprecation guard
+ *
+ * 사장님 영구 룰 #이중지급 절대 금지 원천 차단:
+ * - 13개 레거시 endpoint 는 모든 보정 작업 완료 상태 (재호출 의미 없음)
+ * - 단순 재호출만으로도 가드 미적용 INSERT INTO transactions 발생 가능 → 이중지급 위험
+ * - 이 헬퍼는 ?force=GO 키가 명시되지 않으면 410 Gone 응답
+ * - 사장님이 명시적으로 force=GO 주지 않는 한 호출 자체 차단
+ *
+ * 사용:
+ *   const dep = assertNotDeprecated(c, 'endpoint-name', '...작업 완료 일자/이유')
+ *   if (dep) return dep
+ *
+ * 강제 호출 (사장님 명시 명령 시만):
+ *   ?key=ADMIN_PW&force=GO  → 가드 우회, 원본 endpoint 로직 실행
+ */
+function assertNotDeprecated(c: any, endpointName: string, reason: string): Response | null {
+  const force = c.req.query('force') || ''
+  if (force === 'GO') return null  // 사장님 명시 명령 — 통과
+  return c.json({
+    error: 'ENDPOINT_DEPRECATED',
+    endpoint: endpointName,
+    deprecated_since: '2026-05-13',
+    reason,
+    permanent_rule: '#이중지급 절대 금지 — 재호출 통한 이중지급 원천 차단',
+    note: '본 endpoint 는 보정 작업이 이미 완료되어 재호출 의미가 없습니다. 사장님 명시 명령 시에만 ?force=GO 추가로 우회 가능합니다.',
+    docs: 'P0 Stage 1 deprecation guard (lucky4492 5/8 dup payment 사건 후속 영구 인프라)',
+  }, 410)
+}
+
+/**
  * P0+P2 — ref_id 존재 시 throw (백필 ref_id 가드)
  */
 async function assertNoExistingRefId(db: any, refId: string): Promise<boolean> {
@@ -5868,6 +5898,8 @@ app.post('/api/diag/exec-may11-rewards-safe', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dep = assertNotDeprecated(c, 'exec-may11-rewards-safe', '5/11 보정 완료 (2026-05-11). safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+    if (dep) return dep
     const confirm = c.req.query('confirm') || ''
     if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요' }, 400)
 
@@ -6951,6 +6983,8 @@ app.post('/api/diag/exec-may11-phase4-safe', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dep = assertNotDeprecated(c, 'exec-may11-phase4-safe', '5/11 Phase4 보정 완료 (2026-05-11). safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+    if (dep) return dep
     const confirm = c.req.query('confirm') || ''
     const dryRun = confirm !== 'GO'
     const db = c.env.DB
@@ -7987,6 +8021,8 @@ app.post('/api/diag/backfill-may12-missing', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dep = assertNotDeprecated(c, 'backfill-may12-missing', '5/12 누락 백필 완료 (2026-05-12). safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험. 후속: may13-multi-staking-backfill 사용')
+    if (dep) return dep
 
     const dryRun = c.req.query('dry_run') === '1'
     const db = c.env.DB
@@ -8326,6 +8362,8 @@ app.post('/api/diag/backfill-l2-mirror-missing', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dep = assertNotDeprecated(c, 'backfill-l2-mirror-missing', 'L2 미러 누락 백필 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+    if (dep) return dep
 
     const dryRun = c.req.query('dry_run') === '1'
     const db = c.env.DB
@@ -8434,6 +8472,8 @@ app.post('/api/diag/backfill-referral-mirror-all', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dep = assertNotDeprecated(c, 'backfill-referral-mirror-all', '전체 referral 미러 백필 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+    if (dep) return dep
 
     const dryRun = c.req.query('dry_run') === '1'
     const levelParam = c.req.query('level') || 'all'
@@ -9943,6 +9983,8 @@ app.post('/api/diag/restore-solbat-phase3', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dep = assertNotDeprecated(c, 'restore-solbat-phase3', '솔밧 phase3 복원 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+    if (dep) return dep
     const confirm = c.req.query('confirm') || ''
     if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요' }, 400)
     const db = c.env.DB
@@ -22799,6 +22841,8 @@ app.post('/api/diag/exec-fix-solbat-may8-l1l2-missing', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dep = assertNotDeprecated(c, 'exec-fix-solbat-may8-l1l2-missing', '솔밧 5/8 L1L2 보정 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험. 후속: solbat-513-g-plan-backfill')
+    if (dep) return dep
     const confirm = c.req.query('confirm') || ''
     const dryRun = confirm !== 'GO'
     const db = c.env.DB
@@ -23970,6 +24014,8 @@ app.get('/api/diag/audit-weekday-daily-gap', async (c) => {
 app.get('/api/diag/fix-holiday-entrant-512-daily', async (c) => {
   const key = c.req.query('key') || ''
   if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const dep = assertNotDeprecated(c, 'fix-holiday-entrant-512-daily', '5/12 휴일 진입자 데일리 보정 완료 (2026-05-12). safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+  if (dep) return dep
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'GO'
 
@@ -24474,6 +24520,8 @@ app.get('/api/diag/fix-holiday-entrant-512-daily-ALL27', async (c) => {
 app.get('/api/diag/fix-holiday-entrant-512-daily-910only', async (c) => {
   const key = c.req.query('key') || ''
   if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const dep = assertNotDeprecated(c, 'fix-holiday-entrant-512-daily-910only', '5/9~10 휴일 진입자 5/12 보정 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+  if (dep) return dep
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'GO'
 
@@ -24747,6 +24795,8 @@ app.get('/api/diag/fix-holiday-entrant-512-daily-910only', async (c) => {
 app.get('/api/diag/fix-513-holiday910-and-cleanup-duplicates', async (c) => {
   const key = c.req.query('key') || ''
   if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const dep = assertNotDeprecated(c, 'fix-513-holiday910-and-cleanup-duplicates', '5/13 휴일 5/9~10 진입자 보정 + 중복 정리 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+  if (dep) return dep
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'GO'
 
@@ -25037,6 +25087,8 @@ app.get('/api/diag/fix-513-holiday910-and-cleanup-duplicates', async (c) => {
 app.get('/api/diag/exec-513-phase1-leaf-only', async (c) => {
   const key = c.req.query('key') || ''
   if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const dep = assertNotDeprecated(c, 'exec-513-phase1-leaf-only', '5/13 Phase1 leaf-only 보정 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험. 후속: solbat-513-g-plan-backfill')
+  if (dep) return dep
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'GO'
 
@@ -25391,6 +25443,8 @@ app.get('/api/diag/check-513-user-full-tx', async (c) => {
 app.get('/api/diag/exec-513-bidirectional-matching', async (c) => {
   const key = c.req.query('key') || ''
   if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const dep = assertNotDeprecated(c, 'exec-513-bidirectional-matching', '5/13 양방향 매칭 보정 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+  if (dep) return dep
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'GO'
 
@@ -25862,6 +25916,8 @@ app.get('/api/diag/cleanup-513-bidirectional-duplicates', async (c) => {
 app.get('/api/diag/fix-512-s97-self-orphan', async (c) => {
   const key = c.req.query('key') || ''
   if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const dep = assertNotDeprecated(c, 'fix-512-s97-self-orphan', 's97 self orphan 5/12 보정 완료. safeInsertTransaction 가드 미적용 → 재호출 시 이중지급 위험')
+  if (dep) return dep
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'GO'
 
