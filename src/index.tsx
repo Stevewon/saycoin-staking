@@ -28923,4 +28923,318 @@ app.get('/api/diag/cron-h-plan-monitor', async (c) => {
   }
 })
 
+// ============================================================================
+// Cron Coverage Audit (2026-05-14) — 데일리/매칭 누락 0건 검증 정밀 점검
+// ============================================================================
+//   사장님 명령 (2026-05-13): "어떤 휴일진입자도 오늘 무조건 평일이라 데일리 배당을
+//                              받아야하고 위 아래 회원이 있을때는 무조건 그에 따른
+//                              배당도 집행이 되야하는거야 명심해!"
+//
+//   목적: cron-h-plan-monitor (C1~C8) 가 PASS 해도 알 수 없는
+//         "활성 회원 vs 수령 회원" 누락 사례 정밀 검증
+//
+//   3단계 검증:
+//     STEP 1. yesterdayKst 시점 활성 staking 보유 user 전수 조회
+//             (start_kst <= yesterday <= end_kst AND status IN ('active','capped'))
+//     STEP 2. 각 user 별 paid_date daily_rewards 수령 여부 + 미수령 사유 분류
+//             A. 받음 (정상)
+//             B. 200% cap 도달 (영구 룰 허용)
+//             C. 거치기간 초과 (영구 룰 허용)
+//             D. 알 수 없음 (영구 룰 위반!!)
+//     STEP 3. 데일리 받은 user 의 L1/L2 referrer 매칭 누락 검증
+//             - referrer 활성 + cap 미도달 → 매칭 받음 의무
+//             - 누락 발견 시 → 영구 룰 위반 즉시 보고
+//
+//   사용: GET /api/diag/cron-coverage-audit?password=...&paid_date=2026-05-14
+app.get('/api/diag/cron-coverage-audit', async (c) => {
+  try {
+    const password = c.req.query('password') || ''
+    if (password !== ADMIN_PW) return c.json({ error: 'Unauthorized' }, 401)
+    const db = c.env.DB
+
+    const now = new Date()
+    const todayKst = kstDateStr(now)
+    const paidDate = c.req.query('paid_date') || todayKst
+    const yesterdayKst = kstDateStr(new Date(new Date(paidDate + 'T00:00:00+09:00').getTime() - 24 * 60 * 60 * 1000))
+
+    const USD_TO_QKEY = 150
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STEP 1. yesterdayKst 시점 활성 staking 보유 user 전수 조회
+    //   - cron 의 activeStakings 쿼리와 동일 조건 사용 (line 4560-4580 기준)
+    //   - status IN ('active','capped') — capped 도 일단 포함 (사유 분류 위해)
+    // ─────────────────────────────────────────────────────────────────────
+    const activeStakingsAll = await db.prepare(`
+      SELECT
+        s.id as staking_id,
+        s.user_id,
+        s.amount,
+        s.period_days,
+        s.period_months,
+        s.daily_rate,
+        s.status,
+        date(s.start_date, '+9 hours') as start_kst_date,
+        date(s.end_date, '+9 hours') as end_kst_date,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
+      FROM staking s
+      WHERE s.status IN ('active','capped')
+        AND date(s.end_date, '+9 hours') >= ?
+        AND date(s.start_date, '+9 hours') <= ?
+      ORDER BY s.user_id ASC, s.id ASC
+    `).bind(yesterdayKst, yesterdayKst).all()
+
+    const totalStakings = activeStakingsAll.results.length
+    const uniqueUserIds = new Set<number>()
+    activeStakingsAll.results.forEach((s: any) => uniqueUserIds.add(s.user_id))
+    const totalActiveUsers = uniqueUserIds.size
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STEP 2. paid_date daily_rewards 수령 여부 (user 단위, staking 단위 둘 다)
+    // ─────────────────────────────────────────────────────────────────────
+    const paidUsersRows = await db.prepare(`
+      SELECT DISTINCT user_id FROM daily_rewards WHERE paid_date = ?
+    `).bind(paidDate).all()
+    const paidUserSet = new Set<number>()
+    paidUsersRows.results.forEach((r: any) => paidUserSet.add(r.user_id))
+
+    const paidStakingsRows = await db.prepare(`
+      SELECT DISTINCT staking_id FROM daily_rewards WHERE paid_date = ?
+    `).bind(paidDate).all()
+    const paidStakingSet = new Set<number>()
+    paidStakingsRows.results.forEach((r: any) => paidStakingSet.add(r.staking_id))
+
+    // user 별 200% cap 여부 (현재 시점)
+    async function getUserCapState(userId: number): Promise<{ capped: boolean, paidTotal: number, target: number, percent: number }> {
+      const stakeRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
+      `).bind(userId).first() as any
+      const stakeTotal = Number(stakeRow?.total || 0)
+      if (stakeTotal <= 0) return { capped: false, paidTotal: 0, target: 0, percent: 0 }
+      const paidRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM transactions
+        WHERE user_id = ? AND coin_type = 'QKEY'
+          AND type IN ('daily_qkey', 'referral_reward')
+      `).bind(userId).first() as any
+      const paidTotal = Number(paidRow?.total || 0)
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      const percent = target > 0 ? (paidTotal / target * 100) : 0
+      return { capped: paidTotal >= target, paidTotal, target, percent }
+    }
+
+    // staking 단위 누락 분류
+    const stakingClassification: any[] = []
+    let cat_A_received = 0
+    let cat_B_cap_reached = 0
+    let cat_C_period_done = 0
+    let cat_D_unknown = 0
+    const violations_D: any[] = []  // 영구 룰 위반 후보
+
+    for (const s of activeStakingsAll.results) {
+      const stakingId = s.staking_id as number
+      const userId = s.user_id as number
+      const periodDays = (s.period_days as number) || ((s.period_months as number) * 30)
+      const rewardedCount = Number(s.rewarded_count || 0)
+      const startKst = s.start_kst_date as string
+
+      // 받은 staking 인지
+      const wasPaid = paidStakingSet.has(stakingId)
+
+      if (wasPaid) {
+        cat_A_received++
+        continue
+      }
+
+      // 미수령 — 사유 분류
+      // 사유 B: user 가 cap 도달 (현재 시점)
+      const capState = await getUserCapState(userId)
+      const isCapped = capState.capped || (s.status === 'capped')
+
+      // 사유 C: 거치기간 초과 — 이미 rewarded_count >= period_days
+      const periodDone = rewardedCount >= periodDays
+
+      if (isCapped) {
+        cat_B_cap_reached++
+        stakingClassification.push({
+          staking_id: stakingId, user_id: userId, reason: 'B_cap_reached',
+          rewarded_count: rewardedCount, period_days: periodDays,
+          paid_percent: capState.percent.toFixed(2) + '%',
+          paid_total: capState.paidTotal, cap_target: capState.target,
+        })
+      } else if (periodDone) {
+        cat_C_period_done++
+        stakingClassification.push({
+          staking_id: stakingId, user_id: userId, reason: 'C_period_done',
+          rewarded_count: rewardedCount, period_days: periodDays,
+        })
+      } else {
+        // 사유 D: 알 수 없음 — 영구 룰 위반 가능성!
+        cat_D_unknown++
+        violations_D.push({
+          staking_id: stakingId, user_id: userId,
+          reason: 'D_UNKNOWN_PERMANENT_RULE_VIOLATION',
+          status: s.status, start_kst_date: startKst, end_kst_date: s.end_kst_date,
+          rewarded_count: rewardedCount, period_days: periodDays,
+          last_reward_date: s.last_reward_date,
+          amount: s.amount, daily_rate: s.daily_rate,
+          cap_paid_total: capState.paidTotal, cap_target: capState.target,
+          cap_percent: capState.percent.toFixed(2) + '%',
+          note: '활성 staking 인데 paid_date 데일리 미수령 + cap 미도달 + 거치기간 미초과 = 영구 룰 위반',
+        })
+      }
+    }
+
+    const step2_total_stakings = totalStakings
+    const step2_passed = cat_D_unknown === 0  // 알 수 없는 누락 0건이어야 PASS
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STEP 3. L1/L2 매칭 누락 검증
+    //   - paid_date 에 daily_rewards 받은 (referee, staking_id) 마다
+    //     referee 의 L1 referrer + L2 referrer 가 yesterdayKst 시점 활성 + cap 미도달이면
+    //     매칭 referral_rewards 가 있어야 함
+    // ─────────────────────────────────────────────────────────────────────
+    const paidStakingsList = await db.prepare(`
+      SELECT dr.user_id as referee_id, dr.staking_id, dr.reward_date, dr.usdt_amount
+      FROM daily_rewards dr
+      WHERE dr.paid_date = ?
+      ORDER BY dr.id ASC
+    `).bind(paidDate).all()
+
+    let matchingExpected = 0
+    let matchingMissing = 0
+    const matchingMissingDetails: any[] = []
+
+    for (const dr of paidStakingsList.results) {
+      const refereeId = dr.referee_id as number
+      const stakingId = dr.staking_id as number
+      const rewardDate = dr.reward_date as string
+      const originalAmount = Number(dr.usdt_amount || 0)
+
+      // L1 referrer
+      const l1Row = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(refereeId).first() as any
+      const l1Id = l1Row?.referrer_id as number | null
+
+      if (l1Id) {
+        // L1 yesterdayKst 시점 활성 staking 보유?
+        const l1Active = await db.prepare(`
+          SELECT id FROM staking
+          WHERE user_id = ? AND status IN ('active','capped')
+            AND date(start_date, '+9 hours') <= ?
+            AND date(end_date, '+9 hours') >= ?
+          LIMIT 1
+        `).bind(l1Id, rewardDate, rewardDate).first()
+
+        if (l1Active) {
+          // L1 cap 미도달?
+          const l1Cap = await getUserCapState(l1Id)
+          if (!l1Cap.capped) {
+            matchingExpected++
+            // 매칭 row 존재?
+            const l1Row = await db.prepare(`
+              SELECT id, reward_amount FROM referral_rewards
+              WHERE referrer_id = ? AND referee_id = ? AND level = 1
+                AND staking_id = ? AND reward_date = ?
+              LIMIT 1
+            `).bind(l1Id, refereeId, stakingId, rewardDate).first() as any
+
+            if (!l1Row) {
+              matchingMissing++
+              matchingMissingDetails.push({
+                level: 1, referrer_id: l1Id, referee_id: refereeId,
+                staking_id: stakingId, reward_date: rewardDate,
+                expected_amount: Math.round(originalAmount * 0.20),
+                referrer_cap_percent: l1Cap.percent.toFixed(2) + '%',
+                note: 'L1 활성 + cap 미도달 + 매칭 row 없음 = 영구 룰 위반',
+              })
+            }
+          }
+        }
+
+        // L2 referrer
+        const l2Row = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(l1Id).first() as any
+        const l2Id = l2Row?.referrer_id as number | null
+
+        if (l2Id) {
+          const l2Active = await db.prepare(`
+            SELECT id FROM staking
+            WHERE user_id = ? AND status IN ('active','capped')
+              AND date(start_date, '+9 hours') <= ?
+              AND date(end_date, '+9 hours') >= ?
+            LIMIT 1
+          `).bind(l2Id, rewardDate, rewardDate).first()
+
+          if (l2Active) {
+            const l2Cap = await getUserCapState(l2Id)
+            if (!l2Cap.capped) {
+              matchingExpected++
+              const l2Match = await db.prepare(`
+                SELECT id, reward_amount FROM referral_rewards
+                WHERE referrer_id = ? AND referee_id = ? AND level = 2
+                  AND staking_id = ? AND reward_date = ?
+                LIMIT 1
+              `).bind(l2Id, refereeId, stakingId, rewardDate).first() as any
+
+              if (!l2Match) {
+                matchingMissing++
+                matchingMissingDetails.push({
+                  level: 2, referrer_id: l2Id, referee_id: refereeId,
+                  staking_id: stakingId, reward_date: rewardDate,
+                  expected_amount: Math.round(originalAmount * 0.10),
+                  referrer_cap_percent: l2Cap.percent.toFixed(2) + '%',
+                  note: 'L2 활성 + cap 미도달 + 매칭 row 없음 = 영구 룰 위반',
+                })
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const step3_passed = matchingMissing === 0
+    const all_passed = step2_passed && step3_passed
+
+    return c.json({
+      success: true,
+      title: 'Cron Coverage Audit — 데일리/매칭 누락 0건 정밀 검증',
+      paid_date: paidDate,
+      yesterday_kst_reference: yesterdayKst,
+      checked_at_kst: kstDateStr(now) + ' ' + now.toISOString().split('T')[1].split('.')[0] + ' UTC',
+      all_passed,
+      verdict: all_passed
+        ? '✅ 누락 0건 — 사장님 영구 룰 100% 준수 (휴일진입자/매칭 모두 정상)'
+        : '⚠️ 누락 발견 — 즉시 보정 endpoint 작성 필요',
+      // ─────────── STEP 1 ───────────
+      step1_active_stakings: {
+        total_stakings: totalStakings,
+        total_active_users: totalActiveUsers,
+        criterion: `start_kst <= ${yesterdayKst} AND end_kst >= ${yesterdayKst} AND status IN ('active','capped')`,
+      },
+      // ─────────── STEP 2 ───────────
+      step2_daily_coverage: {
+        passed: step2_passed,
+        total_stakings: step2_total_stakings,
+        category_A_received: cat_A_received,
+        category_B_cap_reached: cat_B_cap_reached,
+        category_C_period_done: cat_C_period_done,
+        category_D_unknown_violation: cat_D_unknown,
+        paid_users_distinct: paidUserSet.size,
+        violations_D: violations_D.slice(0, 50),
+      },
+      // ─────────── STEP 3 ───────────
+      step3_matching_coverage: {
+        passed: step3_passed,
+        matching_expected: matchingExpected,
+        matching_missing: matchingMissing,
+        missing_details: matchingMissingDetails.slice(0, 50),
+      },
+      permanent_rule_quote: '사장님 명령: "어떤 휴일진입자도 오늘 무조건 평일이라 데일리 배당을 받아야하고 위 아래 회원이 있을때는 무조건 그에 따른 배당도 집행이 되야하는거야"',
+    })
+  } catch (error: any) {
+    console.error('cron-coverage-audit error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
 export default app
