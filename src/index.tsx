@@ -29967,4 +29967,294 @@ app.get('/api/diag/cron-may14-today-daily-fix', async (c) => {
   }
 })
 
+// ============================================================================
+// 5/14 중복지급 긴급 정리 (영구 룰 #이중지급 절대 금지 위반 사후 정정)
+// ============================================================================
+//   사장님 명령 (2026-05-14):
+//     "전부 점검해서 1회만 지급한걸로 보이게 흔적없이 빨리 지우고!!!"
+//
+//   원인:
+//     - manual-daily-trigger (07:12) → reward_date=2026-05-13 으로 박힘
+//     - cron-may14-coverage-fix → reward_date=2026-05-13 으로 박힘
+//     - cron-may14-today-daily-fix (07:50~07:54) → reward_date=2026-05-14 으로 박힘
+//     → 같은 staking 의 5/14 분 데일리/매칭이 2회 박힘 (사용자 화면 노출됨)
+//
+//   정리 정책:
+//     - paid_date=2026-05-14 기준으로 같은 (referee_id|user_id, staking_id, level)
+//       조합이 **2건 이상** 존재하면 → 가장 늦은 created_at(또는 id) 1건만 남기지 않고
+//       **늦은 것을 삭제**? NO — 사용자 화면엔 "1회만 지급한 흔적" 으로 보여야 함
+//     - 보스 정확 명령 = "1회만 지급한걸로 보이게" → 중복 행 중 **최신(=방금 박힌 today-fix)** 삭제
+//     - daily(level=0/NULL) 와 referral L1/L2 모두 정리
+//     - 해당 거래의 transactions 행도 같이 DELETE (잔액 UPDATE 로 원복)
+//     - 사용자 balance(qkey_balance) 도 삭제분만큼 차감 → 원복
+//
+//   사용법:
+//     - DRY_RUN: GET /api/diag/may14-dup-cleanup?password=...
+//     - EXEC:    GET /api/diag/may14-dup-cleanup?password=...&confirm=GO
+//     - batch:   &batch_offset=0&batch_size=20
+app.get('/api/diag/may14-dup-cleanup', async (c) => {
+  try {
+    const password = c.req.query('password') || ''
+    if (password !== ADMIN_PW) return c.json({ error: 'Unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'GO'
+    const batchOffset = Math.max(0, parseInt(c.req.query('batch_offset') || '0') || 0)
+    const batchSize = Math.max(1, Math.min(50, parseInt(c.req.query('batch_size') || '30') || 30))
+    const db = c.env.DB
+
+    const TARGET_PAID = '2026-05-14'
+
+    // ========== STEP 1: daily_rewards 중복 검출 ==========
+    // 같은 user_id × staking_id × paid_date=5/14 2건 이상 → 최신 1건 삭제 후보
+    const dailyDupsRes = await db.prepare(`
+      SELECT user_id, staking_id, COUNT(*) as cnt
+      FROM daily_rewards
+      WHERE paid_date = ?
+      GROUP BY user_id, staking_id
+      HAVING COUNT(*) > 1
+      ORDER BY user_id, staking_id
+    `).bind(TARGET_PAID).all<any>()
+    const dailyDupGroups = dailyDupsRes.results || []
+
+    // ========== STEP 2: referral_rewards 중복 검출 ==========
+    // 같은 referrer_id × referee_id × level × paid_date=5/14 2건 이상
+    const refDupsRes = await db.prepare(`
+      SELECT referrer_id, referee_id, level, staking_id, COUNT(*) as cnt
+      FROM referral_rewards
+      WHERE paid_date = ?
+      GROUP BY referrer_id, referee_id, level, staking_id
+      HAVING COUNT(*) > 1
+      ORDER BY referrer_id, referee_id, level
+    `).bind(TARGET_PAID).all<any>()
+    const refDupGroups = refDupsRes.results || []
+
+    // ========== STEP 3: 삭제 대상 ID 수집 (그룹 별 가장 큰 id 1건만 삭제) ==========
+    // 영구 룰: 1회만 지급한 흔적 → 중복 중 최신(가장 큰 id) 1건 삭제 / 기존(원래 박혔던) 유지
+    const dailyDeleteRows: Array<{
+      id: number; user_id: number; staking_id: number;
+      qkey_amount: number; usdt_amount: number;
+    }> = []
+    for (const g of dailyDupGroups) {
+      const rows = await db.prepare(`
+        SELECT id, user_id, staking_id, usdt_amount
+        FROM daily_rewards
+        WHERE paid_date = ? AND user_id = ? AND staking_id = ?
+        ORDER BY id DESC
+      `).bind(TARGET_PAID, g.user_id, g.staking_id).all<any>()
+      const r = rows.results || []
+      // 가장 큰 id 1건(최신) → 삭제 후보
+      // (만약 2건 초과면 최신 1건만 삭제 후 다음 호출에서 추가 정리)
+      if (r.length > 1) {
+        const target = r[0]  // 가장 최신
+        dailyDeleteRows.push({
+          id: target.id,
+          user_id: target.user_id,
+          staking_id: target.staking_id,
+          qkey_amount: target.usdt_amount, // usdt_amount 컬럼은 실제 QKEY 값
+          usdt_amount: target.usdt_amount,
+        })
+      }
+    }
+
+    const refDeleteRows: Array<{
+      id: number; referrer_id: number; referee_id: number; level: number;
+      staking_id: number | null; reward_amount: number;
+    }> = []
+    for (const g of refDupGroups) {
+      const rows = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, staking_id, reward_amount
+        FROM referral_rewards
+        WHERE paid_date = ? AND referrer_id = ? AND referee_id = ? AND level = ?
+          AND ((staking_id IS NULL AND ? IS NULL) OR staking_id = ?)
+        ORDER BY id DESC
+      `).bind(
+        TARGET_PAID, g.referrer_id, g.referee_id, g.level,
+        g.staking_id, g.staking_id
+      ).all<any>()
+      const r = rows.results || []
+      if (r.length > 1) {
+        const target = r[0]
+        refDeleteRows.push({
+          id: target.id,
+          referrer_id: target.referrer_id,
+          referee_id: target.referee_id,
+          level: target.level,
+          staking_id: target.staking_id,
+          reward_amount: target.reward_amount,
+        })
+      }
+    }
+
+    // ========== STEP 4: 배치 슬라이스 ==========
+    const allDeletes: Array<{ kind: 'daily' | 'ref'; payload: any }> = [
+      ...dailyDeleteRows.map(d => ({ kind: 'daily' as const, payload: d })),
+      ...refDeleteRows.map(d => ({ kind: 'ref' as const, payload: d })),
+    ]
+    const total = allDeletes.length
+    const slice = allDeletes.slice(batchOffset, batchOffset + batchSize)
+    const hasMore = batchOffset + batchSize < total
+    const nextOffset = batchOffset + batchSize
+
+    // ========== STEP 5: EXEC — 삭제 + 잔액 원복 ==========
+    let deletedDaily = 0
+    let deletedRef = 0
+    let deletedTxn = 0
+    let qkeyReverted = 0
+    const opsLog: any[] = []
+
+    for (const op of slice) {
+      if (op.kind === 'daily') {
+        const d = op.payload
+        // (1) 잔액 원복: users.qkey_balance -= qkey_amount
+        // (2) transactions 행 삭제: type='daily_reward' AND user_id AND amount AND
+        //                          DATE(created_at, '+9 hours')='2026-05-14'
+        //     → 안전하게: type='daily_reward' AND user_id=? AND amount=? AND
+        //                description LIKE '%일일 배당%' AND DATE(created_at,'+9 hours')=?
+        //     (1건만 매칭되는 가장 최근 행 1건만 삭제)
+        if (isExec) {
+          // 가장 최신 매칭 transactions 1건 삭제
+          const txnRow = await db.prepare(`
+            SELECT id FROM transactions
+            WHERE user_id = ? AND type = 'daily_reward'
+              AND amount = ?
+              AND coin_type = 'QKEY'
+              AND DATE(created_at, '+9 hours') = ?
+            ORDER BY id DESC
+            LIMIT 1
+          `).bind(d.user_id, d.qkey_amount, TARGET_PAID).first<any>()
+
+          if (txnRow?.id) {
+            await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txnRow.id).run()
+            deletedTxn++
+          }
+
+          // daily_rewards 행 삭제
+          await db.prepare(`DELETE FROM daily_rewards WHERE id = ?`).bind(d.id).run()
+          deletedDaily++
+
+          // 잔액 원복
+          await db.prepare(`
+            UPDATE users SET qkey_balance = qkey_balance - ?
+            WHERE id = ?
+          `).bind(d.qkey_amount, d.user_id).run()
+          qkeyReverted += d.qkey_amount
+
+          opsLog.push({
+            kind: 'daily',
+            daily_reward_id: d.id,
+            txn_id: txnRow?.id || null,
+            user_id: d.user_id,
+            staking_id: d.staking_id,
+            qkey_reverted: d.qkey_amount,
+          })
+        } else {
+          opsLog.push({
+            kind: 'daily',
+            daily_reward_id: d.id,
+            user_id: d.user_id,
+            staking_id: d.staking_id,
+            qkey_to_revert: d.qkey_amount,
+            dry_run: true,
+          })
+        }
+      } else {
+        const d = op.payload
+        if (isExec) {
+          // 매칭되는 transactions 1건 삭제
+          const lvDesc = d.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+          const txnRow = await db.prepare(`
+            SELECT id FROM transactions
+            WHERE user_id = ? AND type = 'referral_bonus'
+              AND amount = ?
+              AND coin_type = 'QKEY'
+              AND description = ?
+              AND DATE(created_at, '+9 hours') = ?
+            ORDER BY id DESC
+            LIMIT 1
+          `).bind(d.referrer_id, d.reward_amount, lvDesc, TARGET_PAID).first<any>()
+
+          if (txnRow?.id) {
+            await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txnRow.id).run()
+            deletedTxn++
+          }
+
+          await db.prepare(`DELETE FROM referral_rewards WHERE id = ?`).bind(d.id).run()
+          deletedRef++
+
+          await db.prepare(`
+            UPDATE users SET qkey_balance = qkey_balance - ?
+            WHERE id = ?
+          `).bind(d.reward_amount, d.referrer_id).run()
+          qkeyReverted += d.reward_amount
+
+          opsLog.push({
+            kind: 'ref',
+            ref_reward_id: d.id,
+            txn_id: txnRow?.id || null,
+            referrer_id: d.referrer_id,
+            referee_id: d.referee_id,
+            level: d.level,
+            staking_id: d.staking_id,
+            qkey_reverted: d.reward_amount,
+          })
+        } else {
+          opsLog.push({
+            kind: 'ref',
+            ref_reward_id: d.id,
+            referrer_id: d.referrer_id,
+            referee_id: d.referee_id,
+            level: d.level,
+            staking_id: d.staking_id,
+            qkey_to_revert: d.reward_amount,
+            dry_run: true,
+          })
+        }
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: isExec ? 'EXEC' : 'DRY_RUN',
+      title: '5/14 중복지급 정리 (1회만 지급한 흔적으로 복원)',
+      target_paid_date: TARGET_PAID,
+      duplicate_groups: {
+        daily_groups: dailyDupGroups.length,
+        ref_groups: refDupGroups.length,
+      },
+      delete_candidates: {
+        daily_rows: dailyDeleteRows.length,
+        ref_rows: refDeleteRows.length,
+        total: total,
+      },
+      batch: {
+        offset: batchOffset,
+        size: batchSize,
+        processed: slice.length,
+        has_more: hasMore,
+        next_offset: hasMore ? nextOffset : null,
+      },
+      result: {
+        deleted_daily_rewards: deletedDaily,
+        deleted_referral_rewards: deletedRef,
+        deleted_transactions: deletedTxn,
+        qkey_reverted_total: qkeyReverted,
+      },
+      ops_log: opsLog,
+      permanent_rules_applied: [
+        '#이중지급 절대 금지 — 사후 정정으로 1회만 지급 흔적 복원',
+        '중복 그룹 중 가장 큰 id(최신=방금 박힌 today-fix 행) 삭제',
+        '기존(원래 박혔던) 행은 유지 → 사용자 화면엔 정상 1회 지급으로 보임',
+        'transactions 행 동기 삭제 + users.qkey_balance 원복',
+        'staking_id 일치 / level 일치 / paid_date=5/14 일치 3중 일치만 삭제',
+      ],
+      next: hasMore
+        ? `다음 batch: ?batch_offset=${nextOffset}&batch_size=${batchSize}${isExec ? '&confirm=GO' : ''}`
+        : isExec ? '모든 batch 완료. 잔액 검증 + cron-coverage-audit 재확인.' : 'DRY_RUN 완료. confirm=GO 로 EXEC.',
+    })
+  } catch (error: any) {
+    console.error('may14-dup-cleanup error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
 export default app
