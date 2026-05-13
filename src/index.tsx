@@ -43,12 +43,23 @@ const ADMIN_PW = 'Qta@2026!Sec#Admin'
  * P0+P2 — 같은 (user_id, type, coin_type, amount, KST date) row 존재 시 throw
  * 모든 백필/manual transactions INSERT 직전 의무 호출
  *
+ * D안 (2026-05-13): refereeId 컨텍스트 옵션 추가
+ *   - 추천 보너스 매칭처럼 같은 (uid, type, amount, date) 에 여러 referee 분이 들어가는 경우
+ *     referee 별 가드가 필요. 같은 amount 라도 referee_id 가 다르면 다른 row 로 인정.
+ *   - 식별 방법:
+ *     A) referral_rewards 원장에 (referrer_id, referee_id, level, reward_date OR paid_date, reward_amount) row 존재
+ *     B) transactions.ref_id 가 `*_referee{N}` 패턴 + N === refereeId
+ *     C) transactions.ref_id 가 referral_rewards.id 와 매핑되면 해당 referee_id 비교
+ *   - 위 중 하나라도 일치하면 차단, 모두 불일치하면 통과 (즉 새로운 referee 분 INSERT 허용)
+ *
  * @param db D1Database
  * @param uid user_id
  * @param type 'daily_reward' | 'referral_reward' | 기타 transactions.type
  * @param amount 금액 (QKEY 단위)
  * @param kstDate 'YYYY-MM-DD' KST 기준 날짜
  * @param coinType 'QKEY' (기본) | 'QTA' | 'QX' | 'USDT'
+ * @param refereeId (옵션) 같은 amount 라도 다른 referee 면 통과 — referral_rewards 컨텍스트
+ * @param level (옵션, refereeId 와 함께) 1 또는 2 — referral_rewards.level 정확 매칭
  * @returns true (안전) — 존재 시 Error throw
  */
 async function assertNoExistingPayment(
@@ -57,24 +68,95 @@ async function assertNoExistingPayment(
   type: string,
   amount: number,
   kstDate: string,
-  coinType: string = 'QKEY'
+  coinType: string = 'QKEY',
+  refereeId?: number,
+  level?: 1 | 2
 ): Promise<boolean> {
-  const existing = await db.prepare(`
+  // STEP 0: 같은 (uid, type, coin, amount, kst_date) row 모두 조회
+  const candidatesRes = await db.prepare(`
     SELECT id, ref_id, created_at FROM transactions
     WHERE user_id = ? AND type = ? AND coin_type = ? AND amount = ?
       AND date(datetime(created_at, '+9 hours')) = ?
-    LIMIT 1
-  `).bind(uid, type, coinType, amount, kstDate).first()
-  if (existing) {
+    ORDER BY id ASC
+  `).bind(uid, type, coinType, amount, kstDate).all()
+  const candidates = (candidatesRes.results as any[]) || []
+
+  if (candidates.length === 0) return true  // 같은 amount/date row 없음 → 안전
+
+  // refereeId 미지정 → 기존 broad guard 그대로 (첫 후보로 차단)
+  if (!refereeId) {
+    const existing = candidates[0]
     const e: any = new Error(
       `DUPLICATE_PAYMENT_BLOCKED: uid=${uid} type=${type} amount=${amount} ` +
-      `coin=${coinType} kst_date=${kstDate} existing_tx_id=${(existing as any).id} ` +
-      `existing_ref_id=${(existing as any).ref_id}`
+      `coin=${coinType} kst_date=${kstDate} existing_tx_id=${existing.id} ` +
+      `existing_ref_id=${existing.ref_id}`
     )
     e.code = 'DUPLICATE_PAYMENT_BLOCKED'
     e.existing = existing
+    e.candidate_count = candidates.length
     throw e
   }
+
+  // refereeId 지정 → 각 후보가 "그 referee 분" 인지 검증
+  // 같은 referee 분이 이미 있으면 차단, 모두 다른 referee 분이면 통과
+  for (const cand of candidates) {
+    const refIdStr = String(cand.ref_id || '')
+
+    // Pattern B: ref_id 가 '*_referee{N}' 패턴
+    const refereeMatch = refIdStr.match(/_referee(\d+)\b/)
+    if (refereeMatch && Number(refereeMatch[1]) === refereeId) {
+      const e: any = new Error(
+        `DUPLICATE_PAYMENT_BLOCKED (referee context): uid=${uid} type=${type} amount=${amount} ` +
+        `kst_date=${kstDate} referee_id=${refereeId} existing_tx_id=${cand.id} ref_id=${cand.ref_id}`
+      )
+      e.code = 'DUPLICATE_PAYMENT_BLOCKED'
+      e.existing = cand
+      e.match_reason = 'ref_id_referee_pattern'
+      throw e
+    }
+
+    // Pattern C: ref_id 가 숫자 → referral_rewards.id 매핑 → referee_id 비교
+    if (/^\d+$/.test(refIdStr)) {
+      const rrRow = await db.prepare(`
+        SELECT id, referee_id, level FROM referral_rewards WHERE id = ?
+      `).bind(Number(refIdStr)).first() as any
+      if (rrRow && Number(rrRow.referee_id) === refereeId) {
+        // level 도 지정됐으면 함께 매칭
+        if (level && Number(rrRow.level) !== level) continue
+        const e: any = new Error(
+          `DUPLICATE_PAYMENT_BLOCKED (referee context via ledger): uid=${uid} type=${type} amount=${amount} ` +
+          `kst_date=${kstDate} referee_id=${refereeId} existing_tx_id=${cand.id} rr_ledger_id=${rrRow.id}`
+        )
+        e.code = 'DUPLICATE_PAYMENT_BLOCKED'
+        e.existing = cand
+        e.match_reason = 'rr_ledger_referee_match'
+        throw e
+      }
+    }
+  }
+
+  // Pattern A: referral_rewards 원장 자체에 같은 (referrer, referee, level, date, amount) row 있는지
+  //   referrer_id = uid (수령자), referee_id = refereeId
+  if (level) {
+    const rrExist = await db.prepare(`
+      SELECT id FROM referral_rewards
+      WHERE referrer_id = ? AND referee_id = ? AND level = ? AND reward_amount = ?
+        AND (paid_date = ? OR reward_date = ?
+             OR date(datetime(created_at, '+9 hours')) = ?)
+      LIMIT 1
+    `).bind(uid, refereeId, level, amount, kstDate, kstDate, kstDate).first() as any
+    if (rrExist) {
+      const e: any = new Error(
+        `DUPLICATE_PAYMENT_BLOCKED (ledger pre-existing): uid=${uid} type=${type} amount=${amount} ` +
+        `kst_date=${kstDate} referee_id=${refereeId} level=${level} rr_id=${rrExist.id}`
+      )
+      e.code = 'DUPLICATE_PAYMENT_BLOCKED'
+      e.match_reason = 'rr_ledger_direct'
+      throw e
+    }
+  }
+
+  // 같은 amount row 들이 있지만 모두 다른 referee 분 → 통과
   return true
 }
 
@@ -122,14 +204,20 @@ async function assertNoExistingRefId(db: any, refId: string): Promise<boolean> {
 /**
  * P0+P2 — 안전한 transactions INSERT (3중 가드 자동 수행)
  *   1. assertNoExistingRefId
- *   2. assertNoExistingPayment
+ *   2. assertNoExistingPayment (refereeId 컨텍스트 옵션 포함, D안 보강)
  *   3. INSERT + qkey_balance UPDATE (옵션)
  *
- * 사용 예:
+ * D안 (2026-05-13): refereeId / level 옵션 추가
+ *   - 추천 보너스 매칭: 같은 uid 가 같은 날 같은 amount 를 여러 referee 분 받는 정상 케이스 지원
+ *   - 백필 ref_id 패턴 추천: 'bf_{date}_{ctx}_referee{refereeId}' — 가드가 자동 인식
+ *   - referee 컨텍스트 미사용 시 기존 broad guard 그대로 (호환성 유지)
+ *
+ * 사용 예 (referee 컨텍스트):
  *   await safeInsertTransaction(db, {
- *     user_id: 38, type: 'daily_reward', coin_type: 'QKEY',
- *     amount: 2250, description: '일일 배당 (QKEY)',
- *     ref_id: 'bf_513_self_s94', kst_date: '2026-05-13',
+ *     user_id: 44, type: 'referral_reward', coin_type: 'QKEY',
+ *     amount: 150, description: '추천 보너스 (Level 1)',
+ *     ref_id: 'bf_513_solbat_l1_referee45_s72', kst_date: '2026-05-13',
+ *     refereeId: 45, level: 1,
  *     updateBalance: true
  *   })
  */
@@ -143,11 +231,16 @@ async function safeInsertTransaction(db: any, p: {
   kst_date: string
   updateBalance?: boolean
   balanceColumn?: string  // 'qkey_balance' (기본)
+  refereeId?: number      // D안 — 추천 보너스 컨텍스트
+  level?: 1 | 2           // D안 — referral_rewards.level
 }): Promise<{ tx_id: number }> {
   // 1) ref_id 가드
   await assertNoExistingRefId(db, p.ref_id)
-  // 2) 같은 날 같은 사용자 같은 amount 가드 (broad)
-  await assertNoExistingPayment(db, p.user_id, p.type, p.amount, p.kst_date, p.coin_type)
+  // 2) 같은 날 같은 사용자 같은 amount 가드 — D안: refereeId/level 컨텍스트 지원
+  await assertNoExistingPayment(
+    db, p.user_id, p.type, p.amount, p.kst_date, p.coin_type,
+    p.refereeId, p.level
+  )
   // 3) INSERT
   const res = await db.prepare(`
     INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
@@ -25849,6 +25942,234 @@ app.get('/api/diag/audit-balance-vs-tx-mismatch', async (c) => {
   } catch (error: any) {
     console.error('audit-balance-vs-tx-mismatch error:', error)
     return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
+// /api/diag/solbat-513-d-plan-backfill  (2026-05-13, D안 EXEC)
+// ------------------------------------------------------------
+// 사장님 결재 D안: 헬퍼 referee 컨텍스트 보강 활용 → 3건 정확 백필
+//
+// 백필 대상 (deep-trace 결과 확정):
+//   1) 이인실 (u#45, L1, s#72분) → 솔밧 +150 QKEY
+//   2) 유정 (u#49, L2, s#65분)   → 솔밧 +75 QKEY
+//   3) 이현우 (u#93, L2, s#98분, 5/10 휴일진입자) → 솔밧 +75 QKEY
+//   총 +300 QKEY
+//
+// 영구룰 100% 준수:
+//   - L1=20%, L2=10% (산식 검증 통과)
+//   - staking.daily_rate D1 직접 (사전 검증 시 사용)
+//   - description 사용자 노출 안전: '추천 보너스 (Level 1)' / '추천 보너스 (Level 2)' 만
+//   - safeInsertTransaction 헬퍼 의무 사용 (D안 보강된 3중 가드)
+//     1) assertNoExistingRefId
+//     2) assertNoExistingPayment (refereeId + level 컨텍스트)
+//     3) INSERT + balance UPDATE
+//   - ref_id 패턴: 'bf_513_solbat_l{1|2}_referee{N}_s{stakingId}' — referee 컨텍스트 자동 인식
+//
+// 동작:
+//   - DRY_RUN (default): 사전 검증만 (각 referee 의 현재 active staking 합 × ratio == 백필 amount 검증)
+//   - ?confirm=GO: safeInsertTransaction 호출 + referral_rewards 원장 INSERT
+// ============================================================
+app.get('/api/diag/solbat-513-d-plan-backfill', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+    const TARGET_DATE = '2026-05-13'
+
+    // 백필 명단 (deep-trace 정확한 식별 결과)
+    const BACKFILL_LIST = [
+      {
+        referee_id: 45, referee_name: '이인실', level: 1 as 1 | 2,
+        amount: 150, staking_hint: 's#72 (5/5 진입, 두 번째 staking)',
+        ratio: 0.20,
+      },
+      {
+        referee_id: 49, referee_name: '유정', level: 2 as 1 | 2,
+        amount: 75, staking_hint: 's#65 (5/3 진입, 두 번째 staking)',
+        ratio: 0.10,
+      },
+      {
+        referee_id: 93, referee_name: '이현우', level: 2 as 1 | 2,
+        amount: 75, staking_hint: 's#98 (5/10 휴일진입자)',
+        ratio: 0.10,
+      },
+    ]
+
+    // STEP 0: 솔밧 잔액
+    const solbat = await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first() as any
+    if (!solbat) return c.json({ error: 'solbat not found' }, 404)
+
+    // STEP 1: 각 referee 의 현재 active staking 합으로 산식 검증 + 백필 금액 일치 여부
+    const preflight: any[] = []
+    let preflightTotalExpected = 0
+    let allValid = true
+    for (const t of BACKFILL_LIST) {
+      // referee 의 현재 active staking 들
+      const stakesRes = await db.prepare(`
+        SELECT id, amount, daily_rate, status,
+               date(datetime(start_date, '+9 hours')) AS start_kst_date
+        FROM staking WHERE user_id = ? AND status = 'active'
+        ORDER BY id ASC
+      `).bind(t.referee_id).all()
+      const stakes = (stakesRes.results as any[]) || []
+      let totalSelfDaily = 0
+      for (const s of stakes) {
+        totalSelfDaily += Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+      }
+      const expectedMatch = Math.round(totalSelfDaily * t.ratio)
+
+      // referee 가 솔밧이 이미 5/13 에 받은 매칭 합 (referral_rewards 원장 기준)
+      const existingMatchRow = await db.prepare(`
+        SELECT COALESCE(SUM(reward_amount), 0) AS sum
+        FROM referral_rewards
+        WHERE referrer_id = ? AND referee_id = ? AND level = ?
+          AND (paid_date = ? OR reward_date = ?
+               OR date(datetime(created_at, '+9 hours')) = ?)
+      `).bind(SOLBAT_ID, t.referee_id, t.level, TARGET_DATE, TARGET_DATE, TARGET_DATE).first() as any
+      const existingMatch = Number(existingMatchRow?.sum || 0)
+      const missingMatch = expectedMatch - existingMatch
+      const amountMatches = missingMatch === t.amount
+
+      // tx 측 검증 — 이미 솔밧 받은 5/13 tx 중 같은 referee 분 있는지
+      // (이론적으로 ledger 원장과 일치해야 하지만 양쪽 모두 검증)
+      const txSameRefereeRows = await db.prepare(`
+        SELECT id, amount, ref_id, description
+        FROM transactions
+        WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+          AND date(datetime(created_at, '+9 hours')) = ?
+          AND (ref_id LIKE ? OR ref_id IN (
+            SELECT id FROM referral_rewards WHERE referee_id = ? AND level = ?
+          ))
+      `).bind(SOLBAT_ID, TARGET_DATE, `%_referee${t.referee_id}%`, t.referee_id, t.level).all()
+      const txCount = (txSameRefereeRows.results as any[])?.length || 0
+
+      preflight.push({
+        referee_id: t.referee_id, referee_name: t.referee_name,
+        level: t.level, ratio: t.ratio,
+        staking_hint: t.staking_hint,
+        referee_active_stakes: stakes,
+        referee_self_daily_qkey_total: totalSelfDaily,
+        expected_match_for_solbat: expectedMatch,
+        existing_match_in_ledger: existingMatch,
+        missing_match_calculated: missingMatch,
+        amount_to_backfill: t.amount,
+        amount_matches_calculation: amountMatches,
+        existing_tx_count_same_referee_513: txCount,
+        ref_id_to_use: `bf_513_solbat_l${t.level}_referee${t.referee_id}`,
+        description_to_use: t.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)',
+      })
+
+      if (!amountMatches) allValid = false
+      preflightTotalExpected += t.amount
+    }
+
+    if (!isExec) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        target_date: TARGET_DATE,
+        solbat: { id: solbat.id, name: solbat.name, qkey_balance_current: solbat.qkey_balance },
+        all_preflight_valid: allValid,
+        total_to_backfill: preflightTotalExpected,
+        preflight,
+        notes: [
+          'D안 헬퍼 보강: refereeId + level 컨텍스트로 같은 amount 도 다른 referee 면 통과',
+          '영구룰 L1=20%/L2=10% 산식 검증 후 일치하는 경우만 백필 실행',
+          'amount_matches_calculation 가 모두 true 여야 안전',
+          '실제 백필하려면 ?confirm=GO 추가',
+        ]
+      })
+    }
+
+    // EXEC 시 사전 검증 실패하면 차단
+    if (!allValid) {
+      return c.json({
+        success: false,
+        mode: 'EXEC_BLOCKED',
+        error: '사전 검증 실패 (amount_matches_calculation false 가 있음) — 백필 차단',
+        preflight,
+      }, 400)
+    }
+
+    // ====================== EXEC ======================
+    const inserted: any[] = []
+    const skipped: any[] = []
+    let actualSum = 0
+
+    for (const t of BACKFILL_LIST) {
+      const refId = `bf_513_solbat_l${t.level}_referee${t.referee_id}`
+      const description = t.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+      try {
+        const res = await safeInsertTransaction(db, {
+          user_id: SOLBAT_ID,
+          type: 'referral_reward',
+          coin_type: 'QKEY',
+          amount: t.amount,
+          description,
+          ref_id: refId,
+          kst_date: TARGET_DATE,
+          updateBalance: true,
+          refereeId: t.referee_id,   // D안 보강 — referee 컨텍스트 가드
+          level: t.level,
+        })
+        // referral_rewards 원장 INSERT
+        // original_amount = referee 의 누락된 staking 분 self daily (역산: amount / ratio)
+        const originalAmount = Math.round(t.amount / t.ratio)
+        try {
+          await db.prepare(`
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          `).bind(
+            SOLBAT_ID, t.referee_id, t.level,
+            originalAmount, t.amount,
+            TARGET_DATE, TARGET_DATE,
+          ).run()
+        } catch(rrErr: any) {
+          console.error('referral_rewards INSERT 실패 (tx 는 성공):', rrErr?.message)
+        }
+        actualSum += t.amount
+        inserted.push({
+          referee_id: t.referee_id, referee_name: t.referee_name,
+          level: t.level, amount: t.amount,
+          tx_id: (res as any).tx_id, ref_id: refId,
+          original_amount: originalAmount,
+        })
+      } catch (err: any) {
+        skipped.push({
+          referee_id: t.referee_id, referee_name: t.referee_name,
+          level: t.level, amount: t.amount,
+          reason: err?.code || 'unknown',
+          message: err?.message,
+          match_reason: err?.match_reason,
+        })
+      }
+    }
+
+    // 잔액 재조회
+    const after = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first() as any
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      target_date: TARGET_DATE,
+      solbat_balance_before: solbat.qkey_balance,
+      solbat_balance_after: after?.qkey_balance,
+      delta: (after?.qkey_balance || 0) - solbat.qkey_balance,
+      inserted_count: inserted.length,
+      skipped_count: skipped.length,
+      actual_backfill_sum: actualSum,
+      inserted,
+      skipped,
+      note: 'D안 — refereeId 컨텍스트 가드로 정확히 3건 분해 INSERT 시도. 영구룰 #이중지급 절대 금지 준수',
+    })
+  } catch (error: any) {
+    console.error('solbat-513-d-plan-backfill error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
   }
 })
 
