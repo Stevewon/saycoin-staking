@@ -27887,10 +27887,67 @@ app.get('/api/diag/user-l1l2-precision-audit', async (c) => {
       })
     }
 
-    // 5) 기대 매칭 (평일 1일치)
+    // 5) 기대 매칭 (현재 시점 평일 1일치 — 참고용, 일자별 동적 expected 는 8) 에서 계산)
     const expectedL1Match = Math.round(l1DailySumQkey * 0.20)
     const expectedL2Match = Math.round(l2DailySumQkey * 0.10)
     const expectedTotalMatch = expectedL1Match + expectedL2Match
+
+    // 5-B) 영구 룰 #휴일진입자 보호 — 일자별 활성 staking 동적 expected 계산용 인덱스
+    // 각 staking 의 start_kst_date 를 기준으로:
+    //   - 보상은 start_date 의 다음 cron 실행 (보통 D+1, 단 휴일/주말이면 다음 평일) 부터 발생
+    //   - 5/12 (월) start 의 staking 은 5/12 reward → 5/13 (화) paid 가 첫 보상
+    //   - 즉 reward_date >= start_kst_date 인 평일에 해당 staking 이 활성
+    // KST 날짜 'YYYY-MM-DD' 와 staking start_kst_date 비교는 문자열 사전순으로 일치
+    // (날짜 형식 동일하므로 string compare 가 정확)
+    type StakeIdx = {
+      user_id: number
+      staking_id: number
+      self_daily_qkey: number
+      start_kst_date: string
+    }
+    const l1StakeIdx: StakeIdx[] = []
+    for (const d of l1Detail) {
+      for (const s of d.active_stakes as any[]) {
+        l1StakeIdx.push({
+          user_id: d.user_id,
+          staking_id: s.staking_id,
+          self_daily_qkey: s.self_daily_qkey,
+          start_kst_date: String(s.start_kst_date || ''),
+        })
+      }
+    }
+    const l2StakeIdx: StakeIdx[] = []
+    for (const d of l2Detail) {
+      for (const s of d.active_stakes as any[]) {
+        l2StakeIdx.push({
+          user_id: d.user_id,
+          staking_id: s.staking_id,
+          self_daily_qkey: s.self_daily_qkey,
+          start_kst_date: String(s.start_kst_date || ''),
+        })
+      }
+    }
+    // 헬퍼: 주어진 reward_date(KST) 에 활성인 stakes 의 self_daily 합산 → ratio 적용
+    const computeExpectedForDate = (kstDate: string, idx: StakeIdx[], ratio: number) => {
+      let sumDaily = 0
+      const activeStakes: any[] = []
+      for (const s of idx) {
+        if (s.start_kst_date && s.start_kst_date <= kstDate) {
+          sumDaily += s.self_daily_qkey
+          activeStakes.push({
+            user_id: s.user_id, staking_id: s.staking_id,
+            self_daily_qkey: s.self_daily_qkey,
+            start_kst_date: s.start_kst_date,
+          })
+        }
+      }
+      return {
+        expected: Math.round(sumDaily * ratio),
+        active_count: activeStakes.length,
+        active_daily_sum: sumDaily,
+        active_stakes: activeStakes,
+      }
+    }
 
     // 6) 최근 14일 본인 실수령 referral_reward 일별 합계 (KST)
     const txDaily = await db.prepare(`
@@ -27941,21 +27998,74 @@ app.get('/api/diag/user-l1l2-precision-audit', async (c) => {
       } catch(e2) {}
     }
 
-    // 8) 일자별 mismatch
+    // 8) 일자별 mismatch — 영구 룰 #휴일진입자 보호 반영 (일자별 활성 staking 동적 계산)
+    //   - kst_date 는 tx.created_at_kst (= paid 일자)
+    //   - 영구 룰: 보상은 reward_date 의 staking 활성 여부로 결정, paid 는 다음 영업일
+    //   - reward_date = paid_date 의 직전 영업일 (cron 단일화 룰)
+    //   - 단순화: tx.created_at_kst 가 영업일이면 그 날 자체를 reward_date 로 간주
+    //     (현재 시스템은 cron 시점 = paid date, reward_date 컬럼은 직전 영업일)
+    //   - staking.start_kst_date <= reward_date 인 staking 만 활성
+    //
+    // 정확한 reward_date 매핑을 위해 referral_rewards 에서 paid_date → reward_date 조회
+    // (없으면 paid_date 의 직전 영업일을 reward_date 로 가정)
+    const prevBusinessDay = (kstDate: string): string => {
+      // KST 기준 직전 평일 1일 (간단 휴일 룰: isKoreanBusinessDay 사용)
+      const d = new Date(kstDate + 'T00:00:00+09:00')
+      for (let i = 1; i <= 7; i++) {
+        const prev = new Date(d.getTime() - i*24*60*60*1000)
+        const bd = isKoreanBusinessDay(prev)
+        if (bd.isBusinessDay) {
+          const yyyy = prev.getUTCFullYear()
+          const mm = String(prev.getUTCMonth()+1).padStart(2,'0')
+          const dd = String(prev.getUTCDate()).padStart(2,'0')
+          return `${yyyy}-${mm}-${dd}`
+        }
+      }
+      return kstDate
+    }
+
+    // referral_rewards 에서 본인 paid_date → reward_date 매핑 캐시
+    const rrMapRes = await db.prepare(`
+      SELECT DISTINCT paid_date, reward_date
+      FROM referral_rewards
+      WHERE referrer_id = ?
+        AND paid_date >= date('now','+9 hours','-21 days')
+    `).bind(TARGET_ID).all()
+    const paidToRewardMap: Record<string, string> = {}
+    for (const r of (rrMapRes.results as any[]) || []) {
+      if (r.paid_date && r.reward_date) paidToRewardMap[String(r.paid_date)] = String(r.reward_date)
+    }
+
     const mismatchByDate: any[] = []
     for (const row of txDailyRows) {
       const kstDate = row.kst_date
       const dateObj = new Date(kstDate + 'T00:00:00+09:00')
       const dow = dateObj.getUTCDay()
       const { isBusinessDay } = isKoreanBusinessDay(dateObj)
-      const expectedL1 = isBusinessDay ? expectedL1Match : 0
-      const expectedL2 = isBusinessDay ? expectedL2Match : 0
+
+      // reward_date 결정 (영구 룰 #cron 단일화):
+      //   1. ledger 에 paid_date=kstDate 인 row 가 있으면 그 reward_date 사용
+      //   2. 없으면 kstDate 의 직전 영업일 사용
+      const rewardDate = paidToRewardMap[kstDate] || prevBusinessDay(kstDate)
+
+      // 영구 룰 #휴일진입자 보호: rewardDate 시점 활성 staking 만 카운트
+      const l1Exp = computeExpectedForDate(rewardDate, l1StakeIdx, 0.20)
+      const l2Exp = computeExpectedForDate(rewardDate, l2StakeIdx, 0.10)
+
+      const expectedL1 = isBusinessDay ? l1Exp.expected : 0
+      const expectedL2 = isBusinessDay ? l2Exp.expected : 0
       const actualL1 = Number(row.l1_received_qkey) || 0
       const actualL2 = Number(row.l2_received_qkey) || 0
       mismatchByDate.push({
         kst_date: kstDate,
         weekday: ['일','월','화','수','목','금','토'][dow],
         is_business_day: isBusinessDay,
+        reward_date_mapped: rewardDate,
+        reward_date_source: paidToRewardMap[kstDate] ? 'ledger' : 'derived(prev_business_day)',
+        l1_active_stake_count: l1Exp.active_count,
+        l1_active_daily_sum: l1Exp.active_daily_sum,
+        l2_active_stake_count: l2Exp.active_count,
+        l2_active_daily_sum: l2Exp.active_daily_sum,
         expected_l1: expectedL1,
         actual_l1: actualL1,
         diff_l1: actualL1 - expectedL1,
@@ -28001,7 +28111,11 @@ app.get('/api/diag/user-l1l2-precision-audit', async (c) => {
       notes: [
         '영구룰: L1=20%, L2=10% — 본 진단 산식은 이 비율로 고정',
         '영구룰: staking.daily_rate D1 직접 조회 — amount 추정 금지',
+        '영구룰 #휴일진입자 보호: 각 staking.start_kst_date 시점 활성 여부로 일자별 expected 동적 계산',
+        '영구룰 #cron 단일화: reward_date = paid_date 직전 영업일 (ledger 매핑 우선, 없으면 derived)',
         '평일이 아닌 KST 일자(토/일/공휴일)는 expected = 0 (cron 발생 안 함)',
+        'expected_total_match_per_business_day 는 현재 시점 활성 staking 전체 합 — 참고용',
+        'mismatch_by_date 의 expected_l1/l2 는 그 날짜의 활성 staking 만 합산한 동적 값',
         'diff_total > 0 = 과지급 (이중지급 가능성) / diff_total < 0 = 미지급 (백필 필요)',
         '이 엔드포인트는 read-only — DB UPDATE 0건',
       ]
