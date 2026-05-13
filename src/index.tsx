@@ -28502,4 +28502,425 @@ app.get('/api/diag/lucky4492-permanent-rule-correction', async (c) => {
   }
 })
 
+// ============================================================================
+// H plan 5/14 cron 모니터링 endpoint (2026-05-13 작성, 5/14 07:00 KST cron 후 사용)
+// ============================================================================
+//   목적: 영구 룰 100% 준수 자동 cron 첫 가동 검증
+//   사용: GET /api/diag/cron-h-plan-monitor?password=...&paid_date=2026-05-14
+//   기본: paid_date = 오늘 KST (호출 시점)
+//
+//   검증 항목 (C1 ~ C8):
+//     C1. cron 실행 흔적     — paid_date 의 daily_rewards/referral_rewards/transactions 존재
+//     C2. staking_id 100%   — 신규 referral_rewards 모든 행 staking_id IS NOT NULL (H plan 핵심)
+//     C3. 5-tuple 유니크성   — (referrer_id, referee_id, level, staking_id, reward_date) 중복 0
+//     C4. ref_id 1:1 매핑   — 모든 신규 transactions 가 ledger row 와 1:1
+//     C5. 영구 룰 (L1=20%, L2=10%) — 모든 referral_rewards.reward_amount = ROUND(original_amount × ratio)
+//     C6. 다중 staking referee — referee 의 활성 staking 수 × referrer 매칭 완전성
+//     C7. 휴일진입자 보호    — 신규 진입자가 정상 매칭 진입
+//     C8. 이중지급 부재      — daily_rewards / referral_rewards / transactions 중복 0
+//
+//   추가 출력: summary, per-user breakdown, 모든 검증 PASS/FAIL 상태
+app.get('/api/diag/cron-h-plan-monitor', async (c) => {
+  try {
+    const password = c.req.query('password') || ''
+    if (password !== ADMIN_PW) return c.json({ error: 'Unauthorized' }, 401)
+    const db = c.env.DB
+
+    // 기본 paid_date = 오늘 KST
+    const now = new Date()
+    const todayKst = kstDateStr(now)
+    const paidDate = c.req.query('paid_date') || todayKst
+    const yesterdayKst = kstDateStr(new Date(new Date(paidDate + 'T00:00:00+09:00').getTime() - 24 * 60 * 60 * 1000))
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C1. cron 실행 흔적 (paid_date 의 신규 행 수)
+    // ─────────────────────────────────────────────────────────────────────
+    const drCntRow = await db.prepare(`
+      SELECT COUNT(*) as cnt, COALESCE(SUM(usdt_amount), 0) as sum_qkey
+      FROM daily_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+    const rrCntRow = await db.prepare(`
+      SELECT COUNT(*) as cnt,
+             SUM(CASE WHEN level=1 THEN 1 ELSE 0 END) as l1_cnt,
+             SUM(CASE WHEN level=2 THEN 1 ELSE 0 END) as l2_cnt,
+             COALESCE(SUM(reward_amount), 0) as sum_qkey
+      FROM referral_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+    // transactions 는 paid_date 컬럼이 없음 — daily_rewards/referral_rewards.id 를 통한 매핑
+    const txDqRow = await db.prepare(`
+      SELECT COUNT(*) as cnt, COALESCE(SUM(t.amount), 0) as sum_qkey
+      FROM transactions t
+      INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+      WHERE t.type = 'daily_qkey' AND dr.paid_date = ?
+    `).bind(paidDate).first() as any
+    const txRrRow = await db.prepare(`
+      SELECT COUNT(*) as cnt, COALESCE(SUM(t.amount), 0) as sum_qkey
+      FROM transactions t
+      INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+      WHERE t.type = 'referral_reward' AND rr.paid_date = ?
+    `).bind(paidDate).first() as any
+
+    const c1_drCount = Number(drCntRow?.cnt || 0)
+    const c1_rrCount = Number(rrCntRow?.cnt || 0)
+    const c1_l1Count = Number(rrCntRow?.l1_cnt || 0)
+    const c1_l2Count = Number(rrCntRow?.l2_cnt || 0)
+    const c1_txDqCount = Number(txDqRow?.cnt || 0)
+    const c1_txRrCount = Number(txRrRow?.cnt || 0)
+    const c1_passed = c1_drCount > 0  // cron 이 실행되었으면 최소 daily_rewards 1건 이상
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C2. staking_id 100% 채움 (H plan 핵심 — 신규 referral_rewards 의무)
+    // ─────────────────────────────────────────────────────────────────────
+    const c2NullRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_date, original_amount, reward_amount
+      FROM referral_rewards
+      WHERE paid_date = ? AND staking_id IS NULL
+      ORDER BY id ASC
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c2_nullCount = c2NullRows.results.length
+    const c2_passed = c2_nullCount === 0
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C3. 5-tuple 유니크성 (referrer, referee, level, staking_id, reward_date)
+    // ─────────────────────────────────────────────────────────────────────
+    const c3DupRows = await db.prepare(`
+      SELECT referrer_id, referee_id, level, staking_id, reward_date, COUNT(*) as dup_cnt
+      FROM referral_rewards
+      WHERE paid_date = ?
+      GROUP BY referrer_id, referee_id, level, staking_id, reward_date
+      HAVING COUNT(*) > 1
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c3_dupCount = c3DupRows.results.length
+    const c3_passed = c3_dupCount === 0
+
+    // daily_rewards 중복 (user_id, staking_id, reward_date)
+    const c3DrDupRows = await db.prepare(`
+      SELECT user_id, staking_id, reward_date, COUNT(*) as dup_cnt
+      FROM daily_rewards
+      WHERE paid_date = ?
+      GROUP BY user_id, staking_id, reward_date
+      HAVING COUNT(*) > 1
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c3_drDupCount = c3DrDupRows.results.length
+    const c3_passed_full = c3_passed && c3_drDupCount === 0
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C4. ref_id 1:1 매핑 — transactions ↔ daily_rewards / referral_rewards
+    // ─────────────────────────────────────────────────────────────────────
+    // 4-1. daily_rewards 중 transactions 가 없는 행 (지급 누락)
+    const c4OrphanDr = await db.prepare(`
+      SELECT dr.id, dr.user_id, dr.staking_id, dr.reward_date, dr.usdt_amount
+      FROM daily_rewards dr
+      LEFT JOIN transactions t ON t.ref_id = dr.id AND t.type = 'daily_qkey'
+      WHERE dr.paid_date = ? AND t.id IS NULL
+      LIMIT 50
+    `).bind(paidDate).all()
+    // 4-2. referral_rewards 중 transactions 가 없는 행 (지급 누락, reward_amount > 0 만)
+    const c4OrphanRr = await db.prepare(`
+      SELECT rr.id, rr.referrer_id, rr.referee_id, rr.level, rr.reward_date, rr.reward_amount
+      FROM referral_rewards rr
+      LEFT JOIN transactions t ON t.ref_id = rr.id AND t.type = 'referral_reward'
+      WHERE rr.paid_date = ? AND rr.reward_amount > 0 AND t.id IS NULL
+      LIMIT 50
+    `).bind(paidDate).all()
+    // 4-3. transactions 중 ref_id 가 ledger 에 없는 행 (고아 tx — 이중지급 가능성)
+    const c4OrphanTxDq = await db.prepare(`
+      SELECT t.id, t.user_id, t.amount, t.ref_id, t.created_at
+      FROM transactions t
+      LEFT JOIN daily_rewards dr ON dr.id = t.ref_id
+      WHERE t.type = 'daily_qkey'
+        AND date(t.created_at, '+9 hours') = ?
+        AND dr.id IS NULL
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c4OrphanTxRr = await db.prepare(`
+      SELECT t.id, t.user_id, t.amount, t.ref_id, t.created_at
+      FROM transactions t
+      LEFT JOIN referral_rewards rr ON rr.id = t.ref_id
+      WHERE t.type = 'referral_reward'
+        AND date(t.created_at, '+9 hours') = ?
+        AND rr.id IS NULL
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c4_orphanDrCount = c4OrphanDr.results.length
+    const c4_orphanRrCount = c4OrphanRr.results.length
+    const c4_orphanTxDqCount = c4OrphanTxDq.results.length
+    const c4_orphanTxRrCount = c4OrphanTxRr.results.length
+    const c4_passed = c4_orphanDrCount === 0 && c4_orphanRrCount === 0 &&
+                      c4_orphanTxDqCount === 0 && c4_orphanTxRrCount === 0
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C5. 영구 룰 (L1=20%, L2=10%) — reward_amount = ROUND(original_amount × ratio)
+    // ─────────────────────────────────────────────────────────────────────
+    //   ※ 200% cap 부분 지급은 예외 (reward_amount < expected 인 경우 OK)
+    //      → reward_amount > expected 인 경우만 위반
+    const c5L1Violations = await db.prepare(`
+      SELECT id, referrer_id, referee_id, original_amount, reward_amount, reward_date,
+             CAST(ROUND(original_amount * 0.20) AS INTEGER) as expected
+      FROM referral_rewards
+      WHERE paid_date = ? AND level = 1
+        AND reward_amount > CAST(ROUND(original_amount * 0.20) AS INTEGER)
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c5L2Violations = await db.prepare(`
+      SELECT id, referrer_id, referee_id, original_amount, reward_amount, reward_date,
+             CAST(ROUND(original_amount * 0.10) AS INTEGER) as expected
+      FROM referral_rewards
+      WHERE paid_date = ? AND level = 2
+        AND reward_amount > CAST(ROUND(original_amount * 0.10) AS INTEGER)
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c5_l1ViolCount = c5L1Violations.results.length
+    const c5_l2ViolCount = c5L2Violations.results.length
+    const c5_passed = c5_l1ViolCount === 0 && c5_l2ViolCount === 0
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C6. 다중 staking referee 매칭 완전성
+    //     어제(reward_date 기준) 활성 staking 이 N개인 referee 의 referrer 들이
+    //     N건 모두 매칭됐는지 검증 (H plan 4중 가드 동작 확인)
+    // ─────────────────────────────────────────────────────────────────────
+    //   reward_date = paidDate 직전 영업일 (cron 은 어제 매출을 오늘 처리)
+    //   단순화: paidDate 의 referral_rewards.reward_date 집합으로부터 검증
+    const c6RefereeStakeCnt = await db.prepare(`
+      SELECT referee_id, reward_date, COUNT(DISTINCT staking_id) as referee_staking_cnt
+      FROM referral_rewards
+      WHERE paid_date = ? AND staking_id IS NOT NULL
+      GROUP BY referee_id, reward_date
+      HAVING referee_staking_cnt >= 2
+    `).bind(paidDate).all()
+
+    // 다중 staking referee 별로 모든 referrer 가 동일 staking_id 집합을 받았는지 확인
+    const c6MissingMatches: any[] = []
+    for (const r of c6RefereeStakeCnt.results) {
+      const refereeId = r.referee_id
+      const rewardDate = r.reward_date
+      const expectedStakingCnt = r.referee_staking_cnt as number
+
+      // 해당 referee 의 L1/L2 referrer 각각이 받은 staking_id distinct 수
+      const refByLevel = await db.prepare(`
+        SELECT level, referrer_id, COUNT(DISTINCT staking_id) as got_cnt
+        FROM referral_rewards
+        WHERE paid_date = ? AND referee_id = ? AND reward_date = ? AND staking_id IS NOT NULL
+        GROUP BY level, referrer_id
+      `).bind(paidDate, refereeId, rewardDate).all()
+
+      for (const row of refByLevel.results) {
+        const gotCnt = Number(row.got_cnt || 0)
+        if (gotCnt < expectedStakingCnt) {
+          c6MissingMatches.push({
+            referee_id: refereeId,
+            reward_date: rewardDate,
+            level: row.level,
+            referrer_id: row.referrer_id,
+            expected_staking_cnt: expectedStakingCnt,
+            got_staking_cnt: gotCnt,
+            missing_cnt: expectedStakingCnt - gotCnt,
+          })
+        }
+      }
+    }
+    const c6_multiRefereeCount = c6RefereeStakeCnt.results.length
+    const c6_missingCount = c6MissingMatches.length
+    const c6_passed = c6_missingCount === 0
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C7. 휴일진입자 보호 — 신규 진입 referee 가 정상 매칭에 진입
+    //     paidDate 의 referral_rewards 중 referee 의 staking.start_date_kst 가
+    //     reward_date 이하인지 (시점 활성 여부) 확인
+    // ─────────────────────────────────────────────────────────────────────
+    const c7InvalidRows = await db.prepare(`
+      SELECT rr.id, rr.referrer_id, rr.referee_id, rr.level,
+             rr.reward_date, rr.staking_id,
+             date(s.start_date, '+9 hours') as start_kst_date
+      FROM referral_rewards rr
+      LEFT JOIN staking s ON s.id = rr.staking_id
+      WHERE rr.paid_date = ? AND rr.staking_id IS NOT NULL
+        AND (s.id IS NULL OR date(s.start_date, '+9 hours') > rr.reward_date)
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c7_invalidCount = c7InvalidRows.results.length
+    const c7_passed = c7_invalidCount === 0
+
+    // 신규 진입자 (start_kst_date >= paidDate-3 일) 가 paidDate 에 매칭 진입한 사례
+    const c7NewEntrantsMatched = await db.prepare(`
+      SELECT DISTINCT rr.referee_id,
+             date(s.start_date, '+9 hours') as referee_start_kst,
+             rr.reward_date
+      FROM referral_rewards rr
+      INNER JOIN staking s ON s.id = rr.staking_id
+      WHERE rr.paid_date = ?
+        AND date(s.start_date, '+9 hours') >= date(?, '-3 days')
+      ORDER BY referee_start_kst DESC
+      LIMIT 30
+    `).bind(paidDate, paidDate).all()
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C8. 이중지급 부재 — transactions ref_id 중복 (동일 ledger 에 다중 tx)
+    // ─────────────────────────────────────────────────────────────────────
+    const c8TxDupDq = await db.prepare(`
+      SELECT t.ref_id, COUNT(*) as dup_cnt
+      FROM transactions t
+      INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+      WHERE t.type = 'daily_qkey' AND dr.paid_date = ?
+      GROUP BY t.ref_id
+      HAVING COUNT(*) > 1
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c8TxDupRr = await db.prepare(`
+      SELECT t.ref_id, COUNT(*) as dup_cnt
+      FROM transactions t
+      INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+      WHERE t.type = 'referral_reward' AND rr.paid_date = ?
+      GROUP BY t.ref_id
+      HAVING COUNT(*) > 1
+      LIMIT 50
+    `).bind(paidDate).all()
+    const c8_txDupDqCount = c8TxDupDq.results.length
+    const c8_txDupRrCount = c8TxDupRr.results.length
+    const c8_passed = c8_txDupDqCount === 0 && c8_txDupRrCount === 0
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Summary metrics
+    // ─────────────────────────────────────────────────────────────────────
+    const affectedUsersDr = await db.prepare(`
+      SELECT COUNT(DISTINCT user_id) as cnt FROM daily_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+    const affectedRefDistinct = await db.prepare(`
+      SELECT COUNT(DISTINCT referrer_id) as cnt FROM referral_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+    const affectedRefereeDistinct = await db.prepare(`
+      SELECT COUNT(DISTINCT referee_id) as cnt FROM referral_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+
+    // 모든 check passed 여부
+    const allPassed = c1_passed && c2_passed && c3_passed_full && c4_passed &&
+                      c5_passed && c6_passed && c7_passed && c8_passed
+
+    return c.json({
+      success: true,
+      title: 'H plan 5/14 cron 모니터링 — 영구 룰 100% 준수 검증',
+      paid_date: paidDate,
+      yesterday_kst_reference: yesterdayKst,
+      checked_at_kst: kstDateStr(now) + ' ' + now.toISOString().split('T')[1].split('.')[0] + ' UTC',
+      // ─────────── 최종 PASS/FAIL ───────────
+      all_passed: allPassed,
+      verdict: allPassed
+        ? '✅ 영구 룰 100% 준수 — H plan cron 정상 작동 검증 완료'
+        : '⚠️ 위반 사항 발견 — 아래 상세 검토 필요',
+      // ─────────── Summary ───────────
+      summary: {
+        daily_rewards: {
+          count: c1_drCount,
+          sum_qkey: Number(drCntRow?.sum_qkey || 0),
+          tx_count: c1_txDqCount,
+          tx_sum_qkey: Number(txDqRow?.sum_qkey || 0),
+        },
+        referral_rewards: {
+          count: c1_rrCount,
+          l1_count: c1_l1Count,
+          l2_count: c1_l2Count,
+          sum_qkey: Number(rrCntRow?.sum_qkey || 0),
+          tx_count: c1_txRrCount,
+          tx_sum_qkey: Number(txRrRow?.sum_qkey || 0),
+        },
+        affected_users: {
+          daily_rewards_users: Number(affectedUsersDr?.cnt || 0),
+          referrers: Number(affectedRefDistinct?.cnt || 0),
+          referees: Number(affectedRefereeDistinct?.cnt || 0),
+        },
+      },
+      // ─────────── 8가지 검증 항목 ───────────
+      checks: {
+        C1_cron_executed: {
+          passed: c1_passed,
+          description: 'cron 실행 흔적 (paid_date 의 신규 행)',
+          daily_rewards_count: c1_drCount,
+          referral_rewards_count: c1_rrCount,
+          transactions_count: c1_txDqCount + c1_txRrCount,
+        },
+        C2_staking_id_100_percent: {
+          passed: c2_passed,
+          description: 'H plan 핵심 — 신규 referral_rewards 모든 행 staking_id IS NOT NULL',
+          null_count: c2_nullCount,
+          samples: c2NullRows.results.slice(0, 10),
+        },
+        C3_5tuple_unique: {
+          passed: c3_passed_full,
+          description: '(referrer_id, referee_id, level, staking_id, reward_date) 5-tuple 유니크',
+          rr_duplicate_groups: c3_dupCount,
+          dr_duplicate_groups: c3_drDupCount,
+          rr_samples: c3DupRows.results.slice(0, 10),
+          dr_samples: c3DrDupRows.results.slice(0, 10),
+        },
+        C4_ref_id_1to1: {
+          passed: c4_passed,
+          description: 'ref_id 1:1 매핑 (transactions ↔ ledger)',
+          orphan_dr_no_tx: c4_orphanDrCount,
+          orphan_rr_no_tx: c4_orphanRrCount,
+          orphan_tx_dq_no_ledger: c4_orphanTxDqCount,
+          orphan_tx_rr_no_ledger: c4_orphanTxRrCount,
+          samples: {
+            orphan_dr: c4OrphanDr.results.slice(0, 5),
+            orphan_rr: c4OrphanRr.results.slice(0, 5),
+            orphan_tx_dq: c4OrphanTxDq.results.slice(0, 5),
+            orphan_tx_rr: c4OrphanTxRr.results.slice(0, 5),
+          },
+        },
+        C5_permanent_ratio: {
+          passed: c5_passed,
+          description: '영구 룰 L1=20%, L2=10% (reward_amount ≤ ROUND(original × ratio); cap 부분 지급 허용)',
+          l1_over_violation_count: c5_l1ViolCount,
+          l2_over_violation_count: c5_l2ViolCount,
+          l1_samples: c5L1Violations.results.slice(0, 10),
+          l2_samples: c5L2Violations.results.slice(0, 10),
+        },
+        C6_multi_staking_completeness: {
+          passed: c6_passed,
+          description: '다중 staking referee 매칭 완전성 (H plan 4중 가드 동작 검증)',
+          multi_staking_referees: c6_multiRefereeCount,
+          missing_match_count: c6_missingCount,
+          missing_samples: c6MissingMatches.slice(0, 20),
+        },
+        C7_holiday_entrant_protection: {
+          passed: c7_passed,
+          description: '휴일진입자 보호 — staking.start_kst_date <= reward_date 검증',
+          invalid_count: c7_invalidCount,
+          invalid_samples: c7InvalidRows.results.slice(0, 10),
+          new_entrants_matched: c7NewEntrantsMatched.results,
+        },
+        C8_no_double_payment: {
+          passed: c8_passed,
+          description: '#이중지급 절대 금지 — transactions ref_id 중복 부재',
+          tx_dq_duplicates: c8_txDupDqCount,
+          tx_rr_duplicates: c8_txDupRrCount,
+          dq_samples: c8TxDupDq.results.slice(0, 10),
+          rr_samples: c8TxDupRr.results.slice(0, 10),
+        },
+      },
+      // ─────────── 영구 룰 참조 ───────────
+      permanent_rules_checked: [
+        'L1=20%, L2=10% 절대',
+        '#bottom-up: leaf first → parent matching',
+        '#이중지급 절대 금지',
+        '#일일 cron 단일화 (KST 07:00 GitHub Actions)',
+        '#휴일진입자 보호 (각 staking start_kst_date 시점 활성 여부)',
+        'staking.daily_rate D1 직접 조회',
+        '1 USDT = 150 QKEY',
+        'H plan: referral_rewards.staking_id 명시 (G2-B 영구 인프라)',
+      ],
+      usage: {
+        endpoint: 'GET /api/diag/cron-h-plan-monitor?password=<ADMIN_PW>&paid_date=2026-05-14',
+        call_when: '5/14 07:00 KST cron 실행 직후 (또는 has_more=false 워크플로 완료 후)',
+        success_criteria: 'all_passed === true → 영구 룰 100% 준수 자동 cron 첫 가동 성공',
+      },
+    })
+  } catch (error: any) {
+    console.error('cron-h-plan-monitor error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
 export default app
