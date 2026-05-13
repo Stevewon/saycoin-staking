@@ -4715,6 +4715,147 @@ app.get('/api/admin/rewards/cron-lock-status', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★ 휴일진입자 전수 평일 누락 점검 (사장님 영구룰 #휴일진입자) ★★★★★★★★★★★★★★★★★★★★
+//   사장님 명령 (2026-05-13): "휴일진입자 현황 빨리 추출, 지급 안되었으면 즉각 지급, 상위 매칭 반영, 두번다시 잊지말것"
+//
+//   진단 범위:
+//   - 모든 active staking 중 start_date_kst 가 토/일/공휴일 인 staking 전수
+//   - 진입일 이후 ~ 어제(KST) 까지 모든 평일(KST)에 대해 daily_rewards 존재 여부 점검
+//   - 누락 평일 발견 시 해당 staking 의 self/L1/L2 누락 QKEY 산출
+//
+//   경로: GET /api/diag/audit-holiday-entrant-all-weekday?key=ADMIN_PW
+app.get('/api/diag/audit-holiday-entrant-all-weekday', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  try {
+    const db = c.env.DB
+    const now = new Date()
+    const todayKst = kstDateStr(now)
+    const yesterdayKst = kstDateStr(new Date(now.getTime() - 24 * 60 * 60 * 1000))
+
+    // STEP 1: 모든 active staking 추출 + start_date_kst 휴일 여부 판정
+    const allActive = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.status,
+             s.start_date,
+             date(datetime(s.start_date, '+9 hours')) AS kst_start_date,
+             u.name AS user_name, u.email AS user_email,
+             u.qkey_balance, u.referrer_id
+      FROM staking s JOIN users u ON s.user_id = u.id
+      WHERE s.status = 'active'
+      ORDER BY s.id ASC
+    `).all()
+
+    // STEP 2: 휴일진입자 필터링 (KST 기준 start_date 가 토/일/공휴일)
+    const holidayEntrants: any[] = []
+    for (const s of (allActive.results as any[])) {
+      const startDateObj = new Date(s.kst_start_date + 'T00:00:00+09:00')
+      const { isBusinessDay, reason } = isKoreanBusinessDay(startDateObj)
+      if (!isBusinessDay) {
+        holidayEntrants.push({ ...s, start_reason: reason })
+      }
+    }
+
+    // STEP 3: 각 휴일진입자별 진입일 다음날 ~ 어제(KST) 까지 평일 데일리 누락 점검
+    const auditResults: any[] = []
+    let totalMissingSelfQkey = 0
+    let totalMissingDays = 0
+    const missingByDate: Record<string, { count: number; sum_qkey: number; stakings: number[] }> = {}
+
+    for (const s of holidayEntrants) {
+      // 평일 목록 산출: 진입일 다음날부터 어제까지 KST 평일만
+      const weekdaysExpected: string[] = []
+      const startObj = new Date(s.kst_start_date + 'T00:00:00+09:00')
+      const yestObj = new Date(yesterdayKst + 'T00:00:00+09:00')
+      let cursor = new Date(startObj.getTime() + 24 * 60 * 60 * 1000) // 진입일 다음날부터
+      while (cursor.getTime() <= yestObj.getTime()) {
+        const { isBusinessDay } = isKoreanBusinessDay(cursor)
+        if (isBusinessDay) {
+          weekdaysExpected.push(kstDateStr(new Date(cursor.getTime() - 9*60*60*1000)))
+          // ↑ kstDateStr 는 입력을 KST+9 추가하므로 보정해서 호출
+        }
+        cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000)
+      }
+
+      // staking 의 기존 daily_rewards 조회
+      const paidRows = await db.prepare(`
+        SELECT reward_date FROM daily_rewards WHERE staking_id = ?
+      `).bind(s.staking_id).all()
+      const paidDates = new Set((paidRows.results as any[]).map((r: any) => r.reward_date))
+
+      const missing: string[] = []
+      for (const wd of weekdaysExpected) {
+        if (!paidDates.has(wd)) missing.push(wd)
+      }
+
+      const expectedQkeyPerDay = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+
+      // L1/L2 인 referrer 조회
+      let l1UserId: number | null = null
+      let l2UserId: number | null = null
+      let l1Name = '', l2Name = ''
+      if (s.referrer_id) {
+        const l1u = await db.prepare(`SELECT id, name, referrer_id FROM users WHERE id = ?`).bind(s.referrer_id).first() as any
+        if (l1u) {
+          l1UserId = l1u.id; l1Name = l1u.name
+          if (l1u.referrer_id) {
+            const l2u = await db.prepare(`SELECT id, name FROM users WHERE id = ?`).bind(l1u.referrer_id).first() as any
+            if (l2u) { l2UserId = l2u.id; l2Name = l2u.name }
+          }
+        }
+      }
+
+      auditResults.push({
+        staking_id: s.staking_id,
+        user_id: s.user_id,
+        user_name: s.user_name,
+        user_email: s.user_email,
+        amount: s.amount,
+        daily_rate: s.daily_rate,
+        kst_start_date: s.kst_start_date,
+        start_reason: s.start_reason,
+        expected_qkey_per_day: expectedQkeyPerDay,
+        weekdays_expected: weekdaysExpected,
+        weekdays_paid: weekdaysExpected.filter(wd => paidDates.has(wd)),
+        weekdays_missing: missing,
+        missing_count: missing.length,
+        missing_self_qkey: missing.length * expectedQkeyPerDay,
+        l1: l1UserId ? { user_id: l1UserId, name: l1Name, qkey_per_day: Math.round(expectedQkeyPerDay * 0.20) } : null,
+        l2: l2UserId ? { user_id: l2UserId, name: l2Name, qkey_per_day: Math.round(expectedQkeyPerDay * 0.10) } : null,
+      })
+
+      totalMissingSelfQkey += missing.length * expectedQkeyPerDay
+      totalMissingDays += missing.length
+
+      for (const m of missing) {
+        if (!missingByDate[m]) missingByDate[m] = { count: 0, sum_qkey: 0, stakings: [] }
+        missingByDate[m].count++
+        missingByDate[m].sum_qkey += expectedQkeyPerDay
+        missingByDate[m].stakings.push(s.staking_id)
+      }
+    }
+
+    // 누락 있는 staking 만 따로
+    const missingOnly = auditResults.filter(a => a.missing_count > 0)
+
+    return c.json({
+      success: true,
+      audit_today: todayKst,
+      audit_yesterday: yesterdayKst,
+      policy: '영구룰 #휴일진입자: 휴일(토/일/공휴일) 진입 staking 도 진입일 이후 모든 평일 데일리 지급 의무',
+      total_active_stakings: (allActive.results as any[]).length,
+      total_holiday_entrants: holidayEntrants.length,
+      total_with_missing: missingOnly.length,
+      total_missing_days: totalMissingDays,
+      total_missing_self_qkey: totalMissingSelfQkey,
+      missing_by_date: missingByDate,
+      audit_all: auditResults,
+      audit_missing_only: missingOnly,
+    })
+  } catch (error: any) {
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 // ★★★★★★★★★★★★★★★★★★★★ 계정별 일일 배당 집계 (사장님 보고용) ★★★★★★★★★★★★★★★★★★★★
 //   경로: GET /api/diag/daily-by-paid-date?key=ADMIN_PW&paid_date=YYYY-MM-DD
 //   - paid_date 미지정 시 오늘 KST
