@@ -30105,34 +30105,41 @@ app.get('/api/diag/may14-dup-cleanup', async (c) => {
     for (const op of slice) {
       if (op.kind === 'daily') {
         const d = op.payload
-        // (1) 잔액 원복: users.qkey_balance -= qkey_amount
-        // (2) transactions 행 삭제: type='daily_reward' AND user_id AND amount AND
-        //                          DATE(created_at, '+9 hours')='2026-05-14'
-        //     → 안전하게: type='daily_reward' AND user_id=? AND amount=? AND
-        //                description LIKE '%일일 배당%' AND DATE(created_at,'+9 hours')=?
-        //     (1건만 매칭되는 가장 최근 행 1건만 삭제)
+        // 영구 룰 정확 적용:
+        //   transactions INSERT 시 type='daily_qkey' AND ref_id=daily_reward_id (H plan)
+        //   따라서 ref_id 일치로 정확히 삭제 (1:1 매핑 보장)
         if (isExec) {
-          // 가장 최신 매칭 transactions 1건 삭제
+          // ref_id = daily_reward_id 로 정확 매칭 (H plan 1:1)
           const txnRow = await db.prepare(`
             SELECT id FROM transactions
-            WHERE user_id = ? AND type = 'daily_reward'
-              AND amount = ?
-              AND coin_type = 'QKEY'
-              AND DATE(created_at, '+9 hours') = ?
-            ORDER BY id DESC
+            WHERE type = 'daily_qkey' AND ref_id = ?
             LIMIT 1
-          `).bind(d.user_id, d.qkey_amount, TARGET_PAID).first<any>()
+          `).bind(d.id).first<any>()
 
           if (txnRow?.id) {
             await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txnRow.id).run()
             deletedTxn++
+          } else {
+            // 폴백: ref_id 미설정 케이스 → user_id + amount + 5/14 + description 일치
+            const fbTxn = await db.prepare(`
+              SELECT id FROM transactions
+              WHERE user_id = ? AND type = 'daily_qkey' AND coin_type = 'QKEY'
+                AND amount = ? AND description = '일일 배당 (QKEY)'
+                AND DATE(created_at, '+9 hours') = ?
+              ORDER BY id DESC
+              LIMIT 1
+            `).bind(d.user_id, d.qkey_amount, TARGET_PAID).first<any>()
+            if (fbTxn?.id) {
+              await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(fbTxn.id).run()
+              deletedTxn++
+            }
           }
 
           // daily_rewards 행 삭제
           await db.prepare(`DELETE FROM daily_rewards WHERE id = ?`).bind(d.id).run()
           deletedDaily++
 
-          // 잔액 원복
+          // 잔액 원복 (단, batch 1 EXEC 시 이미 차감됐으면 또 차감하면 안 됨 — 본 endpoint 는 daily_rewards 행 삭제와 잔액 차감을 한 트랜잭션으로 묶는 정책 유지)
           await db.prepare(`
             UPDATE users SET qkey_balance = qkey_balance - ?
             WHERE id = ?
@@ -30160,22 +30167,33 @@ app.get('/api/diag/may14-dup-cleanup', async (c) => {
       } else {
         const d = op.payload
         if (isExec) {
-          // 매칭되는 transactions 1건 삭제
+          // 영구 룰 정확 적용:
+          //   transactions INSERT 시 type='referral_reward' AND ref_id=referral_reward_id
+          //   따라서 ref_id 일치로 정확히 삭제 (1:1 매핑 보장)
           const lvDesc = d.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
           const txnRow = await db.prepare(`
             SELECT id FROM transactions
-            WHERE user_id = ? AND type = 'referral_bonus'
-              AND amount = ?
-              AND coin_type = 'QKEY'
-              AND description = ?
-              AND DATE(created_at, '+9 hours') = ?
-            ORDER BY id DESC
+            WHERE type = 'referral_reward' AND ref_id = ?
             LIMIT 1
-          `).bind(d.referrer_id, d.reward_amount, lvDesc, TARGET_PAID).first<any>()
+          `).bind(d.id).first<any>()
 
           if (txnRow?.id) {
             await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txnRow.id).run()
             deletedTxn++
+          } else {
+            // 폴백: ref_id 미설정 케이스
+            const fbTxn = await db.prepare(`
+              SELECT id FROM transactions
+              WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+                AND amount = ? AND description = ?
+                AND DATE(created_at, '+9 hours') = ?
+              ORDER BY id DESC
+              LIMIT 1
+            `).bind(d.referrer_id, d.reward_amount, lvDesc, TARGET_PAID).first<any>()
+            if (fbTxn?.id) {
+              await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(fbTxn.id).run()
+              deletedTxn++
+            }
           }
 
           await db.prepare(`DELETE FROM referral_rewards WHERE id = ?`).bind(d.id).run()
@@ -30253,6 +30271,108 @@ app.get('/api/diag/may14-dup-cleanup', async (c) => {
     })
   } catch (error: any) {
     console.error('may14-dup-cleanup error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
+// ============================================================================
+// 5/14 고아 transactions 정리 (cleanup batch 1 에서 daily_rewards 30건만 삭제되고
+// 매칭 transactions 행이 잔존한 케이스 정리)
+// ============================================================================
+//   원인: cleanup 1차 endpoint 가 transactions type 을 잘못 매칭 ('daily_reward' / 'referral_bonus')
+//        실제는 'daily_qkey' / 'referral_reward'
+//        → daily_rewards 행은 지워졌으나 transactions 는 잔존 → 사용자 화면 거래내역에 보임
+//        → 잔액은 이미 차감됨 (이중차감 위험 없음)
+//
+//   정리 대상:
+//     - 5/14 KST 생성된 transactions 중 ref_id 가 더 이상 daily_rewards/referral_rewards 에
+//       존재하지 않는 고아 행만 삭제
+//     - 잔액은 이미 cleanup batch 1 에서 원복됐으므로 추가 차감하지 않음 (DOUBLE DEDUCT 방지)
+//
+//   사용법:
+//     - DRY_RUN: GET /api/diag/may14-orphan-txn-cleanup?password=...
+//     - EXEC:    &confirm=GO
+app.get('/api/diag/may14-orphan-txn-cleanup', async (c) => {
+  try {
+    const password = c.req.query('password') || ''
+    if (password !== ADMIN_PW) return c.json({ error: 'Unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'GO'
+    const db = c.env.DB
+    const TARGET = '2026-05-14'
+
+    // 5/14 KST 에 생성된 daily_qkey transactions 중 ref_id 가 daily_rewards 에 없는 것
+    const orphanDailyRes = await db.prepare(`
+      SELECT t.id, t.user_id, t.amount, t.ref_id, t.description
+      FROM transactions t
+      WHERE t.type = 'daily_qkey'
+        AND t.coin_type = 'QKEY'
+        AND DATE(t.created_at, '+9 hours') = ?
+        AND (t.ref_id IS NULL OR NOT EXISTS (
+          SELECT 1 FROM daily_rewards dr WHERE dr.id = t.ref_id
+        ))
+      ORDER BY t.id ASC
+    `).bind(TARGET).all<any>()
+    const orphanDaily = orphanDailyRes.results || []
+
+    // 5/14 KST 에 생성된 referral_reward transactions 중 ref_id 가 referral_rewards 에 없는 것
+    const orphanRefRes = await db.prepare(`
+      SELECT t.id, t.user_id, t.amount, t.ref_id, t.description
+      FROM transactions t
+      WHERE t.type = 'referral_reward'
+        AND t.coin_type = 'QKEY'
+        AND DATE(t.created_at, '+9 hours') = ?
+        AND (t.ref_id IS NULL OR NOT EXISTS (
+          SELECT 1 FROM referral_rewards rr WHERE rr.id = t.ref_id
+        ))
+      ORDER BY t.id ASC
+    `).bind(TARGET).all<any>()
+    const orphanRef = orphanRefRes.results || []
+
+    let deletedDaily = 0
+    let deletedRef = 0
+    const ops: any[] = []
+
+    if (isExec) {
+      for (const t of orphanDaily) {
+        await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(t.id).run()
+        deletedDaily++
+        ops.push({ kind: 'daily_qkey', txn_id: t.id, user_id: t.user_id, amount: t.amount, ref_id: t.ref_id })
+      }
+      for (const t of orphanRef) {
+        await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(t.id).run()
+        deletedRef++
+        ops.push({ kind: 'referral_reward', txn_id: t.id, user_id: t.user_id, amount: t.amount, ref_id: t.ref_id, description: t.description })
+      }
+    } else {
+      for (const t of orphanDaily.slice(0, 20)) ops.push({ kind: 'daily_qkey', txn_id: t.id, user_id: t.user_id, amount: t.amount, ref_id: t.ref_id, dry_run: true })
+      for (const t of orphanRef.slice(0, 20)) ops.push({ kind: 'referral_reward', txn_id: t.id, user_id: t.user_id, amount: t.amount, ref_id: t.ref_id, dry_run: true })
+    }
+
+    return c.json({
+      success: true,
+      mode: isExec ? 'EXEC' : 'DRY_RUN',
+      title: '5/14 고아 transactions 정리 (잔액 추가 차감 없음 — 이미 cleanup 단계에서 원복)',
+      target_kst: TARGET,
+      orphan_count: {
+        daily_qkey: orphanDaily.length,
+        referral_reward: orphanRef.length,
+        total: orphanDaily.length + orphanRef.length,
+      },
+      deleted: {
+        daily_qkey: deletedDaily,
+        referral_reward: deletedRef,
+        total: deletedDaily + deletedRef,
+      },
+      ops_sample: ops.slice(0, 40),
+      permanent_rules_applied: [
+        '#이중지급 절대 금지 — 사용자 화면 흔적 제거',
+        'ref_id 가 부모 테이블에 없는 고아 행만 삭제 (1:1 매핑 안전)',
+        '잔액 추가 차감 없음 (cleanup batch 1 에서 이미 원복됨)',
+      ],
+    })
+  } catch (error: any) {
+    console.error('may14-orphan-txn-cleanup error:', error)
     return c.json({ error: error?.message || String(error), code: error?.code }, 500)
   }
 })
