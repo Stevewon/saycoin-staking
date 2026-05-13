@@ -27502,15 +27502,13 @@ app.get('/api/diag/may13-multi-staking-backfill', async (c) => {
       expected_amount: number  // 영구 룰 audit 으로 확인된 미지급액
     }
     const FIX_TARGETS: FixTarget[] = [
-      // 5/13 5명 (L1=20%, L2=10% 영구 룰)
+      // 5/13 5명 영구 룰 검증 완료 (L1=20%, L2=10%)
       { referrer_id: 57, referrer_email: 'asd135799',  reward_date: '2026-05-13', level: 1, expected_amount: 150 },
       { referrer_id: 54, referrer_email: 'aafhka',     reward_date: '2026-05-13', level: 1, expected_amount: 150 },
       { referrer_id: 49, referrer_email: 'naim197059', reward_date: '2026-05-13', level: 2, expected_amount: 75 },
       { referrer_id: 48, referrer_email: 'naim1970',   reward_date: '2026-05-13', level: 1, expected_amount: 150 },
       { referrer_id: 41, referrer_email: 'bigbang',    reward_date: '2026-05-13', level: 1, expected_amount: 150 },
-      // lucky4492 5/13 L2 + 5/12 L2 (만성 -225)
-      { referrer_id: 69, referrer_email: 'lucky4492',  reward_date: '2026-05-13', level: 2, expected_amount: 225 },
-      { referrer_id: 69, referrer_email: 'lucky4492',  reward_date: '2026-05-12', level: 2, expected_amount: 225 },
+      // lucky4492 (u#69) 는 audit 의 KST 일자 매핑 이슈로 별도 분석 → 본 endpoint 에서 제외
     ]
 
     // STEP 1: 각 보정 대상별로 누락 staking 정확 식별 (G2-B 2-pass)
