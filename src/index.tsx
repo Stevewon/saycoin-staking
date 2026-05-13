@@ -26000,19 +26000,43 @@ app.get('/api/diag/solbat-l1l2-precision-audit', async (c) => {
     const txDailyRows = (txDaily.results as any[]) || []
 
     // 7) referral_rewards 원장 일별 합계 (paid_date 기준)
-    const rrDaily = await db.prepare(`
-      SELECT paid_date,
-             SUM(CASE WHEN level = 1 THEN amount ELSE 0 END) AS l1_paid_qkey,
-             SUM(CASE WHEN level = 2 THEN amount ELSE 0 END) AS l2_paid_qkey,
-             SUM(amount) AS total_paid_qkey,
-             COUNT(*) AS row_count
-      FROM referral_rewards
-      WHERE user_id = ? AND coin_type = 'QKEY'
-        AND paid_date >= date('now','+9 hours','-14 days')
-      GROUP BY paid_date
-      ORDER BY paid_date DESC
-    `).bind(SOLBAT_ID).all()
-    const rrDailyRows = (rrDaily.results as any[]) || []
+    //   ★ 영구룰 스키마 준수: referral_rewards 실제 컬럼 = referrer_id(수령자), referee_id(대상),
+    //     level, original_amount, reward_amount, reward_date, paid_date, created_at
+    //     (coin_type / user_id / ref_id 컬럼 의존 금지 — migration 0006 에 없음)
+    //   ★ 솔밧은 referrer_id 위치 (보너스 수령자)
+    let rrDailyRows: any[] = []
+    try {
+      const rrDaily = await db.prepare(`
+        SELECT paid_date,
+               SUM(CASE WHEN level = 1 THEN reward_amount ELSE 0 END) AS l1_paid_qkey,
+               SUM(CASE WHEN level = 2 THEN reward_amount ELSE 0 END) AS l2_paid_qkey,
+               SUM(reward_amount) AS total_paid_qkey,
+               COUNT(*) AS row_count
+        FROM referral_rewards
+        WHERE referrer_id = ?
+          AND paid_date >= date('now','+9 hours','-14 days')
+        GROUP BY paid_date
+        ORDER BY paid_date DESC
+      `).bind(SOLBAT_ID).all()
+      rrDailyRows = (rrDaily.results as any[]) || []
+    } catch(e) {
+      // paid_date 컬럼 없는 환경 폴백 — reward_date 로 대체
+      try {
+        const rrFallback = await db.prepare(`
+          SELECT reward_date AS paid_date,
+                 SUM(CASE WHEN level = 1 THEN reward_amount ELSE 0 END) AS l1_paid_qkey,
+                 SUM(CASE WHEN level = 2 THEN reward_amount ELSE 0 END) AS l2_paid_qkey,
+                 SUM(reward_amount) AS total_paid_qkey,
+                 COUNT(*) AS row_count
+          FROM referral_rewards
+          WHERE referrer_id = ?
+            AND reward_date >= date('now','+9 hours','-14 days')
+          GROUP BY reward_date
+          ORDER BY reward_date DESC
+        `).bind(SOLBAT_ID).all()
+        rrDailyRows = (rrFallback.results as any[]) || []
+      } catch(e2) {}
+    }
 
     // 8) 일자별 mismatch (실수령 - 기대) — 평일만 의미 있음, 휴일은 0 기대
     const mismatchByDate: any[] = []
