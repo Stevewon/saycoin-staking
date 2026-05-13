@@ -24530,6 +24530,272 @@ app.get('/api/diag/fix-513-holiday910-and-cleanup-duplicates', async (c) => {
 })
 
 // ============================================================
+// /api/diag/exec-513-phase1-leaf-only
+// ----------------------------------------------------
+// PHASE 1 only — 5/9·5/10 진입자 5명 5/13 본인 데일리 지급
+//   영구룰 #bottom-up: leaf 먼저 (이 엔드포인트가 leaf 처리 전담)
+//   영구룰 #휴일진입자: 휴일 진입자 평일 데일리 지급 의무
+//   안전장치: daily_rewards EXISTS + same-day same-amount tx EXISTS + ref_id EXISTS
+//   ref_id: bf_513_self_s<sid>
+// ============================================================
+app.get('/api/diag/exec-513-phase1-leaf-only', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const TARGET_DATE = '2026-05-13'
+    const PAID_DATE = '2026-05-13'
+
+    const leafRows = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate,
+             date(datetime(s.start_date, '+9 hours')) AS kst_start_date,
+             u.name AS user_name, u.email AS user_email, u.qkey_balance
+      FROM staking s JOIN users u ON s.user_id = u.id
+      WHERE s.status = 'active'
+        AND date(datetime(s.start_date, '+9 hours')) IN ('2026-05-09', '2026-05-10')
+      ORDER BY s.id ASC
+    `).all()
+    const leafStakings = (leafRows.results || []) as any[]
+
+    const preview: any[] = []
+    let totalQkey = 0
+
+    for (const s of leafStakings) {
+      const sid = Number(s.staking_id)
+      const uid = Number(s.user_id)
+      const qkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+
+      const existingDr = await db.prepare(`SELECT id, usdt_amount FROM daily_rewards WHERE staking_id = ? AND reward_date = ? LIMIT 1`).bind(sid, TARGET_DATE).first() as any
+      const existingTx = await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = 'daily_reward' AND coin_type = 'QKEY' AND amount = ?
+          AND date(datetime(created_at, '+9 hours')) = ?
+        LIMIT 1
+      `).bind(uid, qkey, TARGET_DATE).first()
+      const refIdSelf = `bf_513_self_s${sid}`
+      const existingRef = await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdSelf).first()
+      const needInsert = !existingDr && !existingTx && !existingRef
+
+      preview.push({
+        staking_id: sid, user_id: uid, user_name: s.user_name, user_email: s.user_email,
+        amount: s.amount, daily_rate: s.daily_rate, kst_start_date: s.kst_start_date,
+        qkey_balance_before: s.qkey_balance, self_qkey_to_pay: qkey,
+        already_paid_5_13_daily_rewards: existingDr ? true : false,
+        already_paid_5_13_transactions: existingTx ? true : false,
+        backfill_ref_exists: existingRef ? true : false,
+        action: needInsert ? 'WILL_INSERT' : 'SKIP',
+      })
+      if (needInsert) totalQkey += qkey
+    }
+
+    if (!isExec) {
+      return c.json({
+        success: true, mode: 'DRY_RUN', target_date: TARGET_DATE,
+        target_count: leafStakings.length,
+        will_insert_count: preview.filter((p: any) => p.action === 'WILL_INSERT').length,
+        total_qkey_to_pay: totalQkey,
+        preview,
+        next: '실행하려면 ?confirm=GO 추가',
+      })
+    }
+
+    const inserted: any[] = []
+    const skipped: any[] = []
+    let actualQkey = 0
+
+    for (const p of preview as any[]) {
+      if (p.action !== 'WILL_INSERT') {
+        skipped.push({ staking_id: p.staking_id, user_id: p.user_id, reason: 'already_paid_or_ref_exists' })
+        continue
+      }
+      const sid = p.staking_id
+      const uid = p.user_id
+      const qkey = p.self_qkey_to_pay
+      const refIdSelf = `bf_513_self_s${sid}`
+
+      const drIns = await db.prepare(`
+        INSERT INTO daily_rewards (staking_id, user_id, usdt_amount, reward_date, paid_date, created_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+      `).bind(sid, uid, qkey, TARGET_DATE, PAID_DATE).run()
+
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'daily_reward', 'QKEY', ?, ?, ?)
+      `).bind(uid, qkey, '일일 배당 (QKEY)', refIdSelf).run()
+
+      await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(qkey, uid).run()
+
+      actualQkey += qkey
+      inserted.push({
+        staking_id: sid, user_id: uid, user_name: p.user_name, user_email: p.user_email,
+        qkey: qkey, daily_reward_id: drIns.meta?.last_row_id,
+      })
+    }
+
+    const afterCheck: any[] = []
+    for (const p of preview as any[]) {
+      const dr = await db.prepare(`SELECT id, usdt_amount FROM daily_rewards WHERE staking_id = ? AND reward_date = ?`).bind(p.staking_id, TARGET_DATE).first() as any
+      const u = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(p.user_id).first() as any
+      afterCheck.push({
+        staking_id: p.staking_id, user_id: p.user_id, user_name: p.user_name,
+        paid_5_13_qkey: dr?.usdt_amount || null, qkey_balance_after: u?.qkey_balance,
+      })
+    }
+
+    return c.json({
+      success: true, mode: 'EXEC', target_date: TARGET_DATE,
+      inserted_count: inserted.length, skipped_count: skipped.length,
+      total_qkey_inserted: actualQkey, inserted, skipped, after_check: afterCheck,
+    })
+  } catch (error: any) {
+    console.error('exec-513-phase1-leaf-only error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
+// /api/diag/cleanup-my-bf-holiday-512-mistakes
+// ----------------------------------------------------
+// PHASE 2 — 제가 어제 잘못 박은 bf_holiday_512_* ref_id 패턴 row 만 정확히 삭제
+//   정상 cron row 는 절대 안 건드림 (ref_id LIKE 'bf_holiday_512_%' AND KST date = 2026-05-13)
+//
+// 대상:
+//   - transactions WHERE ref_id LIKE 'bf_holiday_512_%' AND DATE(created_at,'+9 hours')='2026-05-13'
+//     → daily_reward(self) + referral_reward(L1/L2) 모두 삭제
+//   - daily_rewards 는 reward_date='2026-05-12' 인데 paid_date='2026-05-12' 로 박힌 백필 row 도 정리 검토
+//     (단, daily_rewards 는 별도 검토 — 본 엔드포인트는 transactions + qkey_balance 만 처리)
+//   - users.qkey_balance 에서 삭제된 amount 합계 차감
+//   - referral_rewards 동일 ref_id 도 삭제
+// ============================================================
+app.get('/api/diag/cleanup-my-bf-holiday-512-mistakes', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+
+    // 대상 추출: bf_holiday_512_* ref_id 패턴 (제가 어제 박은 백필) 전수
+    //   ※ 새 ref_id 'bf_h910_512_*' 또는 'bf_513_self_*' 는 건드리지 않음 (안전)
+    const rows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at,
+             date(datetime(created_at, '+9 hours')) AS kst_date
+      FROM transactions
+      WHERE ref_id LIKE 'bf_holiday_512_%'
+      ORDER BY user_id ASC, id ASC
+    `).all()
+    const targetRows = (rows.results || []) as any[]
+
+    // 사용자별 amount 합계 집계
+    const userTotal: Record<number, number> = {}
+    const refIdsToDelete: string[] = []
+    const txIdsToDelete: number[] = []
+    const preview: any[] = []
+
+    for (const r of targetRows) {
+      const uid = Number(r.user_id)
+      const amt = Number(r.amount)
+      userTotal[uid] = (userTotal[uid] || 0) + amt
+      refIdsToDelete.push(String(r.ref_id))
+      txIdsToDelete.push(Number(r.id))
+    }
+
+    // 사용자별 잔액 변화 미리보기
+    const userPreview: any[] = []
+    for (const uid of Object.keys(userTotal).map((x: string) => parseInt(x, 10))) {
+      const u = await db.prepare(`SELECT name, email, qkey_balance FROM users WHERE id = ?`).bind(uid).first() as any
+      const removeQkey = userTotal[uid]
+      userPreview.push({
+        user_id: uid, user_name: u?.name, user_email: u?.email,
+        qkey_balance_before: u?.qkey_balance,
+        qkey_to_remove: removeQkey,
+        qkey_balance_after_expected: (u?.qkey_balance || 0) - removeQkey,
+      })
+    }
+
+    if (!isExec) {
+      return c.json({
+        success: true, mode: 'DRY_RUN',
+        target_tx_count: targetRows.length,
+        total_qkey_to_remove: Object.values(userTotal).reduce((a: number, b: number) => a + b, 0),
+        affected_users: userPreview.length,
+        user_preview: userPreview,
+        tx_rows_to_delete: targetRows.map((r: any) => ({
+          id: r.id, user_id: r.user_id, type: r.type, amount: r.amount,
+          ref_id: r.ref_id, created_at: r.created_at, kst_date: r.kst_date,
+        })),
+        next: '실행하려면 ?confirm=GO 추가',
+      })
+    }
+
+    // 실행: transactions DELETE + referral_rewards DELETE + qkey_balance 차감
+    let deletedTxCount = 0
+    let deletedRefCount = 0
+    let totalRemovedQkey = 0
+
+    // 1) 잔액 차감 (사용자별)
+    for (const uid of Object.keys(userTotal).map((x: string) => parseInt(x, 10))) {
+      const removeQkey = userTotal[uid]
+      await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) - ? WHERE id = ?`).bind(removeQkey, uid).run()
+      totalRemovedQkey += removeQkey
+    }
+
+    // 2) transactions DELETE (배치, 500개씩)
+    const BATCH = 500
+    for (let i = 0; i < txIdsToDelete.length; i += BATCH) {
+      const chunk = txIdsToDelete.slice(i, i + BATCH)
+      const placeholders = chunk.map(() => '?').join(',')
+      const res = await db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...chunk).run()
+      deletedTxCount += chunk.length
+    }
+
+    // 3) referral_rewards DELETE (ref_id 일치)
+    for (let i = 0; i < refIdsToDelete.length; i += BATCH) {
+      const chunk = refIdsToDelete.slice(i, i + BATCH)
+      const placeholders = chunk.map(() => '?').join(',')
+      try {
+        await db.prepare(`DELETE FROM referral_rewards WHERE ref_id IN (${placeholders})`).bind(...chunk).run()
+        deletedRefCount += chunk.length
+      } catch(e) {}
+    }
+
+    // 사후 검증: 같은 ref_id 패턴이 0건인지
+    const remainCheck = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM transactions WHERE ref_id LIKE 'bf_holiday_512_%'
+    `).first() as any
+
+    // 사용자별 사후 잔액
+    const afterUserCheck: any[] = []
+    for (const up of userPreview) {
+      const u = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(up.user_id).first() as any
+      afterUserCheck.push({
+        user_id: up.user_id, user_name: up.user_name,
+        qkey_balance_after: u?.qkey_balance,
+        qkey_balance_expected: up.qkey_balance_after_expected,
+        match: (u?.qkey_balance === up.qkey_balance_after_expected),
+      })
+    }
+
+    return c.json({
+      success: true, mode: 'EXEC',
+      deleted_tx_count: deletedTxCount,
+      deleted_referral_rewards_attempts: deletedRefCount,
+      total_qkey_removed: totalRemovedQkey,
+      affected_users: userPreview.length,
+      remaining_bf_holiday_512_rows: remainCheck?.cnt || 0,
+      after_user_check: afterUserCheck,
+    })
+  } catch (error: any) {
+    console.error('cleanup-my-bf-holiday-512-mistakes error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/fix-512-s97-self-orphan
 // ----------------------------------------------------
 // s#97 방승훈 (u#33) 5/12 self 데일리 부분 INSERT 보정:
