@@ -25853,6 +25853,275 @@ app.get('/api/diag/audit-balance-vs-tx-mismatch', async (c) => {
 })
 
 // ============================================================
+// /api/diag/solbat-513-tx-deep-trace  (2026-05-13, B안 read-only)
+// ------------------------------------------------------------
+// 사장님 결재 B안: 솔밧 5/13 tx 11건 각각의 referee 매핑 역추적
+// "-300 정체" 완전 규명 — precision-audit 의 3,000 vs 2,700 차이 분해
+//
+// 영구룰 100% 준수:
+//   - L1=20%, L2=10% (절대)
+//   - read-only SELECT only (DB UPDATE 0건)
+//   - description 사용자 노출 안전 (INSERT 없음)
+//
+// 동작:
+//   1) 솔밧 5/13 KST referral_reward tx 전체 조회 (created_at 기준)
+//   2) 각 tx 의 ref_id 로 referral_rewards 원장 행 매핑 → referee_id 식별
+//   3) 솔밧 L1/L2 회원 명단과 cross-check → 누가 빠졌는지/누가 중복인지
+//   4) precision-audit 의 기대값(3,000) 구성 회원 vs 실제 tx 매핑 회원 set 차이
+//   5) referral_rewards 원장에서 paid_date 또는 reward_date 5/13 회원 명세도 함께
+//   6) 각 회원 active staking 의 amount × daily_rate × ratio 가 tx amount 와 일치하는지 검증
+// ============================================================
+app.get('/api/diag/solbat-513-tx-deep-trace', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  try {
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+    const TARGET_DATE = '2026-05-13'
+
+    // STEP 1: 솔밧 5/13 KST 전체 referral_reward tx
+    const txRes = await db.prepare(`
+      SELECT id AS tx_id, type, coin_type, amount, description, ref_id,
+             created_at,
+             datetime(created_at, '+9 hours') AS created_kst,
+             substr(datetime(created_at, '+9 hours'), 12, 2) AS kst_hour
+      FROM transactions
+      WHERE user_id = ? AND type = 'referral_reward'
+        AND date(datetime(created_at, '+9 hours')) = ?
+      ORDER BY id ASC
+    `).bind(SOLBAT_ID, TARGET_DATE).all()
+    const allTx = (txRes.results as any[]) || []
+
+    // STEP 2: 각 tx 의 ref_id → referral_rewards 원장 매핑 시도
+    //   ref_id 가 숫자면 referral_rewards.id 일 가능성 (cron 패턴)
+    //   ref_id 가 'bf_513_*' 면 백필 패턴
+    const txWithLedger: any[] = []
+    for (const tx of allTx) {
+      let ledger: any = null
+      const rid = String(tx.ref_id || '')
+      // 패턴 A: ref_id 가 숫자 → referral_rewards.id 매핑
+      if (/^\d+$/.test(rid)) {
+        const ledgerRow = await db.prepare(`
+          SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+                 reward_date, paid_date,
+                 datetime(created_at, '+9 hours') AS rr_created_kst
+          FROM referral_rewards WHERE id = ?
+        `).bind(Number(rid)).first()
+        if (ledgerRow) ledger = ledgerRow
+      }
+      // 패턴 B: ref_id 가 'bf_513_*' → 백필 식별자
+      // 패턴 C: 매핑 실패 시 amount + level + 5/13 reward/paid_date 로 referee 추정
+      if (!ledger) {
+        const lv = rid.includes('Level 1') || (tx.description || '').includes('Level 1') ? 1 :
+                   (rid.includes('Level 2') || (tx.description || '').includes('Level 2') ? 2 : null)
+        if (lv) {
+          const candRows = await db.prepare(`
+            SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+                   reward_date, paid_date,
+                   datetime(created_at, '+9 hours') AS rr_created_kst
+            FROM referral_rewards
+            WHERE referrer_id = ? AND level = ? AND reward_amount = ?
+              AND (paid_date = ? OR reward_date = ?
+                   OR date(datetime(created_at, '+9 hours')) = ?)
+            ORDER BY id ASC
+          `).bind(SOLBAT_ID, lv, Number(tx.amount), TARGET_DATE, TARGET_DATE, TARGET_DATE).all()
+          const cands = (candRows.results as any[]) || []
+          if (cands.length === 1) ledger = cands[0]
+          else if (cands.length > 1) ledger = { multiple_candidates: cands.length, cands }
+        }
+      }
+
+      // referee 정보 보강
+      let refereeInfo: any = null
+      if (ledger && ledger.referee_id) {
+        const refUser = await db.prepare(`
+          SELECT id, name, email, referrer_id FROM users WHERE id = ?
+        `).bind(ledger.referee_id).first() as any
+        // referee 의 active staking (현재 시점)
+        const refStakes = await db.prepare(`
+          SELECT id AS staking_id, amount, daily_rate, status
+          FROM staking WHERE user_id = ? AND status = 'active'
+        `).bind(ledger.referee_id).all()
+        const stakes = (refStakes.results as any[]) || []
+        let userSelfDailyExpected = 0
+        for (const s of stakes) {
+          userSelfDailyExpected += Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+        }
+        refereeInfo = {
+          referee_id: refUser?.id,
+          referee_name: refUser?.name,
+          referee_email: refUser?.email,
+          referrer_id_of_referee: refUser?.referrer_id,
+          active_stakes_count: stakes.length,
+          self_daily_qkey_expected_today: userSelfDailyExpected,
+        }
+      }
+
+      const level = ledger?.level
+                  || (String(tx.description || '').includes('Level 1') ? 1
+                  : (String(tx.description || '').includes('Level 2') ? 2 : null))
+
+      txWithLedger.push({
+        tx_id: tx.tx_id,
+        amount: Number(tx.amount),
+        description: tx.description,
+        ref_id: tx.ref_id,
+        created_kst: tx.created_kst,
+        kst_hour: tx.kst_hour,
+        level,
+        ledger,
+        referee: refereeInfo,
+      })
+    }
+
+    // STEP 3: 솔밧 L1/L2 회원 명단
+    const l1Res = await db.prepare(`
+      SELECT id, name FROM users WHERE referrer_id = ? ORDER BY id ASC
+    `).bind(SOLBAT_ID).all()
+    const l1Users = (l1Res.results as any[]) || []
+
+    const l2Res = await db.prepare(`
+      SELECT u.id, u.name, u.referrer_id AS l1_id, l1.name AS l1_name
+      FROM users u JOIN users l1 ON u.referrer_id = l1.id
+      WHERE l1.referrer_id = ?
+      ORDER BY u.id ASC
+    `).bind(SOLBAT_ID).all()
+    const l2Users = (l2Res.results as any[]) || []
+
+    // STEP 4: tx 에서 매핑된 referee_id set vs 멤버 명단 비교
+    const txMappedRefereeIds = new Set<number>()
+    for (const t of txWithLedger) {
+      if (t.referee?.referee_id) txMappedRefereeIds.add(Number(t.referee.referee_id))
+    }
+    const l1MemberIds = new Set(l1Users.map((u: any) => Number(u.id)))
+    const l2MemberIds = new Set(l2Users.map((u: any) => Number(u.id)))
+
+    const l1NotInTx = l1Users.filter((u: any) => !txMappedRefereeIds.has(Number(u.id)))
+    const l2NotInTx = l2Users.filter((u: any) => !txMappedRefereeIds.has(Number(u.id)))
+
+    // STEP 5: 합계
+    let l1TxSum = 0, l2TxSum = 0
+    let l1TxCount = 0, l2TxCount = 0
+    for (const t of txWithLedger) {
+      if (t.level === 1) { l1TxSum += t.amount; l1TxCount++ }
+      else if (t.level === 2) { l2TxSum += t.amount; l2TxCount++ }
+    }
+
+    // STEP 6: 각 회원 staking 현재 상태 기준 기대값 (precision-audit 와 같은 계산)
+    async function computeMemberDaily(userIds: number[]) {
+      const out: any[] = []
+      let sum = 0
+      for (const uid of userIds) {
+        const stRes = await db.prepare(`
+          SELECT id, amount, daily_rate FROM staking WHERE user_id = ? AND status = 'active'
+        `).bind(uid).all()
+        const stakes = (stRes.results as any[]) || []
+        let total = 0
+        for (const s of stakes) total += Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+        sum += total
+        out.push({ user_id: uid, active_stake_count: stakes.length, daily_qkey: total })
+      }
+      return { sum, detail: out }
+    }
+    const l1ExpectedDetail = await computeMemberDaily(l1Users.map((u: any) => Number(u.id)))
+    const l2ExpectedDetail = await computeMemberDaily(l2Users.map((u: any) => Number(u.id)))
+
+    const expectedL1Match = Math.round(l1ExpectedDetail.sum * 0.20)
+    const expectedL2Match = Math.round(l2ExpectedDetail.sum * 0.10)
+    const expectedTotal = expectedL1Match + expectedL2Match
+
+    // STEP 7: tx 안 매핑된 멤버 = 매칭 미발생 후보, tx 매핑된 멤버 = 매칭 발생 (단 amount 검증 필요)
+    // 각 멤버별 expected_match (현재 staking 기준) vs actual_match (tx 합) 비교
+    function expectedMatchFor(uid: number, level: 1 | 2, detail: any[]) {
+      const r = detail.find((x: any) => x.user_id === uid)
+      if (!r) return 0
+      const ratio = level === 1 ? 0.20 : 0.10
+      return Math.round(r.daily_qkey * ratio)
+    }
+    function actualMatchFor(uid: number, level: 1 | 2) {
+      return txWithLedger
+        .filter(t => t.level === level && t.referee?.referee_id === uid)
+        .reduce((s, t) => s + t.amount, 0)
+    }
+
+    const l1MemberAnalysis = l1Users.map((u: any) => {
+      const uid = Number(u.id)
+      const expected = expectedMatchFor(uid, 1, l1ExpectedDetail.detail)
+      const actual = actualMatchFor(uid, 1)
+      return {
+        user_id: uid, user_name: u.name,
+        expected_match: expected,
+        actual_match: actual,
+        diff: actual - expected,
+        status: expected === actual ? '✅ MATCH'
+              : (actual > expected ? '🔴 OVER' : '🟡 UNDER')
+      }
+    })
+
+    const l2MemberAnalysis = l2Users.map((u: any) => {
+      const uid = Number(u.id)
+      const expected = expectedMatchFor(uid, 2, l2ExpectedDetail.detail)
+      const actual = actualMatchFor(uid, 2)
+      return {
+        user_id: uid, user_name: u.name, l1_name: u.l1_name,
+        expected_match: expected,
+        actual_match: actual,
+        diff: actual - expected,
+        status: expected === actual ? '✅ MATCH'
+              : (actual > expected ? '🔴 OVER' : '🟡 UNDER')
+      }
+    })
+
+    // STEP 8: tx 중 referee 매핑 실패한 행 (의문의 row)
+    const orphanTxs = txWithLedger.filter(t => !t.referee)
+
+    return c.json({
+      success: true,
+      audit_kind: 'solbat_513_tx_deep_trace',
+      target_date: TARGET_DATE,
+      taken_at_kst: new Date(Date.now() + 9*60*60*1000).toISOString().replace('T',' ').replace('Z',''),
+
+      summary: {
+        tx_total_count: allTx.length,
+        l1_tx_count: l1TxCount,
+        l1_tx_sum: l1TxSum,
+        l2_tx_count: l2TxCount,
+        l2_tx_sum: l2TxSum,
+        actual_total: l1TxSum + l2TxSum,
+        expected_l1_match: expectedL1Match,
+        expected_l2_match: expectedL2Match,
+        expected_total: expectedTotal,
+        diff_total: (l1TxSum + l2TxSum) - expectedTotal,
+        diff_l1: l1TxSum - expectedL1Match,
+        diff_l2: l2TxSum - expectedL2Match,
+      },
+
+      l1_member_analysis: l1MemberAnalysis,
+      l2_member_analysis: l2MemberAnalysis,
+
+      l1_not_in_tx: l1NotInTx.map((u: any) => ({ user_id: u.id, user_name: u.name })),
+      l2_not_in_tx: l2NotInTx.map((u: any) => ({ user_id: u.id, user_name: u.name })),
+
+      orphan_txs: orphanTxs,
+
+      // 모든 tx 의 매핑 결과 (디버깅용)
+      tx_with_ledger_mapping: txWithLedger,
+
+      notes: [
+        'read-only SELECT only (DB UPDATE 0건)',
+        '영구룰 L1=20% L2=10% 산식 사용',
+        'expected = 현재 staking active 기준 (precision-audit 와 동일)',
+        'actual = 솔밧 5/13 KST referral_reward tx amount 합',
+        'orphan_txs 가 0건 아니면 ref_id 패턴 불명확 → 수동 확인 필요',
+      ]
+    })
+  } catch (error: any) {
+    console.error('solbat-513-tx-deep-trace error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/solbat-513-missing-trace  (2026-05-13, A안)
 // ------------------------------------------------------------
 // 사장님 결재 A안: 5/13 솔밧 L1 -150 / L2 -150 누락의 정확한 회원 식별 + 백필
