@@ -25853,6 +25853,258 @@ app.get('/api/diag/audit-balance-vs-tx-mismatch', async (c) => {
 })
 
 // ============================================================
+// /api/diag/solbat-513-missing-trace  (2026-05-13, A안)
+// ------------------------------------------------------------
+// 사장님 결재 A안: 5/13 솔밧 L1 -150 / L2 -150 누락의 정확한 회원 식별 + 백필
+//
+// 영구룰 100% 준수:
+//   - L1=20%, L2=10% (절대)
+//   - staking.daily_rate D1 직접 (amount 추정 금지)
+//   - bottom-up: leaf staking 실데이터 먼저 → 부모 매칭 계산
+//   - description 사용자 노출 안전: '추천 보너스 (Level 1)' / '추천 보너스 (Level 2)' 만
+//   - safeInsertTransaction 헬퍼 의무 사용 (3중 가드: ref_id, broad EXISTS, INSERT)
+//   - 1대(L1)/2대(L2) 각 회원의 5/13 self daily tx 존재 여부 확인 후 매칭 산출
+//
+// 동작:
+//   1) 솔밧 L1 7명 + L2 7명 각자의 active staking → daily_rate × 150 = self_daily_qkey
+//   2) 각 회원이 5/13에 실제로 self daily tx 받았는지 조회 (받았으면 매칭 산출 대상)
+//   3) 각 회원당 솔밧이 받아야 할 매칭(QKEY) = self_daily_qkey × 0.20 (L1) 또는 × 0.10 (L2)
+//   4) 솔밧이 실제 5/13 받은 L1/L2 tx 명세 조회 (회원별 분해 가능 시)
+//   5) 누락 회원 식별 → 백필 대상 명단
+//   6) DRY_RUN: 명단/총액 반환, ?confirm=GO 시 safeInsertTransaction 호출
+//
+// 단, 솔밧 L1/L2 회원 중 5/13 self daily 가 0 QKEY 인 (이번 cron 미실행 또는 staking 휴면) 회원은 제외
+// ============================================================
+app.get('/api/diag/solbat-513-missing-trace', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+    const TARGET_DATE = '2026-05-13'
+    const TARGET_DATE_OBJ = new Date(TARGET_DATE + 'T00:00:00+09:00')
+    const { isBusinessDay } = isKoreanBusinessDay(TARGET_DATE_OBJ)
+    if (!isBusinessDay) {
+      return c.json({ error: `${TARGET_DATE} 는 평일이 아니라 매칭 대상 아님` }, 400)
+    }
+
+    // 솔밧
+    const solbat = await db.prepare(`
+      SELECT id, name, qkey_balance FROM users WHERE id = ?
+    `).bind(SOLBAT_ID).first() as any
+    if (!solbat) return c.json({ error: 'solbat not found' }, 404)
+
+    // STEP 1: L1 회원 명단
+    const l1Res = await db.prepare(`
+      SELECT id, name, email FROM users WHERE referrer_id = ? ORDER BY id ASC
+    `).bind(SOLBAT_ID).all()
+    const l1Users = (l1Res.results as any[]) || []
+
+    // STEP 2: L2 회원 명단
+    const l2Res = await db.prepare(`
+      SELECT u.id, u.name, u.email, u.referrer_id AS l1_id, l1.name AS l1_name
+      FROM users u JOIN users l1 ON u.referrer_id = l1.id
+      WHERE l1.referrer_id = ?
+      ORDER BY u.id ASC
+    `).bind(SOLBAT_ID).all()
+    const l2Users = (l2Res.results as any[]) || []
+
+    // ============================================================
+    // 회원별 5/13 self daily 발생 여부 + 매칭 기대값 계산 (bottom-up)
+    // ============================================================
+    async function buildMatchTargets(users: any[], level: 1 | 2) {
+      const ratio = level === 1 ? 0.20 : 0.10
+      const out: any[] = []
+      for (const u of users) {
+        // 회원의 active staking 들 daily_rate 합산
+        const stakesRes = await db.prepare(`
+          SELECT id AS staking_id, amount, daily_rate, status
+          FROM staking WHERE user_id = ? AND status = 'active'
+        `).bind(u.id).all()
+        const stakes = (stakesRes.results as any[]) || []
+        let userSelfDaily = 0
+        for (const s of stakes) {
+          userSelfDaily += Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+        }
+
+        // 회원의 5/13 실제 self daily tx 발생 확인 (cron 이 정상 처리했는지)
+        const selfDailyTx = await db.prepare(`
+          SELECT id, amount, ref_id,
+                 date(datetime(created_at, '+9 hours')) AS kst_date
+          FROM transactions
+          WHERE user_id = ? AND type = 'daily_reward' AND coin_type = 'QKEY'
+            AND date(datetime(created_at, '+9 hours')) = ?
+          ORDER BY id ASC
+        `).bind(u.id, TARGET_DATE).all()
+        const selfTxs = (selfDailyTx.results as any[]) || []
+        const selfTxSum = selfTxs.reduce((s, r: any) => s + Number(r.amount), 0)
+
+        // 매칭 기대값: 회원의 실제 5/13 self daily tx 합 × ratio
+        // (cron 이 회원 self daily 를 안 지급했다면 매칭도 0 — 추정 금지)
+        const expectedMatch = Math.round(selfTxSum * ratio)
+
+        // 솔밧이 이 회원분 매칭을 5/13 에 실제 받았는지 확인 — referral_rewards 원장으로 확정
+        const rrRow = await db.prepare(`
+          SELECT id AS rr_id, reward_amount, original_amount, reward_date, paid_date
+          FROM referral_rewards
+          WHERE referrer_id = ? AND referee_id = ? AND level = ?
+            AND (paid_date = ? OR reward_date = ?)
+          ORDER BY id DESC LIMIT 1
+        `).bind(SOLBAT_ID, u.id, level, TARGET_DATE, TARGET_DATE).first() as any
+        const actualMatch = rrRow ? Number(rrRow.reward_amount) : 0
+
+        out.push({
+          level,
+          user_id: u.id,
+          user_name: u.name,
+          user_email: u.email,
+          ...(level === 2 ? { l1_id: u.l1_id, l1_name: u.l1_name } : {}),
+          active_stakes_count: stakes.length,
+          user_self_daily_qkey_expected: userSelfDaily,
+          user_self_daily_qkey_actual_513: selfTxSum,
+          user_self_daily_tx_count_513: selfTxs.length,
+          expected_match_to_solbat: expectedMatch,
+          actual_match_to_solbat: actualMatch,
+          rr_row: rrRow ? { id: rrRow.rr_id, paid_date: rrRow.paid_date, reward_date: rrRow.reward_date } : null,
+          diff: actualMatch - expectedMatch,
+          status: actualMatch === expectedMatch ? '✅ MATCH'
+                : (actualMatch > expectedMatch ? '🔴 OVER' : '🟡 UNDER'),
+          will_backfill: expectedMatch > actualMatch && (expectedMatch - actualMatch) > 0,
+          backfill_amount: Math.max(0, expectedMatch - actualMatch),
+        })
+      }
+      return out
+    }
+
+    const l1Targets = await buildMatchTargets(l1Users, 1)
+    const l2Targets = await buildMatchTargets(l2Users, 2)
+
+    // 합계
+    const l1ExpectedSum = l1Targets.reduce((s, r) => s + r.expected_match_to_solbat, 0)
+    const l1ActualSum = l1Targets.reduce((s, r) => s + r.actual_match_to_solbat, 0)
+    const l2ExpectedSum = l2Targets.reduce((s, r) => s + r.expected_match_to_solbat, 0)
+    const l2ActualSum = l2Targets.reduce((s, r) => s + r.actual_match_to_solbat, 0)
+    const l1MissingTotal = l1Targets.reduce((s, r) => s + r.backfill_amount, 0)
+    const l2MissingTotal = l2Targets.reduce((s, r) => s + r.backfill_amount, 0)
+
+    // 백필 대상만
+    const l1ToBackfill = l1Targets.filter(t => t.will_backfill)
+    const l2ToBackfill = l2Targets.filter(t => t.will_backfill)
+
+    if (!isExec) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        target_date: TARGET_DATE,
+        solbat: { id: solbat.id, name: solbat.name, qkey_balance_current: solbat.qkey_balance },
+        l1_summary: {
+          expected_sum: l1ExpectedSum,
+          actual_sum: l1ActualSum,
+          missing_total: l1MissingTotal,
+          backfill_target_count: l1ToBackfill.length,
+        },
+        l2_summary: {
+          expected_sum: l2ExpectedSum,
+          actual_sum: l2ActualSum,
+          missing_total: l2MissingTotal,
+          backfill_target_count: l2ToBackfill.length,
+        },
+        grand_total_to_backfill: l1MissingTotal + l2MissingTotal,
+        l1_backfill_candidates: l1ToBackfill,
+        l2_backfill_candidates: l2ToBackfill,
+        l1_all_breakdown: l1Targets,
+        l2_all_breakdown: l2Targets,
+        next: '실제 백필하려면 ?confirm=GO 추가 (safeInsertTransaction 3중 가드 자동 수행)',
+      })
+    }
+
+    // ====================== EXEC: 백필 실행 ======================
+    // safeInsertTransaction 헬퍼만 사용 — 영구룰 #이중지급 절대 금지
+    const inserted: any[] = []
+    const skipped: any[] = []
+    let actualBackfillSum = 0
+
+    for (const t of [...l1ToBackfill, ...l2ToBackfill]) {
+      const lv = t.level
+      const refId = `bf_513_solbat_trace_l${lv}_referee${t.user_id}`
+      const description = lv === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+      try {
+        const res = await safeInsertTransaction(db, {
+          user_id: SOLBAT_ID,
+          type: 'referral_reward',
+          coin_type: 'QKEY',
+          amount: t.backfill_amount,
+          description,
+          ref_id: refId,
+          kst_date: TARGET_DATE,
+          updateBalance: true,
+        })
+        // referral_rewards 원장도 함께 INSERT (스키마: referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+        try {
+          await db.prepare(`
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          `).bind(
+            SOLBAT_ID,
+            t.user_id,
+            lv,
+            t.user_self_daily_qkey_actual_513,
+            t.backfill_amount,
+            TARGET_DATE,
+            TARGET_DATE,
+          ).run()
+        } catch(rrErr: any) {
+          // 원장 INSERT 실패는 tx 가 이미 들어갔으므로 경고만
+          console.error('referral_rewards INSERT 실패 (tx 는 성공):', rrErr?.message)
+        }
+        actualBackfillSum += t.backfill_amount
+        inserted.push({
+          level: lv,
+          referee_user_id: t.user_id,
+          referee_name: t.user_name,
+          amount: t.backfill_amount,
+          tx_id: (res as any).tx_id,
+          ref_id: refId,
+        })
+      } catch (err: any) {
+        skipped.push({
+          level: lv,
+          referee_user_id: t.user_id,
+          referee_name: t.user_name,
+          amount: t.backfill_amount,
+          reason: err?.code || 'unknown',
+          message: err?.message,
+        })
+      }
+    }
+
+    // 백필 후 솔밧 잔액 재조회
+    const after = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first() as any
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      target_date: TARGET_DATE,
+      solbat_balance_before: solbat.qkey_balance,
+      solbat_balance_after: after?.qkey_balance,
+      delta: (after?.qkey_balance || 0) - solbat.qkey_balance,
+      inserted_count: inserted.length,
+      skipped_count: skipped.length,
+      actual_backfill_sum: actualBackfillSum,
+      inserted,
+      skipped,
+      note: 'safeInsertTransaction 3중 가드 통과한 row 만 INSERT — 사장님 영구룰 #이중지급 절대 금지 준수',
+    })
+  } catch (error: any) {
+    console.error('solbat-513-missing-trace error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/solbat-l1l2-precision-audit  (2026-05-13, read-only)
 // ------------------------------------------------------------
 // 사장님 명령: "솔밧꺼 정밀 진단하자 하부 1대와 하부 2대가 또 안맞는다"
