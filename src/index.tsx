@@ -32,6 +32,137 @@ app.use('/static/*', serveStatic({ root: './public' }))
 const ADMIN_ID = 'admin'
 const ADMIN_PW = 'Qta@2026!Sec#Admin'
 
+// ============================================================
+// P0+P2 영구 안전 헬퍼 — 모든 백필/manual INSERT 엔드포인트 의무 사용
+// ----------------------------------------------------
+// 사장님 영구룰 #이중지급 절대 금지 / #cron 단일화 위반 방지
+// 이 헬퍼를 통하지 않는 INSERT 는 영구룰 위반 — 코드 리뷰 시 즉시 차단
+// ============================================================
+
+/**
+ * P0+P2 — 같은 (user_id, type, coin_type, amount, KST date) row 존재 시 throw
+ * 모든 백필/manual transactions INSERT 직전 의무 호출
+ *
+ * @param db D1Database
+ * @param uid user_id
+ * @param type 'daily_reward' | 'referral_reward' | 기타 transactions.type
+ * @param amount 금액 (QKEY 단위)
+ * @param kstDate 'YYYY-MM-DD' KST 기준 날짜
+ * @param coinType 'QKEY' (기본) | 'QTA' | 'QX' | 'USDT'
+ * @returns true (안전) — 존재 시 Error throw
+ */
+async function assertNoExistingPayment(
+  db: any,
+  uid: number,
+  type: string,
+  amount: number,
+  kstDate: string,
+  coinType: string = 'QKEY'
+): Promise<boolean> {
+  const existing = await db.prepare(`
+    SELECT id, ref_id, created_at FROM transactions
+    WHERE user_id = ? AND type = ? AND coin_type = ? AND amount = ?
+      AND date(datetime(created_at, '+9 hours')) = ?
+    LIMIT 1
+  `).bind(uid, type, coinType, amount, kstDate).first()
+  if (existing) {
+    const e: any = new Error(
+      `DUPLICATE_PAYMENT_BLOCKED: uid=${uid} type=${type} amount=${amount} ` +
+      `coin=${coinType} kst_date=${kstDate} existing_tx_id=${(existing as any).id} ` +
+      `existing_ref_id=${(existing as any).ref_id}`
+    )
+    e.code = 'DUPLICATE_PAYMENT_BLOCKED'
+    e.existing = existing
+    throw e
+  }
+  return true
+}
+
+/**
+ * P0+P2 — daily_rewards 테이블 (staking_id, reward_date) 존재 시 throw
+ */
+async function assertNoExistingDailyReward(
+  db: any,
+  stakingId: number,
+  rewardDate: string
+): Promise<boolean> {
+  const existing = await db.prepare(`
+    SELECT id, user_id, usdt_amount FROM daily_rewards
+    WHERE staking_id = ? AND reward_date = ?
+    LIMIT 1
+  `).bind(stakingId, rewardDate).first()
+  if (existing) {
+    const e: any = new Error(
+      `DUPLICATE_DAILY_REWARD_BLOCKED: staking_id=${stakingId} reward_date=${rewardDate} ` +
+      `existing_id=${(existing as any).id} existing_qkey=${(existing as any).usdt_amount}`
+    )
+    e.code = 'DUPLICATE_DAILY_REWARD_BLOCKED'
+    e.existing = existing
+    throw e
+  }
+  return true
+}
+
+/**
+ * P0+P2 — ref_id 존재 시 throw (백필 ref_id 가드)
+ */
+async function assertNoExistingRefId(db: any, refId: string): Promise<boolean> {
+  const existing = await db.prepare(
+    `SELECT id, user_id, amount FROM transactions WHERE ref_id = ? LIMIT 1`
+  ).bind(refId).first()
+  if (existing) {
+    const e: any = new Error(`DUPLICATE_REF_ID_BLOCKED: ref_id=${refId} existing_tx_id=${(existing as any).id}`)
+    e.code = 'DUPLICATE_REF_ID_BLOCKED'
+    e.existing = existing
+    throw e
+  }
+  return true
+}
+
+/**
+ * P0+P2 — 안전한 transactions INSERT (3중 가드 자동 수행)
+ *   1. assertNoExistingRefId
+ *   2. assertNoExistingPayment
+ *   3. INSERT + qkey_balance UPDATE (옵션)
+ *
+ * 사용 예:
+ *   await safeInsertTransaction(db, {
+ *     user_id: 38, type: 'daily_reward', coin_type: 'QKEY',
+ *     amount: 2250, description: '일일 배당 (QKEY)',
+ *     ref_id: 'bf_513_self_s94', kst_date: '2026-05-13',
+ *     updateBalance: true
+ *   })
+ */
+async function safeInsertTransaction(db: any, p: {
+  user_id: number
+  type: string
+  coin_type: string
+  amount: number
+  description: string
+  ref_id: string
+  kst_date: string
+  updateBalance?: boolean
+  balanceColumn?: string  // 'qkey_balance' (기본)
+}): Promise<{ tx_id: number }> {
+  // 1) ref_id 가드
+  await assertNoExistingRefId(db, p.ref_id)
+  // 2) 같은 날 같은 사용자 같은 amount 가드 (broad)
+  await assertNoExistingPayment(db, p.user_id, p.type, p.amount, p.kst_date, p.coin_type)
+  // 3) INSERT
+  const res = await db.prepare(`
+    INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(p.user_id, p.type, p.coin_type, p.amount, p.description, p.ref_id).run()
+  // 4) 잔액 UPDATE (옵션)
+  if (p.updateBalance) {
+    const col = p.balanceColumn || 'qkey_balance'
+    await db.prepare(
+      `UPDATE users SET ${col} = COALESCE(${col},0) + ? WHERE id = ?`
+    ).bind(p.amount, p.user_id).run()
+  }
+  return { tx_id: Number(res.meta?.last_row_id || 0) }
+}
+
 // ============================================
 // Server-side i18n Helper
 // ============================================
@@ -4026,14 +4157,17 @@ app.post('/api/rewards/daily', async (c) => {
     try {
       await db.prepare(`
         CREATE TABLE IF NOT EXISTS daily_cron_lock (
-          lock_date TEXT PRIMARY KEY,
-          source    TEXT NOT NULL,
-          locked_at TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
-          locked_by TEXT,
-          note      TEXT
+          lock_date        TEXT PRIMARY KEY,
+          source           TEXT NOT NULL,
+          locked_at        TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by        TEXT,
+          note             TEXT,
+          last_finished_at TEXT
         )
       `).run()
     } catch(e) {}
+    // ★ P3 (2026-05-13) ★ — 기존 테이블에 last_finished_at 컬럼 없으면 추가 (멱등)
+    try { await db.prepare(`ALTER TABLE daily_cron_lock ADD COLUMN last_finished_at TEXT`).run() } catch(e) {}
 
     // 기존 lock 확인 — 같은 날 다른 source 가 이미 실행했으면 차단
     const existingLock = await db.prepare(`
@@ -4478,6 +4612,28 @@ app.post('/api/rewards/daily', async (c) => {
       message += ` | has_more=true (next offset=${nextOffset})`
     }
 
+    // ★ P3 (2026-05-13) ★ — 마지막 batch (hasMore=false) 에서만 daily_cron_lock.last_finished_at 업데이트
+    //   배경: 같은 날 같은 source 의 batch 페이지네이션 호출들은 lock row 를 공유.
+    //   첫 batch 에서 INSERT, 이후 batch 는 통과만 함. 마지막 batch 가 끝났을 때 finished_at 기록.
+    //   → 헬스체크/audit 가 (locked_at 있고 last_finished_at NULL 이고 30분+ 지남) 이면 stale 로 판별.
+    let cronFinishedAtKst: string | null = null
+    if (!hasMore) {
+      try {
+        const finishRes = await db.prepare(`
+          UPDATE daily_cron_lock
+          SET last_finished_at = datetime('now','+9 hours')
+          WHERE lock_date = ?
+        `).bind(todayKstForLock).run()
+        // 업데이트 후 실제 값을 다시 조회해 응답에 포함 (사장님/AI 확인용)
+        const row = await db.prepare(`
+          SELECT last_finished_at FROM daily_cron_lock WHERE lock_date = ?
+        `).bind(todayKstForLock).first() as any
+        cronFinishedAtKst = row?.last_finished_at || null
+      } catch(e) {
+        console.error('[P3] daily_cron_lock.last_finished_at UPDATE 실패:', e)
+      }
+    }
+
     return c.json({
       success: true,
       message: message,
@@ -4495,7 +4651,10 @@ app.post('/api/rewards/daily', async (c) => {
       batch_processed: batchProcessed,
       next_offset: nextOffset,
       total_active: totalActive,
-      has_more: hasMore
+      has_more: hasMore,
+      // ★ P3 (2026-05-13) — cron 완료 시각 추적 ★
+      cron_finished_at_kst: cronFinishedAtKst,
+      cron_completed: !hasMore && cronFinishedAtKst !== null
     })
   } catch (error) {
     console.error('Daily reward error:', error)
@@ -4548,11 +4707,12 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
     try {
       await db.prepare(`
         CREATE TABLE IF NOT EXISTS daily_cron_lock (
-          lock_date TEXT PRIMARY KEY,
-          source    TEXT NOT NULL,
-          locked_at TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
-          locked_by TEXT,
-          note      TEXT
+          lock_date        TEXT PRIMARY KEY,
+          source           TEXT NOT NULL,
+          locked_at        TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by        TEXT,
+          note             TEXT,
+          last_finished_at TEXT
         )
       `).run()
     } catch(e) {}
@@ -4684,11 +4844,12 @@ app.get('/api/admin/rewards/cron-lock-status', async (c) => {
     try {
       await db.prepare(`
         CREATE TABLE IF NOT EXISTS daily_cron_lock (
-          lock_date TEXT PRIMARY KEY,
-          source    TEXT NOT NULL,
-          locked_at TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
-          locked_by TEXT,
-          note      TEXT
+          lock_date        TEXT PRIMARY KEY,
+          source           TEXT NOT NULL,
+          locked_at        TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by        TEXT,
+          note             TEXT,
+          last_finished_at TEXT
         )
       `).run()
     } catch(e) {}
@@ -4732,6 +4893,35 @@ app.get('/api/diag/audit-holiday-entrant-all-weekday', async (c) => {
     const now = new Date()
     const todayKst = kstDateStr(now)
     const yesterdayKst = kstDateStr(new Date(now.getTime() - 24 * 60 * 60 * 1000))
+    // KST 현재 시각 (audit 스냅샷 촬영 시점) — 사용자/AI 가 stale audit 판별용
+    const auditTakenAtKst = new Date(now.getTime() + 9*60*60*1000).toISOString().replace('T',' ').replace('Z','')
+
+    // ★ P1 (2026-05-13) ★ — cron 실행 상태 메타데이터
+    //   audit 응답에 오늘 cron 이 이미 돌았는지, 언제 시작했는지 표시 →
+    //   "휴일진입자 누락 0건" 같은 결과가 stale snapshot 인지 즉시 판별 가능
+    let cronStatusToday: any = null
+    let cronStatusYesterday: any = null
+    try {
+      // daily_cron_lock 테이블 보장 (없으면 생성)
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS daily_cron_lock (
+          lock_date        TEXT PRIMARY KEY,
+          source           TEXT NOT NULL,
+          locked_at        TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by        TEXT,
+          note             TEXT,
+          last_finished_at TEXT
+        )
+      `).run()
+      // ★ P3 (2026-05-13) ★ — 기존 테이블에 last_finished_at 컬럼 없으면 추가 (멱등)
+      try { await db.prepare(`ALTER TABLE daily_cron_lock ADD COLUMN last_finished_at TEXT`).run() } catch(e) {}
+      cronStatusToday = await db.prepare(`
+        SELECT lock_date, source, locked_at, locked_by, note, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
+      `).bind(todayKst).first()
+      cronStatusYesterday = await db.prepare(`
+        SELECT lock_date, source, locked_at, locked_by, note, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
+      `).bind(yesterdayKst).first()
+    } catch(e) {}
 
     // STEP 1: 모든 active staking 추출 + start_date_kst 휴일 여부 판정
     const allActive = await db.prepare(`
@@ -4763,6 +4953,13 @@ app.get('/api/diag/audit-holiday-entrant-all-weekday', async (c) => {
 
     for (const s of holidayEntrants) {
       // 평일 목록 산출: 진입일 다음날부터 어제까지 KST 평일만
+      // ★ P1 BUGFIX (2026-05-13) ★
+      //   cursor 는 이미 'T00:00:00+09:00' 로 만들어진 KST 정각 Date 객체이므로
+      //   kstDateStr(cursor) 만 호출해도 올바른 KST 날짜 문자열이 나옴.
+      //   기존 코드: kstDateStr(new Date(cursor.getTime() - 9*60*60*1000)) 는
+      //   -9시간을 뺀 후 kstDateStr 내부에서 +9시간을 더해 결과적으로 cursor 자체가 되어야 하지만,
+      //   ISO 변환 과정에서 -9시간 보정이 자정을 넘겨 라벨이 -1일 어긋남.
+      //   → cursor 그대로 kstDateStr 에 넘기는 것이 정확.
       const weekdaysExpected: string[] = []
       const startObj = new Date(s.kst_start_date + 'T00:00:00+09:00')
       const yestObj = new Date(yesterdayKst + 'T00:00:00+09:00')
@@ -4770,8 +4967,7 @@ app.get('/api/diag/audit-holiday-entrant-all-weekday', async (c) => {
       while (cursor.getTime() <= yestObj.getTime()) {
         const { isBusinessDay } = isKoreanBusinessDay(cursor)
         if (isBusinessDay) {
-          weekdaysExpected.push(kstDateStr(new Date(cursor.getTime() - 9*60*60*1000)))
-          // ↑ kstDateStr 는 입력을 KST+9 추가하므로 보정해서 호출
+          weekdaysExpected.push(kstDateStr(cursor))
         }
         cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000)
       }
@@ -4837,10 +5033,30 @@ app.get('/api/diag/audit-holiday-entrant-all-weekday', async (c) => {
     // 누락 있는 staking 만 따로
     const missingOnly = auditResults.filter(a => a.missing_count > 0)
 
+    // ★ P1 (2026-05-13) ★ — cron 완료/진행 메타데이터 종합
+    //   cron_completed = 오늘 cron lock 이 존재하고 source 가 cron_auto/manual_admin 중 하나
+    //   last_cron_run_kst_at = 오늘 cron 의 locked_at (시작 시각)
+    //   audit_taken_at_kst = audit 호출 순간 (stale 판별용)
+    //   ⚠ last_cron_run_kst_at 이 audit_taken_at_kst 보다 5분 이상 과거이고
+    //     missing_count > 0 이면 진짜 누락 (재시도 필요).
+    //     반대로 cron 이 아직 안 돌았으면 missing 은 정상 (놀라지 말것).
+    const cronCompletedToday = !!cronStatusToday
+    const lastCronRunKstAt = cronStatusToday?.locked_at || null
+    const stalenessWarning = !cronCompletedToday
+      ? `⚠ 오늘(${todayKst}) cron 아직 미실행 — audit 의 weekdays_missing 은 자연스러운 상태입니다. cron 실행 후 재검사하세요.`
+      : null
+
     return c.json({
       success: true,
       audit_today: todayKst,
       audit_yesterday: yesterdayKst,
+      // ★ P1 메타데이터 (stale snapshot 판별용) ★
+      audit_taken_at_kst: auditTakenAtKst,
+      last_cron_run_kst_at: lastCronRunKstAt,
+      cron_completed: cronCompletedToday,
+      cron_status_today: cronStatusToday,
+      cron_status_yesterday: cronStatusYesterday,
+      staleness_warning: stalenessWarning,
       policy: '영구룰 #휴일진입자: 휴일(토/일/공휴일) 진입 staking 도 진입일 이후 모든 평일 데일리 지급 의무',
       total_active_stakings: (allActive.results as any[]).length,
       total_holiday_entrants: holidayEntrants.length,
@@ -25182,6 +25398,173 @@ app.get('/api/diag/exec-513-bidirectional-matching', async (c) => {
     })
   } catch (error: any) {
     console.error('exec-513-bidirectional-matching error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
+// /api/diag/cleanup-513-bidirectional-duplicates
+// ------------------------------------------------------------
+// 2026-05-13 사장님 발견: 김용선(u#38) 5/13 12:38 추천 보너스 L1 1,050 QKEY 2회 중복
+// 원인: PHASE 3 양방향 매칭이 UPSTREAM (bf_513_up_s95_l1) 과 DOWNSTREAM (bf_513_down_u38_l1)
+//       두 경로에서 동일 user_id 에 동일 금액을 INSERT.
+//       exSameL1 안전 체크가 첫 UPSTREAM INSERT 직후의 같은 요청 내 DOWNSTREAM 검사에서
+//       이미 INSERT 된 row 를 못 잡은 것으로 추정 (혹은 두 ref_id 가 달라서 양쪽 다 통과).
+//
+// 동작:
+//   1) bf_513_up_*  +  bf_513_down_*  ref_id 로 INSERT 된 모든 row 조회
+//   2) (user_id, type, amount, KST date='2026-05-13') 로 묶어 카운트
+//   3) 같은 그룹에 2개 이상 있으면 → 1개만 남기고 나머지 DELETE + 잔액 차감
+//
+// dry-run (default) 결과 사장님 확인 후 ?confirm=GO 로 실제 정리.
+// ============================================================
+app.get('/api/diag/cleanup-513-bidirectional-duplicates', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const TARGET_DATE = '2026-05-13'
+
+    // STEP 1: PHASE 3 에서 INSERT 한 모든 transactions row 조회
+    //   ref_id LIKE 'bf_513_up_%' OR ref_id LIKE 'bf_513_down_%'
+    const phase3Rows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id,
+             created_at,
+             date(datetime(created_at, '+9 hours')) AS kst_date
+      FROM transactions
+      WHERE (ref_id LIKE 'bf_513_up_%' OR ref_id LIKE 'bf_513_down_%')
+      ORDER BY user_id ASC, amount ASC, id ASC
+    `).all()
+
+    const allRows = (phase3Rows.results as any[]) || []
+
+    // STEP 2: (user_id, type, amount, kst_date) 그룹별 묶기
+    const groups = new Map<string, any[]>()
+    for (const r of allRows) {
+      const k = `${r.user_id}|${r.type}|${r.amount}|${r.kst_date}`
+      if (!groups.has(k)) groups.set(k, [])
+      groups.get(k)!.push(r)
+    }
+
+    // STEP 3: 2개 이상 있는 그룹 = 중복
+    const duplicateGroups: any[] = []
+    let totalRowsToDelete = 0
+    let totalQkeyToReclaim = 0
+    const reclaimByUser: Record<number, number> = {}
+
+    for (const [k, rows] of groups.entries()) {
+      if (rows.length < 2) continue
+      // 가장 작은 id 1개를 KEEP, 나머지는 DELETE 대상
+      rows.sort((a: any, b: any) => a.id - b.id)
+      const keep = rows[0]
+      const toDelete = rows.slice(1)
+      const sumDeleted = toDelete.reduce((s: number, r: any) => s + Number(r.amount), 0)
+
+      duplicateGroups.push({
+        group_key: k,
+        user_id: rows[0].user_id,
+        type: rows[0].type,
+        amount: rows[0].amount,
+        kst_date: rows[0].kst_date,
+        total_rows: rows.length,
+        keep_row: { id: keep.id, ref_id: keep.ref_id, created_at: keep.created_at },
+        delete_rows: toDelete.map((r: any) => ({
+          id: r.id, ref_id: r.ref_id, created_at: r.created_at, amount: r.amount
+        })),
+        qkey_to_reclaim: sumDeleted,
+      })
+
+      totalRowsToDelete += toDelete.length
+      totalQkeyToReclaim += sumDeleted
+      reclaimByUser[rows[0].user_id] = (reclaimByUser[rows[0].user_id] || 0) + sumDeleted
+    }
+
+    // 회원별 사용자 이름 join
+    const userIds = Object.keys(reclaimByUser).map(Number)
+    const userInfo: Record<number, any> = {}
+    if (userIds.length > 0) {
+      const placeholders = userIds.map(() => '?').join(',')
+      const usersRows = await db.prepare(
+        `SELECT id, name, email, qkey_balance FROM users WHERE id IN (${placeholders})`
+      ).bind(...userIds).all()
+      for (const u of (usersRows.results as any[])) {
+        userInfo[u.id] = { name: u.name, email: u.email, qkey_balance_current: u.qkey_balance }
+      }
+    }
+
+    const reclaimSummary = userIds.map(uid => ({
+      user_id: uid,
+      ...(userInfo[uid] || {}),
+      qkey_to_reclaim: reclaimByUser[uid],
+      qkey_balance_after: (userInfo[uid]?.qkey_balance_current || 0) - reclaimByUser[uid],
+    }))
+
+    if (!isExec) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        target_date: TARGET_DATE,
+        phase3_total_rows: allRows.length,
+        duplicate_group_count: duplicateGroups.length,
+        total_rows_to_delete: totalRowsToDelete,
+        total_qkey_to_reclaim: totalQkeyToReclaim,
+        reclaim_summary: reclaimSummary,
+        duplicate_groups: duplicateGroups,
+        next: '실제 정리하려면 ?confirm=GO 추가',
+      })
+    }
+
+    // ====================== EXEC ======================
+    const deletedRows: any[] = []
+    const balanceUpdates: any[] = []
+
+    for (const g of duplicateGroups) {
+      for (const r of g.delete_rows) {
+        await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(r.id).run()
+        // referral_rewards 도 같은 ref_id 로 연동되어 있으면 함께 삭제
+        try {
+          await db.prepare(`DELETE FROM referral_rewards WHERE ref_id = ?`).bind(r.ref_id).run()
+        } catch(e) {}
+        deletedRows.push({ tx_id: r.id, ref_id: r.ref_id, user_id: g.user_id, amount: r.amount })
+      }
+      // 잔액 차감
+      await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) - ? WHERE id = ?`)
+        .bind(g.qkey_to_reclaim, g.user_id).run()
+      balanceUpdates.push({ user_id: g.user_id, deducted: g.qkey_to_reclaim })
+    }
+
+    // 정리 후 재검증
+    const afterRows = await db.prepare(`
+      SELECT user_id, type, amount,
+             date(datetime(created_at, '+9 hours')) AS kst_date,
+             COUNT(*) AS cnt
+      FROM transactions
+      WHERE (ref_id LIKE 'bf_513_up_%' OR ref_id LIKE 'bf_513_down_%')
+      GROUP BY user_id, type, amount, kst_date
+      HAVING COUNT(*) > 1
+    `).all()
+    const remainingDuplicates = (afterRows.results as any[]) || []
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      target_date: TARGET_DATE,
+      deleted_count: deletedRows.length,
+      total_qkey_reclaimed: totalQkeyToReclaim,
+      balance_updates: balanceUpdates,
+      deleted_rows: deletedRows,
+      reclaim_summary: reclaimSummary,
+      remaining_duplicates_after: remainingDuplicates.length,
+      remaining_duplicates_detail: remainingDuplicates,
+      verification: remainingDuplicates.length === 0
+        ? '✅ 모든 중복 정리 완료'
+        : '⚠ 잔여 중복 발견 — 수동 점검 필요',
+    })
+  } catch (error: any) {
+    console.error('cleanup-513-bidirectional-duplicates error:', error)
     return c.json({ error: error?.message || String(error) }, 500)
   }
 })

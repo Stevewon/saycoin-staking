@@ -1,0 +1,22 @@
+-- ★ P3 (2026-05-13) — daily_cron_lock 테이블에 last_finished_at 컬럼 추가
+--
+--   배경:
+--     - 기존 daily_cron_lock 는 locked_at (시작 시각) 만 있어서 cron 이 정상 완료됐는지 알 수 없음
+--     - 사장님 P0~P4 예방 조치 중 P3 — cron 시작/완료 분리 추적
+--
+--   동작:
+--     - cron 시작 시: INSERT (lock_date, source, locked_at, locked_by, note)
+--     - cron 정상 완료 시: UPDATE last_finished_at = datetime('now','+9 hours')
+--     - 헬스체크/audit 가 (locked_at IS NOT NULL AND last_finished_at IS NULL) 인 row 를
+--       발견하면 "중도 실패 또는 진행중" 으로 판단 가능
+--
+--   사용처:
+--     - /api/rewards/daily 완료 지점에서 UPDATE
+--     - /api/diag/audit-holiday-entrant-all-weekday 응답 메타데이터
+--     - P4 헬스체크 cron 이 stale lock (locked > 30분, finished IS NULL) 탐지
+--
+--   영구 룰:
+--     - #일일 cron 단일화 — 같은 날 같은 source 의 batch 페이지네이션은 lock UPDATE 호출 안함
+--       마지막 batch (more_results=false) 에서만 last_finished_at 업데이트
+
+ALTER TABLE daily_cron_lock ADD COLUMN last_finished_at TEXT;
