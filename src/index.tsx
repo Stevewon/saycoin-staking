@@ -4528,6 +4528,23 @@ app.post('/api/rewards/daily', async (c) => {
     try { await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN staking_id INTEGER`).run() } catch(e) {}
     try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_referral_rewards_staking_id ON referral_rewards(staking_id)`).run() } catch(e) {}
 
+    // ★★★★★ 영구 대책 #2 (2026-05-14) — UNIQUE 인덱스 (DB 레벨 이중지급 절대 차단) ★★★★★
+    //   사장님 영구명령: "1회만 지급한걸로 보이게 흔적없이"
+    //   원인: 4중 가드가 reward_date 컬럼만 보고 같은 paid_date 인 다른 reward_date 행 허용 → 중복 INSERT
+    //   대책: D1 UNIQUE 인덱스로 (user, staking, paid_date) 조합 1회만 INSERT 허용
+    //         → 코드 가드 빠뜨려도 D1 단에서 INSERT 자체가 실패
+    //
+    //   ※ 기존 행에 중복 있는 상태로 인덱스 생성하면 실패하므로 try-catch 로 안전 처리
+    //     첫 배포 시 인덱스 생성 실패 → may14-dup-cleanup 으로 중복 제거 후 재배포 → 성공
+    try { await db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_daily_rewards_paid_per_staking
+      ON daily_rewards(user_id, staking_id, paid_date)`).run() } catch(e) {
+      console.warn('[Permanent#2] uniq_daily_rewards_paid_per_staking 인덱스 생성 실패 (기존 중복 존재 가능):', (e as any)?.message)
+    }
+    try { await db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_referral_rewards_paid
+      ON referral_rewards(referrer_id, referee_id, level, staking_id, paid_date)`).run() } catch(e) {
+      console.warn('[Permanent#2] uniq_referral_rewards_paid 인덱스 생성 실패 (기존 중복 존재 가능):', (e as any)?.message)
+    }
+
     // ★ 사장님 룰 (2026-05-07 명확화) ★
     //   기준일 = yesterdayKst (어제 KST 00:00:00 ~ 23:59:59 의 24시간 윈도우 매출 전체 포함)
     //   ⇒ start_date_kst <= yesterdayKst 인 staking 만 어제 매출로 인정 (휴일 가입자 포함, 룰 B 백필)
@@ -4674,11 +4691,17 @@ app.post('/api/rewards/daily', async (c) => {
             break
           }
 
-          // 중복 방지 — 같은 (user, staking, reward_date) 가 이미 있으면 skip
+          // ★★★ 영구 대책 #1 (2026-05-14) — 5중 가드 (paid_date 추가) ★★★
+          //   사장님 영구명령: #이중지급 절대 금지
+          //   원인: 기존 4중 가드는 reward_date 만 봄 → 같은 paid_date 인 다른 reward_date 행 허용
+          //         (today-fix 사고 재현 방지)
+          //   대책: (user, staking, reward_date) OR (user, staking, paid_date=today) 동시 체크
+          //         → 같은 날 paid_date 행이 이미 있으면 무조건 SKIP (reward_date 무관)
           const exists = await db.prepare(`
             SELECT COUNT(*) as count FROM daily_rewards
-            WHERE user_id = ? AND staking_id = ? AND reward_date = ?
-          `).bind(staking.user_id, staking.staking_id, accrualDate).first()
+            WHERE user_id = ? AND staking_id = ?
+              AND (reward_date = ? OR paid_date = ?)
+          `).bind(staking.user_id, staking.staking_id, accrualDate, today).first()
           if (exists.count > 0) continue
 
           // 금액별 차등 배당률 적용
@@ -4763,11 +4786,14 @@ app.post('/api/rewards/daily', async (c) => {
                 //   기존: (referrer, referee, level, reward_date) 4-tuple 만 → referee 의 첫 staking 만 처리 (결함)
                 //   변경: staking_id 까지 5-tuple 정확 매칭 → referee 의 N 개 staking 모두 처리
                 //   legacy NULL 호환: staking_id IS NULL + original_amount 같으면 SKIP (이중지급 방지)
+                // ★★★ 영구 대책 #1 (2026-05-14) — paid_date 추가 6중 가드 ★★★
+                //   같은 paid_date(today) 에 같은 (referrer, referee, level, staking_id) 행 있으면 무조건 SKIP
                 const l1Exists = await db.prepare(`
                   SELECT COUNT(*) as count FROM referral_rewards
-                  WHERE referrer_id = ? AND referee_id = ? AND level = 1 AND reward_date = ?
+                  WHERE referrer_id = ? AND referee_id = ? AND level = 1
+                    AND (reward_date = ? OR paid_date = ?)
                     AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
-                `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate, staking.staking_id, qkeyAmount).first()
+                `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate, today, staking.staking_id, qkeyAmount).first()
 
                 if (l1Exists.count === 0) {
                   let level1Reward = Math.round(qkeyAmount * 0.20)
@@ -4830,11 +4856,13 @@ app.post('/api/rewards/daily', async (c) => {
                     //   기존: (referrer, referee, level, reward_date) 4-tuple 만 → referee 의 첫 staking 만 처리 (결함)
                     //   변경: staking_id 까지 5-tuple 정확 매칭 → referee 의 N 개 staking 모두 처리
                     //   legacy NULL 호환: staking_id IS NULL + original_amount 같으면 SKIP (이중지급 방지)
+                    // ★★★ 영구 대책 #1 (2026-05-14) — paid_date 추가 6중 가드 ★★★
                     const l2Exists = await db.prepare(`
                       SELECT COUNT(*) as count FROM referral_rewards
-                      WHERE referrer_id = ? AND referee_id = ? AND level = 2 AND reward_date = ?
+                      WHERE referrer_id = ? AND referee_id = ? AND level = 2
+                        AND (reward_date = ? OR paid_date = ?)
                         AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
-                    `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate, staking.staking_id, qkeyAmount).first()
+                    `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate, today, staking.staking_id, qkeyAmount).first()
 
                     if (l2Exists.count === 0) {
                       let level2Reward = Math.round(qkeyAmount * 0.10)
@@ -29743,11 +29771,15 @@ app.get('/api/diag/cron-may14-today-daily-fix', async (c) => {
         continue
       }
 
-      // 4중 가드 1: 이미 (user, staking, reward_date=5/14) 있으면 SKIP
+      // ★★★ 영구 대책 #1 (2026-05-14) — 5중 가드 (paid_date 추가) ★★★
+      //   사장님 영구명령: #이중지급 절대 금지
+      //   기존: reward_date 만 봄 → 같은 paid_date 인 다른 reward_date 행 허용 (today-fix 사고 재현 위험)
+      //   대책: reward_date OR paid_date(today) 둘 중 하나라도 일치하면 SKIP
       const exists = await db.prepare(`
         SELECT COUNT(*) as count FROM daily_rewards
-        WHERE user_id = ? AND staking_id = ? AND reward_date = ?
-      `).bind(userId, stakingId, REWARD_DATE).first() as any
+        WHERE user_id = ? AND staking_id = ?
+          AND (reward_date = ? OR paid_date = ?)
+      `).bind(userId, stakingId, REWARD_DATE, PAID_DATE).first() as any
       if (exists.count > 0) {
         alreadyExistsSkip++
         log.skip = 'already_exists'
@@ -29820,12 +29852,14 @@ app.get('/api/diag/cron-may14-today-daily-fix', async (c) => {
         `).bind(l1Id, REWARD_DATE, REWARD_DATE).first()
 
         if (l1Active) {
-          // H plan 5-tuple 가드
+          // ★★★ 영구 대책 #1 (2026-05-14) — paid_date 추가 6중 가드 ★★★
+          //   reward_date OR paid_date 둘 중 하나라도 일치하면 SKIP (이중지급 절대 금지)
           const l1Exists = await db.prepare(`
             SELECT COUNT(*) as count FROM referral_rewards
-            WHERE referrer_id=? AND referee_id=? AND level=1 AND reward_date=?
+            WHERE referrer_id=? AND referee_id=? AND level=1
+              AND (reward_date=? OR paid_date=?)
               AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
-          `).bind(l1Id, userId, REWARD_DATE, stakingId, qkeyAmount).first() as any
+          `).bind(l1Id, userId, REWARD_DATE, PAID_DATE, stakingId, qkeyAmount).first() as any
 
           if (l1Exists.count === 0) {
             let l1Reward = Math.round(qkeyAmount * 0.20)  // ★ L1=20% 영구 룰 ★
@@ -29873,11 +29907,13 @@ app.get('/api/diag/cron-may14-today-daily-fix', async (c) => {
             `).bind(l2Id, REWARD_DATE, REWARD_DATE).first()
 
             if (l2Active) {
+              // ★★★ 영구 대책 #1 (2026-05-14) — paid_date 추가 6중 가드 ★★★
               const l2Exists = await db.prepare(`
                 SELECT COUNT(*) as count FROM referral_rewards
-                WHERE referrer_id=? AND referee_id=? AND level=2 AND reward_date=?
+                WHERE referrer_id=? AND referee_id=? AND level=2
+                  AND (reward_date=? OR paid_date=?)
                   AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
-              `).bind(l2Id, userId, REWARD_DATE, stakingId, qkeyAmount).first() as any
+              `).bind(l2Id, userId, REWARD_DATE, PAID_DATE, stakingId, qkeyAmount).first() as any
 
               if (l2Exists.count === 0) {
                 let l2Reward = Math.round(qkeyAmount * 0.10)  // ★ L2=10% 영구 룰 ★
