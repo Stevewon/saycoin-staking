@@ -24232,6 +24232,304 @@ app.get('/api/diag/fix-holiday-entrant-512-daily-910only', async (c) => {
 })
 
 // ============================================================
+// /api/diag/fix-513-holiday910-and-cleanup-duplicates
+// ----------------------------------------------------
+// 사장님 명령 (2026-05-13):
+//   1) 5/9·5/10 진입자(s#94~98) 5/13 본인 데일리 지급 (5/12치 1일분, leaf 먼저 — bottom-up)
+//   2) 상위 솔밧(L1/L2) 5/13 매칭 중복 1회만 남기고 나머지 삭제 + 잔액 회수
+//
+// 영구룰 준수:
+//   #bottom-up: leaf(본인) 먼저 INSERT → 상위(L1/L2) 중복 DELETE 순서
+//   #이중지급금지: GROUP BY (user_id, amount, type, KST date) HAVING COUNT>=2 만 정리
+//   #단일 cron: 5/13 self 누락된 leaf 만 보충
+//   #112: description '일일 배당 (QKEY)' 사용
+//   dedupe ref_id: 'bf_513_self_s<sid>' (3중 EXISTS)
+//
+// 호출 (dry_run): GET ?key=ADMIN_PW
+// 호출 (실행):    GET ?key=ADMIN_PW&confirm=GO
+// ============================================================
+app.get('/api/diag/fix-513-holiday910-and-cleanup-duplicates', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const TARGET_DATE = '2026-05-13'
+    const PAID_DATE = '2026-05-13'
+
+    // ====================================================================
+    // PHASE 1 — LEAF FIRST (bottom-up): 5/9·5/10 진입자 본인 5/13 데일리 보충
+    // ====================================================================
+    const leafRows = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate,
+             date(datetime(s.start_date, '+9 hours')) AS kst_start_date,
+             u.name AS user_name, u.email AS user_email, u.qkey_balance, u.referrer_id
+      FROM staking s JOIN users u ON s.user_id = u.id
+      WHERE s.status = 'active'
+        AND date(datetime(s.start_date, '+9 hours')) IN ('2026-05-09', '2026-05-10')
+      ORDER BY s.id ASC
+    `).all()
+    const leafStakings = (leafRows.results || []) as any[]
+
+    const leafPreview: any[] = []
+    let totalLeafSelfQkey = 0
+
+    for (const s of leafStakings) {
+      const sid = Number(s.staking_id)
+      const uid = Number(s.user_id)
+      const expectedQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+
+      // 5/13 daily_rewards 존재 여부
+      const existingDr = await db.prepare(`
+        SELECT id, usdt_amount FROM daily_rewards WHERE staking_id = ? AND reward_date = ? LIMIT 1
+      `).bind(sid, TARGET_DATE).first() as any
+
+      // 5/13 self transactions 존재 여부 (ref_id 무관 — KST 날짜 기준)
+      const existingTx = await db.prepare(`
+        SELECT id, ref_id FROM transactions
+        WHERE user_id = ? AND type = 'daily_reward' AND coin_type = 'QKEY' AND amount = ?
+          AND date(datetime(created_at, '+9 hours')) = ?
+        LIMIT 1
+      `).bind(uid, expectedQkey, TARGET_DATE).first() as any
+
+      // 백필 ref_id 가드
+      const refIdSelf = `bf_513_self_s${sid}`
+      const existingRef = await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdSelf).first()
+
+      const needInsert = !existingDr && !existingTx && !existingRef
+
+      leafPreview.push({
+        staking_id: sid,
+        user_id: uid,
+        user_name: s.user_name,
+        user_email: s.user_email,
+        amount: s.amount,
+        daily_rate: s.daily_rate,
+        kst_start_date: s.kst_start_date,
+        qkey_balance_before: s.qkey_balance,
+        self_qkey_to_pay: expectedQkey,
+        already_paid_5_13_daily_rewards: existingDr ? true : false,
+        already_paid_5_13_transactions: existingTx ? true : false,
+        backfill_ref_exists: existingRef ? true : false,
+        action: needInsert ? 'WILL_INSERT' : 'SKIP',
+      })
+
+      if (needInsert) totalLeafSelfQkey += expectedQkey
+    }
+
+    // ====================================================================
+    // PHASE 2 — 상위 매칭 5/13 중복 정리 (bottom-up: leaf 완료 후)
+    //   GROUP BY (user_id, amount, type='referral_reward', KST date=5/13) HAVING COUNT>=2
+    //   첫 1건(created_at ASC, id ASC) 유지, 나머지 DELETE + qkey_balance 차감
+    // ====================================================================
+    const dupRows = await db.prepare(`
+      SELECT user_id, amount, COUNT(*) AS cnt,
+             GROUP_CONCAT(id, ',') AS tx_ids,
+             GROUP_CONCAT(ref_id, ',') AS ref_ids,
+             GROUP_CONCAT(created_at, ',') AS times,
+             GROUP_CONCAT(description, ',') AS descs
+      FROM transactions
+      WHERE type = 'referral_reward'
+        AND coin_type = 'QKEY'
+        AND date(datetime(created_at, '+9 hours')) = ?
+      GROUP BY user_id, amount
+      HAVING COUNT(*) >= 2
+      ORDER BY user_id ASC, amount ASC
+    `).bind(TARGET_DATE).all()
+    const dupGroups = (dupRows.results || []) as any[]
+
+    const dupPreview: any[] = []
+    let totalDuplicateQkeyToRemove = 0
+
+    for (const g of dupGroups) {
+      const uid = Number(g.user_id)
+      const amt = Number(g.amount)
+      const cnt = Number(g.cnt)
+      const txIds = String(g.tx_ids || '').split(',').map((x: string) => parseInt(x.trim(), 10)).filter((n: number) => !Number.isNaN(n))
+      const refIds = String(g.ref_ids || '').split(',')
+      const times = String(g.times || '').split(',')
+      const descs = String(g.descs || '').split(',')
+
+      // 각 row 의 id 와 created_at 을 정렬해 첫 1건만 keep
+      const rowsDetail = txIds.map((id: number, i: number) => ({
+        id,
+        ref_id: refIds[i] || null,
+        created_at: times[i] || null,
+        description: descs[i] || null,
+      }))
+      rowsDetail.sort((a: any, b: any) => {
+        const ta = a.created_at || ''
+        const tb = b.created_at || ''
+        if (ta !== tb) return ta < tb ? -1 : 1
+        return a.id - b.id
+      })
+
+      const keep = rowsDetail[0]
+      const remove = rowsDetail.slice(1)
+      const removeQkey = amt * remove.length
+
+      // 사용자 정보 보강
+      const u = await db.prepare(`SELECT name, email, qkey_balance FROM users WHERE id = ?`).bind(uid).first() as any
+
+      dupPreview.push({
+        user_id: uid,
+        user_name: u?.name,
+        user_email: u?.email,
+        qkey_balance_before: u?.qkey_balance,
+        amount_each: amt,
+        total_count: cnt,
+        keep: { id: keep.id, ref_id: keep.ref_id, created_at: keep.created_at },
+        remove_count: remove.length,
+        remove_qkey_total: removeQkey,
+        remove_rows: remove,
+      })
+      totalDuplicateQkeyToRemove += removeQkey
+    }
+
+    if (!isExec) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        target_date: TARGET_DATE,
+        phase1_leaf_holiday910: {
+          target_count: leafStakings.length,
+          will_insert_count: leafPreview.filter((p: any) => p.action === 'WILL_INSERT').length,
+          total_self_qkey_to_pay: totalLeafSelfQkey,
+          preview: leafPreview,
+        },
+        phase2_duplicate_cleanup: {
+          duplicate_groups: dupGroups.length,
+          total_qkey_to_remove: totalDuplicateQkeyToRemove,
+          preview: dupPreview,
+        },
+        next: '실행하려면 ?confirm=GO 추가',
+      })
+    }
+
+    // ====================================================================
+    // EXECUTION (confirm=GO) — bottom-up: PHASE 1 (leaf INSERT) → PHASE 2 (dup DELETE)
+    // ====================================================================
+    const phase1Inserted: any[] = []
+    const phase1Skipped: any[] = []
+
+    for (const p of leafPreview as any[]) {
+      if (p.action !== 'WILL_INSERT') {
+        phase1Skipped.push({ staking_id: p.staking_id, user_id: p.user_id, reason: 'already_paid_or_ref_exists' })
+        continue
+      }
+      const sid = p.staking_id
+      const uid = p.user_id
+      const qkey = p.self_qkey_to_pay
+      const refIdSelf = `bf_513_self_s${sid}`
+
+      // daily_rewards INSERT
+      const drIns = await db.prepare(`
+        INSERT INTO daily_rewards (staking_id, user_id, usdt_amount, reward_date, paid_date, created_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+      `).bind(sid, uid, qkey, TARGET_DATE, PAID_DATE).run()
+
+      // transactions INSERT (사용자 노출 안전 description)
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'daily_reward', 'QKEY', ?, ?, ?)
+      `).bind(uid, qkey, '일일 배당 (QKEY)', refIdSelf).run()
+
+      // 잔액 증가
+      await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(qkey, uid).run()
+
+      phase1Inserted.push({
+        staking_id: sid, user_id: uid, user_name: p.user_name, user_email: p.user_email,
+        qkey: qkey, daily_reward_id: drIns.meta?.last_row_id,
+      })
+    }
+
+    // PHASE 2 — 중복 매칭 DELETE + 잔액 회수
+    const phase2Removed: any[] = []
+    let actualRemovedQkey = 0
+
+    for (const g of dupPreview as any[]) {
+      const uid = g.user_id
+      const removeIds: number[] = g.remove_rows.map((r: any) => r.id)
+      const removeQkey = g.remove_qkey_total
+      if (removeIds.length === 0) continue
+
+      // transactions DELETE (IN clause)
+      const placeholders = removeIds.map(() => '?').join(',')
+      await db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...removeIds).run()
+
+      // referral_rewards 동일 ref_id 삭제 (있으면)
+      for (const r of g.remove_rows as any[]) {
+        if (r.ref_id) {
+          try {
+            await db.prepare(`DELETE FROM referral_rewards WHERE ref_id = ?`).bind(r.ref_id).run()
+          } catch(e) {}
+        }
+      }
+
+      // 잔액 차감
+      await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) - ? WHERE id = ?`).bind(removeQkey, uid).run()
+
+      actualRemovedQkey += removeQkey
+      phase2Removed.push({
+        user_id: uid, user_name: g.user_name, user_email: g.user_email,
+        amount_each: g.amount_each, removed_count: removeIds.length,
+        removed_qkey: removeQkey, removed_tx_ids: removeIds, kept_tx_id: g.keep.id,
+      })
+    }
+
+    // ====================================================================
+    // 사후 검증
+    // ====================================================================
+    const afterPhase1: any[] = []
+    for (const p of leafPreview as any[]) {
+      const sid = p.staking_id
+      const dr = await db.prepare(`SELECT id, usdt_amount FROM daily_rewards WHERE staking_id = ? AND reward_date = ?`).bind(sid, TARGET_DATE).first() as any
+      const u = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(p.user_id).first() as any
+      afterPhase1.push({
+        staking_id: sid, user_id: p.user_id, user_name: p.user_name,
+        paid_5_13_qkey: dr?.usdt_amount || null, qkey_balance_after: u?.qkey_balance,
+      })
+    }
+
+    const afterPhase2Dup = await db.prepare(`
+      SELECT user_id, amount, COUNT(*) AS cnt
+      FROM transactions
+      WHERE type = 'referral_reward' AND coin_type = 'QKEY'
+        AND date(datetime(created_at, '+9 hours')) = ?
+      GROUP BY user_id, amount
+      HAVING COUNT(*) >= 2
+    `).bind(TARGET_DATE).all()
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      target_date: TARGET_DATE,
+      phase1_leaf_holiday910: {
+        inserted_count: phase1Inserted.length,
+        skipped_count: phase1Skipped.length,
+        total_self_qkey_inserted: phase1Inserted.reduce((sum: number, x: any) => sum + x.qkey, 0),
+        inserted: phase1Inserted,
+        skipped: phase1Skipped,
+      },
+      phase2_duplicate_cleanup: {
+        groups_cleaned: phase2Removed.length,
+        total_qkey_removed: actualRemovedQkey,
+        removed_details: phase2Removed,
+      },
+      after_check: {
+        phase1_leaf: afterPhase1,
+        phase2_remaining_duplicates: afterPhase2Dup.results || [],
+      },
+    })
+  } catch (error: any) {
+    console.error('fix-513-holiday910-and-cleanup-duplicates error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/fix-512-s97-self-orphan
 // ----------------------------------------------------
 // s#97 방승훈 (u#33) 5/12 self 데일리 부분 INSERT 보정:
