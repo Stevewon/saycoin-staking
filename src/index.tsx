@@ -25852,4 +25852,248 @@ app.get('/api/diag/audit-balance-vs-tx-mismatch', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/solbat-l1l2-precision-audit  (2026-05-13, read-only)
+// ------------------------------------------------------------
+// 사장님 명령: "솔밧꺼 정밀 진단하자 하부 1대와 하부 2대가 또 안맞는다"
+//
+// 영구룰 100% 준수:
+//   - L1=20%, L2=10% (절대 위반 금지)
+//   - staking.daily_rate D1 직접 조회 (amount 보고 추측 금지)
+//   - bottom-up: leaf staking 실사 → 부모 매칭 산정
+//   - read-only SELECT only (DB UPDATE 0건)
+//   - description 사용자 노출 안전 (이 엔드포인트는 description INSERT 없음)
+//
+// 진단 범위:
+//   1) 솔밧(u#44) 본인 정보 (잔액 현재값 포함)
+//   2) L1 하부 (직접 추천) 전체 명단 + 각자 active staking + daily_rate + 일 데일리 발생액(QKEY)
+//   3) L2 하부 (L1의 직접 추천) 전체 명단 + 각자 active staking + daily_rate + 일 데일리 발생액(QKEY)
+//   4) 기대 매칭 (1일치): L1합 × 20% + L2합 × 10%
+//   5) 최근 7일(KST) 솔밧이 실제 수령한 referral_reward tx 일별 합계 vs 기대값 비교
+//   6) 일자별 mismatch 표 (실수령 - 기대) — 양수면 과지급, 음수면 미지급
+//   7) referral_rewards 원장 테이블도 일자별 함께 표시
+//
+// 출력 의도: 사장님이 한 화면에서 "하부 1대/2대 명단 + 매칭 산식 + 일별 mismatch" 모두 보고 판단 가능.
+// ============================================================
+app.get('/api/diag/solbat-l1l2-precision-audit', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  try {
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+
+    // 0) 솔밧 본인
+    const solbat = await db.prepare(`
+      SELECT id, name, email, qkey_balance, referrer_id,
+             datetime(created_at, '+9 hours') AS created_kst
+      FROM users WHERE id = ?
+    `).bind(SOLBAT_ID).first() as any
+    if (!solbat) return c.json({ error: 'solbat user not found' }, 404)
+
+    // 1) L1 직추천 명단 (referrer_id = 솔밧)
+    const l1UsersRes = await db.prepare(`
+      SELECT id, name, email, referrer_id,
+             datetime(created_at, '+9 hours') AS created_kst
+      FROM users WHERE referrer_id = ? ORDER BY id ASC
+    `).bind(SOLBAT_ID).all()
+    const l1Users = (l1UsersRes.results as any[]) || []
+
+    // 2) L2 명단 (L1 의 직추천 = 솔밧의 L2)
+    let l2Users: any[] = []
+    if (l1Users.length > 0) {
+      const ph = l1Users.map(() => '?').join(',')
+      const l2Res = await db.prepare(`
+        SELECT u.id, u.name, u.email, u.referrer_id AS l1_id,
+               l1.name AS l1_name,
+               datetime(u.created_at, '+9 hours') AS created_kst
+        FROM users u JOIN users l1 ON u.referrer_id = l1.id
+        WHERE l1.referrer_id = ?
+        ORDER BY u.id ASC
+      `).bind(SOLBAT_ID).all()
+      l2Users = (l2Res.results as any[]) || []
+    }
+
+    // 3) L1 회원별 active staking + daily_rate 실데이터 조회 (영구룰: D1 직접)
+    const l1Detail: any[] = []
+    let l1DailySumQkey = 0
+    for (const u of l1Users) {
+      const stakes = await db.prepare(`
+        SELECT id AS staking_id, amount, daily_rate, status,
+               datetime(start_date, '+9 hours') AS start_kst,
+               date(start_date, '+9 hours') AS start_kst_date
+        FROM staking WHERE user_id = ? AND status = 'active'
+        ORDER BY id ASC
+      `).bind(u.id).all()
+      const sList = (stakes.results as any[]) || []
+      let userDailyQkey = 0
+      const stakeDetail = sList.map((s: any) => {
+        const dailyQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+        userDailyQkey += dailyQkey
+        return {
+          staking_id: s.staking_id,
+          amount: Number(s.amount),
+          daily_rate: Number(s.daily_rate),
+          start_kst_date: s.start_kst_date,
+          self_daily_qkey: dailyQkey,
+        }
+      })
+      l1DailySumQkey += userDailyQkey
+      l1Detail.push({
+        user_id: u.id, user_name: u.name, user_email: u.email,
+        created_kst: u.created_kst,
+        active_stakes: stakeDetail,
+        user_total_daily_qkey: userDailyQkey,
+      })
+    }
+
+    // 4) L2 회원별 active staking + daily_rate
+    const l2Detail: any[] = []
+    let l2DailySumQkey = 0
+    for (const u of l2Users) {
+      const stakes = await db.prepare(`
+        SELECT id AS staking_id, amount, daily_rate, status,
+               datetime(start_date, '+9 hours') AS start_kst,
+               date(start_date, '+9 hours') AS start_kst_date
+        FROM staking WHERE user_id = ? AND status = 'active'
+        ORDER BY id ASC
+      `).bind(u.id).all()
+      const sList = (stakes.results as any[]) || []
+      let userDailyQkey = 0
+      const stakeDetail = sList.map((s: any) => {
+        const dailyQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+        userDailyQkey += dailyQkey
+        return {
+          staking_id: s.staking_id,
+          amount: Number(s.amount),
+          daily_rate: Number(s.daily_rate),
+          start_kst_date: s.start_kst_date,
+          self_daily_qkey: dailyQkey,
+        }
+      })
+      l2DailySumQkey += userDailyQkey
+      l2Detail.push({
+        user_id: u.id, user_name: u.name, user_email: u.email,
+        l1_id: u.l1_id, l1_name: u.l1_name, created_kst: u.created_kst,
+        active_stakes: stakeDetail,
+        user_total_daily_qkey: userDailyQkey,
+      })
+    }
+
+    // 5) 기대 매칭 (1일치, 평일 기준)
+    const expectedL1Match = Math.round(l1DailySumQkey * 0.20)
+    const expectedL2Match = Math.round(l2DailySumQkey * 0.10)
+    const expectedTotalMatch = expectedL1Match + expectedL2Match
+
+    // 6) 최근 14일 솔밧 실수령 referral_reward 일별 합계 (KST)
+    const txDaily = await db.prepare(`
+      SELECT date(datetime(created_at, '+9 hours')) AS kst_date,
+             SUM(CASE WHEN description LIKE '%Level 1%' THEN amount ELSE 0 END) AS l1_received_qkey,
+             SUM(CASE WHEN description LIKE '%Level 2%' THEN amount ELSE 0 END) AS l2_received_qkey,
+             SUM(amount) AS total_received_qkey,
+             COUNT(*) AS tx_count
+      FROM transactions
+      WHERE user_id = ? AND type = 'referral_reward' AND coin_type = 'QKEY'
+        AND datetime(created_at, '+9 hours') >= datetime('now','+9 hours','-14 days')
+      GROUP BY kst_date
+      ORDER BY kst_date DESC
+    `).bind(SOLBAT_ID).all()
+    const txDailyRows = (txDaily.results as any[]) || []
+
+    // 7) referral_rewards 원장 일별 합계 (paid_date 기준)
+    const rrDaily = await db.prepare(`
+      SELECT paid_date,
+             SUM(CASE WHEN level = 1 THEN amount ELSE 0 END) AS l1_paid_qkey,
+             SUM(CASE WHEN level = 2 THEN amount ELSE 0 END) AS l2_paid_qkey,
+             SUM(amount) AS total_paid_qkey,
+             COUNT(*) AS row_count
+      FROM referral_rewards
+      WHERE user_id = ? AND coin_type = 'QKEY'
+        AND paid_date >= date('now','+9 hours','-14 days')
+      GROUP BY paid_date
+      ORDER BY paid_date DESC
+    `).bind(SOLBAT_ID).all()
+    const rrDailyRows = (rrDaily.results as any[]) || []
+
+    // 8) 일자별 mismatch (실수령 - 기대) — 평일만 의미 있음, 휴일은 0 기대
+    const mismatchByDate: any[] = []
+    for (const row of txDailyRows) {
+      const kstDate = row.kst_date
+      const dateObj = new Date(kstDate + 'T00:00:00+09:00')
+      const dow = dateObj.getUTCDay() // 0=일,6=토 (UTC 변환 후도 동일 weekday)
+      // 평일 기준만 영업일 — 휴일 보정은 isKoreanBusinessDay 가 더 정확하나
+      // 매칭은 cron 에서 평일에만 발생하므로 평일이면 expected, 휴일이면 0
+      const { isBusinessDay } = isKoreanBusinessDay(dateObj)
+      const expectedL1 = isBusinessDay ? expectedL1Match : 0
+      const expectedL2 = isBusinessDay ? expectedL2Match : 0
+      const actualL1 = Number(row.l1_received_qkey) || 0
+      const actualL2 = Number(row.l2_received_qkey) || 0
+      mismatchByDate.push({
+        kst_date: kstDate,
+        weekday: ['일','월','화','수','목','금','토'][dow],
+        is_business_day: isBusinessDay,
+        expected_l1: expectedL1,
+        actual_l1: actualL1,
+        diff_l1: actualL1 - expectedL1,
+        expected_l2: expectedL2,
+        actual_l2: actualL2,
+        diff_l2: actualL2 - expectedL2,
+        expected_total: expectedL1 + expectedL2,
+        actual_total: actualL1 + actualL2,
+        diff_total: (actualL1 + actualL2) - (expectedL1 + expectedL2),
+        tx_count: Number(row.tx_count),
+        status: ((actualL1 + actualL2) - (expectedL1 + expectedL2)) === 0
+          ? '✅ MATCH'
+          : ((actualL1 + actualL2) > (expectedL1 + expectedL2) ? '🔴 OVER (과지급)' : '🟡 UNDER (미지급)')
+      })
+    }
+
+    return c.json({
+      success: true,
+      audit_kind: 'solbat_l1l2_precision_readonly',
+      taken_at_kst: new Date(Date.now() + 9*60*60*1000).toISOString().replace('T',' ').replace('Z',''),
+      ratios: { L1: '20%', L2: '10%' },
+
+      solbat: {
+        user_id: solbat.id, name: solbat.name, email: solbat.email,
+        qkey_balance_current: solbat.qkey_balance,
+        created_kst: solbat.created_kst,
+      },
+
+      // bottom-up 영구룰: L1/L2 leaf staking 실데이터 먼저 노출
+      l1_summary: {
+        member_count: l1Users.length,
+        total_daily_qkey: l1DailySumQkey,
+        expected_match_to_solbat: expectedL1Match, // × 20%
+      },
+      l2_summary: {
+        member_count: l2Users.length,
+        total_daily_qkey: l2DailySumQkey,
+        expected_match_to_solbat: expectedL2Match, // × 10%
+      },
+      expected_total_match_per_business_day: expectedTotalMatch,
+
+      // 일자별 mismatch (실수령 - 기대)
+      mismatch_by_date: mismatchByDate,
+
+      // 원장 데이터 (paid_date 기준)
+      referral_rewards_ledger_by_paid_date: rrDailyRows,
+
+      // 상세 (펼침)
+      l1_detail: l1Detail,
+      l2_detail: l2Detail,
+
+      notes: [
+        '영구룰: L1=20%, L2=10% — 본 진단 산식은 이 비율로 고정',
+        '영구룰: staking.daily_rate D1 직접 조회 — amount 추정 금지',
+        '평일이 아닌 KST 일자(토/일/공휴일)는 expected = 0 (cron 발생 안 함)',
+        'diff_total > 0 = 과지급 (이중지급 가능성) / diff_total < 0 = 미지급 (백필 필요)',
+        '이 엔드포인트는 read-only — DB UPDATE 0건',
+      ]
+    })
+  } catch (error: any) {
+    console.error('solbat-l1l2-precision-audit error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
