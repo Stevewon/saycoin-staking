@@ -23690,6 +23690,271 @@ app.get('/api/diag/fix-holiday-entrant-512-daily', async (c) => {
 })
 
 // ============================================================
+// /api/diag/fix-holiday-entrant-512-daily-ALL27
+// ----------------------------------------------------
+// 사장님 명령 (2026-05-13): 휴일진입자 27건 전수 5/12(화) 데일리 즉시 백필
+//   영구룰 #휴일진입자: 휴일 진입자도 진입일 이후 모든 평일 데일리 지급 의무
+//   5/12 cron 이 휴일진입자 27건 self 데일리 누락 → 50,850 QKEY 미지급
+//
+// 영구룰 준수:
+//   #1: amount × daily_rate × 150 = QKEY/일
+//   #2: L1=20% / L2=10% 매칭 보너스
+//   #112: description 한국어 안전 (사용자 노출 안전)
+//   #일일 배당 cron 단일화: cron INSERT 와 동일 포맷
+//   dedupe: ref_id = 'bf_holiday_512_s<staking_id>_<type>' 3중 EXISTS 가드
+//
+// 대상 27건 (KST 기준 휴일진입자 전수, 5/12 self 미지급):
+//   그룹 A (5/3 일요일 진입, 18건): 44,45,46,47,48,49,53,54,56,57,58,59,60,61,62,63,64,65
+//   그룹 B (5/5 어린이날 진입, 4건): 71,72,73,74
+//   그룹 C (5/9 토요일 진입, 4건): 94,95,96,97
+//   그룹 D (5/10 일요일 진입, 1건): 98
+//
+// 합계: 50,850 QKEY (self) + L1≈10,170 + L2≈5,085 = 약 66,105 QKEY
+//
+// 호출 (dry_run): GET ?key=ADMIN_PW
+// 호출 (실행):    GET ?key=ADMIN_PW&confirm=GO
+// ============================================================
+app.get('/api/diag/fix-holiday-entrant-512-daily-ALL27', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const TARGET_DATE = '2026-05-12'
+    const PAID_DATE = '2026-05-12'
+    // ★ 휴일진입자 27건 전수 (audit 2026-05-13 확정)
+    const ALL_TARGET_STAKINGS = [
+      // 그룹 A — 5/3 일요일 진입 (18건)
+      44, 45, 46, 47, 48, 49, 53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+      // 그룹 B — 5/5 어린이날 진입 (4건)
+      71, 72, 73, 74,
+      // 그룹 C — 5/9 토요일 진입 (4건)
+      94, 95, 96, 97,
+      // 그룹 D — 5/10 일요일 진입 (1건)
+      98
+    ]
+    const onlyParam = c.req.query('only') || ''
+    const TARGET_STAKINGS = onlyParam
+      ? onlyParam.split(',').map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => ALL_TARGET_STAKINGS.includes(n))
+      : ALL_TARGET_STAKINGS
+
+    // 사전 검증: 대상 staking 정보 + 이미 지급 여부 + 중복 ref_id 가드
+    const preview: any[] = []
+    let totalSelfQkey = 0
+    let totalL1Qkey = 0
+    let totalL2Qkey = 0
+
+    for (const sid of TARGET_STAKINGS) {
+      const s = await db.prepare(`
+        SELECT s.id, s.user_id, s.amount, s.daily_rate, s.status,
+               date(datetime(s.start_date, '+9 hours')) AS kst_start_date,
+               u.name AS user_name, u.email AS user_email, u.qkey_balance, u.referrer_id
+        FROM staking s JOIN users u ON s.user_id = u.id
+        WHERE s.id = ? AND s.status = 'active'
+      `).bind(sid).first() as any
+
+      if (!s) {
+        preview.push({ staking_id: sid, status: 'NOT_FOUND_OR_INACTIVE' })
+        continue
+      }
+
+      const expectedQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+
+      // 이미 5/12 지급됐는지 (daily_rewards EXISTS)
+      const existing = await db.prepare(`
+        SELECT id FROM daily_rewards WHERE staking_id = ? AND reward_date = ? LIMIT 1
+      `).bind(sid, TARGET_DATE).first()
+
+      // 영구룰 #2: L1(referrer) 20%, L2(referrer of referrer) 10%
+      let l1UserId: number | null = null
+      let l2UserId: number | null = null
+      let l1Name = '', l2Name = ''
+      if (s.referrer_id) {
+        const l1u = await db.prepare(`SELECT id, name, referrer_id FROM users WHERE id = ?`).bind(s.referrer_id).first() as any
+        if (l1u) {
+          l1UserId = l1u.id
+          l1Name = l1u.name
+          if (l1u.referrer_id) {
+            const l2u = await db.prepare(`SELECT id, name FROM users WHERE id = ?`).bind(l1u.referrer_id).first() as any
+            if (l2u) { l2UserId = l2u.id; l2Name = l2u.name }
+          }
+        }
+      }
+
+      const l1Qkey = l1UserId ? Math.round(expectedQkey * 0.20) : 0
+      const l2Qkey = l2UserId ? Math.round(expectedQkey * 0.10) : 0
+
+      // dedupe: ref_id 가드 (transactions) — 3중 EXISTS
+      const refIdSelf = `bf_holiday_512_s${sid}_self`
+      const refIdL1 = `bf_holiday_512_s${sid}_l1`
+      const refIdL2 = `bf_holiday_512_s${sid}_l2`
+      const exSelf = await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdSelf).first()
+      const exL1 = l1UserId ? await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdL1).first() : null
+      const exL2 = l2UserId ? await db.prepare(`SELECT id FROM transactions WHERE ref_id = ? LIMIT 1`).bind(refIdL2).first() : null
+
+      preview.push({
+        staking_id: sid,
+        user_id: s.user_id,
+        user_name: s.user_name,
+        user_email: s.user_email,
+        amount: s.amount,
+        daily_rate: s.daily_rate,
+        kst_start_date: s.kst_start_date,
+        qkey_balance_before: s.qkey_balance,
+        self_qkey: expectedQkey,
+        already_paid_5_12: existing ? true : false,
+        l1: l1UserId ? { user_id: l1UserId, name: l1Name, qkey: l1Qkey, already_inserted: exL1 ? true : false } : null,
+        l2: l2UserId ? { user_id: l2UserId, name: l2Name, qkey: l2Qkey, already_inserted: exL2 ? true : false } : null,
+        self_already_inserted: exSelf ? true : false,
+      })
+
+      if (!existing && !exSelf) totalSelfQkey += expectedQkey
+      if (l1UserId && !exL1) totalL1Qkey += l1Qkey
+      if (l2UserId && !exL2) totalL2Qkey += l2Qkey
+    }
+
+    if (!isExec) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        target_date: TARGET_DATE,
+        target_stakings_count: TARGET_STAKINGS.length,
+        target_stakings: TARGET_STAKINGS,
+        preview,
+        sums: {
+          self_qkey_to_insert: totalSelfQkey,
+          l1_qkey_to_insert: totalL1Qkey,
+          l2_qkey_to_insert: totalL2Qkey,
+          grand_total_qkey: totalSelfQkey + totalL1Qkey + totalL2Qkey,
+        },
+        next: '실행하려면 ?confirm=GO 추가',
+      })
+    }
+
+    // ==== 실행 (GO) — 3중 안전장치 적용 ====
+    const inserted: any[] = []
+    const skipped: any[] = []
+    let actualSelfQkey = 0
+    let actualL1Qkey = 0
+    let actualL2Qkey = 0
+
+    for (const p of preview as any[]) {
+      if (p.status === 'NOT_FOUND_OR_INACTIVE') { skipped.push(p); continue }
+
+      const sid = p.staking_id
+      const uid = p.user_id
+
+      // 1) 본인 데일리 INSERT (daily_rewards + transactions + users.qkey_balance UPDATE)
+      //    이중 가드: already_paid_5_12 (daily_rewards EXISTS) + self_already_inserted (transactions ref_id EXISTS)
+      if (!p.already_paid_5_12 && !p.self_already_inserted) {
+        const refIdSelf = `bf_holiday_512_s${sid}_self`
+        // daily_rewards (cron 동일 컬럼 — usdt_amount 실제 QKEY 단위, 영구룰 #7)
+        const drIns = await db.prepare(`
+          INSERT INTO daily_rewards (staking_id, user_id, usdt_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, datetime('now'))
+        `).bind(sid, uid, p.self_qkey, TARGET_DATE, PAID_DATE).run()
+
+        // transactions (description 한국어 안전 — 영구룰 #112)
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'daily_reward', 'QKEY', ?, ?, ?)
+        `).bind(uid, p.self_qkey, '일일 배당 (QKEY)', refIdSelf).run()
+
+        // 잔액 증가
+        await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.self_qkey, uid).run()
+
+        actualSelfQkey += p.self_qkey
+        inserted.push({ staking_id: sid, user_id: uid, type: 'self', qkey: p.self_qkey, daily_reward_id: drIns.meta?.last_row_id })
+      } else {
+        skipped.push({ staking_id: sid, user_id: uid, type: 'self', reason: p.already_paid_5_12 ? 'daily_rewards_exists' : 'transactions_ref_id_exists' })
+      }
+
+      // 2) L1 매칭 INSERT (transactions + qkey_balance + referral_rewards)
+      if (p.l1 && !p.l1.already_inserted) {
+        const refIdL1 = `bf_holiday_512_s${sid}_l1`
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(p.l1.user_id, p.l1.qkey, '추천 보너스 (Level 1)', refIdL1).run()
+
+        await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.l1.qkey, p.l1.user_id).run()
+
+        // referral_rewards 테이블 (있는 경우)
+        try {
+          await db.prepare(`
+            INSERT INTO referral_rewards (user_id, from_user_id, level, amount, coin_type, reward_date, paid_date, ref_id, created_at)
+            VALUES (?, ?, 1, ?, 'QKEY', ?, ?, ?, datetime('now'))
+          `).bind(p.l1.user_id, uid, p.l1.qkey, TARGET_DATE, PAID_DATE, refIdL1).run()
+        } catch(e) {}
+
+        actualL1Qkey += p.l1.qkey
+        inserted.push({ staking_id: sid, user_id: p.l1.user_id, type: 'L1', qkey: p.l1.qkey, from_user_id: uid })
+      } else if (p.l1) {
+        skipped.push({ staking_id: sid, user_id: p.l1.user_id, type: 'L1', reason: 'transactions_ref_id_exists' })
+      }
+
+      // 3) L2 매칭 INSERT
+      if (p.l2 && !p.l2.already_inserted) {
+        const refIdL2 = `bf_holiday_512_s${sid}_l2`
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(p.l2.user_id, p.l2.qkey, '추천 보너스 (Level 2)', refIdL2).run()
+
+        await db.prepare(`UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) + ? WHERE id = ?`).bind(p.l2.qkey, p.l2.user_id).run()
+
+        try {
+          await db.prepare(`
+            INSERT INTO referral_rewards (user_id, from_user_id, level, amount, coin_type, reward_date, paid_date, ref_id, created_at)
+            VALUES (?, ?, 2, ?, 'QKEY', ?, ?, ?, datetime('now'))
+          `).bind(p.l2.user_id, uid, p.l2.qkey, TARGET_DATE, PAID_DATE, refIdL2).run()
+        } catch(e) {}
+
+        actualL2Qkey += p.l2.qkey
+        inserted.push({ staking_id: sid, user_id: p.l2.user_id, type: 'L2', qkey: p.l2.qkey, from_user_id: uid })
+      } else if (p.l2) {
+        skipped.push({ staking_id: sid, user_id: p.l2.user_id, type: 'L2', reason: 'transactions_ref_id_exists' })
+      }
+    }
+
+    // 사후 검증 — 각 staking 의 5/12 daily_rewards 행 + 본인 잔액 + L1/L2 잔액
+    const afterCheck: any[] = []
+    for (const sid of TARGET_STAKINGS) {
+      const dr = await db.prepare(`SELECT id, user_id, usdt_amount FROM daily_rewards WHERE staking_id = ? AND reward_date = ?`).bind(sid, TARGET_DATE).first() as any
+      if (dr) {
+        const u = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(dr.user_id).first() as any
+        afterCheck.push({ staking_id: sid, user_id: dr.user_id, paid_5_12_qkey: dr.usdt_amount, qkey_balance_after: u?.qkey_balance })
+      } else {
+        afterCheck.push({ staking_id: sid, status: 'STILL_MISSING' })
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      target_date: TARGET_DATE,
+      target_stakings_count: TARGET_STAKINGS.length,
+      inserted_count: inserted.length,
+      skipped_count: skipped.length,
+      sums: {
+        self_qkey_inserted: actualSelfQkey,
+        l1_qkey_inserted: actualL1Qkey,
+        l2_qkey_inserted: actualL2Qkey,
+        grand_total_qkey: actualSelfQkey + actualL1Qkey + actualL2Qkey,
+      },
+      inserted,
+      skipped,
+      after_check: afterCheck,
+    })
+  } catch (error: any) {
+    console.error('fix-holiday-entrant-512-daily-ALL27 error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/fix-512-s97-self-orphan
 // ----------------------------------------------------
 // s#97 방승훈 (u#33) 5/12 self 데일리 부분 INSERT 보정:
