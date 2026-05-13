@@ -27447,6 +27447,337 @@ app.get('/api/diag/solbat-l1l2-precision-audit', async (c) => {
 })
 
 // ============================================================
+// /api/diag/may13-multi-staking-backfill  (2026-05-13, 영구 룰 기준 EXEC)
+// ------------------------------------------------------------
+// 사장님 결재: 6명 multi-staking referee 매칭 누락 보정 (영구 룰 기준)
+// 5/13 cron 이 H plan 적용 전이라 다중-staking referee 의 일부 staking 누락
+// G2-B 패턴 그대로 — 4중 가드 + staking_id 명시
+//
+// 대상:
+//   - asd135799 (u#57) 5/13 L1 -150
+//   - aafhka (u#54) 5/13 L1 -150
+//   - naim197059 (u#49) 5/13 L2 -75
+//   - naim1970 (u#48) 5/13 L1 -150
+//   - bigbang (u#41) 5/13 L1 -150
+//   - lucky4492 (u#69) 5/13 L2 -225
+//   - lucky4492 (u#69) 5/12 L2 -225 (만성 누락)
+//
+// 동작:
+//   - DRY_RUN (default): 영구 룰 기준 누락 staking 정확 식별
+//   - ?confirm=GO: safeInsertTransaction + referral_rewards 원장 INSERT
+// ============================================================
+app.get('/api/diag/may13-multi-staking-backfill', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+
+    // G2-B 영구 인프라 idempotent ALTER
+    let stakingIdColAdded = false
+    let stakingIdColExisted = false
+    try {
+      const pragmaRes = await db.prepare(`PRAGMA table_info(referral_rewards)`).all()
+      const cols = ((pragmaRes.results as any[]) || []).map((r: any) => r.name)
+      stakingIdColExisted = cols.includes('staking_id')
+      if (!stakingIdColExisted) {
+        await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN staking_id INTEGER`).run()
+        try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_referral_rewards_staking_id ON referral_rewards(staking_id)`).run() } catch {}
+        try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_referral_rewards_composite ON referral_rewards(referrer_id, referee_id, level, staking_id, reward_date)`).run() } catch {}
+        stakingIdColAdded = true
+      }
+    } catch (e: any) {
+      console.error('may13 ALTER 실패 (계속):', e?.message)
+    }
+
+    // 영구 룰 기준 6명 7건 보정 spec (audit 로 검증된 영구 룰 정답)
+    // 각 entry: 보정 대상 user(referrer) 와 reward_date, 그리고 그 트리에서 누락된 referee+level 식별
+    type FixTarget = {
+      referrer_id: number
+      referrer_email: string
+      reward_date: string  // 5/13 또는 5/12
+      level: 1 | 2
+      expected_amount: number  // 영구 룰 audit 으로 확인된 미지급액
+    }
+    const FIX_TARGETS: FixTarget[] = [
+      // 5/13 5명 (L1=20%, L2=10% 영구 룰)
+      { referrer_id: 57, referrer_email: 'asd135799',  reward_date: '2026-05-13', level: 1, expected_amount: 150 },
+      { referrer_id: 54, referrer_email: 'aafhka',     reward_date: '2026-05-13', level: 1, expected_amount: 150 },
+      { referrer_id: 49, referrer_email: 'naim197059', reward_date: '2026-05-13', level: 2, expected_amount: 75 },
+      { referrer_id: 48, referrer_email: 'naim1970',   reward_date: '2026-05-13', level: 1, expected_amount: 150 },
+      { referrer_id: 41, referrer_email: 'bigbang',    reward_date: '2026-05-13', level: 1, expected_amount: 150 },
+      // lucky4492 5/13 L2 + 5/12 L2 (만성 -225)
+      { referrer_id: 69, referrer_email: 'lucky4492',  reward_date: '2026-05-13', level: 2, expected_amount: 225 },
+      { referrer_id: 69, referrer_email: 'lucky4492',  reward_date: '2026-05-12', level: 2, expected_amount: 225 },
+    ]
+
+    // STEP 1: 각 보정 대상별로 누락 staking 정확 식별 (G2-B 2-pass)
+    const preflight: any[] = []
+    let allValid = true
+    let preflightTotalExpected = 0
+
+    for (const t of FIX_TARGETS) {
+      const ratio = t.level === 1 ? 0.20 : 0.10
+
+      // referrer 본인 잔액
+      const referrer = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id = ?`).bind(t.referrer_id).first() as any
+      if (!referrer) {
+        preflight.push({ ...t, error: 'referrer not found' })
+        allValid = false
+        continue
+      }
+
+      // referrer 의 referee 명단 (level=1 이면 직접 referee, level=2 이면 L1 의 referee = L2)
+      let refereesRes: any
+      if (t.level === 1) {
+        refereesRes = await db.prepare(`
+          SELECT id, name, email FROM users WHERE referrer_id = ? ORDER BY id ASC
+        `).bind(t.referrer_id).all()
+      } else {
+        // L2: referrer 의 L1 들의 referee (즉 L2)
+        refereesRes = await db.prepare(`
+          SELECT u.id, u.name, u.email FROM users u
+          JOIN users l1 ON u.referrer_id = l1.id
+          WHERE l1.referrer_id = ?
+          ORDER BY u.id ASC
+        `).bind(t.referrer_id).all()
+      }
+      const referees = (refereesRes.results as any[]) || []
+
+      // 각 referee 의 누락 staking 식별 (G2-B 2-pass per referee)
+      const refereeFixes: any[] = []
+      let totalMissingSum = 0
+
+      for (const ref of referees) {
+        // referee 의 active staking 들
+        const stakesRes = await db.prepare(`
+          SELECT id, amount, daily_rate,
+                 date(datetime(start_date, '+9 hours')) AS start_kst_date
+          FROM staking WHERE user_id = ? AND status = 'active'
+          ORDER BY id ASC
+        `).bind(ref.id).all()
+        const stakes = ((stakesRes.results as any[]) || []).map((s: any) => ({
+          staking_id: Number(s.id),
+          amount: Number(s.amount),
+          daily_rate: Number(s.daily_rate),
+          start_kst_date: s.start_kst_date,
+          self_daily_qkey: Math.round(Number(s.amount) * Number(s.daily_rate) * 150),
+        }))
+
+        // 해당 referee + reward_date 의 ledger 행 조회
+        const ledgerRes = await db.prepare(`
+          SELECT id, original_amount, reward_amount, reward_date, paid_date, created_at, staking_id
+          FROM referral_rewards
+          WHERE referrer_id = ? AND referee_id = ? AND level = ?
+            AND (reward_date = ? OR paid_date = ?
+                 OR date(datetime(created_at, '+9 hours')) = ?)
+          ORDER BY id ASC
+        `).bind(t.referrer_id, ref.id, t.level, t.reward_date, t.reward_date, t.reward_date).all()
+        const ledgerRows = (ledgerRes.results as any[]) || []
+
+        // Pass 1: ledger.staking_id NOT NULL 매칭
+        const processedStakingIds = new Set<number>()
+        for (const lr of ledgerRows) {
+          if (lr.staking_id != null) processedStakingIds.add(Number(lr.staking_id))
+        }
+        // Pass 2: legacy NULL row 차감 (original_amount 기준)
+        const remainingStakes = stakes.filter((s: any) => !processedStakingIds.has(s.staking_id))
+        const legacyOriginalCounts: Record<number, number> = {}
+        for (const lr of ledgerRows) {
+          if (lr.staking_id == null) {
+            const orig = Number(lr.original_amount)
+            legacyOriginalCounts[orig] = (legacyOriginalCounts[orig] || 0) + 1
+          }
+        }
+        const missingStakes: any[] = []
+        for (const s of remainingStakes) {
+          const orig = s.self_daily_qkey
+          if ((legacyOriginalCounts[orig] || 0) > 0) {
+            legacyOriginalCounts[orig]--
+            continue
+          }
+          missingStakes.push(s)
+        }
+
+        // 이 referee 의 누락 매칭 합 = Σ (missing.self_daily_qkey × ratio)
+        const refMissingSum = missingStakes.reduce(
+          (sum, s) => sum + Math.round(s.self_daily_qkey * ratio), 0
+        )
+        totalMissingSum += refMissingSum
+
+        if (missingStakes.length > 0) {
+          refereeFixes.push({
+            referee_id: ref.id,
+            referee_name: ref.name,
+            referee_email: ref.email,
+            ledger_already_processed: ledgerRows.map((r: any) => ({
+              rr_id: r.id,
+              original_amount: r.original_amount,
+              reward_amount: r.reward_amount,
+              staking_id: r.staking_id,
+            })),
+            missing_stakes: missingStakes.map((s: any) => ({
+              staking_id: s.staking_id,
+              staking_amount: s.amount,
+              daily_rate: s.daily_rate,
+              self_daily_qkey: s.self_daily_qkey,
+              bonus_qkey: Math.round(s.self_daily_qkey * ratio),
+              ref_id: `bf_${t.reward_date.replace(/-/g,'')}_u${t.referrer_id}_l${t.level}_ref${ref.id}_s${s.staking_id}`,
+            })),
+            referee_missing_sum: refMissingSum,
+          })
+        }
+      }
+
+      const amountMatches = totalMissingSum === t.expected_amount
+
+      preflight.push({
+        referrer_id: t.referrer_id,
+        referrer_email: t.referrer_email,
+        referrer_name: referrer.name,
+        referrer_qkey_balance: referrer.qkey_balance,
+        reward_date: t.reward_date,
+        level: t.level,
+        ratio,
+        expected_amount: t.expected_amount,
+        total_missing_sum: totalMissingSum,
+        amount_matches_calculation: amountMatches,
+        referees_with_missing: refereeFixes,
+      })
+
+      if (!amountMatches) allValid = false
+      preflightTotalExpected += t.expected_amount
+    }
+
+    if (!isExec) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        targets_count: FIX_TARGETS.length,
+        g2b_schema: {
+          staking_id_col_existed_before: stakingIdColExisted,
+          staking_id_col_added_now: stakingIdColAdded,
+          status: (stakingIdColExisted || stakingIdColAdded) ? 'READY' : 'MISSING',
+        },
+        all_preflight_valid: allValid,
+        total_to_backfill: preflightTotalExpected,
+        preflight,
+        notes: [
+          '영구 룰: L1=20%, L2=10%, staking.daily_rate D1 직접 조회',
+          'G2-B: 4중 가드 (ref_id, broad EXISTS, refereeId+level, staking_id)',
+          '#bottom-up: leaf staking 별 정확 식별 후 부모 매칭 보정',
+          '#이중지급 절대 금지: ledger.staking_id NOT NULL Pass 1 + legacy NULL Pass 2',
+          'description: 추천 보너스 (Level 1/2) — 사용자 노출 안전 한국어',
+          '실제 백필하려면 ?confirm=GO 추가',
+        ]
+      })
+    }
+
+    if (!allValid) {
+      return c.json({
+        success: false,
+        mode: 'EXEC_BLOCKED',
+        error: '사전 검증 실패 — amount_matches_calculation false 가 있음. 백필 차단',
+        preflight,
+      }, 400)
+    }
+
+    // ====================== EXEC ======================
+    const inserted: any[] = []
+    const skipped: any[] = []
+    let actualSum = 0
+
+    for (const pf of preflight) {
+      const description = pf.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+      for (const rfx of pf.referees_with_missing as any[]) {
+        for (const spec of rfx.missing_stakes as any[]) {
+          try {
+            const res = await safeInsertTransaction(db, {
+              user_id: pf.referrer_id,
+              type: 'referral_reward',
+              coin_type: 'QKEY',
+              amount: spec.bonus_qkey,
+              description,
+              ref_id: spec.ref_id,
+              kst_date: pf.reward_date,
+              updateBalance: true,
+              refereeId: rfx.referee_id,
+              level: pf.level,
+              stakingOriginalAmount: spec.self_daily_qkey,
+              stakingId: spec.staking_id,
+            })
+            // referral_rewards 원장 INSERT (staking_id 명시)
+            try {
+              await db.prepare(`
+                INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at, staking_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+              `).bind(
+                pf.referrer_id, rfx.referee_id, pf.level,
+                spec.self_daily_qkey, spec.bonus_qkey,
+                pf.reward_date, pf.reward_date,
+                spec.staking_id,
+              ).run()
+            } catch (rrErr: any) {
+              console.error('referral_rewards INSERT 실패 (tx 성공):', rrErr?.message)
+            }
+            actualSum += spec.bonus_qkey
+            inserted.push({
+              referrer_id: pf.referrer_id, referrer_email: pf.referrer_email,
+              referee_id: rfx.referee_id, referee_name: rfx.referee_name,
+              level: pf.level, reward_date: pf.reward_date,
+              amount: spec.bonus_qkey,
+              staking_id: spec.staking_id,
+              original_amount: spec.self_daily_qkey,
+              tx_id: (res as any).tx_id, ref_id: spec.ref_id,
+            })
+          } catch (err: any) {
+            skipped.push({
+              referrer_id: pf.referrer_id, referrer_email: pf.referrer_email,
+              referee_id: rfx.referee_id, referee_name: rfx.referee_name,
+              level: pf.level, reward_date: pf.reward_date,
+              amount: spec.bonus_qkey,
+              staking_id: spec.staking_id,
+              reason: err?.code || 'unknown',
+              message: err?.message,
+              match_reason: err?.match_reason,
+            })
+          }
+        }
+      }
+    }
+
+    // 6명 잔액 재조회
+    const afterBalances: any[] = []
+    for (const uid of [57, 54, 49, 48, 41, 69]) {
+      const u = await db.prepare(`SELECT id, email, qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+      afterBalances.push(u)
+    }
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      g2b_schema: {
+        staking_id_col_existed_before: stakingIdColExisted,
+        staking_id_col_added_now: stakingIdColAdded,
+      },
+      total_expected: preflightTotalExpected,
+      actual_backfill_sum: actualSum,
+      inserted_count: inserted.length,
+      skipped_count: skipped.length,
+      inserted,
+      skipped,
+      balances_after: afterBalances,
+      note: '영구 룰 기준 (L1=20%, L2=10%) 6명 multi-staking 누락 보정. cron H plan 적용 후 신규 row 100% 정확 식별.',
+    })
+  } catch (error: any) {
+    console.error('may13-multi-staking-backfill error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
+// ============================================================
 // /api/diag/user-l1l2-precision-audit  (2026-05-13, generic read-only)
 // ------------------------------------------------------------
 // 사장님 명시 영구 룰 (L1=20%, L2=10%, staking.daily_rate D1 직접 조회) 기준
