@@ -28012,4 +28012,324 @@ app.get('/api/diag/user-l1l2-precision-audit', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/lucky4492-permanent-rule-correction  (2026-05-13)
+// ------------------------------------------------------------
+// 사장님 명령: "lucky4492 도 영구 룰 기준으로 실행하라!"
+//
+// 영구 룰 정밀 분석 결과 (D1 직접 조회):
+//   L2 referee 8명: 71,72,75,78,79,80,83 (모두 5/6 start) + 88 (5/12 start)
+//   L1 referee 1명: 70 박원태 s82 (5/6 start, 7000 × 0.7%)
+//
+//   일자별 영구 룰 expected vs actual:
+//     5/6 reward → 5/7 paid: L1 1470 + L2 1125 (7명) = 2595 ✅ MATCH
+//     5/7 reward → 5/8 paid: L1 1470 + L2 1125 (7명) = 2595
+//                             → 정상 cron tx (2636~2657, ref_id 650~671) 발생 후
+//                                10:57 에 8건 중복 백필 (NULL ref_id) → +2,595 OVER 🔴
+//     5/10 reward → 5/11 paid: L1 1470 + L2 1125 (7명) = 2595
+//                             → tx 만 존재 (2189~2220, NULL ref_id), ledger 누락 ⚠️
+//     5/11 reward → 5/12 paid: 2595 ✅ MATCH
+//     5/12 reward → 5/13 paid: L1 1470 + L2 1350 (8명, +88 신규) = 2820 ✅ MATCH
+//
+// 보정 액션 (영구 룰 기준):
+//   A) 5/8 DOUBLE PAYMENT 환수: tx 8건 reversal (-2,595 QKEY)
+//      대상 tx_id: 1979, 1983, 1986, 1992, 2001, 2004, 2007, 2010 (NULL ref_id, KST 10:57)
+//      방법: type='admin_adjustment', amount=-금액, 잔액 차감
+//      description: '보정 환수 (5/8 이중지급 정정) - 영구 룰'
+//   B) 5/11 ledger backfill: referral_rewards 8건 INSERT (QKEY 변동 없음, audit 트레이서빌리티만)
+//      각 tx 와 동일한 amount/level 로 reward_date=2026-05-10, paid_date=2026-05-11
+//      staking_id 명시 (영구 인프라 G2-B)
+//
+// 동작:
+//   - DRY_RUN (default): 환수/백필 대상 정확 식별 + 사전검증
+//   - ?confirm=GO: 실제 EXEC
+// ============================================================
+app.get('/api/diag/lucky4492-permanent-rule-correction', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: '관리자 인증이 필요합니다' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'GO'
+
+  try {
+    const db = c.env.DB
+    const TARGET_USER_ID = 69  // lucky4492 (김연심2)
+    const TARGET_EMAIL = 'lucky4492'
+
+    // 영구 인프라 idempotent ALTER
+    let stakingIdColAdded = false
+    let stakingIdColExisted = false
+    try {
+      const pragmaRes = await db.prepare(`PRAGMA table_info(referral_rewards)`).all()
+      const cols = ((pragmaRes.results as any[]) || []).map((r: any) => r.name)
+      stakingIdColExisted = cols.includes('staking_id')
+      if (!stakingIdColExisted) {
+        await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN staking_id INTEGER`).run()
+        try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_referral_rewards_staking_id ON referral_rewards(staking_id)`).run() } catch {}
+        try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_referral_rewards_composite ON referral_rewards(referrer_id, referee_id, level, staking_id, reward_date)`).run() } catch {}
+        stakingIdColAdded = true
+      }
+    } catch (e: any) {
+      console.error('lucky4492 ALTER 실패 (계속):', e?.message)
+    }
+
+    // ====================== 사전 검증 ======================
+    const user = await db.prepare(
+      `SELECT id, email, name, qkey_balance FROM users WHERE id = ?`
+    ).bind(TARGET_USER_ID).first() as any
+    if (!user) return c.json({ error: 'lucky4492 (u#69) not found' }, 404)
+    if (user.email !== TARGET_EMAIL) {
+      return c.json({ error: `email mismatch: expected=${TARGET_EMAIL} actual=${user.email}` }, 400)
+    }
+
+    // ====================== ACTION A: 5/8 DOUBLE PAYMENT 환수 ======================
+    // 8건 tx_id: 1979, 1983, 1986, 1992, 2001, 2004, 2007, 2010
+    const DUP_TX_IDS = [1979, 1983, 1986, 1992, 2001, 2004, 2007, 2010]
+    const dupTxs: any[] = []
+    for (const tid of DUP_TX_IDS) {
+      const row = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, description, ref_id,
+               datetime(created_at, '+9 hours') AS created_at_kst
+        FROM transactions WHERE id = ?
+      `).bind(tid).first() as any
+      dupTxs.push(row)
+    }
+    // 사전 검증: 모두 user_id=69, type=referral_reward, ref_id=NULL, KST 2026-05-08
+    const dupValidation = dupTxs.map((t: any) => ({
+      tx_id: t?.id,
+      ok: t && Number(t.user_id) === TARGET_USER_ID
+          && t.type === 'referral_reward'
+          && t.coin_type === 'QKEY'
+          && (t.ref_id === null || t.ref_id === undefined)
+          && String(t.created_at_kst || '').startsWith('2026-05-08'),
+      user_id: t?.user_id,
+      type: t?.type,
+      amount: t?.amount,
+      ref_id: t?.ref_id,
+      created_at_kst: t?.created_at_kst,
+    }))
+    const dupAllOk = dupValidation.every(v => v.ok)
+    const dupTotal = dupTxs.reduce((s, t) => s + Number(t?.amount || 0), 0)
+    const dupExpectedTotal = 2595  // 영구 룰 expected
+
+    // 이미 환수된 적 있는지 가드 (ref_id 패턴)
+    const reversalRefIdPattern = 'rev_508_dup_u69_tx'
+    const existingReversalRes = await db.prepare(`
+      SELECT id, ref_id, amount FROM transactions
+      WHERE user_id = ? AND type = 'admin_adjustment'
+        AND ref_id LIKE ?
+    `).bind(TARGET_USER_ID, reversalRefIdPattern + '%').all()
+    const existingReversals = (existingReversalRes.results as any[]) || []
+    const alreadyReversed = existingReversals.length > 0
+
+    // ====================== ACTION B: 5/11 ledger backfill ======================
+    // 8건 tx_id: 2189(L1 1470), 2193(75), 2196(150), 2202(150), 2211(75), 2214(75), 2217(525), 2220(75)
+    // reward_date=2026-05-10, paid_date=2026-05-11
+    // mapping (영구 룰 기준):
+    const LEDGER_BF_TX = [
+      { tx_id: 2189, level: 1, amount: 1470, referee_id: 70, staking_id: 82, original_amount: 7350 },  // 7000*0.007*150=7350
+      { tx_id: 2193, level: 2, amount: 75,   referee_id: 71, staking_id: 87, original_amount: 750 },   // 1000*0.005*150=750
+      { tx_id: 2196, level: 2, amount: 150,  referee_id: 72, staking_id: 78, original_amount: 1500 },  // 2000*0.005*150=1500
+      { tx_id: 2202, level: 2, amount: 150,  referee_id: 75, staking_id: 86, original_amount: 1500 },
+      { tx_id: 2211, level: 2, amount: 75,   referee_id: 78, staking_id: 85, original_amount: 750 },
+      { tx_id: 2214, level: 2, amount: 75,   referee_id: 79, staking_id: 83, original_amount: 750 },
+      { tx_id: 2217, level: 2, amount: 525,  referee_id: 80, staking_id: 79, original_amount: 5250 }, // 5000*0.007*150=5250
+      { tx_id: 2220, level: 2, amount: 75,   referee_id: 83, staking_id: 88, original_amount: 750 },
+    ]
+    const ledgerBfValidation: any[] = []
+    for (const m of LEDGER_BF_TX) {
+      const tx = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id,
+               datetime(created_at, '+9 hours') AS created_at_kst
+        FROM transactions WHERE id = ?
+      `).bind(m.tx_id).first() as any
+      // 기존 ledger row 가 이미 있는지 가드
+      const existingLedger = await db.prepare(`
+        SELECT id FROM referral_rewards
+        WHERE referrer_id = ? AND referee_id = ? AND level = ?
+          AND reward_date = '2026-05-10'
+      `).bind(TARGET_USER_ID, m.referee_id, m.level).first()
+      ledgerBfValidation.push({
+        ...m,
+        tx_user_id: tx?.user_id,
+        tx_amount: tx?.amount,
+        tx_ref_id: tx?.ref_id,
+        tx_created_at_kst: tx?.created_at_kst,
+        tx_amount_match: Number(tx?.amount || 0) === m.amount,
+        tx_user_match: Number(tx?.user_id || 0) === TARGET_USER_ID,
+        tx_kst_match: String(tx?.created_at_kst || '').startsWith('2026-05-11'),
+        ledger_already_exists: !!existingLedger,
+      })
+    }
+    const ledgerBfAllOk = ledgerBfValidation.every(v =>
+      v.tx_amount_match && v.tx_user_match && v.tx_kst_match && !v.ledger_already_exists
+    )
+
+    // ====================== DRY_RUN 반환 ======================
+    if (!isExec) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance },
+        g2b_schema: {
+          staking_id_col_existed_before: stakingIdColExisted,
+          staking_id_col_added_now: stakingIdColAdded,
+        },
+        action_A_dup_reversal: {
+          target_tx_ids: DUP_TX_IDS,
+          dup_total_qkey: dupTotal,
+          expected_total_qkey: dupExpectedTotal,
+          total_matches: dupTotal === dupExpectedTotal,
+          all_tx_validation_ok: dupAllOk,
+          already_reversed: alreadyReversed,
+          existing_reversal_count: existingReversals.length,
+          existing_reversals: existingReversals,
+          tx_details: dupValidation,
+          balance_after_reversal: user.qkey_balance - dupTotal,
+          ready: dupAllOk && dupTotal === dupExpectedTotal && !alreadyReversed,
+        },
+        action_B_ledger_backfill: {
+          target_count: LEDGER_BF_TX.length,
+          target_total_qkey: LEDGER_BF_TX.reduce((s, m) => s + m.amount, 0),
+          all_validation_ok: ledgerBfAllOk,
+          balance_no_change: true,
+          mappings: ledgerBfValidation,
+          ready: ledgerBfAllOk,
+        },
+        permanent_rule_summary: {
+          rule_l1: '20% (referee daily × 0.20)',
+          rule_l2: '10% (referee daily × 0.10)',
+          rule_data_source: 'staking.daily_rate D1 직접 조회',
+          rule_double_payment: '절대 금지 — 5/8 위반 발견 → 환수',
+          rule_bottom_up: 'leaf staking 별 4중 가드 (ref_id, broad EXISTS, refereeId+level, staking_id)',
+          rule_holiday_protection: '휴일 진입자 보호 — 5/12 referee=88 신규 진입 인정',
+        },
+        notes: [
+          '영구 룰 기준 분석 완료 — lucky4492 위반 = 1건 (5/8 +2595 OVER)',
+          '5/11 tx 는 금액 정당, ledger만 누락 → backfill 로 audit 트레이서빌리티 회복',
+          '실제 EXEC 하려면 ?confirm=GO 추가',
+        ],
+      })
+    }
+
+    // ====================== EXEC GATE ======================
+    if (alreadyReversed) {
+      return c.json({
+        success: false,
+        mode: 'EXEC_BLOCKED',
+        error: '5/8 환수 이미 적용됨 — 이중 환수 차단',
+        existing_reversals: existingReversals,
+      }, 400)
+    }
+    if (!dupAllOk || dupTotal !== dupExpectedTotal) {
+      return c.json({
+        success: false,
+        mode: 'EXEC_BLOCKED',
+        error: 'Action A 사전 검증 실패',
+        validation: dupValidation,
+        dup_total: dupTotal,
+        expected: dupExpectedTotal,
+      }, 400)
+    }
+    if (!ledgerBfAllOk) {
+      return c.json({
+        success: false,
+        mode: 'EXEC_BLOCKED',
+        error: 'Action B 사전 검증 실패',
+        validation: ledgerBfValidation,
+      }, 400)
+    }
+
+    // ====================== ACTION A EXEC: 5/8 환수 ======================
+    // 8건 reversal — type='admin_adjustment', amount=-<원금>, ref_id 고정 패턴
+    const reversalResults: any[] = []
+    for (let i = 0; i < dupTxs.length; i++) {
+      const t = dupTxs[i]
+      const revRefId = `${reversalRefIdPattern}${t.id}`
+      // ref_id 가드 (이중 환수 방지)
+      const exist = await db.prepare(`SELECT id FROM transactions WHERE ref_id = ?`).bind(revRefId).first()
+      if (exist) {
+        reversalResults.push({ tx_id: t.id, skipped: 'ref_id exists', ref_id: revRefId })
+        continue
+      }
+      const res = await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'admin_adjustment', 'QKEY', ?, ?, ?)
+      `).bind(
+        TARGET_USER_ID,
+        -Number(t.amount),
+        `보정 환수 (5/8 이중지급 정정) - 영구 룰 #이중지급 절대 금지`,
+        revRefId,
+      ).run()
+      await db.prepare(
+        `UPDATE users SET qkey_balance = COALESCE(qkey_balance,0) - ? WHERE id = ?`
+      ).bind(Number(t.amount), TARGET_USER_ID).run()
+      reversalResults.push({
+        original_tx_id: t.id,
+        original_amount: t.amount,
+        reversal_tx_id: Number(res.meta?.last_row_id || 0),
+        reversal_amount: -Number(t.amount),
+        ref_id: revRefId,
+      })
+    }
+    const reversalSum = reversalResults.reduce((s, r: any) => s + Number(r.reversal_amount || 0), 0)
+
+    // ====================== ACTION B EXEC: 5/11 ledger backfill ======================
+    const ledgerInserted: any[] = []
+    for (const m of LEDGER_BF_TX) {
+      try {
+        await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at, staking_id)
+          VALUES (?, ?, ?, ?, ?, '2026-05-10', '2026-05-11', datetime('now'), ?)
+        `).bind(
+          TARGET_USER_ID, m.referee_id, m.level,
+          m.original_amount, m.amount,
+          m.staking_id,
+        ).run()
+        ledgerInserted.push({
+          referee_id: m.referee_id, level: m.level,
+          amount: m.amount, original_amount: m.original_amount,
+          staking_id: m.staking_id,
+          linked_tx_id: m.tx_id,
+        })
+      } catch (e: any) {
+        ledgerInserted.push({ ...m, error: e?.message })
+      }
+    }
+
+    // 최종 잔액 재조회
+    const afterUser = await db.prepare(
+      `SELECT id, email, qkey_balance FROM users WHERE id = ?`
+    ).bind(TARGET_USER_ID).first()
+
+    return c.json({
+      success: true,
+      mode: 'EXEC',
+      user_before: { qkey_balance: user.qkey_balance },
+      user_after: afterUser,
+      action_A_reversal: {
+        target_count: DUP_TX_IDS.length,
+        reversal_count: reversalResults.length,
+        reversal_sum_qkey: reversalSum,  // 음수
+        absolute_recovered: Math.abs(reversalSum),
+        details: reversalResults,
+      },
+      action_B_ledger_backfill: {
+        inserted_count: ledgerInserted.length,
+        inserted_sum_qkey: ledgerInserted.reduce((s, r: any) => s + Number(r.amount || 0), 0),
+        details: ledgerInserted,
+      },
+      permanent_rule_compliance: {
+        l1_pct: '20%',
+        l2_pct: '10%',
+        double_payment: '5/8 환수 완료 — 영구 룰 #이중지급 절대 금지 회복',
+        ledger_tracability: '5/11 referral_rewards 8 rows 백필 완료',
+      },
+      note: 'lucky4492 영구 룰 기준 보정 완료. balance 음수 = 환수, ledger = audit 트레이서빌리티 회복 (QKEY 변동 없음)',
+    })
+  } catch (error: any) {
+    console.error('lucky4492-permanent-rule-correction error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
 export default app
