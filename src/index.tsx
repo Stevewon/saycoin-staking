@@ -4492,6 +4492,11 @@ app.post('/api/rewards/daily', async (c) => {
     // paid_date 컬럼 보장 (없으면 추가)
     try { await db.prepare(`ALTER TABLE daily_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
     try { await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN paid_date TEXT`).run() } catch(e) {}
+    // H plan (2026-05-13) — referral_rewards.staking_id 컬럼 보장 (G2-B 영구 인프라)
+    //   기존 row 는 NULL (legacy), 신규 row 부터 staking_id 명시 의무
+    //   cron 의 referee 다중 staking 매칭 결함 영구 해결
+    try { await db.prepare(`ALTER TABLE referral_rewards ADD COLUMN staking_id INTEGER`).run() } catch(e) {}
+    try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_referral_rewards_staking_id ON referral_rewards(staking_id)`).run() } catch(e) {}
 
     // ★ 사장님 룰 (2026-05-07 명확화) ★
     //   기준일 = yesterdayKst (어제 KST 00:00:00 ~ 23:59:59 의 24시간 윈도우 매출 전체 포함)
@@ -4724,11 +4729,15 @@ app.post('/api/rewards/daily', async (c) => {
               `).bind(level1Referrer.referrer_id, accrualDate, accrualDate).first()
 
               if (level1Active) {
-                // 1대 중복 체크
+                // ★ H plan (2026-05-13) ★ — staking_id 인식 중복 가드
+                //   기존: (referrer, referee, level, reward_date) 4-tuple 만 → referee 의 첫 staking 만 처리 (결함)
+                //   변경: staking_id 까지 5-tuple 정확 매칭 → referee 의 N 개 staking 모두 처리
+                //   legacy NULL 호환: staking_id IS NULL + original_amount 같으면 SKIP (이중지급 방지)
                 const l1Exists = await db.prepare(`
                   SELECT COUNT(*) as count FROM referral_rewards
                   WHERE referrer_id = ? AND referee_id = ? AND level = 1 AND reward_date = ?
-                `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate).first()
+                    AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+                `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate, staking.staking_id, qkeyAmount).first()
 
                 if (l1Exists.count === 0) {
                   let level1Reward = Math.round(qkeyAmount * 0.20)
@@ -4748,10 +4757,11 @@ app.post('/api/rewards/daily', async (c) => {
                       `).bind(level1Reward, level1Referrer.referrer_id).run()
 
                       // [패치 2026-05-11] ref_id 1:1 매핑 — referral_rewards 먼저 INSERT 후 last_row_id 캡처
+                      // H plan (2026-05-13): staking_id 명시 INSERT (G2-B 영구 인프라 활용)
                       const rrL1Ins = await db.prepare(`
-                        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                        VALUES (?, ?, 1, ?, ?, ?, ?)
-                      `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today).run()
+                        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+                        VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                      `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today, staking.staking_id).run()
                       const rrL1Id = (rrL1Ins as any)?.meta?.last_row_id ?? null
 
                       // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
@@ -4786,10 +4796,15 @@ app.post('/api/rewards/daily', async (c) => {
                   `).bind(level2Referrer.referrer_id, accrualDate, accrualDate).first()
 
                   if (level2Active) {
+                    // ★ H plan (2026-05-13) ★ — staking_id 인식 중복 가드 (L2)
+                    //   기존: (referrer, referee, level, reward_date) 4-tuple 만 → referee 의 첫 staking 만 처리 (결함)
+                    //   변경: staking_id 까지 5-tuple 정확 매칭 → referee 의 N 개 staking 모두 처리
+                    //   legacy NULL 호환: staking_id IS NULL + original_amount 같으면 SKIP (이중지급 방지)
                     const l2Exists = await db.prepare(`
                       SELECT COUNT(*) as count FROM referral_rewards
                       WHERE referrer_id = ? AND referee_id = ? AND level = 2 AND reward_date = ?
-                    `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate).first()
+                        AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+                    `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate, staking.staking_id, qkeyAmount).first()
 
                     if (l2Exists.count === 0) {
                       let level2Reward = Math.round(qkeyAmount * 0.10)
@@ -4808,10 +4823,11 @@ app.post('/api/rewards/daily', async (c) => {
                           `).bind(level2Reward, level2Referrer.referrer_id).run()
 
                           // [패치 2026-05-11] ref_id 1:1 매핑 — referral_rewards 먼저 INSERT 후 last_row_id 캡처
+                          // H plan (2026-05-13): staking_id 명시 INSERT (G2-B 영구 인프라 활용)
                           const rrL2Ins = await db.prepare(`
-                            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                            VALUES (?, ?, 2, ?, ?, ?, ?)
-                          `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today).run()
+                            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+                            VALUES (?, ?, 2, ?, ?, ?, ?, ?)
+                          `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today, staking.staking_id).run()
                           const rrL2Id = (rrL2Ins as any)?.meta?.last_row_id ?? null
 
                           // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
@@ -5686,6 +5702,7 @@ app.post('/api/rewards/daily-v2', async (c) => {
         const childUid = ins.user_id
         const childOwn = ins.qkey_amount
         const accrualDate = ins.reward_date
+        const childStakingId = ins.staking_id  // H plan (2026-05-13) — staking_id 컨텍스트
         if (childOwn <= 0) continue
 
         const parentId = referrerOf.get(childUid)
@@ -5699,10 +5716,13 @@ app.post('/api/rewards/daily-v2', async (c) => {
           `).bind(parentId, accrualDate, accrualDate).first()
 
           if (parentActive) {
+            // ★ H plan (2026-05-13) ★ — staking_id 인식 중복 가드 (daily-v2 L1)
+            //   기존 4-tuple → 5-tuple (staking_id 추가) + legacy NULL 호환
             const l1Exists = await db.prepare(`
               SELECT COUNT(*) AS count FROM referral_rewards
               WHERE referrer_id = ? AND referee_id = ? AND level = 1 AND reward_date = ?
-            `).bind(parentId, childUid, accrualDate).first() as any
+                AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+            `).bind(parentId, childUid, accrualDate, childStakingId, childOwn).first() as any
             if (Number(l1Exists?.count || 0) === 0) {
               if (!isCapped(parentId)) {
                 let l1Reward = Math.round(childOwn * 0.20)
@@ -5710,10 +5730,11 @@ app.post('/api/rewards/daily-v2', async (c) => {
                 if (l1Reward > l1Remaining) l1Reward = Math.max(0, Math.floor(l1Remaining))
                 if (l1Reward > 0) {
                   await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(l1Reward, parentId).run()
+                  // H plan (2026-05-13): staking_id 명시 INSERT
                   const rrL1Ins = await db.prepare(`
-                    INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                    VALUES (?, ?, 1, ?, ?, ?, ?)
-                  `).bind(parentId, childUid, childOwn, l1Reward, accrualDate, today).run()
+                    INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                  `).bind(parentId, childUid, childOwn, l1Reward, accrualDate, today, childStakingId).run()
                   const rrL1Id = (rrL1Ins as any)?.meta?.last_row_id ?? null
                   const l1TxExists = await db.prepare(`
                     SELECT id FROM transactions WHERE type = 'referral_reward' AND ref_id = ? LIMIT 1
@@ -5746,10 +5767,12 @@ app.post('/api/rewards/daily-v2', async (c) => {
             `).bind(grandId, accrualDate, accrualDate).first()
 
             if (grandActive) {
+              // ★ H plan (2026-05-13) ★ — staking_id 인식 중복 가드 (daily-v2 L2)
               const l2Exists = await db.prepare(`
                 SELECT COUNT(*) AS count FROM referral_rewards
                 WHERE referrer_id = ? AND referee_id = ? AND level = 2 AND reward_date = ?
-              `).bind(grandId, childUid, accrualDate).first() as any
+                  AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+              `).bind(grandId, childUid, accrualDate, childStakingId, childOwn).first() as any
               if (Number(l2Exists?.count || 0) === 0) {
                 if (!isCapped(grandId)) {
                   let l2Reward = Math.round(childOwn * 0.10)
@@ -5757,10 +5780,11 @@ app.post('/api/rewards/daily-v2', async (c) => {
                   if (l2Reward > l2Remaining) l2Reward = Math.max(0, Math.floor(l2Remaining))
                   if (l2Reward > 0) {
                     await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(l2Reward, grandId).run()
+                    // H plan (2026-05-13): staking_id 명시 INSERT
                     const rrL2Ins = await db.prepare(`
-                      INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                      VALUES (?, ?, 2, ?, ?, ?, ?)
-                    `).bind(grandId, childUid, childOwn, l2Reward, accrualDate, today).run()
+                      INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+                      VALUES (?, ?, 2, ?, ?, ?, ?, ?)
+                    `).bind(grandId, childUid, childOwn, l2Reward, accrualDate, today, childStakingId).run()
                     const rrL2Id = (rrL2Ins as any)?.meta?.last_row_id ?? null
                     const l2TxExists = await db.prepare(`
                       SELECT id FROM transactions WHERE type = 'referral_reward' AND ref_id = ? LIMIT 1
@@ -6030,6 +6054,7 @@ app.post('/api/diag/exec-may11-rewards-safe', async (c) => {
         try {
           const childUid = ins.user_id
           const childOwn = ins.qkey_amount
+          const childStakingId = ins.staking_id  // H plan (2026-05-13) — staking_id 컨텍스트
           if (childOwn <= 0) continue
           const parentId = referrerOf.get(childUid)
           if (parentId == null) continue
@@ -6041,20 +6066,23 @@ app.post('/api/diag/exec-may11-rewards-safe', async (c) => {
             LIMIT 1
           `).bind(parentId, REWARD_DATE, REWARD_DATE).first()
           if (parentActive) {
+            // ★ H plan (2026-05-13) ★ — staking_id 인식 중복 가드 (daily-v2 phase4 L1)
             const l1Exists = await db.prepare(`
               SELECT COUNT(*) AS c FROM referral_rewards
               WHERE referrer_id=? AND referee_id=? AND level=1 AND reward_date=?
-            `).bind(parentId, childUid, REWARD_DATE).first() as any
+                AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+            `).bind(parentId, childUid, REWARD_DATE, childStakingId, childOwn).first() as any
             if (Number(l1Exists?.c || 0) === 0 && !isCapped(parentId)) {
               let l1 = Math.round(childOwn * 0.20)
               const rem = remainingOf(parentId)
               if (l1 > rem) l1 = Math.max(0, Math.floor(rem))
               if (l1 > 0) {
                 await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(l1, parentId).run()
+                // H plan (2026-05-13): staking_id 명시 INSERT
                 const rrIns = await db.prepare(`
-                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                  VALUES (?, ?, 1, ?, ?, ?, ?)
-                `).bind(parentId, childUid, childOwn, l1, REWARD_DATE, PAID_DATE).run()
+                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+                  VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                `).bind(parentId, childUid, childOwn, l1, REWARD_DATE, PAID_DATE, childStakingId).run()
                 const rrId = (rrIns as any)?.meta?.last_row_id ?? null
                 const txEx = await db.prepare(`SELECT id FROM transactions WHERE type='referral_reward' AND ref_id=? LIMIT 1`).bind(rrId).first()
                 if (!txEx) {
@@ -6078,20 +6106,23 @@ app.post('/api/diag/exec-may11-rewards-safe', async (c) => {
             LIMIT 1
           `).bind(grandId, REWARD_DATE, REWARD_DATE).first()
           if (grandActive) {
+            // ★ H plan (2026-05-13) ★ — staking_id 인식 중복 가드 (daily-v2 phase4 L2)
             const l2Exists = await db.prepare(`
               SELECT COUNT(*) AS c FROM referral_rewards
               WHERE referrer_id=? AND referee_id=? AND level=2 AND reward_date=?
-            `).bind(grandId, childUid, REWARD_DATE).first() as any
+                AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+            `).bind(grandId, childUid, REWARD_DATE, childStakingId, childOwn).first() as any
             if (Number(l2Exists?.c || 0) === 0 && !isCapped(grandId)) {
               let l2 = Math.round(childOwn * 0.10)
               const rem = remainingOf(grandId)
               if (l2 > rem) l2 = Math.max(0, Math.floor(rem))
               if (l2 > 0) {
                 await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(l2, grandId).run()
+                // H plan (2026-05-13): staking_id 명시 INSERT
                 const rrIns = await db.prepare(`
-                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
-                  VALUES (?, ?, 2, ?, ?, ?, ?)
-                `).bind(grandId, childUid, childOwn, l2, REWARD_DATE, PAID_DATE).run()
+                  INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+                  VALUES (?, ?, 2, ?, ?, ?, ?, ?)
+                `).bind(grandId, childUid, childOwn, l2, REWARD_DATE, PAID_DATE, childStakingId).run()
                 const rrId = (rrIns as any)?.meta?.last_row_id ?? null
                 const txEx = await db.prepare(`SELECT id FROM transactions WHERE type='referral_reward' AND ref_id=? LIMIT 1`).bind(rrId).first()
                 if (!txEx) {
