@@ -30758,4 +30758,149 @@ app.get('/api/diag/may15-simulate', async (c) => {
   }
 })
 
+// ============================================
+// 진단 — 스왑 거래내역 (qta_balance/qx_balance/qkey_balance 중 스왑으로 가감된 계정 보고)
+// 영구룰: 회사 정책상 최초 지갑 전송된 QTA/QX 수량 외에, 스왑(swap_in / swap_out)으로 잔액 변화가 발생한 계정 식별
+// 사용법: GET /api/diag/swap-balance-audit?password=...
+// 순수 read-only — INSERT/UPDATE 0건
+// ============================================
+app.get('/api/diag/swap-balance-audit', async (c) => {
+  try {
+    const password = c.req.query('password') || ''
+    if (password !== ADMIN_PW) return c.json({ error: 'Unauthorized' }, 401)
+    const db = c.env.DB
+
+    // STEP 1: 전 사용자 조회 (현재 잔액 4종)
+    const usersRes = await db.prepare(`
+      SELECT id, email, name, qta_balance, qx_balance, qkey_balance, usdt_balance
+      FROM users
+      ORDER BY id ASC
+    `).all<any>()
+    const users = usersRes.results || []
+
+    // STEP 2: 전 사용자 스왑 내역 일괄 집계 (transactions 테이블)
+    //   swap_in : 받은 코인 (+) — 양수로 저장
+    //   swap_out: 보낸 코인 (-) — 음수로 저장 (정합성 룰)
+    const swapRes = await db.prepare(`
+      SELECT user_id, type, coin_type, COALESCE(SUM(amount),0) as sum_amount, COUNT(*) as cnt
+      FROM transactions
+      WHERE type IN ('swap_in','swap_out')
+      GROUP BY user_id, type, coin_type
+    `).all<any>()
+
+    // user_id → coin_type → { in_sum, out_sum_abs, in_cnt, out_cnt }
+    const swapMap: Record<number, Record<string, { in_sum: number; out_sum: number; in_cnt: number; out_cnt: number }>> = {}
+    for (const r of (swapRes.results || [])) {
+      const uid = Number(r.user_id)
+      const coin = r.coin_type as string
+      if (!swapMap[uid]) swapMap[uid] = {}
+      if (!swapMap[uid][coin]) swapMap[uid][coin] = { in_sum: 0, out_sum: 0, in_cnt: 0, out_cnt: 0 }
+      if (r.type === 'swap_in') {
+        swapMap[uid][coin].in_sum = Number(r.sum_amount || 0)
+        swapMap[uid][coin].in_cnt = Number(r.cnt || 0)
+      } else {
+        // swap_out 은 음수로 저장됨 → 절대값
+        swapMap[uid][coin].out_sum = Math.abs(Number(r.sum_amount || 0))
+        swapMap[uid][coin].out_cnt = Number(r.cnt || 0)
+      }
+    }
+
+    // STEP 3: 각 사용자별 코인별 net 스왑 (in - out)
+    //   QTA, QX, QKEY, USDT 각각에 대해 net 계산
+    //   net > 0 → 스왑으로 잔액 증가 (그 만큼이 "스왑분" — 출금 가능 대상)
+    //   net < 0 → 스왑으로 잔액 감소 (QKEY 가 보통 음수)
+    const COINS = ['QTA', 'QX', 'QKEY', 'USDT']
+    const accountReport: any[] = []
+    for (const u of users) {
+      const uid = Number(u.id)
+      const sm = swapMap[uid] || {}
+      const hasSwap = COINS.some(c => sm[c] && ((sm[c].in_sum || 0) > 0 || (sm[c].out_sum || 0) > 0))
+      if (!hasSwap) continue  // 스왑 내역이 전혀 없는 계정 제외
+
+      const coinDetail: Record<string, any> = {}
+      for (const coin of COINS) {
+        const s = sm[coin] || { in_sum: 0, out_sum: 0, in_cnt: 0, out_cnt: 0 }
+        const net = s.in_sum - s.out_sum
+        if (s.in_sum === 0 && s.out_sum === 0) continue
+        coinDetail[coin] = {
+          swap_in_total: s.in_sum,
+          swap_in_count: s.in_cnt,
+          swap_out_total: s.out_sum,
+          swap_out_count: s.out_cnt,
+          net: net,  // (+)면 스왑으로 늘어난 분 / (-)면 스왑으로 줄어든 분
+        }
+      }
+
+      accountReport.push({
+        user_id: uid,
+        email: u.email || `u${uid}`,
+        name: u.name || '',
+        current_balance: {
+          QTA: Number(u.qta_balance || 0),
+          QX: Number(u.qx_balance || 0),
+          QKEY: Number(u.qkey_balance || 0),
+          USDT: Number(u.usdt_balance || 0),
+        },
+        swap_activity: coinDetail,
+        // 회사 최초 지급분 추정 = 현재 잔액 - 스왑 net
+        // (단, 데일리 배당으로 쌓인 QKEY 는 회사 최초 지급분이 아닌 매일 발생 → QKEY 는 별도 해석 필요)
+        estimated_company_initial: {
+          QTA: Number(u.qta_balance || 0) - ((coinDetail['QTA']?.net) || 0),
+          QX: Number(u.qx_balance || 0) - ((coinDetail['QX']?.net) || 0),
+        },
+        estimated_swap_only: {
+          QTA: (coinDetail['QTA']?.net) || 0,
+          QX: (coinDetail['QX']?.net) || 0,
+          USDT: (coinDetail['USDT']?.net) || 0,
+        },
+      })
+    }
+
+    // 정렬: QTA 또는 QX 스왑 net 절대값 큰 순
+    accountReport.sort((a, b) => {
+      const aSum = Math.abs(a.estimated_swap_only.QTA) + Math.abs(a.estimated_swap_only.QX) + Math.abs(a.estimated_swap_only.USDT)
+      const bSum = Math.abs(b.estimated_swap_only.QTA) + Math.abs(b.estimated_swap_only.QX) + Math.abs(b.estimated_swap_only.USDT)
+      return bSum - aSum
+    })
+
+    // 코인별 전체 합계
+    const totals = {
+      QTA: { swap_in: 0, swap_out: 0, net: 0 },
+      QX:  { swap_in: 0, swap_out: 0, net: 0 },
+      QKEY:{ swap_in: 0, swap_out: 0, net: 0 },
+      USDT:{ swap_in: 0, swap_out: 0, net: 0 },
+    }
+    for (const r of accountReport) {
+      for (const coin of COINS) {
+        const d = r.swap_activity[coin]
+        if (!d) continue
+        totals[coin as keyof typeof totals].swap_in += d.swap_in_total
+        totals[coin as keyof typeof totals].swap_out += d.swap_out_total
+        totals[coin as keyof typeof totals].net += d.net
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: 'READ_ONLY_DIAGNOSTIC',
+      title: '스왑으로 가감된 계정 전수 보고 (회사 최초 지급분 외 스왑 활동 식별)',
+      generated_at_kst: new Date(Date.now() + 9*3600*1000).toISOString().replace('T',' ').slice(0,19),
+      total_users: users.length,
+      users_with_swap_activity: accountReport.length,
+      coin_totals: totals,
+      accounts: accountReport,
+      legend: {
+        swap_in_total: '받은 누적 수량 (양수)',
+        swap_out_total: '보낸 누적 수량 (절대값)',
+        net: 'in - out (양수=스왑으로 늘어난 분 / 음수=스왑으로 줄어든 분)',
+        estimated_company_initial: '현재잔액 - 스왑net (= 회사 최초 지급분으로 추정, QTA/QX 만)',
+        estimated_swap_only: '스왑으로 가감된 net 만 (QTA/QX/USDT)',
+      },
+    })
+  } catch (error: any) {
+    console.error('swap-balance-audit error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
+  }
+})
+
 export default app
