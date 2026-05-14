@@ -30468,9 +30468,9 @@ app.get('/api/diag/may15-simulate', async (c) => {
     const userIds = Array.from(new Set((stakings.results || []).map((s: any) => s.user_id)))
     const userMap: Record<number, { username: string, name: string, qkey_balance: number, referrer_id: number | null }> = {}
     for (const uid of userIds) {
-      const u = await db.prepare(`SELECT id, username, name, qkey_balance, referrer_id FROM users WHERE id = ?`).bind(uid).first<any>()
+      const u = await db.prepare(`SELECT id, email, name, qkey_balance, referrer_id FROM users WHERE id = ?`).bind(uid).first<any>()
       if (u) userMap[u.id] = {
-        username: u.username,
+        username: u.email || `u${u.id}`,
         name: u.name || '',
         qkey_balance: Number(u.qkey_balance || 0),
         referrer_id: u.referrer_id,
