@@ -30455,8 +30455,7 @@ app.get('/api/diag/may15-simulate', async (c) => {
         s.daily_rate,
         date(s.start_date, '+9 hours') as start_kst,
         date(s.end_date, '+9 hours') as end_kst,
-        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
-        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count
       FROM staking s
       WHERE s.status = 'active'
         AND date(s.end_date, '+9 hours') >= ?
@@ -30464,12 +30463,11 @@ app.get('/api/diag/may15-simulate', async (c) => {
       ORDER BY s.user_id ASC, s.id ASC
     `).bind(REWARD_DATE, REWARD_DATE).all<any>()
 
-    // ========== STEP 2: 사용자 정보 + 현재 잔액 ==========
-    const userIds = Array.from(new Set((stakings.results || []).map((s: any) => s.user_id)))
+    // ========== STEP 2: 전 사용자 일괄 조회 (전체 referrer 체인 포함) ==========
     const userMap: Record<number, { username: string, name: string, qkey_balance: number, referrer_id: number | null }> = {}
-    for (const uid of userIds) {
-      const u = await db.prepare(`SELECT id, email, name, qkey_balance, referrer_id FROM users WHERE id = ?`).bind(uid).first<any>()
-      if (u) userMap[u.id] = {
+    const allUsersRes = await db.prepare(`SELECT id, email, name, qkey_balance, referrer_id FROM users`).all<any>()
+    for (const u of (allUsersRes.results || [])) {
+      userMap[u.id] = {
         username: u.email || `u${u.id}`,
         name: u.name || '',
         qkey_balance: Number(u.qkey_balance || 0),
@@ -30477,35 +30475,75 @@ app.get('/api/diag/may15-simulate', async (c) => {
       }
     }
 
-    // ========== STEP 3: 200% cap helper ==========
-    async function getCap(userId: number): Promise<{ capped: boolean; paidTotal: number; target: number; remaining: number }> {
-      const sR = await db.prepare(`SELECT COALESCE(SUM(amount),0) as total FROM staking WHERE user_id=? AND status IN ('active','completed','capped')`).bind(userId).first<any>()
-      const stakeTotal = Number(sR?.total || 0)
-      if (stakeTotal <= 0) return { capped: false, paidTotal: 0, target: 0, remaining: 0 }
-      const pR = await db.prepare(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=? AND coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')`).bind(userId).first<any>()
-      const paidTotal = Number(pR?.total || 0)
-      const target = stakeTotal * 2 * USD_TO_QKEY
-      return { capped: paidTotal >= target, paidTotal, target, remaining: Math.max(0, target - paidTotal) }
+    // ========== STEP 3: 200% cap 일괄 사전 계산 ==========
+    // user_id → stakeTotal (status active/completed/capped)
+    const stakeTotalMap: Record<number, number> = {}
+    const stRes = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) as total
+      FROM staking
+      WHERE status IN ('active','completed','capped')
+      GROUP BY user_id
+    `).all<any>()
+    for (const r of (stRes.results || [])) stakeTotalMap[r.user_id] = Number(r.total || 0)
+
+    // user_id → paidTotal (transactions QKEY daily_qkey + referral_reward)
+    const paidTotalMap: Record<number, number> = {}
+    const ptRes = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) as total
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')
+      GROUP BY user_id
+    `).all<any>()
+    for (const r of (ptRes.results || [])) paidTotalMap[r.user_id] = Number(r.total || 0)
+
+    // user_id → { paidTotal, target, remaining, capped } 시뮬레이션 누적용 mutable cap state
+    const capState: Record<number, { paidTotal: number; target: number; remaining: number; capped: boolean }> = {}
+    function getCap(uid: number) {
+      if (!capState[uid]) {
+        const stakeTotal = stakeTotalMap[uid] || 0
+        const paidTotal = paidTotalMap[uid] || 0
+        const target = stakeTotal * 2 * USD_TO_QKEY
+        capState[uid] = {
+          paidTotal, target,
+          remaining: Math.max(0, target - paidTotal),
+          capped: stakeTotal > 0 && paidTotal >= target,
+        }
+      }
+      return capState[uid]
     }
 
-    // ========== STEP 4: 영구 대책 #1 가드 — 이미 5/14치가 지급됐는지 확인 ==========
-    async function alreadyPaidDaily(userId: number, stakingId: number): Promise<boolean> {
-      const r = await db.prepare(`
-        SELECT COUNT(*) as c FROM daily_rewards
-        WHERE user_id=? AND staking_id=?
-          AND (reward_date=? OR paid_date=?)
-      `).bind(userId, stakingId, REWARD_DATE, PAID_DATE).first<any>()
-      return (r?.c || 0) > 0
+    // ========== STEP 4: 영구 대책 #1 가드 일괄 사전 조회 ==========
+    // (user_id, staking_id) → already paid daily on REWARD_DATE/PAID_DATE
+    const paidDailySet = new Set<string>()
+    const pdRes = await db.prepare(`
+      SELECT DISTINCT user_id, staking_id FROM daily_rewards
+      WHERE reward_date=? OR paid_date=?
+    `).bind(REWARD_DATE, PAID_DATE).all<any>()
+    for (const r of (pdRes.results || [])) paidDailySet.add(`${r.user_id}:${r.staking_id}`)
+    function alreadyPaidDaily(uid: number, sid: number) { return paidDailySet.has(`${uid}:${sid}`) }
+
+    // (referrer_id, referee_id, level, staking_id) → already paid referral
+    const paidRefSet = new Set<string>()
+    const prRes = await db.prepare(`
+      SELECT DISTINCT referrer_id, referee_id, level, COALESCE(staking_id,-1) as staking_id
+      FROM referral_rewards
+      WHERE reward_date=? OR paid_date=?
+    `).bind(REWARD_DATE, PAID_DATE).all<any>()
+    for (const r of (prRes.results || [])) paidRefSet.add(`${r.referrer_id}:${r.referee_id}:${r.level}:${r.staking_id}`)
+    function alreadyPaidRef(referrerId: number, refereeId: number, level: number, stakingId: number) {
+      return paidRefSet.has(`${referrerId}:${refereeId}:${level}:${stakingId}`)
+        || paidRefSet.has(`${referrerId}:${refereeId}:${level}:-1`)
     }
-    async function alreadyPaidRef(referrerId: number, refereeId: number, level: number, stakingId: number, originalAmount: number): Promise<boolean> {
-      const r = await db.prepare(`
-        SELECT COUNT(*) as c FROM referral_rewards
-        WHERE referrer_id=? AND referee_id=? AND level=?
-          AND (reward_date=? OR paid_date=?)
-          AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
-      `).bind(referrerId, refereeId, level, REWARD_DATE, PAID_DATE, stakingId, originalAmount).first<any>()
-      return (r?.c || 0) > 0
-    }
+
+    // ========== STEP 4-b: 5/14 시점 active staking 가진 user_id set (L1/L2 자격) ==========
+    const activeUserSet = new Set<number>()
+    const auRes = await db.prepare(`
+      SELECT DISTINCT user_id FROM staking
+      WHERE status='active'
+        AND date(start_date,'+9 hours') <= ?
+        AND date(end_date,'+9 hours') >= ?
+    `).bind(REWARD_DATE, REWARD_DATE).all<any>()
+    for (const r of (auRes.results || [])) activeUserSet.add(r.user_id)
 
     // ========== STEP 5: 계정별 누적 시뮬레이션 ==========
     // per-account: { user_id, username, daily_qkey, l1_qkey, l2_qkey, total_qkey, current_balance, after_balance }
@@ -30564,8 +30602,7 @@ app.get('/api/diag/may15-simulate', async (c) => {
       }
 
       // 영구 대책 #1 가드 시뮬레이션 — 이미 5/14치 박혔는지
-      const alreadyPaid = await alreadyPaidDaily(userId, stakingId)
-      if (alreadyPaid) {
+      if (alreadyPaidDaily(userId, stakingId)) {
         stakingsSkipped++
         acc.skip_reasons.push(`staking#${stakingId}:already_paid`)
         perStaking.push({ staking_id: stakingId, user_id: userId, username: acc.username, skip: 'already_paid' })
@@ -30573,7 +30610,7 @@ app.get('/api/diag/may15-simulate', async (c) => {
       }
 
       // 200% cap 사전 체크 (본인)
-      const userCap = await getCap(userId)
+      const userCap = getCap(userId)
       if (userCap.capped) {
         stakingsSkipped++
         acc.skip_reasons.push(`staking#${stakingId}:user_capped`)
@@ -30622,89 +30659,46 @@ app.get('/api/diag/may15-simulate', async (c) => {
       // ─── L1 매칭 (20%) ───
       const l1Id = userMap[userId]?.referrer_id
       if (l1Id) {
-        // L1 referrer 5/14 시점 active 인지
-        const l1Active = await db.prepare(`
-          SELECT id FROM staking
-          WHERE user_id=? AND status='active'
-            AND date(start_date,'+9 hours') <= ?
-            AND date(end_date,'+9 hours') >= ?
-          LIMIT 1
-        `).bind(l1Id, REWARD_DATE, REWARD_DATE).first()
-        if (l1Active) {
-          const alreadyL1 = await alreadyPaidRef(l1Id, userId, 1, stakingId, qkeyAmount)
-          if (!alreadyL1) {
-            let l1Reward = Math.round(qkeyAmount * 0.20)  // L1=20%
-            const l1Cap = await getCap(l1Id)
-            if (!l1Cap.capped) {
-              if (l1Reward > l1Cap.remaining) l1Reward = Math.max(0, Math.floor(l1Cap.remaining))
-              if (l1Reward > 0) {
-                const l1Acc = getOrInit(l1Id)
-                l1Acc.l1_qkey += l1Reward
-                l1Acc.total_qkey += l1Reward
-                l1Acc.after_balance += l1Reward
-                totalL1Qkey += l1Reward
-                stakingLog.l1 = l1Reward
-                stakingLog.l1_to = l1Id
-              }
+        if (activeUserSet.has(l1Id) && !alreadyPaidRef(l1Id, userId, 1, stakingId)) {
+          let l1Reward = Math.round(qkeyAmount * 0.20)  // L1=20%
+          const l1Cap = getCap(l1Id)
+          if (!l1Cap.capped) {
+            if (l1Reward > l1Cap.remaining) l1Reward = Math.max(0, Math.floor(l1Cap.remaining))
+            if (l1Reward > 0) {
+              const l1Acc = getOrInit(l1Id)
+              l1Acc.l1_qkey += l1Reward
+              l1Acc.total_qkey += l1Reward
+              l1Acc.after_balance += l1Reward
+              totalL1Qkey += l1Reward
+              stakingLog.l1 = l1Reward
+              stakingLog.l1_to = l1Id
+              // cap state 누적
+              l1Cap.paidTotal += l1Reward
+              l1Cap.remaining = Math.max(0, l1Cap.target - l1Cap.paidTotal)
             }
           }
         }
 
-        // ─── L2 매칭 (10%) ───
-        const l2User = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(l1Id).first<any>()
-        const l2Id = l2User?.referrer_id
+        // ─── L2 매칭 (10%) — userMap에서 referrer_id 조회 ───
+        const l2Id = userMap[l1Id]?.referrer_id
         if (l2Id) {
-          const l2Active = await db.prepare(`
-            SELECT id FROM staking
-            WHERE user_id=? AND status='active'
-              AND date(start_date,'+9 hours') <= ?
-              AND date(end_date,'+9 hours') >= ?
-            LIMIT 1
-          `).bind(l2Id, REWARD_DATE, REWARD_DATE).first()
-          if (l2Active) {
-            const alreadyL2 = await alreadyPaidRef(l2Id, userId, 2, stakingId, qkeyAmount)
-            if (!alreadyL2) {
-              let l2Reward = Math.round(qkeyAmount * 0.10)  // L2=10%
-              const l2Cap = await getCap(l2Id)
-              if (!l2Cap.capped) {
-                if (l2Reward > l2Cap.remaining) l2Reward = Math.max(0, Math.floor(l2Cap.remaining))
-                if (l2Reward > 0) {
-                  const l2Acc = getOrInit(l2Id)
-                  // l2Acc.username/balance 보장
-                  if (!userMap[l2Id]) {
-                    const ru = await db.prepare(`SELECT id, username, name, qkey_balance FROM users WHERE id=?`).bind(l2Id).first<any>()
-                    if (ru) {
-                      userMap[l2Id] = { username: ru.username, name: ru.name || '', qkey_balance: Number(ru.qkey_balance || 0), referrer_id: null }
-                      l2Acc.username = ru.username
-                      l2Acc.name = ru.name || ''
-                      l2Acc.current_balance = Number(ru.qkey_balance || 0)
-                      l2Acc.after_balance = l2Acc.current_balance + l2Acc.total_qkey
-                    }
-                  }
-                  l2Acc.l2_qkey += l2Reward
-                  l2Acc.total_qkey += l2Reward
-                  l2Acc.after_balance += l2Reward
-                  totalL2Qkey += l2Reward
-                  stakingLog.l2 = l2Reward
-                  stakingLog.l2_to = l2Id
-                }
+          if (activeUserSet.has(l2Id) && !alreadyPaidRef(l2Id, userId, 2, stakingId)) {
+            let l2Reward = Math.round(qkeyAmount * 0.10)  // L2=10%
+            const l2Cap = getCap(l2Id)
+            if (!l2Cap.capped) {
+              if (l2Reward > l2Cap.remaining) l2Reward = Math.max(0, Math.floor(l2Cap.remaining))
+              if (l2Reward > 0) {
+                const l2Acc = getOrInit(l2Id)
+                l2Acc.l2_qkey += l2Reward
+                l2Acc.total_qkey += l2Reward
+                l2Acc.after_balance += l2Reward
+                totalL2Qkey += l2Reward
+                stakingLog.l2 = l2Reward
+                stakingLog.l2_to = l2Id
+                l2Cap.paidTotal += l2Reward
+                l2Cap.remaining = Math.max(0, l2Cap.target - l2Cap.paidTotal)
               }
             }
-          }
-        }
-      }
-
-      // L1 referrer 가 accountMap 에 신규로 들어왔으면 username/balance 채우기
-      if (l1Id && !userMap[l1Id]) {
-        const ru = await db.prepare(`SELECT id, username, name, qkey_balance FROM users WHERE id=?`).bind(l1Id).first<any>()
-        if (ru) {
-          userMap[l1Id] = { username: ru.username, name: ru.name || '', qkey_balance: Number(ru.qkey_balance || 0), referrer_id: null }
-          const l1Acc = accountMap[l1Id]
-          if (l1Acc) {
-            l1Acc.username = ru.username
-            l1Acc.name = ru.name || ''
-            l1Acc.current_balance = Number(ru.qkey_balance || 0)
-            l1Acc.after_balance = l1Acc.current_balance + l1Acc.total_qkey
           }
         }
       }
