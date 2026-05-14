@@ -1592,8 +1592,17 @@ app.post('/api/auth/login', async (c) => {
     const db = c.env.DB
 
     // 이메일로 사용자 조회 (비밀번호는 별도 검증)
+    // ★ 영구정책 (2026-05-14): qta_initial/qx_initial(회사 지급분, 출금불가) + qta_withdrawable/qx_withdrawable/usdt_withdrawable(출금가능) 함께 조회
+    await ensureWithdrawableSchema(c.env.DB)
     const user = await db.prepare(`
-      SELECT id, email, password, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, referral_code, created_at
+      SELECT id, email, password, name, phone, wallet_address, usdt_wallet_address,
+             qta_balance, qx_balance, qkey_balance, usdt_balance,
+             COALESCE(qta_initial,0) as qta_initial,
+             COALESCE(qx_initial,0) as qx_initial,
+             COALESCE(qta_withdrawable,0) as qta_withdrawable,
+             COALESCE(qx_withdrawable,0) as qx_withdrawable,
+             COALESCE(usdt_withdrawable,0) as usdt_withdrawable,
+             referral_code, created_at
       FROM users WHERE LOWER(email) = ?
     `).bind(normalizedEmail).first()
 
@@ -1642,6 +1651,12 @@ app.post('/api/auth/login', async (c) => {
         qx_balance: user.qx_balance,
         qkey_balance: user.qkey_balance,
         usdt_balance: user.usdt_balance,
+        // ★ 영구정책 (2026-05-14): 출처별 분리 노출 — 카드 UI 옵션 A "회사지급 (출금가능)" 형식
+        qta_initial: Number(user.qta_initial || 0),
+        qx_initial: Number(user.qx_initial || 0),
+        qta_withdrawable: Number(user.qta_withdrawable || 0),
+        qx_withdrawable: Number(user.qx_withdrawable || 0),
+        usdt_withdrawable: Number(user.usdt_withdrawable || 0),
         referral_code: referralCode,
         created_at: user.created_at
       }
@@ -1795,6 +1810,42 @@ async function ensureWithdrawalFeeSchema(db: any) {
   }
 }
 
+// ★★★ 영구정책 (2026-05-14, 사장님 .md 명시) ★★★
+// users 테이블에 출처 추적 컬럼 보장 — 회사 지급분(initial) vs 출금가능(withdrawable) 분리
+//   qta_initial:      회사 최초 진입 시 지급된 QTA (절대 출금 불가)
+//   qx_initial:       회사 최초 진입 시 지급된 QX (절대 출금 불가)
+//   qta_withdrawable: 데일리/매칭/추천 출처 → QTA 스왑 결과 (출금 가능)
+//   qx_withdrawable:  데일리/매칭/추천 출처 → QX 스왑 결과 (출금 가능)
+//   usdt_withdrawable: 데일리/매칭/추천 출처 → USDT 스왑 결과 (출금 가능, 100 USDT 이상부터)
+// QKEY 는 모두 데일리/매칭/추천 출처 → qkey_balance 그대로 출금 가능
+// 표시용 qta_balance / qx_balance / usdt_balance = initial + withdrawable 합산 (카드 UI 표시 + 호환성)
+let _withdrawableSchemaEnsured = false
+async function ensureWithdrawableSchema(db: any) {
+  if (_withdrawableSchemaEnsured) return
+  try {
+    const info = await db.prepare(`PRAGMA table_info(users)`).all()
+    const cols = new Set((info.results || []).map((r: any) => r.name))
+    if (!cols.has('qta_initial')) {
+      await db.prepare(`ALTER TABLE users ADD COLUMN qta_initial REAL DEFAULT 0`).run()
+    }
+    if (!cols.has('qx_initial')) {
+      await db.prepare(`ALTER TABLE users ADD COLUMN qx_initial REAL DEFAULT 0`).run()
+    }
+    if (!cols.has('qta_withdrawable')) {
+      await db.prepare(`ALTER TABLE users ADD COLUMN qta_withdrawable REAL DEFAULT 0`).run()
+    }
+    if (!cols.has('qx_withdrawable')) {
+      await db.prepare(`ALTER TABLE users ADD COLUMN qx_withdrawable REAL DEFAULT 0`).run()
+    }
+    if (!cols.has('usdt_withdrawable')) {
+      await db.prepare(`ALTER TABLE users ADD COLUMN usdt_withdrawable REAL DEFAULT 0`).run()
+    }
+    _withdrawableSchemaEnsured = true
+  } catch (e) {
+    _withdrawableSchemaEnsured = true
+  }
+}
+
 // 출금 신청 (금요일 오전 10시 ~ 오후 2시 KST만 가능)
 app.post('/api/withdrawal/request', async (c) => {
   try {
@@ -1826,33 +1877,71 @@ app.post('/api/withdrawal/request', async (c) => {
     // ★ Lazy migration: withdrawals 테이블에 fee/net_amount/fee_rate 컬럼 확보
     await ensureWithdrawalFeeSchema(db)
 
-    // 사용자 잔액 확인
+    // ★★★ 영구정책 (2026-05-14, 사장님 .md 명시) ★★★
+    // 출금 가능 대상 = 데일리/매칭/추천 출처 코인 + 그 스왑 결과물 (qta_withdrawable, qx_withdrawable, usdt_withdrawable)
+    // 출금 절대 금지 = 회사 최초 진입 시 지급분 (qta_initial, qx_initial) + 그 스왑 결과물
+    // QKEY 는 데일리/매칭 출처만 존재 → qkey_balance 그대로 사용
+    await ensureWithdrawableSchema(db)
+
+    // USDT 100 이하 출금 불가 경고 (사장님 정책 2026-05-14)
+    if (coinType === 'USDT' && amount < 100) {
+      return c.json({ error: 'USDT 출금은 100 USDT 이상부터 가능합니다. (100개 이하 출금 불가)' }, 400)
+    }
+
+    // 사용자 잔액 확인 (출금가능 컬럼 우선)
     const user = await db.prepare(`
-      SELECT qta_balance, qx_balance, qkey_balance, usdt_balance FROM users WHERE id = ?
+      SELECT qta_balance, qx_balance, qkey_balance, usdt_balance,
+             COALESCE(qta_withdrawable,0) as qta_withdrawable,
+             COALESCE(qx_withdrawable,0) as qx_withdrawable,
+             COALESCE(usdt_withdrawable,0) as usdt_withdrawable
+      FROM users WHERE id = ?
     `).bind(userId).first()
 
     if (!user) {
       return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
     }
 
-    // 잔액 확인 (잔액은 출금 신청 시 즉시 차감되므로 현재 잔액만 체크)
-    const balanceField = coinType === 'QTA' ? 'qta_balance' : 
-                         coinType === 'QX' ? 'qx_balance' : 
-                         coinType === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
-    const currentBalance = (user[balanceField] || 0) as number
+    // ★ 출금가능 컬럼만 차감 대상 — 회사 지급분(initial) 절대 제외 ★
+    // QTA/QX/USDT: 출금가능(*_withdrawable) 컬럼 사용
+    // QKEY: 데일리/매칭 출처만 존재 → 기존 qkey_balance 그대로
+    const withdrawableField = coinType === 'QTA' ? 'qta_withdrawable' :
+                              coinType === 'QX' ? 'qx_withdrawable' :
+                              coinType === 'QKEY' ? 'qkey_balance' : 'usdt_withdrawable'
+    // 표시용 총합 컬럼 (동기 차감 대상 — QTA/QX/USDT 만)
+    const displayField = coinType === 'QTA' ? 'qta_balance' :
+                         coinType === 'QX' ? 'qx_balance' :
+                         coinType === 'QKEY' ? null : 'usdt_balance'
 
-    if (currentBalance < amount) {
-      return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
+    const currentWithdrawable = Number(user[withdrawableField] || 0)
+
+    if (currentWithdrawable < amount) {
+      const coinLabel = coinType === 'QTA' ? 'QTA' : coinType === 'QX' ? 'QX' : coinType === 'QKEY' ? 'QKEY' : 'USDT'
+      return c.json({
+        error: `출금 가능 ${coinLabel} 수량이 부족합니다. (출금가능: ${currentWithdrawable.toLocaleString()} / 신청: ${amount.toLocaleString()}). 회사 최초 지급분은 출금 대상이 아닙니다.`
+      }, 400)
     }
 
     // ★ 5% 출금 수수료 계산 (사장님 정책 2026-05-11)
     const fee = Math.round(amount * WITHDRAWAL_FEE_RATE * 100) / 100  // 소수점 2자리 반올림
     const netAmount = Math.round((amount - fee) * 100) / 100           // 사용자 실수령액
 
-    // 잔액 즉시 차감 (출금 신청 시점, 신청 원본 수량 100% 차감) - 경쟁조건 방지: UPDATE 결과 확인
-    const deductResult = await db.prepare(`
-      UPDATE users SET ${balanceField} = ${balanceField} - ? WHERE id = ? AND ${balanceField} >= ?
-    `).bind(amount, userId, amount).run()
+    // 잔액 즉시 차감 — 출금가능 컬럼(필수) + 표시용 총합 컬럼(동기) 양쪽 차감
+    // 경쟁조건 방지: 출금가능 컬럼 기준 UPDATE 결과 확인
+    let deductResult
+    if (displayField) {
+      // QTA/QX/USDT: withdrawable + balance 양쪽 차감
+      deductResult = await db.prepare(`
+        UPDATE users
+        SET ${withdrawableField} = ${withdrawableField} - ?,
+            ${displayField} = ${displayField} - ?
+        WHERE id = ? AND ${withdrawableField} >= ?
+      `).bind(amount, amount, userId, amount).run()
+    } else {
+      // QKEY: qkey_balance 만 차감
+      deductResult = await db.prepare(`
+        UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ? AND qkey_balance >= ?
+      `).bind(amount, userId, amount).run()
+    }
 
     if (!deductResult.meta.changes || deductResult.meta.changes === 0) {
       return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
@@ -1981,14 +2070,24 @@ app.post('/api/withdrawal/cancel/:withdrawalId', async (c) => {
       return c.json({ error: '이미 처리된 신청입니다' }, 400)
     }
 
-    // 차감했던 잔액 복원
-    const balanceField = withdrawal.coin_type === 'QTA' ? 'qta_balance' :
-                         withdrawal.coin_type === 'QX' ? 'qx_balance' :
-                         withdrawal.coin_type === 'QKEY' ? 'qkey_balance' : 'usdt_balance'
-
-    await db.prepare(`
-      UPDATE users SET ${balanceField} = ${balanceField} + ? WHERE id = ?
-    `).bind(withdrawal.amount, withdrawal.user_id).run()
+    // 차감했던 잔액 복원 — 영구정책: 출금가능 컬럼 + 표시용 총합 양쪽 복원
+    await ensureWithdrawableSchema(db)
+    const coin = withdrawal.coin_type as string
+    const wField = coin === 'QTA' ? 'qta_withdrawable' :
+                   coin === 'QX' ? 'qx_withdrawable' :
+                   coin === 'QKEY' ? 'qkey_balance' : 'usdt_withdrawable'
+    const dField = coin === 'QTA' ? 'qta_balance' :
+                   coin === 'QX' ? 'qx_balance' :
+                   coin === 'QKEY' ? null : 'usdt_balance'
+    if (dField) {
+      await db.prepare(`
+        UPDATE users SET ${wField} = ${wField} + ?, ${dField} = ${dField} + ? WHERE id = ?
+      `).bind(withdrawal.amount, withdrawal.amount, withdrawal.user_id).run()
+    } else {
+      await db.prepare(`
+        UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
+      `).bind(withdrawal.amount, withdrawal.user_id).run()
+    }
 
     // 환불 거래 기록
     try {
@@ -2115,8 +2214,16 @@ app.post('/api/swap/qkey-to-qta', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (${(user.qkey_balance || 0).toLocaleString()} QKEY / ${requiredQkey.toLocaleString()} QKEY)` }, 400)
     }
 
-    // QKEY 차감 & QTA 증가 - 경쟁조건 방지 (원자적 UPDATE)
-    const swapQtaResult = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ?, qta_balance = qta_balance + ? WHERE id = ? AND qkey_balance >= ?`).bind(requiredQkey, amount, userId, requiredQkey).run()
+    // ★ 영구정책 (2026-05-14): QKEY → QTA 스왑 시 데일리/매칭 출처 → qta_withdrawable 누적 (출금 가능)
+    await ensureWithdrawableSchema(db)
+    // QKEY 차감 & QTA 증가 (qta_balance 표시용 + qta_withdrawable 출금가능) - 경쟁조건 방지
+    const swapQtaResult = await db.prepare(`
+      UPDATE users
+      SET qkey_balance = qkey_balance - ?,
+          qta_balance = qta_balance + ?,
+          qta_withdrawable = COALESCE(qta_withdrawable,0) + ?
+      WHERE id = ? AND qkey_balance >= ?
+    `).bind(requiredQkey, amount, amount, userId, requiredQkey).run()
     if (!swapQtaResult.meta.changes || swapQtaResult.meta.changes === 0) {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
     }
@@ -2132,8 +2239,8 @@ app.post('/api/swap/qkey-to-qta', async (c) => {
       // 거래 내역 (QTA 증가 - swap_in으로 기록 → 출금 가능 수량에 반영)
       await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QTA', ?, ?, ?)`).bind(userId, amount, descKor, refIn).run()
     } catch (txErr) {
-      // tx INSERT 실패 시 잔액 역방향 rollback (스왑 로직 보강 #4)
-      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ?, qta_balance = qta_balance - ? WHERE id = ?`).bind(requiredQkey, amount, userId).run()
+      // tx INSERT 실패 시 잔액 역방향 rollback (스왑 로직 보강 #4) — withdrawable 도 rollback
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ?, qta_balance = qta_balance - ?, qta_withdrawable = COALESCE(qta_withdrawable,0) - ? WHERE id = ?`).bind(requiredQkey, amount, amount, userId).run()
       console.error('swap qkey->qta tx insert failed, balance rolled back:', txErr)
       return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
     }
@@ -2161,7 +2268,15 @@ app.post('/api/swap/qkey-to-qx', async (c) => {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (${(user.qkey_balance || 0).toLocaleString()} QKEY / ${requiredQkey.toLocaleString()} QKEY)` }, 400)
     }
 
-    const swapQxResult = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ?, qx_balance = qx_balance + ? WHERE id = ? AND qkey_balance >= ?`).bind(requiredQkey, amount, userId, requiredQkey).run()
+    // ★ 영구정책 (2026-05-14): QKEY → QX 스왑 시 데일리/매칭 출처 → qx_withdrawable 누적 (출금 가능)
+    await ensureWithdrawableSchema(db)
+    const swapQxResult = await db.prepare(`
+      UPDATE users
+      SET qkey_balance = qkey_balance - ?,
+          qx_balance = qx_balance + ?,
+          qx_withdrawable = COALESCE(qx_withdrawable,0) + ?
+      WHERE id = ? AND qkey_balance >= ?
+    `).bind(requiredQkey, amount, amount, userId, requiredQkey).run()
     if (!swapQxResult.meta.changes || swapQxResult.meta.changes === 0) {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
     }
@@ -2176,7 +2291,7 @@ app.post('/api/swap/qkey-to-qx', async (c) => {
       await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'QKEY', ?, ?, ?)`).bind(userId, -Math.abs(requiredQkey), descKor, refOut).run()
       await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QX', ?, ?, ?)`).bind(userId, amount, descKor, refIn).run()
     } catch (txErr) {
-      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ?, qx_balance = qx_balance - ? WHERE id = ?`).bind(requiredQkey, amount, userId).run()
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ?, qx_balance = qx_balance - ?, qx_withdrawable = COALESCE(qx_withdrawable,0) - ? WHERE id = ?`).bind(requiredQkey, amount, amount, userId).run()
       console.error('swap qkey->qx tx insert failed, balance rolled back:', txErr)
       return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
     }
@@ -2204,7 +2319,15 @@ app.post('/api/swap/usdt-to-qkey', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (${(user.usdt_balance || 0).toFixed(2)} USDT / ${amount.toFixed(2)} USDT)` }, 400)
     }
 
-    const swapUkResult = await db.prepare(`UPDATE users SET usdt_balance = usdt_balance - ?, qkey_balance = qkey_balance + ? WHERE id = ? AND usdt_balance >= ?`).bind(amount, qkeyToReceive, userId, amount).run()
+    // ★ 영구정책: USDT 는 데일리/매칭 출처 스왑으로만 생김 → usdt_withdrawable 함께 차감
+    await ensureWithdrawableSchema(db)
+    const swapUkResult = await db.prepare(`
+      UPDATE users
+      SET usdt_balance = usdt_balance - ?,
+          usdt_withdrawable = MAX(COALESCE(usdt_withdrawable,0) - ?, 0),
+          qkey_balance = qkey_balance + ?
+      WHERE id = ? AND usdt_balance >= ?
+    `).bind(amount, amount, qkeyToReceive, userId, amount).run()
     if (!swapUkResult.meta.changes || swapUkResult.meta.changes === 0) {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
@@ -2247,7 +2370,16 @@ app.post('/api/swap/usdt-to-qta', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (${(user.usdt_balance || 0).toFixed(2)} USDT)` }, 400)
     }
 
-    const swapUqtaResult = await db.prepare(`UPDATE users SET usdt_balance = usdt_balance - ?, qta_balance = qta_balance + ? WHERE id = ? AND usdt_balance >= ?`).bind(amount, qtaToReceive, userId, amount).run()
+    // ★ 영구정책: USDT(데일리출처) → QTA 스왑 → qta_withdrawable 누적 (출금 가능)
+    await ensureWithdrawableSchema(db)
+    const swapUqtaResult = await db.prepare(`
+      UPDATE users
+      SET usdt_balance = usdt_balance - ?,
+          usdt_withdrawable = MAX(COALESCE(usdt_withdrawable,0) - ?, 0),
+          qta_balance = qta_balance + ?,
+          qta_withdrawable = COALESCE(qta_withdrawable,0) + ?
+      WHERE id = ? AND usdt_balance >= ?
+    `).bind(amount, amount, qtaToReceive, qtaToReceive, userId, amount).run()
     if (!swapUqtaResult.meta.changes || swapUqtaResult.meta.changes === 0) {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
@@ -2262,7 +2394,7 @@ app.post('/api/swap/usdt-to-qta', async (c) => {
       await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'USDT', ?, ?, ?)`).bind(userId, -Math.abs(amount), descKor, refOut).run()
       await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QTA', ?, ?, ?)`).bind(userId, qtaToReceive, descKor, refIn).run()
     } catch (txErr) {
-      await db.prepare(`UPDATE users SET usdt_balance = usdt_balance + ?, qta_balance = qta_balance - ? WHERE id = ?`).bind(amount, qtaToReceive, userId).run()
+      await db.prepare(`UPDATE users SET usdt_balance = usdt_balance + ?, usdt_withdrawable = COALESCE(usdt_withdrawable,0) + ?, qta_balance = qta_balance - ?, qta_withdrawable = COALESCE(qta_withdrawable,0) - ? WHERE id = ?`).bind(amount, amount, qtaToReceive, qtaToReceive, userId).run()
       console.error('swap usdt->qta tx insert failed, balance rolled back:', txErr)
       return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
     }
@@ -2290,7 +2422,16 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
       return c.json({ error: `USDT 잔액이 부족합니다 (${(user.usdt_balance || 0).toFixed(2)} USDT)` }, 400)
     }
 
-    const swapUqxResult = await db.prepare(`UPDATE users SET usdt_balance = usdt_balance - ?, qx_balance = qx_balance + ? WHERE id = ? AND usdt_balance >= ?`).bind(amount, qxToReceive, userId, amount).run()
+    // ★ 영구정책: USDT(데일리출처) → QX 스왑 → qx_withdrawable 누적 (출금 가능)
+    await ensureWithdrawableSchema(db)
+    const swapUqxResult = await db.prepare(`
+      UPDATE users
+      SET usdt_balance = usdt_balance - ?,
+          usdt_withdrawable = MAX(COALESCE(usdt_withdrawable,0) - ?, 0),
+          qx_balance = qx_balance + ?,
+          qx_withdrawable = COALESCE(qx_withdrawable,0) + ?
+      WHERE id = ? AND usdt_balance >= ?
+    `).bind(amount, amount, qxToReceive, qxToReceive, userId, amount).run()
     if (!swapUqxResult.meta.changes || swapUqxResult.meta.changes === 0) {
       return c.json({ error: `USDT 잔액이 부족합니다 (concurrent request)` }, 400)
     }
@@ -2305,7 +2446,7 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
       await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_out', 'USDT', ?, ?, ?)`).bind(userId, -Math.abs(amount), descKor, refOut).run()
       await db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id) VALUES (?, 'swap_in', 'QX', ?, ?, ?)`).bind(userId, qxToReceive, descKor, refIn).run()
     } catch (txErr) {
-      await db.prepare(`UPDATE users SET usdt_balance = usdt_balance + ?, qx_balance = qx_balance - ? WHERE id = ?`).bind(amount, qxToReceive, userId).run()
+      await db.prepare(`UPDATE users SET usdt_balance = usdt_balance + ?, usdt_withdrawable = COALESCE(usdt_withdrawable,0) + ?, qx_balance = qx_balance - ?, qx_withdrawable = COALESCE(qx_withdrawable,0) - ? WHERE id = ?`).bind(amount, amount, qxToReceive, qxToReceive, userId).run()
       console.error('swap usdt->qx tx insert failed, balance rolled back:', txErr)
       return c.json({ error: '스왑 거래내역 기록 실패 — 잔액 원복되었습니다. 다시 시도해주세요.' }, 500)
     }
@@ -2533,21 +2674,32 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
     const qkeyReward = staking.qkey_reward || 0
     const qxReward = staking.qx_reward || 0
 
-    // QTA는 항상 지급
+    // ★★★ 영구정책 (2026-05-14, 사장님 .md 명시) ★★★
+    // 회사 최초 진입 시 지급분(QTA/QX) 은 qta_initial / qx_initial 컬럼에 격리 → 절대 출금 불가
+    // 표시용 qta_balance / qx_balance 는 동기 업데이트 (initial + withdrawable 합산값)
+    await ensureWithdrawableSchema(db)
+
+    // QTA는 항상 지급 (회사 지급분 → qta_initial + qta_balance 동기)
     await db.prepare(`
-      UPDATE users SET qta_balance = qta_balance + ? WHERE id = ?
-    `).bind(staking.qta_reward, staking.user_id).run()
+      UPDATE users
+      SET qta_balance = qta_balance + ?,
+          qta_initial = COALESCE(qta_initial,0) + ?
+      WHERE id = ?
+    `).bind(staking.qta_reward, staking.qta_reward, staking.user_id).run()
 
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'staking_reward', 'QTA', ?, ?)
     `).bind(staking.user_id, staking.qta_reward, `Staking reward (${periodDays}d)`).run()
 
-    // QX 지급 (0보다 클 때만)
+    // QX 지급 (0보다 클 때만) — 회사 지급분 → qx_initial + qx_balance 동기
     if (qxReward > 0) {
       await db.prepare(`
-        UPDATE users SET qx_balance = qx_balance + ? WHERE id = ?
-      `).bind(qxReward, staking.user_id).run()
+        UPDATE users
+        SET qx_balance = qx_balance + ?,
+            qx_initial = COALESCE(qx_initial,0) + ?
+        WHERE id = ?
+      `).bind(qxReward, qxReward, staking.user_id).run()
 
       await db.prepare(`
         INSERT INTO transactions (user_id, type, coin_type, amount, description)
@@ -3348,10 +3500,16 @@ app.get('/api/admin/user/:userId', async (c) => {
     const db = c.env.DB
     const userId = c.req.param('userId')
 
-    // 사용자 기본 정보
+    await ensureWithdrawableSchema(db)
+    // 사용자 기본 정보 (+ 출금자격 source-tracking 컬럼)
     const user = await db.prepare(`
       SELECT id, email, name, phone, wallet_address, usdt_wallet_address, 
              qta_balance, qx_balance, qkey_balance, usdt_balance, 
+             COALESCE(qta_initial,0) as qta_initial,
+             COALESCE(qx_initial,0) as qx_initial,
+             COALESCE(qta_withdrawable,0) as qta_withdrawable,
+             COALESCE(qx_withdrawable,0) as qx_withdrawable,
+             COALESCE(usdt_withdrawable,0) as usdt_withdrawable,
              referral_code, referrer_id, created_at
       FROM users WHERE id = ?
     `).bind(userId).first()
@@ -3671,9 +3829,33 @@ app.post('/api/admin/user/:userId/restore-balance', async (c) => {
       return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
     }
 
-    const { qta, qx, qkey, usdt } = await c.req.json().catch(() => ({}))
+    await ensureWithdrawableSchema(db)
+    const body = await c.req.json().catch(() => ({})) as any
+    const { qta, qx, qkey, usdt } = body
+    // 출처 옵션 (출금가능/회사지급)
+    // - qta_initial / qx_initial : 회사 지급분 (출금 불가)
+    // - qta_withdrawable / qx_withdrawable / usdt_withdrawable : 출금 가능분
+    const qtaInit = Number(body.qta_initial || 0)
+    const qxInit = Number(body.qx_initial || 0)
+    const qtaWd = Number(body.qta_withdrawable || 0)
+    const qxWd = Number(body.qx_withdrawable || 0)
+    const usdtWd = Number(body.usdt_withdrawable || 0)
+
+    // 1) 표시용 balance 컬럼 누적 (기존 동작 호환 유지)
     await db.prepare(`UPDATE users SET qta_balance = COALESCE(qta_balance,0) + ?, qx_balance = COALESCE(qx_balance,0) + ?, qkey_balance = COALESCE(qkey_balance,0) + ?, usdt_balance = COALESCE(usdt_balance,0) + ? WHERE id = ?`).bind(qta||0, qx||0, qkey||0, usdt||0, userId).run()
-    const user = await db.prepare(`SELECT id,name,qta_balance,qx_balance,qkey_balance,usdt_balance FROM users WHERE id = ?`).bind(userId).first()
+
+    // 2) 출처 추적 컬럼 누적 (영구 정책 — 출금 자격 source-tracking)
+    if (qtaInit || qxInit || qtaWd || qxWd || usdtWd) {
+      await db.prepare(`UPDATE users SET 
+        qta_initial = COALESCE(qta_initial,0) + ?, 
+        qx_initial = COALESCE(qx_initial,0) + ?, 
+        qta_withdrawable = COALESCE(qta_withdrawable,0) + ?, 
+        qx_withdrawable = COALESCE(qx_withdrawable,0) + ?, 
+        usdt_withdrawable = COALESCE(usdt_withdrawable,0) + ? 
+        WHERE id = ?`).bind(qtaInit, qxInit, qtaWd, qxWd, usdtWd, userId).run()
+    }
+
+    const user = await db.prepare(`SELECT id,name,qta_balance,qx_balance,qkey_balance,usdt_balance,qta_initial,qx_initial,qta_withdrawable,qx_withdrawable,usdt_withdrawable FROM users WHERE id = ?`).bind(userId).first()
     return c.json({ success: true, user })
   } catch(e: any) { return c.json({ error: e.message }, 500) }
 })
@@ -10638,9 +10820,15 @@ app.get('/api/diag/user-detail', async (c) => {
 
     const db = c.env.DB
 
+    await ensureWithdrawableSchema(db)
     const user = await db.prepare(`
       SELECT id, name, email, country, language, referral_code, referrer_id, created_at,
-        qta_balance, qx_balance, qkey_balance, usdt_balance
+        qta_balance, qx_balance, qkey_balance, usdt_balance,
+        COALESCE(qta_initial,0) as qta_initial,
+        COALESCE(qx_initial,0) as qx_initial,
+        COALESCE(qta_withdrawable,0) as qta_withdrawable,
+        COALESCE(qx_withdrawable,0) as qx_withdrawable,
+        COALESCE(usdt_withdrawable,0) as usdt_withdrawable
       FROM users WHERE id = ?
     `).bind(userId).first() as any
 
@@ -14537,8 +14725,16 @@ app.get('/api/user/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
+    await ensureWithdrawableSchema(db)
     const user = await db.prepare(`
-      SELECT id, email, name, phone, wallet_address, usdt_wallet_address, qta_balance, qx_balance, qkey_balance, usdt_balance, created_at
+      SELECT id, email, name, phone, wallet_address, usdt_wallet_address,
+             qta_balance, qx_balance, qkey_balance, usdt_balance,
+             COALESCE(qta_initial,0) as qta_initial,
+             COALESCE(qx_initial,0) as qx_initial,
+             COALESCE(qta_withdrawable,0) as qta_withdrawable,
+             COALESCE(qx_withdrawable,0) as qx_withdrawable,
+             COALESCE(usdt_withdrawable,0) as usdt_withdrawable,
+             created_at
       FROM users WHERE id = ?
     `).bind(userId).first()
 
@@ -16063,31 +16259,34 @@ app.get('/dashboard', (c) => {
                         <p class="text-xs opacity-75 mt-1" id="stakingCount"></p>
                     </div>
                     
-                    <!-- USDT Balance (두 번째) -->
+                    <!-- USDT Balance (두 번째) — 옵션 A: 회사지급분 (출금가능분) -->
                     <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.usdt_balance">USDT 잔액</span>
                             <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">회사지급 <span class="font-semibold">0</span> <span class="opacity-80">(출금가능 <span id="usdtWithdrawable" class="font-semibold">0</span>)</span></p>
                     </div>
                     
-                    <!-- QTA (세 번째) -->
+                    <!-- QTA (세 번째) — 옵션 A: 회사지급분 (출금가능분) -->
                     <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qta_coin">QTA코인(지갑전송수량)</span>
                             <i class="fas fa-coins text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qtaBalance">0</p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">회사지급 <span id="qtaInitial" class="font-semibold">0</span> <span class="opacity-80">(출금가능 <span id="qtaWithdrawable" class="font-semibold">0</span>)</span></p>
                     </div>
                     
-                    <!-- QX (네 번째) -->
+                    <!-- QX (네 번째) — 옵션 A: 회사지급분 (출금가능분) -->
                     <div class="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qx_coin">QX 코인</span>
                             <i class="fas fa-coins text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qxBalance">0</p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">회사지급 <span id="qxInitial" class="font-semibold">0</span> <span class="opacity-80">(출금가능 <span id="qxWithdrawable" class="font-semibold">0</span>)</span></p>
                     </div>
                     
                     <!-- QKEY (다섯 번째 - QX 옆 배치) -->
@@ -16848,6 +17047,18 @@ app.get('/dashboard', (c) => {
                         document.getElementById('qxBalance').textContent = user.qx_balance.toLocaleString();
                         document.getElementById('qkeyBalance').textContent = (user.qkey_balance || 0).toLocaleString();
                         document.getElementById('usdtBalance').textContent = user.usdt_balance.toFixed(2);
+
+                        // 옵션 A: 회사지급분 (출금가능분) — 영구 정책 source-tracking
+                        const qtaInitEl = document.getElementById('qtaInitial');
+                        const qtaWdEl = document.getElementById('qtaWithdrawable');
+                        const qxInitEl = document.getElementById('qxInitial');
+                        const qxWdEl = document.getElementById('qxWithdrawable');
+                        const usdtWdEl = document.getElementById('usdtWithdrawable');
+                        if (qtaInitEl) qtaInitEl.textContent = Math.floor(Number(user.qta_initial || 0)).toLocaleString();
+                        if (qtaWdEl) qtaWdEl.textContent = Math.floor(Number(user.qta_withdrawable || 0)).toLocaleString();
+                        if (qxInitEl) qxInitEl.textContent = Math.floor(Number(user.qx_initial || 0)).toLocaleString();
+                        if (qxWdEl) qxWdEl.textContent = Math.floor(Number(user.qx_withdrawable || 0)).toLocaleString();
+                        if (usdtWdEl) usdtWdEl.textContent = Number(user.usdt_withdrawable || 0).toFixed(2);
                         
                         // 스왑 가능 QKEY 잔액 업데이트
                         const swapEl = document.getElementById('swapQkeyBalance');
@@ -30755,6 +30966,159 @@ app.get('/api/diag/may15-simulate', async (c) => {
   } catch (error: any) {
     console.error('may15-simulate error:', error)
     return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
+// ============================================
+// 출금 자격 source-tracking 마이그레이션 (영구 정책, 2026-05-14 사장님 .md 명시 지시)
+//   회사 최초 지급분(QTA/QX) → qta_initial/qx_initial (출금 불가)
+//   데일리/매칭/직접추천 QKEY 스왑 결과(QTA/QX/USDT) → qta_withdrawable/qx_withdrawable/usdt_withdrawable (출금 가능)
+//
+// 산식:
+//   - 한 계정의 스왑 net (in - out) > 0  →  그 만큼이 "스왑으로 늘어난 분" (=출금가능, *_withdrawable)
+//   - 현재 잔액 - 스왑 net (= 회사 최초 지급분, *_initial)
+//   - QKEY 는 *_initial 컬럼 없음 (회사 신규 진입 QKEY 도 데일리와 합산되므로 별도 분리 X)
+//   - USDT 는 회사 지급분 없음 → 전액이 스왑/입금 결과 → 전액 usdt_withdrawable 로 간주
+//
+// 사용법: POST /api/diag/migrate-source-tracking?password=...&confirm=GO
+//   - dryRun=1 : INSERT/UPDATE 없이 계획만 반환 (기본)
+//   - confirm=GO : 실제 UPDATE 실행 (1회만 — 중복 실행 시 누적 위험 → ensureSchema flag + already-set 체크)
+// ============================================
+app.post('/api/diag/migrate-source-tracking', async (c) => {
+  try {
+    const password = c.req.query('password') || ''
+    if (password !== ADMIN_PW) return c.json({ error: 'Unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const dryRun = confirm !== 'GO'
+    const db = c.env.DB
+
+    await ensureWithdrawableSchema(db)
+
+    // STEP 1: 전 사용자 + 스왑 집계
+    const usersRes = await db.prepare(`
+      SELECT id, email, name, qta_balance, qx_balance, qkey_balance, usdt_balance,
+             qta_initial, qx_initial, qta_withdrawable, qx_withdrawable, usdt_withdrawable
+      FROM users
+      ORDER BY id ASC
+    `).all<any>()
+    const users = usersRes.results || []
+
+    const swapRes = await db.prepare(`
+      SELECT user_id, type, coin_type, COALESCE(SUM(amount),0) as sum_amount
+      FROM transactions
+      WHERE type IN ('swap_in','swap_out')
+      GROUP BY user_id, type, coin_type
+    `).all<any>()
+
+    const swapMap: Record<number, Record<string, { in_sum: number; out_sum: number }>> = {}
+    for (const r of (swapRes.results || [])) {
+      const uid = Number(r.user_id)
+      const coin = r.coin_type as string
+      if (!swapMap[uid]) swapMap[uid] = {}
+      if (!swapMap[uid][coin]) swapMap[uid][coin] = { in_sum: 0, out_sum: 0 }
+      if (r.type === 'swap_in') swapMap[uid][coin].in_sum = Number(r.sum_amount || 0)
+      else swapMap[uid][coin].out_sum = Math.abs(Number(r.sum_amount || 0))
+    }
+
+    // STEP 2: 계정별 마이그레이션 계획 산출
+    const plan: any[] = []
+    let executedCount = 0
+    let skippedAlreadySet = 0
+
+    for (const u of users) {
+      const uid = Number(u.id)
+      const sm = swapMap[uid] || {}
+      const qtaBal = Number(u.qta_balance || 0)
+      const qxBal = Number(u.qx_balance || 0)
+      const usdtBal = Number(u.usdt_balance || 0)
+
+      // 스왑 net (in - out) — 양수=스왑으로 늘어남
+      const qtaNet = (sm['QTA']?.in_sum || 0) - (sm['QTA']?.out_sum || 0)
+      const qxNet = (sm['QX']?.in_sum || 0) - (sm['QX']?.out_sum || 0)
+      const usdtNet = (sm['USDT']?.in_sum || 0) - (sm['USDT']?.out_sum || 0)
+
+      // 산식 결정
+      //   QTA/QX:
+      //     - 스왑 net > 0 → withdrawable = net (그 만큼은 데일리QKEY 스왑 결과)
+      //     - withdrawable = max(0, net) (음수면 0)
+      //     - initial = max(0, current - withdrawable) = 회사 최초 지급분 잔존
+      //   USDT:
+      //     - 회사 지급분 없음 → 전액 withdrawable
+      const qtaWd = Math.max(0, qtaNet)
+      const qtaInit = Math.max(0, qtaBal - qtaWd)
+      const qxWd = Math.max(0, qxNet)
+      const qxInit = Math.max(0, qxBal - qxWd)
+      const usdtWd = Math.max(0, usdtBal)  // 전액 withdrawable
+
+      // 이미 마이그레이션 완료된 계정 식별 (initial+withdrawable 합이 balance 와 일치하면 skip)
+      const prevQtaInit = Number(u.qta_initial || 0)
+      const prevQtaWd = Number(u.qta_withdrawable || 0)
+      const prevQxInit = Number(u.qx_initial || 0)
+      const prevQxWd = Number(u.qx_withdrawable || 0)
+      const prevUsdtWd = Number(u.usdt_withdrawable || 0)
+
+      const qtaAlreadySet = (prevQtaInit + prevQtaWd) > 0 && Math.abs((prevQtaInit + prevQtaWd) - qtaBal) < 0.0001
+      const qxAlreadySet = (prevQxInit + prevQxWd) > 0 && Math.abs((prevQxInit + prevQxWd) - qxBal) < 0.0001
+      const usdtAlreadySet = prevUsdtWd > 0 && Math.abs(prevUsdtWd - usdtBal) < 0.0001
+
+      const allSet = (qtaBal === 0 || qtaAlreadySet) && (qxBal === 0 || qxAlreadySet) && (usdtBal === 0 || usdtAlreadySet)
+      if (allSet) {
+        skippedAlreadySet++
+        continue
+      }
+
+      const row = {
+        user_id: uid,
+        email: u.email,
+        name: u.name || '',
+        before: {
+          qta_balance: qtaBal, qx_balance: qxBal, usdt_balance: usdtBal,
+          qta_initial: prevQtaInit, qta_withdrawable: prevQtaWd,
+          qx_initial: prevQxInit, qx_withdrawable: prevQxWd,
+          usdt_withdrawable: prevUsdtWd,
+        },
+        swap_net: { QTA: qtaNet, QX: qxNet, USDT: usdtNet },
+        after: {
+          qta_initial: qtaInit, qta_withdrawable: qtaWd,
+          qx_initial: qxInit, qx_withdrawable: qxWd,
+          usdt_withdrawable: usdtWd,
+        },
+      }
+      plan.push(row)
+
+      if (!dryRun) {
+        await db.prepare(`UPDATE users SET 
+          qta_initial = ?, 
+          qx_initial = ?, 
+          qta_withdrawable = ?, 
+          qx_withdrawable = ?, 
+          usdt_withdrawable = ? 
+          WHERE id = ?`).bind(qtaInit, qxInit, qtaWd, qxWd, usdtWd, uid).run()
+        executedCount++
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: dryRun ? 'DRY_RUN' : 'EXECUTED',
+      title: '출금 자격 source-tracking 마이그레이션 (영구 정책 2026-05-14)',
+      generated_at_kst: new Date(Date.now() + 9*3600*1000).toISOString().replace('T',' ').slice(0,19),
+      total_users: users.length,
+      plan_rows: plan.length,
+      executed_count: executedCount,
+      skipped_already_set: skippedAlreadySet,
+      formula: {
+        QTA: 'withdrawable = max(0, swap_in - swap_out) / initial = max(0, balance - withdrawable)',
+        QX:  'withdrawable = max(0, swap_in - swap_out) / initial = max(0, balance - withdrawable)',
+        USDT: 'withdrawable = balance (회사 지급분 없음, 전액 출금 가능)',
+        QKEY: '컬럼 분리 없음 (qkey_balance 전체가 출금 가능 — 데일리/매칭/추천 합산)',
+      },
+      plan,
+      hint: dryRun ? '실행하려면 ?password=...&confirm=GO 추가' : '실행 완료',
+    })
+  } catch (error: any) {
+    console.error('migrate-source-tracking error:', error)
+    return c.json({ error: error?.message || String(error) }, 500)
   }
 })
 
