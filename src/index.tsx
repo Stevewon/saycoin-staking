@@ -30413,4 +30413,355 @@ app.get('/api/diag/may14-orphan-txn-cleanup', async (c) => {
   }
 })
 
+// ============================================================================
+// 5/15 cron 자동 지급 시뮬레이션 (오늘 신규 진입자 없다고 가정)
+// ============================================================================
+//   사장님 명령 (2026-05-14):
+//     "내일 그럼 오늘 신규진입자가 없다고 가정하고 내일자 각 계정별 지급금액과
+//      각 계정별 내일자 잔액을 보고해봐"
+//
+//   영구룰 정확 적용:
+//     - reward_date=2026-05-14 (5/14 매출 기준)
+//     - paid_date=2026-05-15 (5/15 cron 지급일)
+//     - 5/14 시점 활성 staking (start_kst <= 5/14 AND end_kst >= 5/14)
+//     - staking.daily_rate D1 직접 조회 (추측 금지)
+//     - L1=20%, L2=10% 매칭 (referrer 5/14 시점 active 일 때만)
+//     - 200% cap 사용자 단위 (B안)
+//     - 거치기간 초과 staking skip
+//     - 5/14 paid_date 기준 daily_rewards 이미 있으면 SKIP (영구 대책 #1 가드 시뮬레이션)
+//
+//   순수 시뮬레이션 — INSERT/UPDATE 0건, 잔액 변경 0건
+//
+//   사용법:
+//     GET /api/diag/may15-simulate?password=...
+app.get('/api/diag/may15-simulate', async (c) => {
+  try {
+    const password = c.req.query('password') || ''
+    if (password !== ADMIN_PW) return c.json({ error: 'Unauthorized' }, 401)
+    const db = c.env.DB
+
+    const REWARD_DATE = '2026-05-14'  // 5/14 매출 (어제 cron 기준)
+    const PAID_DATE = '2026-05-15'    // 5/15 cron 지급일
+    const USD_TO_QKEY = 150
+
+    // ========== STEP 1: 5/14 시점 활성 staking 전수 조회 ==========
+    const stakings = await db.prepare(`
+      SELECT
+        s.user_id,
+        s.id as staking_id,
+        s.amount,
+        s.period_days,
+        s.period_months,
+        s.daily_rate,
+        date(s.start_date, '+9 hours') as start_kst,
+        date(s.end_date, '+9 hours') as end_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
+      FROM staking s
+      WHERE s.status = 'active'
+        AND date(s.end_date, '+9 hours') >= ?
+        AND date(s.start_date, '+9 hours') <= ?
+      ORDER BY s.user_id ASC, s.id ASC
+    `).bind(REWARD_DATE, REWARD_DATE).all<any>()
+
+    // ========== STEP 2: 사용자 정보 + 현재 잔액 ==========
+    const userIds = Array.from(new Set((stakings.results || []).map((s: any) => s.user_id)))
+    const userMap: Record<number, { username: string, name: string, qkey_balance: number, referrer_id: number | null }> = {}
+    for (const uid of userIds) {
+      const u = await db.prepare(`SELECT id, username, name, qkey_balance, referrer_id FROM users WHERE id = ?`).bind(uid).first<any>()
+      if (u) userMap[u.id] = {
+        username: u.username,
+        name: u.name || '',
+        qkey_balance: Number(u.qkey_balance || 0),
+        referrer_id: u.referrer_id,
+      }
+    }
+
+    // ========== STEP 3: 200% cap helper ==========
+    async function getCap(userId: number): Promise<{ capped: boolean; paidTotal: number; target: number; remaining: number }> {
+      const sR = await db.prepare(`SELECT COALESCE(SUM(amount),0) as total FROM staking WHERE user_id=? AND status IN ('active','completed','capped')`).bind(userId).first<any>()
+      const stakeTotal = Number(sR?.total || 0)
+      if (stakeTotal <= 0) return { capped: false, paidTotal: 0, target: 0, remaining: 0 }
+      const pR = await db.prepare(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=? AND coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')`).bind(userId).first<any>()
+      const paidTotal = Number(pR?.total || 0)
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      return { capped: paidTotal >= target, paidTotal, target, remaining: Math.max(0, target - paidTotal) }
+    }
+
+    // ========== STEP 4: 영구 대책 #1 가드 — 이미 5/14치가 지급됐는지 확인 ==========
+    async function alreadyPaidDaily(userId: number, stakingId: number): Promise<boolean> {
+      const r = await db.prepare(`
+        SELECT COUNT(*) as c FROM daily_rewards
+        WHERE user_id=? AND staking_id=?
+          AND (reward_date=? OR paid_date=?)
+      `).bind(userId, stakingId, REWARD_DATE, PAID_DATE).first<any>()
+      return (r?.c || 0) > 0
+    }
+    async function alreadyPaidRef(referrerId: number, refereeId: number, level: number, stakingId: number, originalAmount: number): Promise<boolean> {
+      const r = await db.prepare(`
+        SELECT COUNT(*) as c FROM referral_rewards
+        WHERE referrer_id=? AND referee_id=? AND level=?
+          AND (reward_date=? OR paid_date=?)
+          AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
+      `).bind(referrerId, refereeId, level, REWARD_DATE, PAID_DATE, stakingId, originalAmount).first<any>()
+      return (r?.c || 0) > 0
+    }
+
+    // ========== STEP 5: 계정별 누적 시뮬레이션 ==========
+    // per-account: { user_id, username, daily_qkey, l1_qkey, l2_qkey, total_qkey, current_balance, after_balance }
+    const accountMap: Record<number, {
+      username: string; name: string;
+      current_balance: number;
+      daily_qkey: number;
+      l1_qkey: number;
+      l2_qkey: number;
+      total_qkey: number;
+      after_balance: number;
+      details: any[];
+      skip_reasons: string[];
+      cap_status?: string;
+    }> = {}
+
+    function getOrInit(uid: number): any {
+      if (!accountMap[uid]) {
+        const u = userMap[uid] || { username: `u${uid}`, name: '', qkey_balance: 0, referrer_id: null }
+        accountMap[uid] = {
+          username: u.username,
+          name: u.name,
+          current_balance: u.qkey_balance,
+          daily_qkey: 0,
+          l1_qkey: 0,
+          l2_qkey: 0,
+          total_qkey: 0,
+          after_balance: u.qkey_balance,
+          details: [],
+          skip_reasons: [],
+        }
+      }
+      return accountMap[uid]
+    }
+
+    let stakingsProcessed = 0
+    let stakingsSkipped = 0
+    let totalDailyQkey = 0
+    let totalL1Qkey = 0
+    let totalL2Qkey = 0
+    let totalGrandQkey = 0
+    const perStaking: any[] = []
+
+    for (const s of stakings.results || []) {
+      const userId = s.user_id as number
+      const stakingId = s.staking_id as number
+      const periodDays = Number(s.period_days || ((s.period_months as number) * 30))
+      const acc = getOrInit(userId)
+
+      // 거치기간 초과
+      if (Number(s.rewarded_count) >= periodDays) {
+        stakingsSkipped++
+        acc.skip_reasons.push(`staking#${stakingId}:period_exceeded(${s.rewarded_count}/${periodDays})`)
+        perStaking.push({ staking_id: stakingId, user_id: userId, username: acc.username, skip: 'period_exceeded' })
+        continue
+      }
+
+      // 영구 대책 #1 가드 시뮬레이션 — 이미 5/14치 박혔는지
+      const alreadyPaid = await alreadyPaidDaily(userId, stakingId)
+      if (alreadyPaid) {
+        stakingsSkipped++
+        acc.skip_reasons.push(`staking#${stakingId}:already_paid`)
+        perStaking.push({ staking_id: stakingId, user_id: userId, username: acc.username, skip: 'already_paid' })
+        continue
+      }
+
+      // 200% cap 사전 체크 (본인)
+      const userCap = await getCap(userId)
+      if (userCap.capped) {
+        stakingsSkipped++
+        acc.skip_reasons.push(`staking#${stakingId}:user_capped`)
+        acc.cap_status = `CAPPED (paid ${userCap.paidTotal}/${userCap.target})`
+        perStaking.push({ staking_id: stakingId, user_id: userId, username: acc.username, skip: 'user_capped' })
+        continue
+      }
+
+      // staking.daily_rate D1 직접 조회 (영구룰 — 추측 금지)
+      const dailyRate = Number(s.daily_rate) || 0
+      let qkeyAmount = Math.round(Number(s.amount) * dailyRate * USD_TO_QKEY)
+
+      // cap 잔여 한도
+      let remaining = userCap.remaining
+      if (qkeyAmount > remaining) {
+        qkeyAmount = Math.max(0, Math.floor(remaining))
+        if (qkeyAmount <= 0) {
+          stakingsSkipped++
+          acc.skip_reasons.push(`staking#${stakingId}:cap_remaining_zero`)
+          perStaking.push({ staking_id: stakingId, user_id: userId, username: acc.username, skip: 'cap_remaining_zero' })
+          continue
+        }
+      }
+
+      // ─── 본인 daily 지급 ───
+      acc.daily_qkey += qkeyAmount
+      acc.total_qkey += qkeyAmount
+      acc.after_balance += qkeyAmount
+      totalDailyQkey += qkeyAmount
+
+      // 시뮬레이션 상 cap paidTotal 누적 (같은 batch 내 매칭 계산 정확도)
+      userCap.paidTotal += qkeyAmount
+      userCap.remaining = Math.max(0, userCap.target - userCap.paidTotal)
+
+      const stakingLog: any = {
+        staking_id: stakingId,
+        user_id: userId,
+        username: acc.username,
+        amount: Number(s.amount),
+        rate: dailyRate,
+        daily: qkeyAmount,
+        l1: 0, l2: 0,
+        l1_to: null, l2_to: null,
+      }
+
+      // ─── L1 매칭 (20%) ───
+      const l1Id = userMap[userId]?.referrer_id
+      if (l1Id) {
+        // L1 referrer 5/14 시점 active 인지
+        const l1Active = await db.prepare(`
+          SELECT id FROM staking
+          WHERE user_id=? AND status='active'
+            AND date(start_date,'+9 hours') <= ?
+            AND date(end_date,'+9 hours') >= ?
+          LIMIT 1
+        `).bind(l1Id, REWARD_DATE, REWARD_DATE).first()
+        if (l1Active) {
+          const alreadyL1 = await alreadyPaidRef(l1Id, userId, 1, stakingId, qkeyAmount)
+          if (!alreadyL1) {
+            let l1Reward = Math.round(qkeyAmount * 0.20)  // L1=20%
+            const l1Cap = await getCap(l1Id)
+            if (!l1Cap.capped) {
+              if (l1Reward > l1Cap.remaining) l1Reward = Math.max(0, Math.floor(l1Cap.remaining))
+              if (l1Reward > 0) {
+                const l1Acc = getOrInit(l1Id)
+                l1Acc.l1_qkey += l1Reward
+                l1Acc.total_qkey += l1Reward
+                l1Acc.after_balance += l1Reward
+                totalL1Qkey += l1Reward
+                stakingLog.l1 = l1Reward
+                stakingLog.l1_to = l1Id
+              }
+            }
+          }
+        }
+
+        // ─── L2 매칭 (10%) ───
+        const l2User = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(l1Id).first<any>()
+        const l2Id = l2User?.referrer_id
+        if (l2Id) {
+          const l2Active = await db.prepare(`
+            SELECT id FROM staking
+            WHERE user_id=? AND status='active'
+              AND date(start_date,'+9 hours') <= ?
+              AND date(end_date,'+9 hours') >= ?
+            LIMIT 1
+          `).bind(l2Id, REWARD_DATE, REWARD_DATE).first()
+          if (l2Active) {
+            const alreadyL2 = await alreadyPaidRef(l2Id, userId, 2, stakingId, qkeyAmount)
+            if (!alreadyL2) {
+              let l2Reward = Math.round(qkeyAmount * 0.10)  // L2=10%
+              const l2Cap = await getCap(l2Id)
+              if (!l2Cap.capped) {
+                if (l2Reward > l2Cap.remaining) l2Reward = Math.max(0, Math.floor(l2Cap.remaining))
+                if (l2Reward > 0) {
+                  const l2Acc = getOrInit(l2Id)
+                  // l2Acc.username/balance 보장
+                  if (!userMap[l2Id]) {
+                    const ru = await db.prepare(`SELECT id, username, name, qkey_balance FROM users WHERE id=?`).bind(l2Id).first<any>()
+                    if (ru) {
+                      userMap[l2Id] = { username: ru.username, name: ru.name || '', qkey_balance: Number(ru.qkey_balance || 0), referrer_id: null }
+                      l2Acc.username = ru.username
+                      l2Acc.name = ru.name || ''
+                      l2Acc.current_balance = Number(ru.qkey_balance || 0)
+                      l2Acc.after_balance = l2Acc.current_balance + l2Acc.total_qkey
+                    }
+                  }
+                  l2Acc.l2_qkey += l2Reward
+                  l2Acc.total_qkey += l2Reward
+                  l2Acc.after_balance += l2Reward
+                  totalL2Qkey += l2Reward
+                  stakingLog.l2 = l2Reward
+                  stakingLog.l2_to = l2Id
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // L1 referrer 가 accountMap 에 신규로 들어왔으면 username/balance 채우기
+      if (l1Id && !userMap[l1Id]) {
+        const ru = await db.prepare(`SELECT id, username, name, qkey_balance FROM users WHERE id=?`).bind(l1Id).first<any>()
+        if (ru) {
+          userMap[l1Id] = { username: ru.username, name: ru.name || '', qkey_balance: Number(ru.qkey_balance || 0), referrer_id: null }
+          const l1Acc = accountMap[l1Id]
+          if (l1Acc) {
+            l1Acc.username = ru.username
+            l1Acc.name = ru.name || ''
+            l1Acc.current_balance = Number(ru.qkey_balance || 0)
+            l1Acc.after_balance = l1Acc.current_balance + l1Acc.total_qkey
+          }
+        }
+      }
+
+      stakingsProcessed++
+      perStaking.push(stakingLog)
+    }
+
+    totalGrandQkey = totalDailyQkey + totalL1Qkey + totalL2Qkey
+
+    // 계정별 정렬 (총 지급액 내림차순)
+    const perAccount = Object.entries(accountMap).map(([uid, a]) => ({
+      user_id: Number(uid),
+      username: a.username,
+      name: a.name,
+      current_balance: a.current_balance,
+      daily_qkey: a.daily_qkey,
+      l1_qkey: a.l1_qkey,
+      l2_qkey: a.l2_qkey,
+      total_qkey: a.total_qkey,
+      after_balance: a.after_balance,
+      cap_status: a.cap_status || null,
+      skip_reasons: a.skip_reasons,
+    })).sort((a, b) => b.total_qkey - a.total_qkey)
+
+    return c.json({
+      success: true,
+      mode: 'SIMULATION',
+      title: '5/15(금) cron 자동 지급 시뮬레이션 (5/14치 지급) — 신규 진입자 0 가정',
+      reward_date: REWARD_DATE,
+      paid_date: PAID_DATE,
+      assumptions: [
+        '오늘(5/14) 신규 진입자 없다고 가정',
+        '5/14 시점 활성 staking 만 처리 (start_kst <= 5/14 AND end_kst >= 5/14)',
+        'staking.daily_rate D1 직접 조회 (영구룰)',
+        'L1=20%, L2=10% (referrer 5/14 active 일 때만)',
+        '200% cap (B안, 사용자 단위)',
+        '영구 대책 #1 가드 — 이미 5/14치 지급된 staking SKIP',
+      ],
+      summary: {
+        total_stakings: (stakings.results || []).length,
+        stakings_processed: stakingsProcessed,
+        stakings_skipped: stakingsSkipped,
+        accounts_paid: perAccount.filter(a => a.total_qkey > 0).length,
+        accounts_with_skip: perAccount.filter(a => a.skip_reasons.length > 0).length,
+        total_daily_qkey: totalDailyQkey,
+        total_l1_qkey: totalL1Qkey,
+        total_l2_qkey: totalL2Qkey,
+        grand_total_qkey: totalGrandQkey,
+      },
+      per_account: perAccount,
+      per_staking: perStaking,
+    })
+  } catch (error: any) {
+    console.error('may15-simulate error:', error)
+    return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
 export default app
