@@ -11847,6 +11847,126 @@ app.get('/api/diag/scan-rr-without-tx', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ QKEY 잔액 정합성 전수 스캔: users.qkey_balance vs Σ(daily + referral - withdrawal) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: 합계 안 맞는 계정 전수조사 — boss 직접 요청
+//   계산식:
+//     expected_balance =
+//         Σ(transactions.amount WHERE type='daily_qkey' AND coin_type='QKEY')
+//       + Σ(transactions.amount WHERE type='referral_reward' AND coin_type='QKEY')
+//       - Σ(withdrawals.amount WHERE coin_type='QKEY' AND status IN ('approved','completed','processing','pending'))
+//     mismatch = users.qkey_balance - expected_balance
+//   안전성: SELECT only, UPDATE 없음
+//   경로: GET /api/diag/scan-balance-mismatch?key=ADMIN_PW
+//        옵션: &threshold=1  (|diff|>=1 만 보고), &limit=200
+app.get('/api/diag/scan-balance-mismatch', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const threshold = Number(c.req.query('threshold') || '1')
+    const limit = parseInt(c.req.query('limit') || '500')
+
+    // 1) users 전체 (qkey_balance != null)
+    const users = await db.prepare(`
+      SELECT id, email, name, qkey_balance
+      FROM users
+      WHERE qkey_balance IS NOT NULL
+      ORDER BY id ASC
+    `).all<any>()
+
+    // 2) tx 합계 by user (daily + referral)
+    const txSums = await db.prepare(`
+      SELECT user_id,
+             SUM(CASE WHEN type='daily_qkey' THEN amount ELSE 0 END) AS sum_daily,
+             SUM(CASE WHEN type='referral_reward' THEN amount ELSE 0 END) AS sum_referral
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND type IN ('daily_qkey','referral_reward')
+      GROUP BY user_id
+    `).all<any>()
+
+    // 3) 출금 합계 by user (pending+approved+completed+processing 모두 포함 = 이미 잔액에서 차감된 것)
+    const wdSums = await db.prepare(`
+      SELECT user_id,
+             SUM(amount) AS sum_withdraw
+      FROM withdrawals
+      WHERE coin_type = 'QKEY'
+        AND status IN ('approved','completed','processing','pending')
+      GROUP BY user_id
+    `).all<any>()
+
+    const txMap: Record<string, { d: number, r: number }> = {}
+    for (const row of (txSums.results || [])) {
+      txMap[String(row.user_id)] = { d: Number(row.sum_daily || 0), r: Number(row.sum_referral || 0) }
+    }
+    const wdMap: Record<string, number> = {}
+    for (const row of (wdSums.results || [])) {
+      wdMap[String(row.user_id)] = Number(row.sum_withdraw || 0)
+    }
+
+    const mismatches: any[] = []
+    let totalChecked = 0
+    let totalOk = 0
+    let totalNegative = 0
+
+    for (const u of (users.results || [])) {
+      totalChecked++
+      const k = String(u.id)
+      const sumDaily = txMap[k]?.d || 0
+      const sumReferral = txMap[k]?.r || 0
+      const sumWd = wdMap[k] || 0
+      const expected = sumDaily + sumReferral - sumWd
+      const actual = Number(u.qkey_balance || 0)
+      const diff = actual - expected
+
+      if (actual < 0) totalNegative++
+
+      if (Math.abs(diff) >= threshold) {
+        mismatches.push({
+          user_id: u.id, email: u.email, name: u.name,
+          qkey_balance: actual,
+          sum_daily_tx: sumDaily,
+          sum_referral_tx: sumReferral,
+          sum_withdraw: sumWd,
+          expected_balance: expected,
+          diff: diff,
+          diff_sign: diff > 0 ? 'BALANCE_HIGH_THAN_TX' : 'BALANCE_LOW_THAN_TX',
+          negative_balance: actual < 0
+        })
+      } else {
+        totalOk++
+      }
+    }
+
+    // diff 절대값 큰 순 정렬
+    mismatches.sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff))
+    const top = mismatches.slice(0, limit)
+
+    const totalDiffAbs = mismatches.reduce((acc, m) => acc + Math.abs(m.diff), 0)
+    const totalDiffSigned = mismatches.reduce((acc, m) => acc + m.diff, 0)
+
+    return c.json({
+      success: true,
+      summary: {
+        total_users_checked: totalChecked,
+        users_ok: totalOk,
+        users_mismatch: mismatches.length,
+        users_with_negative_balance: totalNegative,
+        sum_abs_diff: totalDiffAbs,
+        sum_signed_diff: totalDiffSigned,
+        threshold,
+        returned: top.length
+      },
+      mismatches: top
+    })
+  } catch (error) {
+    console.error('scan-balance-mismatch error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 단일 회원 referral_rewards tx 백필 (solbat 같은 case 용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   경로: POST /api/diag/fix-tx-for-rr?key=ADMIN_PW&user_id=44&paid_dates=2026-05-15&dry_run=1
