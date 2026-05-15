@@ -10782,7 +10782,7 @@ app.get('/api/diag/missing-rewards-scan', async (c) => {
     const stakings = await db.prepare(`
       SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.start_date, s.end_date,
              u.email, u.name
-      FROM stakings s
+      FROM staking s
       JOIN users u ON u.id = s.user_id
       WHERE s.status = 'active' OR s.status IS NULL OR s.status = ''
       ORDER BY s.user_id, s.id
