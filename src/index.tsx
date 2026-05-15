@@ -11304,6 +11304,139 @@ app.get('/api/diag/user-paid-date-detail', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 사용자 전체 staking + 일자별 daily_rewards 매트릭스 (사장님 2026-05-15 7차 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "bang8241 case 가장 오류나기 쉽다. 1000$ 리셋 후 휴일 추가 4000$.
+//                 5/11 정상, 5/12·5/13 4000$건 누락, 5/14·5/15 다시 정상"
+//
+//   진단 목적: 한 회원의 모든 staking (active + closed) × 일자별 daily_rewards 매트릭스 확인
+//             특히 같은 user_id 가 staking_id 별로 각각 데일리 받았는지 검증
+//
+//   경로: GET /api/diag/user-staking-matrix?key=ADMIN_PW&email=bang8241&dates=2026-05-11,2026-05-12,2026-05-13,2026-05-14,2026-05-15
+//   또는 user_id=33 로도 조회 가능
+app.get('/api/diag/user-staking-matrix', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const email = c.req.query('email') || ''
+    const userIdParam = c.req.query('user_id') || ''
+    const datesParam = c.req.query('dates') || '2026-05-11,2026-05-12,2026-05-13,2026-05-14,2026-05-15'
+    const dates = datesParam.split(',').map(s => s.trim()).filter(Boolean)
+
+    // user 조회
+    let user: any = null
+    if (userIdParam) {
+      user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(parseInt(userIdParam)).first()
+    } else if (email) {
+      user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE email = ?`).bind(email).first()
+    }
+    if (!user) return c.json({ error: 'user not found', email, user_id: userIdParam }, 404)
+
+    // 모든 staking (active + closed)
+    const stakings = await db.prepare(`
+      SELECT id, user_id, amount, daily_rate, duration_days, start_date, end_date, status,
+             total_received, accrued_qkey, last_reward_date, created_at
+      FROM staking
+      WHERE user_id = ?
+      ORDER BY id ASC
+    `).bind(user.id).all<any>()
+
+    // 일자별 × staking_id 별 daily_rewards 매트릭스
+    const matrix: Record<string, Record<number, any>> = {}
+    for (const dateStr of dates) {
+      matrix[dateStr] = {}
+      for (const s of (stakings.results || [])) {
+        const dr = await db.prepare(`
+          SELECT id, usdt_amount, reward_date, paid_date, created_at
+          FROM daily_rewards
+          WHERE user_id = ? AND staking_id = ? AND reward_date = ?
+        `).bind(user.id, s.id, dateStr).all<any>()
+
+        // staking 활성 여부 (해당 일자에 active 였는지)
+        const start = (s.start_date || '').slice(0, 10)
+        const end = (s.end_date || '').slice(0, 10)
+        const wasActive = start <= dateStr && (!end || end === '' || end > dateStr)
+
+        // 평일 여부 (KST 정오 기준)
+        const dt = new Date(dateStr + 'T12:00:00+09:00')
+        const dow = dt.getUTCDay() // 0=일, 6=토
+        const isWeekday = dow !== 0 && dow !== 6
+
+        const expectedQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+        const actualQkey = (dr.results || []).reduce((acc: number, r: any) => acc + Number(r.usdt_amount || 0), 0)
+
+        matrix[dateStr][s.id] = {
+          staking_id: s.id,
+          amount: s.amount,
+          daily_rate: s.daily_rate,
+          status: s.status,
+          start_date: s.start_date,
+          end_date: s.end_date,
+          was_active_on_date: wasActive,
+          is_weekday: isWeekday,
+          should_be_paid: wasActive && isWeekday,
+          expected_qkey: expectedQkey,
+          actual_qkey: actualQkey,
+          dr_row_count: (dr.results || []).length,
+          dr_rows: dr.results || [],
+          status_label: wasActive && isWeekday
+            ? (actualQkey === 0 ? 'MISSING' : (actualQkey === expectedQkey ? 'OK' : (actualQkey > expectedQkey ? 'OVERPAID' : 'PARTIAL')))
+            : 'N/A'
+        }
+      }
+    }
+
+    // 일자별 합계
+    const dailySummary: Record<string, any> = {}
+    for (const dateStr of dates) {
+      let expectedSum = 0
+      let actualSum = 0
+      let missingStakings: number[] = []
+      for (const s of (stakings.results || [])) {
+        const cell = matrix[dateStr][s.id]
+        if (cell.should_be_paid) {
+          expectedSum += cell.expected_qkey
+          actualSum += cell.actual_qkey
+          if (cell.status_label === 'MISSING') missingStakings.push(s.id)
+        }
+      }
+      dailySummary[dateStr] = {
+        expected_total: expectedSum,
+        actual_total: actualSum,
+        diff: expectedSum - actualSum,
+        missing_staking_ids: missingStakings
+      }
+    }
+
+    // transactions 5/11 ~ 5/15 daily_qkey 만 추출 (참고용)
+    const txDaily = await db.prepare(`
+      SELECT id, user_id, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE user_id = ?
+        AND type = 'daily_qkey'
+        AND DATE(created_at) >= '2026-05-11'
+        AND DATE(created_at) <= '2026-05-15'
+      ORDER BY created_at ASC
+    `).bind(user.id).all<any>()
+
+    return c.json({
+      success: true,
+      user,
+      stakings_count: (stakings.results || []).length,
+      stakings: stakings.results || [],
+      dates_scanned: dates,
+      daily_summary: dailySummary,
+      matrix,
+      transactions_daily_5_11_to_5_15: txDaily.results || []
+    })
+  } catch (error) {
+    console.error('user-staking-matrix error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 5/14 paid_date 보강 미러링 — A안 강행 (사장님 2026-05-15 결재 "A안으로 해줘") ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 원문: "A안으로 해줘" (5/14와 무조건 동일하게)
