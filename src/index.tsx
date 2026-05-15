@@ -9767,6 +9767,315 @@ app.post('/api/diag/rebuild-may15-from-may14', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 5/15 referral_rewards 보충 INSERT (옵션 1, 멱등 안전, 사장님 2026-05-15 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "옵션1로 지금 모든 회원들이 민감하게 바라보고 있어 확실하고 논리적으로 계산이 맞아야해"
+//
+//   배경 — rebuild-may15-from-may14 endpoint 가 Cloudflare 524 (Origin timeout) 으로
+//          2회 중단되어 5/15 referral_rewards INSERT 가 일부만 진행된 상태:
+//          현재 5/15: own=183,000 ✅, L1=24,270 (목표 35,550), L2=10,785 (목표 16,275)
+//          → daily_rewards 56건은 모두 INSERT 완료, referral_rewards 109건 중 일부 INSERT 누락
+//
+//   처리 원칙 (멱등 안전):
+//     1) 5/14 referral_rewards 109건을 source of truth 로 read-only 사용
+//     2) 각 5/14 행에 대해 5/15 에 동일 키 행이 이미 존재하는지 EXISTS 검사:
+//        키 = (referrer_id, referee_id, level, reward_date='2026-05-15')
+//     3) 미존재 시에만 INSERT (reward_date='2026-05-15', paid_date='2026-05-15')
+//     4) INSERT 성공 시 transactions mirror INSERT (type, ref_id 가드 동반)
+//     5) INSERT 성공 시 users.qkey_balance += reward_amount
+//     6) 이미 존재하는 행은 skip (재호출 시 중복 절대 발생 안 함)
+//
+//   daily_rewards 는 손대지 않음 (own=183,000 이미 5/14 와 일치).
+//   다른 paid_date 데이터 절대 손대지 않음 (5/14 read-only, 5/15 만 INSERT).
+//
+//   경로: POST /api/diag/topup-may15-referrals?key=ADMIN_PW&dry_run=1   (조회)
+//         POST /api/diag/topup-may15-referrals?key=ADMIN_PW&confirm=GO  (실행)
+app.post('/api/diag/topup-may15-referrals', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const confirm = c.req.query('confirm') === 'GO'
+    const dryRun = !confirm
+    const db = c.env.DB
+
+    const SRC_PAID_DATE = '2026-05-14'   // 원본 (어제, read-only)
+    const DST_REWARD_DATE = '2026-05-15' // 대상
+    const DST_PAID_DATE = '2026-05-15'   // 대상
+
+    // ============================================================
+    // STEP 1 — 5/14 referral_rewards 원본 109건 SELECT (read-only source of truth)
+    // ============================================================
+    const srcRr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date = ?
+      ORDER BY id ASC
+    `).bind(SRC_PAID_DATE).all() as any
+    const srcRrRows = srcRr?.results || []
+
+    // ============================================================
+    // STEP 2 — 각 5/14 행에 대해 5/15 EXISTS 검사 + INSERT 계획
+    // ============================================================
+    const plan: any[] = []
+    let toInsertCount = 0
+    let alreadyExistsCount = 0
+    let toInsertQkey = 0
+    const balanceDeltas: Record<number, number> = {}
+
+    for (const src of srcRrRows) {
+      const exists = await db.prepare(`
+        SELECT id FROM referral_rewards
+        WHERE referrer_id = ? AND referee_id = ? AND level = ? AND reward_date = ?
+        LIMIT 1
+      `).bind(src.referrer_id, src.referee_id, src.level, DST_REWARD_DATE).first() as any
+
+      if (exists) {
+        alreadyExistsCount++
+        plan.push({
+          src_rr_id: src.id,
+          action: 'skip_exists',
+          existing_dst_rr_id: exists.id,
+          referrer_id: src.referrer_id,
+          referee_id: src.referee_id,
+          level: src.level,
+          reward_amount: src.reward_amount
+        })
+      } else {
+        toInsertCount++
+        toInsertQkey += Number(src.reward_amount || 0)
+        const uid = Number(src.referrer_id)
+        balanceDeltas[uid] = (balanceDeltas[uid] || 0) + Number(src.reward_amount || 0)
+        plan.push({
+          src_rr_id: src.id,
+          action: 'insert',
+          referrer_id: src.referrer_id,
+          referee_id: src.referee_id,
+          level: src.level,
+          original_amount: src.original_amount,
+          reward_amount: src.reward_amount
+        })
+      }
+    }
+
+    // ============================================================
+    // STEP 3 — DRY_RUN 이면 계획만 반환
+    // ============================================================
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 파라미터를 추가하세요',
+        src_paid_date: SRC_PAID_DATE,
+        dst_paid_date: DST_PAID_DATE,
+        src_rr_total: srcRrRows.length,
+        plan_summary: {
+          to_insert_count: toInsertCount,
+          already_exists_count: alreadyExistsCount,
+          to_insert_qkey: toInsertQkey,
+          affected_users: Object.keys(balanceDeltas).length
+        },
+        balance_deltas: balanceDeltas,
+        plan_first_30: plan.slice(0, 30)
+      })
+    }
+
+    // ============================================================
+    // STEP 4 — 실제 실행 (confirm=GO, EXISTS 가드로 멱등 안전)
+    // ============================================================
+    const executed = {
+      referral_rewards_inserted: 0,
+      referral_rewards_skipped_exists: 0,
+      transactions_inserted: 0,
+      transactions_skipped_exists: 0,
+      balance_users_updated: 0
+    }
+    const insertedDetails: any[] = []
+    const balanceActual: Record<number, number> = {}
+
+    for (const src of srcRrRows) {
+      // EXISTS 재검사 (실행 시점에 다시 확인 — 동시성 안전)
+      const exists = await db.prepare(`
+        SELECT id FROM referral_rewards
+        WHERE referrer_id = ? AND referee_id = ? AND level = ? AND reward_date = ?
+        LIMIT 1
+      `).bind(src.referrer_id, src.referee_id, src.level, DST_REWARD_DATE).first() as any
+
+      if (exists) {
+        executed.referral_rewards_skipped_exists++
+        continue
+      }
+
+      // 4-1) referral_rewards INSERT
+      const rrIns = await db.prepare(`
+        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        src.referrer_id, src.referee_id, src.level,
+        src.original_amount, src.reward_amount,
+        DST_REWARD_DATE, DST_PAID_DATE
+      ).run()
+      const newRrId = (rrIns as any)?.meta?.last_row_id ?? null
+      if (!newRrId) continue
+      executed.referral_rewards_inserted++
+
+      // 4-2) transactions mirror INSERT (type, ref_id 가드)
+      const txExists = await db.prepare(`
+        SELECT id FROM transactions WHERE type = 'referral_reward' AND ref_id = ? LIMIT 1
+      `).bind(newRrId).first()
+      if (!txExists) {
+        const level = Number(src.level)
+        const desc = level === 1 ? '추천 보너스 (Level 1)' : (level === 2 ? '추천 보너스 (Level 2)' : '추천 보너스')
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(src.referrer_id, src.reward_amount, desc, newRrId).run()
+        executed.transactions_inserted++
+      } else {
+        executed.transactions_skipped_exists++
+      }
+
+      // 4-3) qkey_balance 가산 (각 row 별로 즉시 반영 → 부분 실행 시에도 일관성)
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+        .bind(src.reward_amount, src.referrer_id).run()
+
+      const uid = Number(src.referrer_id)
+      balanceActual[uid] = (balanceActual[uid] || 0) + Number(src.reward_amount || 0)
+
+      insertedDetails.push({
+        src_rr_id: src.id,
+        new_rr_id: newRrId,
+        referrer_id: src.referrer_id,
+        referee_id: src.referee_id,
+        level: src.level,
+        reward_amount: src.reward_amount
+      })
+    }
+
+    executed.balance_users_updated = Object.keys(balanceActual).length
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      src_paid_date: SRC_PAID_DATE,
+      dst_paid_date: DST_PAID_DATE,
+      src_rr_total: srcRrRows.length,
+      executed,
+      balance_actual_deltas: balanceActual,
+      inserted_count: insertedDetails.length,
+      inserted_first_30: insertedDetails.slice(0, 30)
+    })
+  } catch (error) {
+    console.error('topup-may15-referrals error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 5/14 vs 5/15 계정별 1:1 검증 (사장님 2026-05-15 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 지시: "확실하고 논리적으로 계산이 맞아야해"
+//
+//   처리: 5/14 paid_date 와 5/15 paid_date 의 계정별 (own / L1 / L2 / total) 을 비교하여
+//         완전 일치하지 않는 계정을 모두 보고
+//
+//   경로: GET /api/diag/verify-may15-equals-may14?key=ADMIN_PW
+app.get('/api/diag/verify-may15-equals-may14', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    async function getDayData(paidDate: string) {
+      const drRows = await db.prepare(`
+        SELECT user_id, SUM(usdt_amount) as own_qkey, COUNT(*) as own_count
+        FROM daily_rewards WHERE paid_date = ?
+        GROUP BY user_id
+      `).bind(paidDate).all() as any
+      const l1Rows = await db.prepare(`
+        SELECT referrer_id as user_id, SUM(reward_amount) as l1_qkey, COUNT(*) as l1_count
+        FROM referral_rewards WHERE paid_date = ? AND level = 1
+        GROUP BY referrer_id
+      `).bind(paidDate).all() as any
+      const l2Rows = await db.prepare(`
+        SELECT referrer_id as user_id, SUM(reward_amount) as l2_qkey, COUNT(*) as l2_count
+        FROM referral_rewards WHERE paid_date = ? AND level = 2
+        GROUP BY referrer_id
+      `).bind(paidDate).all() as any
+      const map: Record<number, any> = {}
+      for (const r of (drRows?.results || [])) {
+        const uid = Number(r.user_id)
+        if (!map[uid]) map[uid] = { user_id: uid, own: 0, l1: 0, l2: 0, own_count: 0, l1_count: 0, l2_count: 0 }
+        map[uid].own = Number(r.own_qkey || 0); map[uid].own_count = Number(r.own_count || 0)
+      }
+      for (const r of (l1Rows?.results || [])) {
+        const uid = Number(r.user_id)
+        if (!map[uid]) map[uid] = { user_id: uid, own: 0, l1: 0, l2: 0, own_count: 0, l1_count: 0, l2_count: 0 }
+        map[uid].l1 = Number(r.l1_qkey || 0); map[uid].l1_count = Number(r.l1_count || 0)
+      }
+      for (const r of (l2Rows?.results || [])) {
+        const uid = Number(r.user_id)
+        if (!map[uid]) map[uid] = { user_id: uid, own: 0, l1: 0, l2: 0, own_count: 0, l1_count: 0, l2_count: 0 }
+        map[uid].l2 = Number(r.l2_qkey || 0); map[uid].l2_count = Number(r.l2_count || 0)
+      }
+      let totalOwn = 0, totalL1 = 0, totalL2 = 0
+      for (const v of Object.values(map)) {
+        totalOwn += v.own; totalL1 += v.l1; totalL2 += v.l2
+      }
+      return { map, totalOwn, totalL1, totalL2, total: totalOwn + totalL1 + totalL2, count: Object.keys(map).length }
+    }
+
+    const d14 = await getDayData('2026-05-14')
+    const d15 = await getDayData('2026-05-15')
+
+    const allUids = new Set<number>([...Object.keys(d14.map).map(Number), ...Object.keys(d15.map).map(Number)])
+    const mismatches: any[] = []
+    let matchCount = 0
+
+    for (const uid of allUids) {
+      const a = d14.map[uid] || { own: 0, l1: 0, l2: 0, own_count: 0, l1_count: 0, l2_count: 0 }
+      const b = d15.map[uid] || { own: 0, l1: 0, l2: 0, own_count: 0, l1_count: 0, l2_count: 0 }
+      const ownDiff = b.own - a.own
+      const l1Diff = b.l1 - a.l1
+      const l2Diff = b.l2 - a.l2
+      if (ownDiff === 0 && l1Diff === 0 && l2Diff === 0) {
+        matchCount++
+      } else {
+        const u = await db.prepare(`SELECT name, email FROM users WHERE id = ?`).bind(uid).first() as any
+        mismatches.push({
+          user_id: uid,
+          name: u?.name || null,
+          email: u?.email || null,
+          may14: { own: a.own, l1: a.l1, l2: a.l2, total: a.own + a.l1 + a.l2 },
+          may15: { own: b.own, l1: b.l1, l2: b.l2, total: b.own + b.l1 + b.l2 },
+          diff: { own: ownDiff, l1: l1Diff, l2: l2Diff, total: ownDiff + l1Diff + l2Diff }
+        })
+      }
+    }
+
+    return c.json({
+      success: true,
+      summary_may14: { count: d14.count, own: d14.totalOwn, l1: d14.totalL1, l2: d14.totalL2, total: d14.total },
+      summary_may15: { count: d15.count, own: d15.totalOwn, l1: d15.totalL1, l2: d15.totalL2, total: d15.total },
+      totals_diff: {
+        own: d15.totalOwn - d14.totalOwn,
+        l1: d15.totalL1 - d14.totalL1,
+        l2: d15.totalL2 - d14.totalL2,
+        total: d15.total - d14.total
+      },
+      affected_users: allUids.size,
+      match_count: matchCount,
+      mismatch_count: mismatches.length,
+      verdict: mismatches.length === 0 ? 'PERFECT_MATCH' : 'MISMATCH_EXISTS',
+      mismatches
+    })
+  } catch (error) {
+    console.error('verify-may15-equals-may14 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+
 // ★★★ 솔밧(u#44) L2 매칭 미러링 누락 2건 정밀 백필 (Phase 1, 2026-05-12 사장님 C안 결재) ★★★
 //   원장 referral_rewards 25건 / 9,150 QKEY  vs  transactions 미러링 23건 / 7,500 QKEY
 //   누락 2건: rr#347 (150 QKEY, 2026-05-06 referee u#49) + rr#524 (1,500 QKEY, 2026-05-06 referee u#76)
