@@ -2004,7 +2004,7 @@ app.post('/api/withdrawal/request', async (c) => {
 
 // 출금 신청 창 상태 조회 (클라이언트 UI 동기화용)
 // 룰: 매주 금요일 10:00~14:00 KST (공휴일 무관)
-// ★ 사장님 2026-05-15 1회성 지시: 2026-05-15 (금) 당일은 16:00 까지 연장 (서버 isWithdrawalWindowOpen 과 동일)
+// ★ 사장님 2026-05-15 (5차) 지시: 2026-05-15 (금) 당일만 18:00 까지 연장 (10:00~18:00). 5/16부터 원래 룰 자동 복원.
 app.get('/api/withdrawal/window', (c) => {
   const now = new Date()
   const kst = new Date(now.getTime() + (9 * 60 * 60 * 1000))
@@ -2012,9 +2012,9 @@ app.get('/api/withdrawal/window', (c) => {
   const day = kst.getUTCDay()
   const hour = kst.getUTCHours()
   const minute = kst.getUTCMinutes()
-  // 1회성 예외: 2026-05-15 (금) → 10:00 ~ 16:00 (사장님 직접 지시)
+  // 1회성 예외: 2026-05-15 (금) → 10:00 ~ 18:00 (사장님 직접 지시, 매우 중요)
   const isMay15 = todayKst === '2026-05-15'
-  const closeHourEffective = isMay15 ? 16 : 14
+  const closeHourEffective = isMay15 ? 18 : 14
   const isOpen = day === 5 && hour >= 10 && hour < closeHourEffective
   // 다음 금요일 날짜 계산 (안내용)
   let diffToNextFriday: number
@@ -4596,15 +4596,15 @@ function getStakingAccrualDatesKst(
 
 // 출금 신청 창 체크
 // 룰: 매주 금요일 10:00~14:00 KST. 공휴일 여부 무관. 실제 지급 처리는 관리자가 수동으로 진행.
-// ★ 사장님 2026-05-15 1회성 지시: 2026-05-15 (금) 당일은 16:00 까지 연장
+// ★ 사장님 2026-05-15 (5차) 지시: 2026-05-15 (금) 당일만 18:00 까지 연장. 5/16부터 원래 룰 자동 복원.
 function isWithdrawalWindowOpen(d: Date): boolean {
   const kst = new Date(d.getTime() + (9 * 60 * 60 * 1000))
   const day = kst.getUTCDay() // 0=일, 5=금
   const hour = kst.getUTCHours()
   const dateStr = `${kst.getUTCFullYear()}-${String(kst.getUTCMonth()+1).padStart(2,'0')}-${String(kst.getUTCDate()).padStart(2,'0')}`
-  // 1회성 예외: 2026-05-15 (금) → 10:00 ~ 16:00 (사장님 직접 지시)
+  // 1회성 예외: 2026-05-15 (금) → 10:00 ~ 18:00 (사장님 직접 지시, 매우 중요)
   if (dateStr === '2026-05-15') {
-    return day === 5 && hour >= 10 && hour < 16
+    return day === 5 && hour >= 10 && hour < 18
   }
   // 기본 룰: 매주 금요일 10:00 ~ 14:00 KST
   return day === 5 && hour >= 10 && hour < 14
@@ -20606,7 +20606,7 @@ app.get('/dashboard', (c) => {
 
             // 출금 가능 시간 체크
             // 룰: 매주 금요일 10:00~14:00 KST. 그 금요일이 한국 공휴일이면 직전 영업일로 이동.
-            // ★ 사장님 2026-05-15 1회성 지시: 2026-05-15 (금) 당일은 16:00 까지 연장
+            // ★ 사장님 2026-05-15 (5차) 지시: 2026-05-15 (금) 당일만 18:00 까지 연장. 5/16부터 원래 룰 자동 복원.
             // 우선 서버 응답을 신뢰, 캐시 없을 때만 클라이언트 fallback 사용
             function isWithdrawalTime() {
                 if (_withdrawalWindowState && typeof _withdrawalWindowState.isOpen === 'boolean') {
@@ -20618,9 +20618,9 @@ app.get('/dashboard', (c) => {
                 var day = kst.getUTCDay();
                 var hour = kst.getUTCHours();
                 var dateStr = kst.getUTCFullYear() + '-' + String(kst.getUTCMonth()+1).padStart(2,'0') + '-' + String(kst.getUTCDate()).padStart(2,'0');
-                // 1회성 예외: 2026-05-15 (금) → 10:00 ~ 16:00 (사장님 직접 지시)
+                // 1회성 예외: 2026-05-15 (금) → 10:00 ~ 18:00 (사장님 직접 지시, 매우 중요)
                 if (dateStr === '2026-05-15') {
-                    return (day === 5 && hour >= 10 && hour < 16);
+                    return (day === 5 && hour >= 10 && hour < 18);
                 }
                 return (day === 5 && hour >= 10 && hour < 14);
             }
