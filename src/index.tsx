@@ -11908,6 +11908,370 @@ app.post('/api/diag/fix-delete-tx-single', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-delete-tx-no-balance: 잔액 차감 없이 tx 만 DELETE (잔액 미반영 잘못된 tx 정리) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: type='daily_reward' 같이 영구룰 위반 type 으로 잘못 들어간 tx 정리
+//        (이미 잔액에는 반영 안 되어 있어 차감 없이 행만 삭제)
+//   안전성:
+//     - user_id + tx_id + expected_amount + expected_type 4중 검증
+//     - 단일 tx 한정
+//     - 잔액 변경 0 (의도적)
+//     - DRY_RUN 기본 / confirm=GO 명시시만 실행
+//   경로 (POST):
+//     /api/diag/fix-delete-tx-no-balance?key=ADMIN_PW
+//        &user_id=33
+//        &tx_id=3100
+//        &expected_amount=3000
+//        &expected_type=daily_reward
+//        &dry_run=1   (또는 confirm=GO)
+app.post('/api/diag/fix-delete-tx-no-balance', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const txId = parseInt(c.req.query('tx_id') || '0')
+    const expectedAmount = Number(c.req.query('expected_amount') || 'NaN')
+    const expectedType = c.req.query('expected_type') || ''
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (!txId) return c.json({ error: 'tx_id required' }, 400)
+    if (!expectedType) return c.json({ error: 'expected_type required' }, 400)
+    if (Number.isNaN(expectedAmount)) return c.json({ error: 'expected_amount required (number)' }, 400)
+
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    const tx = await db.prepare(`
+      SELECT id, user_id, type, amount, coin_type, description, ref_id, created_at
+      FROM transactions WHERE id = ?
+    `).bind(txId).first<any>()
+    if (!tx) return c.json({ error: 'tx not found', tx_id: txId }, 404)
+
+    const validation = {
+      tx_id_match: tx.id === txId,
+      user_id_match: tx.user_id === userId,
+      type_match: tx.type === expectedType,
+      amount_match: Number(tx.amount) === expectedAmount
+    }
+    const allValid = Object.values(validation).every(v => v === true)
+    if (!allValid) {
+      return c.json({
+        success: false,
+        error: 'VALIDATION_FAILED',
+        message: '4중 검증 실패 — 진행 중단',
+        tx_actual: { id: tx.id, user_id: tx.user_id, type: tx.type, amount: tx.amount, ref_id: tx.ref_id, description: tx.description, created_at: tx.created_at },
+        expected: { user_id: userId, tx_id: txId, type: expectedType, amount: expectedAmount },
+        validation
+      }, 400)
+    }
+
+    const plan = {
+      action: 'DELETE_TX_ONLY_NO_BALANCE_CHANGE',
+      tx_id: tx.id, user_id: tx.user_id, type: tx.type, amount: tx.amount,
+      ref_id: tx.ref_id, description: tx.description, created_at: tx.created_at,
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after: user.qkey_balance,
+      balance_delta: 0
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({ success: true, mode: 'DRY_RUN', message: '실제 실행을 원하시면 confirm=GO 추가', user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance }, validation, plan })
+    }
+
+    await db.prepare(`DELETE FROM transactions WHERE id = ? AND user_id = ?`).bind(txId, userId).run()
+
+    return c.json({
+      success: true, mode: 'EXECUTED',
+      user: { id: user.id, email: user.email, name: user.name, qkey_balance_before: user.qkey_balance, qkey_balance_after: user.qkey_balance },
+      validation,
+      result: { deleted_tx_id: txId, balance_changed: false, note: 'tx 행만 삭제, 잔액 변동 없음 (잔액에 미반영된 영구룰 위반 type 정리용)' }
+    })
+  } catch (error) {
+    console.error('fix-delete-tx-no-balance error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-adjust-qkey-balance: 단일 회원 잔액 직접 보정 (사장님 기준 정확한 잔액으로) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: tx 정리 후에도 잔액이 사장님 기준과 다르면 직접 UPDATE
+//   안전성:
+//     - user_id + expected_current_balance (현재 DB값 확인) + new_balance 명시
+//     - DRY_RUN 기본 / confirm=GO 명시시만 실행
+//   경로 (POST):
+//     /api/diag/fix-adjust-qkey-balance?key=ADMIN_PW
+//        &user_id=33
+//        &expected_current_balance=2250
+//        &new_balance=3750
+//        &reason_label=bang8241_recalc_kst_basis
+//        &dry_run=1   (또는 confirm=GO)
+app.post('/api/diag/fix-adjust-qkey-balance', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const expectedCurrent = Number(c.req.query('expected_current_balance') || 'NaN')
+    const newBalance = Number(c.req.query('new_balance') || 'NaN')
+    const reasonLabel = c.req.query('reason_label') || ''
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (Number.isNaN(expectedCurrent)) return c.json({ error: 'expected_current_balance required' }, 400)
+    if (Number.isNaN(newBalance)) return c.json({ error: 'new_balance required' }, 400)
+    if (!reasonLabel) return c.json({ error: 'reason_label required (audit trail)' }, 400)
+
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    if (Number(user.qkey_balance) !== expectedCurrent) {
+      return c.json({
+        success: false,
+        error: 'EXPECTED_CURRENT_MISMATCH',
+        message: '현재 DB 잔액이 expected_current_balance 와 다름 — 누군가 동시 변경한 가능성, 진행 중단',
+        db_qkey_balance: user.qkey_balance,
+        expected_current_balance: expectedCurrent
+      }, 400)
+    }
+
+    const delta = newBalance - expectedCurrent
+
+    const plan = {
+      action: 'UPDATE_QKEY_BALANCE',
+      user_id: user.id,
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after: newBalance,
+      delta,
+      reason_label: reasonLabel
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({ success: true, mode: 'DRY_RUN', message: '실제 실행을 원하시면 confirm=GO 추가', user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance }, plan })
+    }
+
+    await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(newBalance, userId).run()
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    return c.json({
+      success: true, mode: 'EXECUTED',
+      user: { id: user.id, email: user.email, name: user.name, qkey_balance_before: user.qkey_balance, qkey_balance_after: userAfter?.qkey_balance },
+      result: { delta, reason_label: reasonLabel, note: 'users.qkey_balance 직접 보정. tx 행 변동 없음.' }
+    })
+  } catch (error) {
+    console.error('fix-adjust-qkey-balance error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ scan-balance-mismatch-v2: swap_out 포함 정확한 잔액 검증식 전수 ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   영구룰 잔액 검증식:
+//     expected =
+//         Σ(tx WHERE type='daily_qkey' AND coin_type='QKEY')
+//       + Σ(tx WHERE type='referral_reward' AND coin_type='QKEY')
+//       + Σ(tx WHERE type='swap_out' AND coin_type='QKEY')   ← amount 가 음수로 저장됨
+//       + Σ(tx WHERE type='swap_in' AND coin_type='QKEY')    ← 양수
+//       - Σ(withdrawals.amount WHERE coin_type='QKEY' AND status IN approved/completed/processing/pending)
+//   영구룰 위반 type 별도 표시 (daily_reward 등)
+//   안전성: SELECT only
+//   경로: GET /api/diag/scan-balance-mismatch-v2?key=ADMIN_PW&threshold=1&limit=200
+app.get('/api/diag/scan-balance-mismatch-v2', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const threshold = Number(c.req.query('threshold') || '1')
+    const limit = parseInt(c.req.query('limit') || '500')
+
+    const users = await db.prepare(`
+      SELECT id, email, name, qkey_balance
+      FROM users
+      WHERE qkey_balance IS NOT NULL
+      ORDER BY id ASC
+    `).all<any>()
+
+    // 정상 type 합계: daily_qkey + referral_reward + swap_out + swap_in
+    const txNormal = await db.prepare(`
+      SELECT user_id,
+             SUM(CASE WHEN type='daily_qkey' THEN amount ELSE 0 END) AS sum_daily,
+             SUM(CASE WHEN type='referral_reward' THEN amount ELSE 0 END) AS sum_referral,
+             SUM(CASE WHEN type='swap_out' THEN amount ELSE 0 END) AS sum_swap_out,
+             SUM(CASE WHEN type='swap_in' THEN amount ELSE 0 END) AS sum_swap_in
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND type IN ('daily_qkey','referral_reward','swap_out','swap_in')
+      GROUP BY user_id
+    `).all<any>()
+
+    // 영구룰 위반 type 합계 (별도 표시)
+    const txIllegal = await db.prepare(`
+      SELECT user_id, type,
+             SUM(amount) AS sum_amount,
+             COUNT(*) AS cnt
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND type NOT IN ('daily_qkey','referral_reward','swap_out','swap_in','withdrawal')
+      GROUP BY user_id, type
+    `).all<any>()
+
+    const wdSums = await db.prepare(`
+      SELECT user_id, SUM(amount) AS sum_withdraw
+      FROM withdrawals
+      WHERE coin_type = 'QKEY'
+        AND status IN ('approved','completed','processing','pending')
+      GROUP BY user_id
+    `).all<any>()
+
+    const normMap: Record<string, { d: number, r: number, so: number, si: number }> = {}
+    for (const row of (txNormal.results || [])) {
+      normMap[String(row.user_id)] = {
+        d: Number(row.sum_daily || 0),
+        r: Number(row.sum_referral || 0),
+        so: Number(row.sum_swap_out || 0),
+        si: Number(row.sum_swap_in || 0)
+      }
+    }
+    const illegalMap: Record<string, { types: { type: string, sum: number, cnt: number }[], total_sum: number, total_cnt: number }> = {}
+    for (const row of (txIllegal.results || [])) {
+      const k = String(row.user_id)
+      if (!illegalMap[k]) illegalMap[k] = { types: [], total_sum: 0, total_cnt: 0 }
+      illegalMap[k].types.push({ type: row.type, sum: Number(row.sum_amount || 0), cnt: Number(row.cnt || 0) })
+      illegalMap[k].total_sum += Number(row.sum_amount || 0)
+      illegalMap[k].total_cnt += Number(row.cnt || 0)
+    }
+    const wdMap: Record<string, number> = {}
+    for (const row of (wdSums.results || [])) wdMap[String(row.user_id)] = Number(row.sum_withdraw || 0)
+
+    const mismatches: any[] = []
+    let totalChecked = 0, totalOk = 0, totalNegative = 0, totalIllegalUsers = 0
+
+    for (const u of (users.results || [])) {
+      totalChecked++
+      const k = String(u.id)
+      const n = normMap[k] || { d: 0, r: 0, so: 0, si: 0 }
+      const sumWd = wdMap[k] || 0
+      const expected = n.d + n.r + n.so + n.si - sumWd
+      const actual = Number(u.qkey_balance || 0)
+      const diff = actual - expected
+      const illegal = illegalMap[k] || null
+
+      if (actual < 0) totalNegative++
+      if (illegal) totalIllegalUsers++
+
+      if (Math.abs(diff) >= threshold || illegal) {
+        mismatches.push({
+          user_id: u.id, email: u.email, name: u.name,
+          qkey_balance: actual,
+          sum_daily_qkey: n.d,
+          sum_referral_reward: n.r,
+          sum_swap_out: n.so,
+          sum_swap_in: n.si,
+          sum_withdraw: sumWd,
+          expected_balance: expected,
+          diff,
+          diff_sign: diff > 0 ? 'BALANCE_HIGH' : (diff < 0 ? 'BALANCE_LOW' : 'OK'),
+          negative_balance: actual < 0,
+          illegal_types: illegal ? illegal.types : [],
+          illegal_total_sum: illegal ? illegal.total_sum : 0,
+          illegal_total_cnt: illegal ? illegal.total_cnt : 0
+        })
+      } else {
+        totalOk++
+      }
+    }
+
+    mismatches.sort((a, b) => {
+      const aP = a.illegal_total_cnt > 0 ? 1 : 0
+      const bP = b.illegal_total_cnt > 0 ? 1 : 0
+      if (aP !== bP) return bP - aP
+      return Math.abs(b.diff) - Math.abs(a.diff)
+    })
+    const top = mismatches.slice(0, limit)
+    const totalDiffAbs = mismatches.reduce((acc, m) => acc + Math.abs(m.diff), 0)
+    const totalDiffSigned = mismatches.reduce((acc, m) => acc + m.diff, 0)
+
+    return c.json({
+      success: true,
+      formula: "expected = Σdaily_qkey + Σreferral_reward + Σswap_out + Σswap_in - Σwithdrawals (active)",
+      summary: {
+        total_users_checked: totalChecked,
+        users_ok: totalOk,
+        users_mismatch_or_illegal: mismatches.length,
+        users_with_negative_balance: totalNegative,
+        users_with_illegal_tx_types: totalIllegalUsers,
+        sum_abs_diff: totalDiffAbs,
+        sum_signed_diff: totalDiffSigned,
+        threshold,
+        returned: top.length
+      },
+      mismatches: top
+    })
+  } catch (error) {
+    console.error('scan-balance-mismatch-v2 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ scan-illegal-tx-types: 영구룰 위반 type 전수 적발 (daily_reward 등 잘못된 행) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   허용 type: 'daily_qkey','referral_reward','swap_out','swap_in','withdrawal'
+//   안전성: SELECT only
+//   경로: GET /api/diag/scan-illegal-tx-types?key=ADMIN_PW
+app.get('/api/diag/scan-illegal-tx-types', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    const rows = await db.prepare(`
+      SELECT t.id AS tx_id, t.user_id, t.type, t.amount, t.coin_type, t.description, t.ref_id,
+             datetime(t.created_at,'+9 hours') AS created_at_kst,
+             u.email, u.name, u.qkey_balance
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE t.coin_type = 'QKEY'
+        AND t.type NOT IN ('daily_qkey','referral_reward','swap_out','swap_in','withdrawal')
+      ORDER BY t.user_id, t.id
+    `).all<any>()
+
+    const byUser: Record<string, any> = {}
+    for (const r of (rows.results || [])) {
+      const k = String(r.user_id)
+      if (!byUser[k]) byUser[k] = {
+        user_id: r.user_id, email: r.email, name: r.name, qkey_balance: r.qkey_balance,
+        illegal_count: 0, illegal_sum: 0, items: []
+      }
+      byUser[k].illegal_count++
+      byUser[k].illegal_sum += Number(r.amount || 0)
+      byUser[k].items.push({
+        tx_id: r.tx_id, type: r.type, amount: r.amount,
+        description: r.description, ref_id: r.ref_id, created_at_kst: r.created_at_kst
+      })
+    }
+    const userList = Object.values(byUser).sort((a: any, b: any) => b.illegal_count - a.illegal_count)
+    const totalRows = (rows.results || []).length
+
+    return c.json({
+      success: true,
+      allowed_types: ['daily_qkey','referral_reward','swap_out','swap_in','withdrawal'],
+      total_illegal_rows: totalRows,
+      affected_users_count: userList.length,
+      affected_users: userList
+    })
+  } catch (error) {
+    console.error('scan-illegal-tx-types error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
