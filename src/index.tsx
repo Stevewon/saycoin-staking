@@ -2158,12 +2158,15 @@ app.post('/api/swap/qkey-to-usdt', async (c) => {
     }
 
     // QKEY 차감 & USDT 증가 (150 QKEY = 1 USDT) - 경쟁조건 방지
+    // ★ 영구정책 (2026-05-14): QKEY(데일리/매칭/추천 출처)→USDT 스왑 결과는 출금 가능 → usdt_withdrawable 누적
+    await ensureWithdrawableSchema(db)
     const swapResult = await db.prepare(`
       UPDATE users 
       SET qkey_balance = qkey_balance - ?,
-          usdt_balance = usdt_balance + ?
+          usdt_balance = usdt_balance + ?,
+          usdt_withdrawable = COALESCE(usdt_withdrawable,0) + ?
       WHERE id = ? AND qkey_balance >= ?
-    `).bind(requiredQkey, amount, userId, requiredQkey).run()
+    `).bind(requiredQkey, amount, amount, userId, requiredQkey).run()
 
     if (!swapResult.meta.changes || swapResult.meta.changes === 0) {
       return c.json({ error: `${t(c, 'swap.insufficient_qkey')} (concurrent request)` }, 400)
@@ -31059,9 +31062,12 @@ app.post('/api/diag/migrate-source-tracking', async (c) => {
 
       const qtaAlreadySet = (prevQtaInit + prevQtaWd) > 0 && Math.abs((prevQtaInit + prevQtaWd) - qtaBal) < 0.0001
       const qxAlreadySet = (prevQxInit + prevQxWd) > 0 && Math.abs((prevQxInit + prevQxWd) - qxBal) < 0.0001
-      const usdtAlreadySet = prevUsdtWd > 0 && Math.abs(prevUsdtWd - usdtBal) < 0.0001
+      // ★ 영구정책 (2026-05-14): USDT 는 회사 지급분 없음 → 전액 withdrawable
+      //   prevUsdtWd 가 usdtBal 과 일치할 때만 set 으로 본다 (잔액이 늘었으면 다시 갱신 필요)
+      //   USDT 잔액 0 인 계정도 prevUsdtWd 가 0 이면 set 으로 처리 (변화 없음)
+      const usdtAlreadySet = Math.abs(prevUsdtWd - usdtBal) < 0.0001
 
-      const allSet = (qtaBal === 0 || qtaAlreadySet) && (qxBal === 0 || qxAlreadySet) && (usdtBal === 0 || usdtAlreadySet)
+      const allSet = (qtaBal === 0 || qtaAlreadySet) && (qxBal === 0 || qxAlreadySet) && usdtAlreadySet
       if (allSet) {
         skippedAlreadySet++
         continue
