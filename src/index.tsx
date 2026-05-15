@@ -9972,6 +9972,378 @@ app.post('/api/diag/topup-may15-referrals', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ FINAL-C 완벽 동기화 마스터 (사장님 2026-05-15 "c" 결재, 완벽 수정) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "나는 완벽한 수정을 원해... 모든게 오류없이 중복없이 수정되는 옵션...
+//                다시는 이런 2가지 일 중복지급+미지급 이런건 일어나면 안돼"
+//   사장님 결재: [최종-C] = 5/15 완전 wipe + 5/14 잔존 중복 8건 정리 + 5/14 정상분 1:1 미러링
+//
+//   Phase 1: 5/15 paid_date 완전 wipe (transactions 173 + daily_rewards 56 + referral_rewards 99
+//            + qkey_balance 정확 차감)
+//   Phase 2: 5/14 paid_date 잔존 중복 8건 정리 (audit identified):
+//            referral_rewards.id IN (1217, 1225, 1226, 1227, 1241, 1242, 1245, 1246)
+//            (모두 reward_date=5/13 이나 paid_date=5/14 로 잘못 들어간 legacy 중복)
+//            연관 transactions(type='referral_reward', ref_id IN ...) 삭제
+//            각 referrer qkey_balance 정확 차감 (합 -900 QKEY)
+//   Phase 3: Phase 2 후 5/14 의 모든 row 를 5/15 로 1:1 미러링
+//            daily_rewards 56 → INSERT (reward_date=5/15, paid_date=5/15)
+//            referral_rewards 101 → INSERT (reward_date 원본 유지, paid_date=5/15)
+//            각 INSERT 직후 transactions mirror + qkey_balance 가산
+//   Phase 4: 4-layer 자동 검증
+//
+//   경로:
+//     POST /api/diag/final-c-perfect-sync?key=ADMIN_PW&dry_run=1  (사전점검)
+//     POST /api/diag/final-c-perfect-sync?key=ADMIN_PW&confirm=GO (실행)
+app.post('/api/diag/final-c-perfect-sync', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'Missing confirm=GO (or use dry_run=1)' }, 400)
+    }
+
+    const SRC_PAID_DATE = '2026-05-14'
+    const DST_PAID_DATE = '2026-05-15'
+    const DST_REWARD_DATE_DAILY = '2026-05-15'
+
+    // ============================================================
+    // 5/14 잔존 중복 8건 (audit 결과 확정, reward_date=5/13 → paid_date=5/14 오기재)
+    // ============================================================
+    const PHASE2_DUP_IDS = [1217, 1225, 1226, 1227, 1241, 1242, 1245, 1246]
+
+    // ============================================================
+    // PHASE 0 — 사전 진단 + 5/14 스냅샷 (Phase 2 정리 후 기준)
+    // ============================================================
+
+    // 0-1) 5/15 wipe 대상 카운트 + 합계 (per-user qkey 차감용)
+    const may15Tx = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id
+      FROM transactions
+      WHERE DATE(created_at) = ? AND type IN ('daily_qkey', 'referral_reward')
+    `).bind(DST_PAID_DATE).all()
+    const may15TxRows = (may15Tx.results || []) as any[]
+    const may15TxQkeyByUser: Record<number, number> = {}
+    for (const t of may15TxRows) {
+      const uid = Number(t.user_id)
+      may15TxQkeyByUser[uid] = (may15TxQkeyByUser[uid] || 0) + Number(t.amount || 0)
+    }
+
+    const may15Dr = await db.prepare(`SELECT id, user_id, usdt_amount FROM daily_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).all()
+    const may15DrRows = (may15Dr.results || []) as any[]
+    const may15Rr = await db.prepare(`SELECT id, referrer_id, reward_amount FROM referral_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).all()
+    const may15RrRows = (may15Rr.results || []) as any[]
+
+    // 0-2) 5/14 잔존 중복 8건 확인 + 합계
+    const dupRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE id IN (${PHASE2_DUP_IDS.join(',')})
+    `).all()
+    const dupList = (dupRows.results || []) as any[]
+    const dupTxRows = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id FROM transactions
+      WHERE type = 'referral_reward' AND ref_id IN (${PHASE2_DUP_IDS.join(',')})
+    `).all()
+    const dupTxList = (dupTxRows.results || []) as any[]
+    const dupQkeyByUser: Record<number, number> = {}
+    for (const r of dupList) {
+      const uid = Number(r.referrer_id)
+      dupQkeyByUser[uid] = (dupQkeyByUser[uid] || 0) + Number(r.reward_amount || 0)
+    }
+    const dupExcessTotal = dupList.reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+
+    // 0-3) 5/14 paid_date 의 원본 SELECT (Phase 2 이후 = 잔존 중복 제외하고 미러링)
+    const srcDr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE paid_date = ?
+      ORDER BY id ASC
+    `).bind(SRC_PAID_DATE).all()
+    const srcDrRows = (srcDr.results || []) as any[]
+
+    const srcRr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date = ?
+      ORDER BY id ASC
+    `).bind(SRC_PAID_DATE).all()
+    const srcRrRowsAll = (srcRr.results || []) as any[]
+    const srcRrRowsClean = srcRrRowsAll.filter(r => !PHASE2_DUP_IDS.includes(Number(r.id)))
+
+    // 0-4) 5/14 정상분(Phase 2 적용 후) per-user 합계 (검증 기준)
+    const srcOwnByUser: Record<number, number> = {}
+    for (const r of srcDrRows) {
+      const uid = Number(r.user_id)
+      srcOwnByUser[uid] = (srcOwnByUser[uid] || 0) + Number(r.usdt_amount || 0)
+    }
+    const srcL1ByUser: Record<number, number> = {}
+    const srcL2ByUser: Record<number, number> = {}
+    for (const r of srcRrRowsClean) {
+      const uid = Number(r.referrer_id)
+      if (Number(r.level) === 1) srcL1ByUser[uid] = (srcL1ByUser[uid] || 0) + Number(r.reward_amount || 0)
+      if (Number(r.level) === 2) srcL2ByUser[uid] = (srcL2ByUser[uid] || 0) + Number(r.reward_amount || 0)
+    }
+    const srcGrandOwn = Object.values(srcOwnByUser).reduce((s: number, v: any) => s + Number(v), 0)
+    const srcGrandL1 = Object.values(srcL1ByUser).reduce((s: number, v: any) => s + Number(v), 0)
+    const srcGrandL2 = Object.values(srcL2ByUser).reduce((s: number, v: any) => s + Number(v), 0)
+
+    const planSummary = {
+      phase1_wipe: {
+        tx_to_delete: may15TxRows.length,
+        dr_to_delete: may15DrRows.length,
+        rr_to_delete: may15RrRows.length,
+        qkey_balance_subtract_per_user: may15TxQkeyByUser,
+        total_qkey_subtracted: Object.values(may15TxQkeyByUser).reduce((s: number, v: any) => s + Number(v), 0)
+      },
+      phase2_dedupe_may14: {
+        rr_to_delete_ids: PHASE2_DUP_IDS,
+        rr_to_delete_count: dupList.length,
+        tx_linked_to_delete: dupTxList.length,
+        qkey_balance_subtract_per_user: dupQkeyByUser,
+        total_qkey_subtracted: dupExcessTotal
+      },
+      phase3_mirror_to_may15: {
+        dr_to_insert: srcDrRows.length,
+        rr_to_insert: srcRrRowsClean.length,
+        tx_to_insert: srcDrRows.length + srcRrRowsClean.length,
+        qkey_balance_add_total:
+          srcDrRows.reduce((s, r) => s + Number(r.usdt_amount || 0), 0) +
+          srcRrRowsClean.reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+      },
+      expected_final_state: {
+        may14_paid_date: {
+          own: srcGrandOwn, l1: srcGrandL1, l2: srcGrandL2, total: srcGrandOwn + srcGrandL1 + srcGrandL2
+        },
+        may15_paid_date_target: {
+          own: srcGrandOwn, l1: srcGrandL1, l2: srcGrandL2, total: srcGrandOwn + srcGrandL1 + srcGrandL2
+        },
+        match: 'EXPECTED_PERFECT_MATCH'
+      }
+    }
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 파라미터를 추가하세요',
+        plan_summary: planSummary,
+        details: {
+          may14_dup_rows: dupList,
+          may14_dup_tx_rows: dupTxList,
+          may15_wipe_tx_first_10: may15TxRows.slice(0, 10),
+          may15_wipe_dr_first_10: may15DrRows.slice(0, 10),
+          may15_wipe_rr_first_10: may15RrRows.slice(0, 10)
+        }
+      })
+    }
+
+    // ============================================================
+    // PHASE 1 — 5/15 paid_date 완전 wipe
+    // ============================================================
+    const phase1Result = { tx_deleted: 0, dr_deleted: 0, rr_deleted: 0, qkey_subtracted_per_user: {} as Record<number, number> }
+
+    // 1-1) qkey_balance 차감 (transactions 합 기준 — 가장 정확)
+    for (const [uidStr, qkey] of Object.entries(may15TxQkeyByUser)) {
+      const uid = Number(uidStr)
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?')
+        .bind(qkey, uid).run()
+      phase1Result.qkey_subtracted_per_user[uid] = Number(qkey)
+    }
+
+    // 1-2) transactions 삭제
+    const txDel = await db.prepare(`
+      DELETE FROM transactions WHERE DATE(created_at) = ? AND type IN ('daily_qkey', 'referral_reward')
+    `).bind(DST_PAID_DATE).run()
+    phase1Result.tx_deleted = txDel.meta?.changes ?? 0
+
+    // 1-3) daily_rewards 삭제
+    const drDel = await db.prepare(`DELETE FROM daily_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).run()
+    phase1Result.dr_deleted = drDel.meta?.changes ?? 0
+
+    // 1-4) referral_rewards 삭제
+    const rrDel = await db.prepare(`DELETE FROM referral_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).run()
+    phase1Result.rr_deleted = rrDel.meta?.changes ?? 0
+
+    // ============================================================
+    // PHASE 2 — 5/14 잔존 중복 8건 정리
+    // ============================================================
+    const phase2Result = { rr_deleted: 0, tx_deleted: 0, qkey_subtracted_per_user: {} as Record<number, number> }
+
+    // 2-1) qkey_balance 차감 (referrer 기준)
+    for (const [uidStr, qkey] of Object.entries(dupQkeyByUser)) {
+      const uid = Number(uidStr)
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?')
+        .bind(qkey, uid).run()
+      phase2Result.qkey_subtracted_per_user[uid] = Number(qkey)
+    }
+
+    // 2-2) transactions 삭제 (type='referral_reward', ref_id IN dup_ids)
+    const dupTxDel = await db.prepare(`
+      DELETE FROM transactions WHERE type = 'referral_reward' AND ref_id IN (${PHASE2_DUP_IDS.join(',')})
+    `).run()
+    phase2Result.tx_deleted = dupTxDel.meta?.changes ?? 0
+
+    // 2-3) referral_rewards 삭제
+    const dupRrDel = await db.prepare(`
+      DELETE FROM referral_rewards WHERE id IN (${PHASE2_DUP_IDS.join(',')})
+    `).run()
+    phase2Result.rr_deleted = dupRrDel.meta?.changes ?? 0
+
+    // ============================================================
+    // PHASE 3 — 5/14 정상분 → 5/15 1:1 미러링
+    // ============================================================
+    const phase3Result = {
+      dr_inserted: 0, rr_inserted: 0, tx_inserted: 0,
+      qkey_added_per_user: {} as Record<number, number>
+    }
+
+    // 3-1) daily_rewards 미러링
+    for (const r of srcDrRows) {
+      const drIns = await db.prepare(`
+        INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(r.user_id, r.staking_id, r.usdt_amount, DST_REWARD_DATE_DAILY, DST_PAID_DATE).run()
+      const newDrId = (drIns as any)?.meta?.last_row_id
+      if (!newDrId) continue
+      phase3Result.dr_inserted++
+
+      // transactions mirror
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'daily_qkey', 'QKEY', ?, '일일 배당 (QKEY)', ?)
+      `).bind(r.user_id, r.usdt_amount, newDrId).run()
+      phase3Result.tx_inserted++
+
+      // qkey_balance 가산
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?')
+        .bind(r.usdt_amount, r.user_id).run()
+
+      const uid = Number(r.user_id)
+      phase3Result.qkey_added_per_user[uid] = (phase3Result.qkey_added_per_user[uid] || 0) + Number(r.usdt_amount || 0)
+    }
+
+    // 3-2) referral_rewards 미러링 (Phase 2 후 정상분만)
+    for (const r of srcRrRowsClean) {
+      const rrIns = await db.prepare(`
+        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        r.referrer_id, r.referee_id, r.level,
+        r.original_amount, r.reward_amount,
+        r.reward_date,    // 원본 reward_date 유지 (예: 5/14, 5/13)
+        DST_PAID_DATE
+      ).run()
+      const newRrId = (rrIns as any)?.meta?.last_row_id
+      if (!newRrId) continue
+      phase3Result.rr_inserted++
+
+      const level = Number(r.level)
+      const desc = level === 1 ? '추천 보너스 (Level 1)' : (level === 2 ? '추천 보너스 (Level 2)' : '추천 보너스')
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+      `).bind(r.referrer_id, r.reward_amount, desc, newRrId).run()
+      phase3Result.tx_inserted++
+
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?')
+        .bind(r.reward_amount, r.referrer_id).run()
+
+      const uid = Number(r.referrer_id)
+      phase3Result.qkey_added_per_user[uid] = (phase3Result.qkey_added_per_user[uid] || 0) + Number(r.reward_amount || 0)
+    }
+
+    // ============================================================
+    // PHASE 4 — 4-Layer 자동 검증
+    // ============================================================
+
+    // L1: 5/14 dr count == 5/15 dr count
+    const may14DrCount = await db.prepare(`SELECT COUNT(*) as c FROM daily_rewards WHERE paid_date = ?`).bind(SRC_PAID_DATE).first() as any
+    const may15DrCount = await db.prepare(`SELECT COUNT(*) as c FROM daily_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).first() as any
+    const layer1Pass = Number(may14DrCount?.c || 0) === Number(may15DrCount?.c || 0)
+
+    // L2: 5/14 rr count == 5/15 rr count
+    const may14RrCount = await db.prepare(`SELECT COUNT(*) as c FROM referral_rewards WHERE paid_date = ?`).bind(SRC_PAID_DATE).first() as any
+    const may15RrCount = await db.prepare(`SELECT COUNT(*) as c FROM referral_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).first() as any
+    const layer2Pass = Number(may14RrCount?.c || 0) === Number(may15RrCount?.c || 0)
+
+    // L3: per-user own/L1/L2 비교
+    const may14OwnRows = await db.prepare(`SELECT user_id, SUM(usdt_amount) as own FROM daily_rewards WHERE paid_date = ? GROUP BY user_id`).bind(SRC_PAID_DATE).all()
+    const may14L1Rows = await db.prepare(`SELECT referrer_id, SUM(reward_amount) as l1 FROM referral_rewards WHERE paid_date = ? AND level = 1 GROUP BY referrer_id`).bind(SRC_PAID_DATE).all()
+    const may14L2Rows = await db.prepare(`SELECT referrer_id, SUM(reward_amount) as l2 FROM referral_rewards WHERE paid_date = ? AND level = 2 GROUP BY referrer_id`).bind(SRC_PAID_DATE).all()
+    const may15OwnRows = await db.prepare(`SELECT user_id, SUM(usdt_amount) as own FROM daily_rewards WHERE paid_date = ? GROUP BY user_id`).bind(DST_PAID_DATE).all()
+    const may15L1Rows = await db.prepare(`SELECT referrer_id, SUM(reward_amount) as l1 FROM referral_rewards WHERE paid_date = ? AND level = 1 GROUP BY referrer_id`).bind(DST_PAID_DATE).all()
+    const may15L2Rows = await db.prepare(`SELECT referrer_id, SUM(reward_amount) as l2 FROM referral_rewards WHERE paid_date = ? AND level = 2 GROUP BY referrer_id`).bind(DST_PAID_DATE).all()
+
+    const m14Own: Record<number, number> = {}
+    for (const r of (may14OwnRows.results || []) as any[]) m14Own[Number(r.user_id)] = Number(r.own)
+    const m14L1: Record<number, number> = {}
+    for (const r of (may14L1Rows.results || []) as any[]) m14L1[Number(r.referrer_id)] = Number(r.l1)
+    const m14L2: Record<number, number> = {}
+    for (const r of (may14L2Rows.results || []) as any[]) m14L2[Number(r.referrer_id)] = Number(r.l2)
+    const m15Own: Record<number, number> = {}
+    for (const r of (may15OwnRows.results || []) as any[]) m15Own[Number(r.user_id)] = Number(r.own)
+    const m15L1: Record<number, number> = {}
+    for (const r of (may15L1Rows.results || []) as any[]) m15L1[Number(r.referrer_id)] = Number(r.l1)
+    const m15L2: Record<number, number> = {}
+    for (const r of (may15L2Rows.results || []) as any[]) m15L2[Number(r.referrer_id)] = Number(r.l2)
+
+    const allUids = new Set<number>([
+      ...Object.keys(m14Own).map(Number), ...Object.keys(m14L1).map(Number), ...Object.keys(m14L2).map(Number),
+      ...Object.keys(m15Own).map(Number), ...Object.keys(m15L1).map(Number), ...Object.keys(m15L2).map(Number)
+    ])
+    const l3Mismatches: any[] = []
+    for (const uid of allUids) {
+      const own14 = m14Own[uid] || 0
+      const l1_14 = m14L1[uid] || 0
+      const l2_14 = m14L2[uid] || 0
+      const own15 = m15Own[uid] || 0
+      const l1_15 = m15L1[uid] || 0
+      const l2_15 = m15L2[uid] || 0
+      if (own14 !== own15 || l1_14 !== l1_15 || l2_14 !== l2_15) {
+        l3Mismatches.push({
+          user_id: uid,
+          may14: { own: own14, l1: l1_14, l2: l2_14 },
+          may15: { own: own15, l1: l1_15, l2: l2_15 },
+          diff: { own: own15 - own14, l1: l1_15 - l1_14, l2: l2_15 - l2_14 }
+        })
+      }
+    }
+    const layer3Pass = l3Mismatches.length === 0
+
+    // L4: 5/15 transactions 합 == 5/15 (dr + rr) 합
+    const may15TxSum = await db.prepare(`
+      SELECT SUM(amount) as s FROM transactions
+      WHERE DATE(created_at) = ? AND type IN ('daily_qkey','referral_reward')
+    `).bind(DST_PAID_DATE).first() as any
+    const may15DrSum = await db.prepare(`SELECT SUM(usdt_amount) as s FROM daily_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).first() as any
+    const may15RrSum = await db.prepare(`SELECT SUM(reward_amount) as s FROM referral_rewards WHERE paid_date = ?`).bind(DST_PAID_DATE).first() as any
+    const txSum = Number(may15TxSum?.s || 0)
+    const expected = Number(may15DrSum?.s || 0) + Number(may15RrSum?.s || 0)
+    const layer4Pass = txSum === expected
+
+    const allLayersPass = layer1Pass && layer2Pass && layer3Pass && layer4Pass
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      phase1_wipe_may15: phase1Result,
+      phase2_dedupe_may14: phase2Result,
+      phase3_mirror_may14_to_may15: phase3Result,
+      phase4_verify: {
+        layer1_dr_count_match: { pass: layer1Pass, may14: Number(may14DrCount?.c), may15: Number(may15DrCount?.c) },
+        layer2_rr_count_match: { pass: layer2Pass, may14: Number(may14RrCount?.c), may15: Number(may15RrCount?.c) },
+        layer3_per_user_match: { pass: layer3Pass, mismatch_count: l3Mismatches.length, mismatches: l3Mismatches },
+        layer4_tx_sum_eq_dr_plus_rr: { pass: layer4Pass, tx_sum: txSum, dr_plus_rr: expected },
+        verdict: allLayersPass ? 'PERFECT_MATCH' : 'MISMATCH_DETECTED'
+      }
+    })
+  } catch (error) {
+    console.error('final-c-perfect-sync error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 5/15 transactions 전수 무결성 진단 (사장님 2026-05-15 결재) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 원문: "solbat 1대가 1050 2대가 1950 발생되어야 하는데 배당금은 두번발생되고, 일일배당 두번씩 중복 지급되었다"
