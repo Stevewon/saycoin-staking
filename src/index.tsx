@@ -11314,7 +11314,7 @@ app.get('/api/diag/user-paid-date-detail', async (c) => {
 //
 //   경로: GET /api/diag/user-staking-matrix?key=ADMIN_PW&email=bang8241&dates=2026-05-11,2026-05-12,2026-05-13,2026-05-14,2026-05-15
 //   또는 user_id=33 로도 조회 가능
-app.get('/api/diag/user-staking-matrix', async (c) => {
+app.get('/api/diag/user-staking-matrix-v2', async (c) => {
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
