@@ -9972,6 +9972,160 @@ app.post('/api/diag/topup-may15-referrals', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 5/15 잔존 중복 2건 정확 정리 (사장님 2026-05-15 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 지시: "5/15 잔존 중복 2건 정리후 A안"
+//
+//   대상: referral_rewards.id IN (1604, 1605)
+//     - id=1604: referrer=2, referee=42, level=2, reward_date=2026-05-15, amount=75 (keep=1577)
+//     - id=1605: referrer=42, referee=45, level=2, reward_date=2026-05-15, amount=75 (keep=1587)
+//   처리: dup row 삭제 + 연관 transactions 삭제 + qkey_balance 차감 (75씩 user 2, 42)
+//   경로: POST /api/diag/cleanup-may15-residual-dups?key=ADMIN_PW&confirm=GO
+app.post('/api/diag/cleanup-may15-residual-dups', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'Missing confirm=GO (or use dry_run=1)' }, 400)
+    }
+
+    // 정확히 이 2건만 정리 (audit 결과 확정)
+    const TARGET_DUPS = [
+      { dup_id: 1604, keep_id: 1577, referrer_id: 2,  referee_id: 42, level: 2, amount: 75, reward_date: '2026-05-15', paid_date: '2026-05-15' },
+      { dup_id: 1605, keep_id: 1587, referrer_id: 42, referee_id: 45, level: 2, amount: 75, reward_date: '2026-05-15', paid_date: '2026-05-15' }
+    ]
+
+    const plan: any[] = []
+    const balanceDeltas: Record<string, number> = {}
+
+    for (const t of TARGET_DUPS) {
+      // 1) dup row 존재 확인
+      const dupRow = await db.prepare(
+        'SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date FROM referral_rewards WHERE id = ?'
+      ).bind(t.dup_id).first() as any
+
+      // 2) keep row 존재 확인 (안전성)
+      const keepRow = await db.prepare(
+        'SELECT id, referrer_id, referee_id, level, reward_amount, reward_date FROM referral_rewards WHERE id = ?'
+      ).bind(t.keep_id).first() as any
+
+      // 3) 연관 transactions 조회 (type='referral_reward', ref_id=dup_id)
+      const txRows = await db.prepare(
+        "SELECT id, user_id, type, amount, ref_id FROM transactions WHERE type = 'referral_reward' AND ref_id = ?"
+      ).bind(t.dup_id).all()
+
+      const txList = (txRows.results || []) as any[]
+
+      plan.push({
+        dup_id: t.dup_id,
+        keep_id: t.keep_id,
+        dup_exists: !!dupRow,
+        keep_exists: !!keepRow,
+        dup_matches_target: dupRow ? (
+          dupRow.referrer_id === t.referrer_id &&
+          dupRow.referee_id === t.referee_id &&
+          dupRow.level === t.level &&
+          Number(dupRow.reward_amount) === t.amount &&
+          dupRow.reward_date === t.reward_date
+        ) : false,
+        keep_matches_target: keepRow ? (
+          keepRow.referrer_id === t.referrer_id &&
+          keepRow.referee_id === t.referee_id &&
+          keepRow.level === t.level &&
+          keepRow.reward_date === t.reward_date
+        ) : false,
+        related_tx_count: txList.length,
+        related_tx_ids: txList.map(x => x.id),
+        will_delete_rr: !!dupRow,
+        will_delete_tx_count: txList.length,
+        will_subtract_qkey_from_user: t.referrer_id,
+        will_subtract_amount: t.amount
+      })
+
+      if (dupRow) {
+        balanceDeltas[String(t.referrer_id)] = (balanceDeltas[String(t.referrer_id)] || 0) - t.amount
+      }
+    }
+
+    // Safety: 모든 dup이 존재하고 정확히 일치해야만 실행
+    const allSafe = plan.every(p => p.dup_exists && p.keep_exists && p.dup_matches_target && p.keep_matches_target)
+
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 파라미터를 추가하세요',
+        all_safe_to_execute: allSafe,
+        plan,
+        balance_deltas: balanceDeltas
+      })
+    }
+
+    if (!allSafe) {
+      return c.json({
+        success: false,
+        error: 'SAFETY_CHECK_FAILED: dup or keep row missing, or values mismatched',
+        plan
+      }, 400)
+    }
+
+    // ===== EXECUTE =====
+    const executed: any[] = []
+    const balanceActual: Record<string, number> = {}
+
+    for (const t of TARGET_DUPS) {
+      // a) transactions 삭제
+      const txDel = await db.prepare(
+        "DELETE FROM transactions WHERE type = 'referral_reward' AND ref_id = ?"
+      ).bind(t.dup_id).run()
+
+      // b) referral_rewards dup 삭제
+      const rrDel = await db.prepare(
+        'DELETE FROM referral_rewards WHERE id = ?'
+      ).bind(t.dup_id).run()
+
+      // c) qkey_balance 차감 (referrer)
+      const balBefore = await db.prepare(
+        'SELECT qkey_balance FROM users WHERE id = ?'
+      ).bind(t.referrer_id).first() as any
+
+      await db.prepare(
+        'UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?'
+      ).bind(t.amount, t.referrer_id).run()
+
+      const balAfter = await db.prepare(
+        'SELECT qkey_balance FROM users WHERE id = ?'
+      ).bind(t.referrer_id).first() as any
+
+      executed.push({
+        dup_id: t.dup_id,
+        rr_deleted: rrDel.meta?.changes ?? 0,
+        tx_deleted: txDel.meta?.changes ?? 0,
+        user_id: t.referrer_id,
+        qkey_before: balBefore?.qkey_balance,
+        qkey_after: balAfter?.qkey_balance,
+        qkey_delta: (balAfter?.qkey_balance ?? 0) - (balBefore?.qkey_balance ?? 0)
+      })
+
+      balanceActual[String(t.referrer_id)] = (balanceActual[String(t.referrer_id)] || 0) + ((balAfter?.qkey_balance ?? 0) - (balBefore?.qkey_balance ?? 0))
+    }
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      executed,
+      balance_actual_deltas: balanceActual
+    })
+  } catch (error) {
+    console.error('cleanup-may15-residual-dups error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 5/14 vs 5/15 계정별 1:1 검증 (사장님 2026-05-15 결재) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 지시: "확실하고 논리적으로 계산이 맞아야해"
