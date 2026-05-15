@@ -1901,21 +1901,37 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: t(c, 'withdrawal.user_not_found') }, 404)
     }
 
-    // ★ 사장님 2026-05-15 (4차) 지시: 계정당 출금 신청 횟수 1회로 고정 ★
-    //   기준: withdrawals 테이블에 해당 user_id 행이 1건이라도 존재하면 추가 신청 차단
-    //   상태(status) 무관 — pending / approved / rejected / completed 모두 카운트
-    //   취소(cancelled) 도 1회 신청한 이력으로 간주 (재신청 불가)
+    // ★ 사장님 2026-05-15 (5차) 지시: 출금 신청은 같은 금요일(주간) 내 1회로 제한 ★
+    //   기준: 이번 주 월요일 ~ 일요일(KST) 사이에 해당 user_id 의 withdrawals 행이 1건이라도 있으면 추가 신청 차단
+    //   상태(status) 무관 — pending / approved / rejected / completed / cancelled 모두 카운트
+    //   다음 주 금요일 이후에는 다시 1회 신청 가능
+    //   - 이전(4차) 룰: 계정 평생 1회 → 사장님 5차 지시로 주간 1회로 변경
+    //
+    //   주간 경계: KST 기준 이번 주 월요일 00:00 ~ 다음 주 월요일 00:00 (반열린 구간)
+    const nowKstMs = new Date(Date.now() + (9 * 60 * 60 * 1000))
+    // getUTCDay: 0=일, 1=월, ..., 6=토 (KST 보정 후)
+    const _dayNum = nowKstMs.getUTCDay() // 0=일 .. 6=토
+    const _daysFromMonday = (_dayNum + 6) % 7 // 월=0, 화=1, ..., 일=6
+    const _kstMidnightToday = Date.UTC(nowKstMs.getUTCFullYear(), nowKstMs.getUTCMonth(), nowKstMs.getUTCDate())
+    const _kstWeekStartMs = _kstMidnightToday - (_daysFromMonday * 24 * 60 * 60 * 1000)
+    const _kstWeekEndMs = _kstWeekStartMs + (7 * 24 * 60 * 60 * 1000)
+    // KST 자정을 UTC 로 다시 환산 (KST 자정 == UTC 전날 15:00) — created_at 비교용
+    const weekStartUtc = new Date(_kstWeekStartMs - (9 * 60 * 60 * 1000)).toISOString().slice(0, 19).replace('T', ' ')
+    const weekEndUtc = new Date(_kstWeekEndMs - (9 * 60 * 60 * 1000)).toISOString().slice(0, 19).replace('T', ' ')
+
     const existingWithdrawal = await db.prepare(`
       SELECT id, coin_type, amount, status, created_at FROM withdrawals
-      WHERE user_id = ?
-      LIMIT 1
-    `).bind(userId).first()
+      WHERE user_id = ? AND created_at >= ? AND created_at < ?
+      ORDER BY created_at DESC LIMIT 1
+    `).bind(userId, weekStartUtc, weekEndUtc).first()
 
     if (existingWithdrawal) {
       return c.json({
-        error: '계정당 출금 신청은 1회만 가능합니다. 이미 출금 신청 이력이 있습니다.',
+        error: '이번 주 출금 신청은 이미 1회 접수되었습니다. 다음 주 금요일에 다시 신청 가능합니다.',
         already_requested: true,
-        existing: existingWithdrawal
+        existing: existingWithdrawal,
+        week_start_kst: weekStartUtc,
+        week_end_kst: weekEndUtc
       }, 400)
     }
 
@@ -10339,6 +10355,401 @@ app.post('/api/diag/final-c-perfect-sync', async (c) => {
     })
   } catch (error) {
     console.error('final-c-perfect-sync error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ FINAL-C 안전 분할 — Phase 1: 5/15 paid_date 완전 wipe (사장님 결재: 가장 안전한 방법) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "가장 안전한 방법으로 진행해줘 1번"
+//   처리: 5/15 paid_date 의 transactions / daily_rewards / referral_rewards 전부 삭제 +
+//         qkey_balance 정확 차감 (transactions amount 합 기준)
+//   멱등: 재호출 시 이미 0건이면 skip — 안전
+//   경로: POST /api/diag/final-c-phase1-wipe-may15?key=ADMIN_PW&dry_run=1
+//         POST /api/diag/final-c-phase1-wipe-may15?key=ADMIN_PW&confirm=GO
+app.post('/api/diag/final-c-phase1-wipe-may15', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'Missing confirm=GO (or use dry_run=1)' }, 400)
+    }
+    const PAID_DATE = '2026-05-15'
+
+    // 1) wipe 대상 조회 + per-user 잔액 차감액 (tx amount 합 기준)
+    const txRows = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id
+      FROM transactions
+      WHERE DATE(created_at) = ? AND type IN ('daily_qkey', 'referral_reward')
+    `).bind(PAID_DATE).all()
+    const txList = (txRows.results || []) as any[]
+    const qkeyByUser: Record<number, number> = {}
+    for (const t of txList) {
+      const uid = Number(t.user_id)
+      qkeyByUser[uid] = (qkeyByUser[uid] || 0) + Number(t.amount || 0)
+    }
+
+    const drRows = await db.prepare(`SELECT id FROM daily_rewards WHERE paid_date = ?`).bind(PAID_DATE).all()
+    const rrRows = await db.prepare(`SELECT id FROM referral_rewards WHERE paid_date = ?`).bind(PAID_DATE).all()
+
+    const plan = {
+      tx_to_delete: txList.length,
+      dr_to_delete: (drRows.results || []).length,
+      rr_to_delete: (rrRows.results || []).length,
+      qkey_subtract_per_user: qkeyByUser,
+      total_qkey_subtract: Object.values(qkeyByUser).reduce((s: number, v: any) => s + Number(v), 0),
+      affected_users: Object.keys(qkeyByUser).length
+    }
+
+    if (dryRun) {
+      return c.json({ success: true, mode: 'DRY_RUN', message: '실제 실행을 원하시면 confirm=GO 추가', phase: 'phase1_wipe_may15', plan })
+    }
+
+    // 멱등: 이미 모두 비어있으면 skip
+    if (plan.tx_to_delete === 0 && plan.dr_to_delete === 0 && plan.rr_to_delete === 0) {
+      return c.json({ success: true, mode: 'NOOP_ALREADY_EMPTY', phase: 'phase1_wipe_may15' })
+    }
+
+    // 2) 잔액 차감 먼저 (각 사용자별 — tx 삭제 전에 합계 확정된 값 사용)
+    const balanceBefore: Record<number, number> = {}
+    const balanceAfter: Record<number, number> = {}
+    for (const [uidStr, qkey] of Object.entries(qkeyByUser)) {
+      const uid = Number(uidStr)
+      const b1 = await db.prepare('SELECT qkey_balance FROM users WHERE id = ?').bind(uid).first() as any
+      balanceBefore[uid] = Number(b1?.qkey_balance || 0)
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?').bind(qkey, uid).run()
+      const b2 = await db.prepare('SELECT qkey_balance FROM users WHERE id = ?').bind(uid).first() as any
+      balanceAfter[uid] = Number(b2?.qkey_balance || 0)
+    }
+
+    // 3) tx 삭제
+    const txDel = await db.prepare(`
+      DELETE FROM transactions WHERE DATE(created_at) = ? AND type IN ('daily_qkey', 'referral_reward')
+    `).bind(PAID_DATE).run()
+
+    // 4) dr 삭제
+    const drDel = await db.prepare(`DELETE FROM daily_rewards WHERE paid_date = ?`).bind(PAID_DATE).run()
+
+    // 5) rr 삭제
+    const rrDel = await db.prepare(`DELETE FROM referral_rewards WHERE paid_date = ?`).bind(PAID_DATE).run()
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      phase: 'phase1_wipe_may15',
+      result: {
+        tx_deleted: txDel.meta?.changes ?? 0,
+        dr_deleted: drDel.meta?.changes ?? 0,
+        rr_deleted: rrDel.meta?.changes ?? 0,
+        users_balance_subtracted: Object.keys(qkeyByUser).length,
+        total_qkey_subtracted: plan.total_qkey_subtract,
+        balance_before: balanceBefore,
+        balance_after: balanceAfter
+      }
+    })
+  } catch (error) {
+    console.error('final-c-phase1-wipe-may15 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ FINAL-C 안전 분할 — Phase 2: 5/14 잔존 중복 8건 정리 (audit identified) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   대상 referral_rewards.id IN (1217, 1225, 1226, 1227, 1241, 1242, 1245, 1246)
+//   모두 reward_date=5/13 이나 paid_date=5/14 로 잘못 들어간 legacy 중복
+//   총 -900 QKEY 차감 (user 2, 41, 42, 44, 48, 49, 57)
+//   멱등: 이미 정리되어 있으면 skip
+app.post('/api/diag/final-c-phase2-dedupe-may14', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'Missing confirm=GO (or use dry_run=1)' }, 400)
+    }
+    const DUP_IDS = [1217, 1225, 1226, 1227, 1241, 1242, 1245, 1246]
+
+    // 1) 현존 확인
+    const dupRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE id IN (${DUP_IDS.join(',')})
+    `).all()
+    const dupList = (dupRows.results || []) as any[]
+    const dupTxRows = await db.prepare(`
+      SELECT id, user_id, amount, ref_id FROM transactions
+      WHERE type = 'referral_reward' AND ref_id IN (${DUP_IDS.join(',')})
+    `).all()
+    const dupTxList = (dupTxRows.results || []) as any[]
+    const qkeyByUser: Record<number, number> = {}
+    for (const r of dupList) {
+      const uid = Number(r.referrer_id)
+      qkeyByUser[uid] = (qkeyByUser[uid] || 0) + Number(r.reward_amount || 0)
+    }
+
+    const plan = {
+      rr_to_delete_ids: DUP_IDS,
+      rr_to_delete_count: dupList.length,
+      tx_to_delete_count: dupTxList.length,
+      qkey_subtract_per_user: qkeyByUser,
+      total_qkey_subtract: Object.values(qkeyByUser).reduce((s: number, v: any) => s + Number(v), 0)
+    }
+
+    if (dryRun) {
+      return c.json({ success: true, mode: 'DRY_RUN', message: '실제 실행을 원하시면 confirm=GO 추가', phase: 'phase2_dedupe_may14', plan, dup_rows: dupList, dup_tx_rows: dupTxList })
+    }
+
+    // 멱등
+    if (dupList.length === 0) {
+      return c.json({ success: true, mode: 'NOOP_ALREADY_CLEANED', phase: 'phase2_dedupe_may14' })
+    }
+
+    // 안전: dupList 의 id 가 모두 DUP_IDS 내에 있는지 + reward_date='2026-05-13' + paid_date='2026-05-14' 확인
+    const allSafe = dupList.every(r =>
+      DUP_IDS.includes(Number(r.id)) &&
+      String(r.reward_date) === '2026-05-13' &&
+      String(r.paid_date) === '2026-05-14'
+    )
+    if (!allSafe) {
+      return c.json({
+        success: false, error: 'SAFETY_CHECK_FAILED: row metadata mismatch',
+        dup_list: dupList
+      }, 400)
+    }
+
+    // 2) 잔액 차감
+    const balanceBefore: Record<number, number> = {}
+    const balanceAfter: Record<number, number> = {}
+    for (const [uidStr, qkey] of Object.entries(qkeyByUser)) {
+      const uid = Number(uidStr)
+      const b1 = await db.prepare('SELECT qkey_balance FROM users WHERE id = ?').bind(uid).first() as any
+      balanceBefore[uid] = Number(b1?.qkey_balance || 0)
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?').bind(qkey, uid).run()
+      const b2 = await db.prepare('SELECT qkey_balance FROM users WHERE id = ?').bind(uid).first() as any
+      balanceAfter[uid] = Number(b2?.qkey_balance || 0)
+    }
+
+    // 3) tx 삭제
+    const txDel = await db.prepare(`
+      DELETE FROM transactions WHERE type = 'referral_reward' AND ref_id IN (${DUP_IDS.join(',')})
+    `).run()
+
+    // 4) rr 삭제
+    const rrDel = await db.prepare(`DELETE FROM referral_rewards WHERE id IN (${DUP_IDS.join(',')})`).run()
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      phase: 'phase2_dedupe_may14',
+      result: {
+        rr_deleted: rrDel.meta?.changes ?? 0,
+        tx_deleted: txDel.meta?.changes ?? 0,
+        users_balance_subtracted: Object.keys(qkeyByUser).length,
+        total_qkey_subtracted: plan.total_qkey_subtract,
+        balance_before: balanceBefore,
+        balance_after: balanceAfter
+      }
+    })
+  } catch (error) {
+    console.error('final-c-phase2-dedupe-may14 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ FINAL-C 안전 분할 — Phase 3: 5/14 정상분 → 5/15 1:1 미러링 (멱등) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   처리: 5/14 paid_date 의 모든 daily_rewards + referral_rewards 를 5/15 로 복제
+//         daily_rewards: reward_date='2026-05-15', paid_date='2026-05-15'
+//         referral_rewards: reward_date 원본 유지, paid_date='2026-05-15'
+//         각 INSERT 직후 transactions mirror + qkey_balance 가산
+//   멱등 가드:
+//     - daily_rewards: (user_id, staking_id, reward_date='2026-05-15') EXISTS skip
+//     - referral_rewards: (referrer_id, referee_id, level, reward_amount, original_amount, reward_date, paid_date='2026-05-15') EXISTS skip
+//   524 timeout 시 재호출 안전 — 이미 INSERT 된 행은 skip
+//   batch_size 파라미터로 분할 처리 가능 (default 50, dr/rr 합산 기준)
+app.post('/api/diag/final-c-phase3-mirror', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'Missing confirm=GO (or use dry_run=1)' }, 400)
+    }
+    const batchSize = Math.max(1, Math.min(500, Number(c.req.query('batch_size') || '60')))
+    const SRC = '2026-05-14'
+    const DST = '2026-05-15'
+
+    // 1) source 데이터 SELECT
+    const srcDr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE paid_date = ? ORDER BY id ASC
+    `).bind(SRC).all()
+    const srcDrRows = (srcDr.results || []) as any[]
+
+    const srcRr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date = ? ORDER BY id ASC
+    `).bind(SRC).all()
+    const srcRrRows = (srcRr.results || []) as any[]
+
+    // 2) 각 행에 대해 EXISTS 검사
+    type DrPlan = { src: any, action: 'insert' | 'skip_exists', existing_id?: number }
+    type RrPlan = { src: any, action: 'insert' | 'skip_exists', existing_id?: number }
+    const drPlan: DrPlan[] = []
+    const rrPlan: RrPlan[] = []
+
+    for (const r of srcDrRows) {
+      const ex = await db.prepare(`
+        SELECT id FROM daily_rewards WHERE user_id = ? AND staking_id = ? AND reward_date = ? LIMIT 1
+      `).bind(r.user_id, r.staking_id, DST).first() as any
+      drPlan.push({ src: r, action: ex ? 'skip_exists' : 'insert', existing_id: ex?.id })
+    }
+    for (const r of srcRrRows) {
+      const ex = await db.prepare(`
+        SELECT id FROM referral_rewards
+        WHERE referrer_id = ? AND referee_id = ? AND level = ?
+          AND reward_amount = ? AND COALESCE(original_amount, 0) = COALESCE(?, 0)
+          AND reward_date = ? AND paid_date = ?
+        LIMIT 1
+      `).bind(r.referrer_id, r.referee_id, r.level, r.reward_amount, r.original_amount, r.reward_date, DST).first() as any
+      rrPlan.push({ src: r, action: ex ? 'skip_exists' : 'insert', existing_id: ex?.id })
+    }
+
+    const drToInsert = drPlan.filter(p => p.action === 'insert')
+    const rrToInsert = rrPlan.filter(p => p.action === 'insert')
+
+    const planSummary = {
+      src_dr_total: srcDrRows.length,
+      src_rr_total: srcRrRows.length,
+      dr_to_insert: drToInsert.length,
+      dr_skip_exists: drPlan.length - drToInsert.length,
+      rr_to_insert: rrToInsert.length,
+      rr_skip_exists: rrPlan.length - rrToInsert.length,
+      tx_to_insert: drToInsert.length + rrToInsert.length,
+      qkey_balance_add_total:
+        drToInsert.reduce((s, p) => s + Number(p.src.usdt_amount || 0), 0) +
+        rrToInsert.reduce((s, p) => s + Number(p.src.reward_amount || 0), 0)
+    }
+
+    if (dryRun) {
+      return c.json({ success: true, mode: 'DRY_RUN', message: '실제 실행을 원하시면 confirm=GO 추가', phase: 'phase3_mirror', batch_size: batchSize, plan: planSummary })
+    }
+
+    // 3) EXECUTE — batch_size 만큼만 처리 후 응답 (524 회피)
+    let drInserted = 0, rrInserted = 0, txInserted = 0
+    const balanceDeltas: Record<number, number> = {}
+    const insertedDr: any[] = []
+    const insertedRr: any[] = []
+    let processedInBatch = 0
+
+    // 3-1) daily_rewards 먼저
+    for (const p of drToInsert) {
+      if (processedInBatch >= batchSize) break
+      const r = p.src
+      // 다시 EXISTS (재호출 안전)
+      const ex = await db.prepare(`
+        SELECT id FROM daily_rewards WHERE user_id = ? AND staking_id = ? AND reward_date = ? LIMIT 1
+      `).bind(r.user_id, r.staking_id, DST).first()
+      if (ex) continue
+
+      const ins = await db.prepare(`
+        INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(r.user_id, r.staking_id, r.usdt_amount, DST, DST).run()
+      const newId = (ins as any)?.meta?.last_row_id
+      if (!newId) continue
+      drInserted++
+
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'daily_qkey', 'QKEY', ?, '일일 배당 (QKEY)', ?)
+      `).bind(r.user_id, r.usdt_amount, newId).run()
+      txInserted++
+
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?')
+        .bind(r.usdt_amount, r.user_id).run()
+
+      const uid = Number(r.user_id)
+      balanceDeltas[uid] = (balanceDeltas[uid] || 0) + Number(r.usdt_amount || 0)
+      insertedDr.push({ src_id: r.id, new_id: newId, user_id: r.user_id, qkey: r.usdt_amount })
+      processedInBatch++
+    }
+
+    // 3-2) referral_rewards
+    for (const p of rrToInsert) {
+      if (processedInBatch >= batchSize) break
+      const r = p.src
+      const ex = await db.prepare(`
+        SELECT id FROM referral_rewards
+        WHERE referrer_id = ? AND referee_id = ? AND level = ?
+          AND reward_amount = ? AND COALESCE(original_amount, 0) = COALESCE(?, 0)
+          AND reward_date = ? AND paid_date = ?
+        LIMIT 1
+      `).bind(r.referrer_id, r.referee_id, r.level, r.reward_amount, r.original_amount, r.reward_date, DST).first()
+      if (ex) continue
+
+      const ins = await db.prepare(`
+        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(r.referrer_id, r.referee_id, r.level, r.original_amount, r.reward_amount, r.reward_date, DST).run()
+      const newId = (ins as any)?.meta?.last_row_id
+      if (!newId) continue
+      rrInserted++
+
+      const level = Number(r.level)
+      const desc = level === 1 ? '추천 보너스 (Level 1)' : (level === 2 ? '추천 보너스 (Level 2)' : '추천 보너스')
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+      `).bind(r.referrer_id, r.reward_amount, desc, newId).run()
+      txInserted++
+
+      await db.prepare('UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?')
+        .bind(r.reward_amount, r.referrer_id).run()
+
+      const uid = Number(r.referrer_id)
+      balanceDeltas[uid] = (balanceDeltas[uid] || 0) + Number(r.reward_amount || 0)
+      insertedRr.push({ src_id: r.id, new_id: newId, referrer_id: r.referrer_id, level: r.level, qkey: r.reward_amount })
+      processedInBatch++
+    }
+
+    const remainingDr = drToInsert.length - drInserted
+    const remainingRr = rrToInsert.length - rrInserted - (drInserted < drToInsert.length ? rrToInsert.length : 0)
+    const done = (drInserted === drToInsert.length) && (rrInserted === rrToInsert.length)
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      phase: 'phase3_mirror',
+      batch_size: batchSize,
+      result: {
+        dr_inserted: drInserted,
+        rr_inserted: rrInserted,
+        tx_inserted: txInserted,
+        balance_deltas: balanceDeltas,
+        inserted_dr_sample: insertedDr.slice(0, 10),
+        inserted_rr_sample: insertedRr.slice(0, 10)
+      },
+      progress: {
+        dr_total_planned: drToInsert.length,
+        rr_total_planned: rrToInsert.length,
+        dr_inserted_this_call: drInserted,
+        rr_inserted_this_call: rrInserted,
+        all_done: done,
+        next_action: done ? 'CALL_VERIFY' : 'RE_CALL_THIS_ENDPOINT_TO_CONTINUE'
+      }
+    })
+  } catch (error) {
+    console.error('final-c-phase3-mirror error:', error)
     return c.json({ error: String(error) }, 500)
   }
 })
