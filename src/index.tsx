@@ -9487,6 +9487,286 @@ app.get('/api/diag/audit-duplicate-rewards', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 5/15 paid_date 를 5/14 와 1:1 동일하게 재구축 (사장님 2026-05-15 방식 A 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "무조건 배당은 신규 진입자가 없으니 어제와 같아야 한다.
+//                  중복이 또 발생했으니 흔적없이 지우고 어제와 각 계정별 동일 배당하라"
+//
+//   처리 절차:
+//     STEP 1 — 5/15 paid_date 전체 WIPE (흔적 없이 제거):
+//       a) transactions WHERE type='daily_qkey' AND ref_id IN (5/15 dr_id) DELETE
+//       b) transactions WHERE type='referral_reward' AND ref_id IN (5/15 rr_id) DELETE
+//       c) referral_rewards WHERE paid_date='2026-05-15' DELETE
+//       d) daily_rewards WHERE paid_date='2026-05-15' DELETE
+//       e) users.qkey_balance 차감 (각 row amount 만큼 reverse)
+//
+//     STEP 2 — 5/14 → 5/15 1:1 미러링 INSERT:
+//       a) daily_rewards: 5/14 paid_date 행을 reward_date='2026-05-15', paid_date='2026-05-15' 로 복제
+//       b) transactions (daily_qkey): 새 dr_id 로 mirror INSERT, description='일일 배당 (QKEY)'
+//       c) referral_rewards: 5/14 paid_date 행을 reward_date='2026-05-15', paid_date='2026-05-15' 로 복제
+//       d) transactions (referral_reward): 새 rr_id 로 mirror INSERT, description='추천 보너스 (Level 1/2)'
+//       e) users.qkey_balance 가산 (복제된 amount 만큼)
+//
+//   안전장치:
+//     - dry_run=1 기본 (실행은 confirm=GO 명시 필요)
+//     - 5/15 paid_date 만 처리 (다른 날짜 절대 손대지 않음)
+//     - description 영구룰 100% 준수
+//     - 5/14 reward_date 가 아닌 paid_date 기준 (cron 실제 지급일)
+//
+//   경로: POST /api/diag/rebuild-may15-from-may14?key=ADMIN_PW&dry_run=1   (조회)
+//         POST /api/diag/rebuild-may15-from-may14?key=ADMIN_PW&confirm=GO  (실행)
+app.post('/api/diag/rebuild-may15-from-may14', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const confirm = c.req.query('confirm') === 'GO'
+    const dryRun = !confirm
+    const db = c.env.DB
+
+    const SRC_PAID_DATE = '2026-05-14'   // 원본 (어제)
+    const DST_PAID_DATE = '2026-05-15'   // 대상 (오늘)
+    const DST_REWARD_DATE = '2026-05-15' // 대상 reward_date
+
+    // ============================================================
+    // PHASE 0 — 사전 조회 (양쪽 데이터 스냅샷)
+    // ============================================================
+    // 5/14 daily_rewards 원본 (paid_date 기준)
+    const srcDr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE paid_date = ?
+      ORDER BY id ASC
+    `).bind(SRC_PAID_DATE).all() as any
+    const srcDrRows = srcDr?.results || []
+
+    // 5/14 referral_rewards 원본
+    const srcRr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date = ?
+      ORDER BY id ASC
+    `).bind(SRC_PAID_DATE).all() as any
+    const srcRrRows = srcRr?.results || []
+
+    // 5/15 daily_rewards 현재 (지울 대상)
+    const dstDr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE paid_date = ?
+      ORDER BY id ASC
+    `).bind(DST_PAID_DATE).all() as any
+    const dstDrRows = dstDr?.results || []
+
+    // 5/15 referral_rewards 현재 (지울 대상)
+    const dstRr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date = ?
+      ORDER BY id ASC
+    `).bind(DST_PAID_DATE).all() as any
+    const dstRrRows = dstRr?.results || []
+
+    // 5/15 transactions 현재 (지울 대상)
+    const dstDrIds = dstDrRows.map((r: any) => Number(r.id))
+    const dstRrIds = dstRrRows.map((r: any) => Number(r.id))
+
+    let dstDailyTxRows: any[] = []
+    if (dstDrIds.length > 0) {
+      const placeholders = dstDrIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id FROM transactions
+        WHERE type = 'daily_qkey' AND ref_id IN (${placeholders})
+      `).bind(...dstDrIds).all() as any
+      dstDailyTxRows = r?.results || []
+    }
+    let dstRefTxRows: any[] = []
+    if (dstRrIds.length > 0) {
+      const placeholders = dstRrIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id FROM transactions
+        WHERE type = 'referral_reward' AND ref_id IN (${placeholders})
+      `).bind(...dstRrIds).all() as any
+      dstRefTxRows = r?.results || []
+    }
+
+    // ============================================================
+    // PHASE 1 — 잔액 변동 계산
+    // ============================================================
+    // 5/15 wipe 시 사용자별 차감해야 할 잔액
+    const wipeDeltas: Record<number, number> = {}
+    for (const r of dstDrRows) {
+      const uid = Number(r.user_id)
+      wipeDeltas[uid] = (wipeDeltas[uid] || 0) + Number(r.usdt_amount || 0)
+    }
+    for (const r of dstRrRows) {
+      const uid = Number(r.referrer_id)
+      wipeDeltas[uid] = (wipeDeltas[uid] || 0) + Number(r.reward_amount || 0)
+    }
+
+    // 5/14 → 5/15 미러링 시 사용자별 가산할 잔액
+    const insertDeltas: Record<number, number> = {}
+    for (const r of srcDrRows) {
+      const uid = Number(r.user_id)
+      insertDeltas[uid] = (insertDeltas[uid] || 0) + Number(r.usdt_amount || 0)
+    }
+    for (const r of srcRrRows) {
+      const uid = Number(r.referrer_id)
+      insertDeltas[uid] = (insertDeltas[uid] || 0) + Number(r.reward_amount || 0)
+    }
+
+    // 순 변동 (insert - wipe)
+    const netDeltas: Record<number, number> = {}
+    const allUids = new Set<number>([...Object.keys(wipeDeltas).map(Number), ...Object.keys(insertDeltas).map(Number)])
+    for (const uid of allUids) {
+      const w = wipeDeltas[uid] || 0
+      const i = insertDeltas[uid] || 0
+      const net = i - w
+      if (net !== 0) netDeltas[uid] = net
+    }
+
+    const wipeSummary = {
+      daily_rewards_to_delete: dstDrRows.length,
+      daily_rewards_qkey: dstDrRows.reduce((s: number, r: any) => s + Number(r.usdt_amount || 0), 0),
+      referral_rewards_to_delete: dstRrRows.length,
+      referral_rewards_qkey: dstRrRows.reduce((s: number, r: any) => s + Number(r.reward_amount || 0), 0),
+      daily_transactions_to_delete: dstDailyTxRows.length,
+      referral_transactions_to_delete: dstRefTxRows.length
+    }
+    const insertSummary = {
+      daily_rewards_to_insert: srcDrRows.length,
+      daily_rewards_qkey: srcDrRows.reduce((s: number, r: any) => s + Number(r.usdt_amount || 0), 0),
+      referral_rewards_to_insert: srcRrRows.length,
+      referral_rewards_qkey: srcRrRows.reduce((s: number, r: any) => s + Number(r.reward_amount || 0), 0)
+    }
+
+    // ============================================================
+    // DRY_RUN — 계획만 반환
+    // ============================================================
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 파라미터를 추가하세요',
+        src_paid_date: SRC_PAID_DATE,
+        dst_paid_date: DST_PAID_DATE,
+        wipe_plan: wipeSummary,
+        insert_plan: insertSummary,
+        balance_net_deltas: netDeltas,
+        affected_users: allUids.size
+      })
+    }
+
+    // ============================================================
+    // PHASE 2 — 5/15 paid_date 전체 WIPE
+    // ============================================================
+    const executed: any = {
+      daily_transactions_deleted: 0,
+      referral_transactions_deleted: 0,
+      referral_rewards_deleted: 0,
+      daily_rewards_deleted: 0,
+      balance_wipe_users: 0,
+      daily_rewards_inserted: 0,
+      daily_transactions_inserted: 0,
+      referral_rewards_inserted: 0,
+      referral_transactions_inserted: 0,
+      balance_insert_users: 0
+    }
+
+    // 2-a) daily_qkey transactions 삭제
+    for (const tx of dstDailyTxRows) {
+      const r = await db.prepare(`DELETE FROM transactions WHERE id = ? AND type = 'daily_qkey'`).bind(tx.id).run()
+      if ((r as any)?.meta?.changes > 0) executed.daily_transactions_deleted++
+    }
+
+    // 2-b) referral_reward transactions 삭제
+    for (const tx of dstRefTxRows) {
+      const r = await db.prepare(`DELETE FROM transactions WHERE id = ? AND type = 'referral_reward'`).bind(tx.id).run()
+      if ((r as any)?.meta?.changes > 0) executed.referral_transactions_deleted++
+    }
+
+    // 2-c) referral_rewards 삭제
+    for (const rr of dstRrRows) {
+      const r = await db.prepare(`DELETE FROM referral_rewards WHERE id = ? AND paid_date = ?`).bind(rr.id, DST_PAID_DATE).run()
+      if ((r as any)?.meta?.changes > 0) executed.referral_rewards_deleted++
+    }
+
+    // 2-d) daily_rewards 삭제
+    for (const dr of dstDrRows) {
+      const r = await db.prepare(`DELETE FROM daily_rewards WHERE id = ? AND paid_date = ?`).bind(dr.id, DST_PAID_DATE).run()
+      if ((r as any)?.meta?.changes > 0) executed.daily_rewards_deleted++
+    }
+
+    // 2-e) qkey_balance 차감
+    for (const [uid, amt] of Object.entries(wipeDeltas)) {
+      if (amt > 0) {
+        const r = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amt, Number(uid)).run()
+        if ((r as any)?.meta?.changes > 0) executed.balance_wipe_users++
+      }
+    }
+
+    // ============================================================
+    // PHASE 3 — 5/14 → 5/15 1:1 미러링 INSERT
+    // ============================================================
+    // 3-a) daily_rewards 복제 + transactions mirror
+    for (const src of srcDrRows) {
+      const drIns = await db.prepare(`
+        INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(src.user_id, src.staking_id, src.usdt_amount, DST_REWARD_DATE, DST_PAID_DATE).run()
+      const newDrId = (drIns as any)?.meta?.last_row_id ?? null
+      if (newDrId) {
+        executed.daily_rewards_inserted++
+        // transactions mirror
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+        `).bind(src.user_id, src.usdt_amount, '일일 배당 (QKEY)', newDrId).run()
+        executed.daily_transactions_inserted++
+      }
+    }
+
+    // 3-b) referral_rewards 복제 + transactions mirror
+    for (const src of srcRrRows) {
+      const rrIns = await db.prepare(`
+        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(src.referrer_id, src.referee_id, src.level, src.original_amount, src.reward_amount, DST_REWARD_DATE, DST_PAID_DATE).run()
+      const newRrId = (rrIns as any)?.meta?.last_row_id ?? null
+      if (newRrId) {
+        executed.referral_rewards_inserted++
+        const level = Number(src.level)
+        const desc = level === 1 ? '추천 보너스 (Level 1)' : (level === 2 ? '추천 보너스 (Level 2)' : '추천 보너스')
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(src.referrer_id, src.reward_amount, desc, newRrId).run()
+        executed.referral_transactions_inserted++
+      }
+    }
+
+    // 3-c) qkey_balance 가산
+    for (const [uid, amt] of Object.entries(insertDeltas)) {
+      if (amt > 0) {
+        const r = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(amt, Number(uid)).run()
+        if ((r as any)?.meta?.changes > 0) executed.balance_insert_users++
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      src_paid_date: SRC_PAID_DATE,
+      dst_paid_date: DST_PAID_DATE,
+      wipe_summary: wipeSummary,
+      insert_summary: insertSummary,
+      executed,
+      balance_net_deltas: netDeltas,
+      affected_users: allUids.size
+    })
+  } catch (error) {
+    console.error('rebuild-may15-from-may14 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧(u#44) L2 매칭 미러링 누락 2건 정밀 백필 (Phase 1, 2026-05-12 사장님 C안 결재) ★★★
 //   원장 referral_rewards 25건 / 9,150 QKEY  vs  transactions 미러링 23건 / 7,500 QKEY
 //   누락 2건: rr#347 (150 QKEY, 2026-05-06 referee u#49) + rr#524 (1,500 QKEY, 2026-05-06 referee u#76)
