@@ -2127,13 +2127,13 @@ app.post('/api/swap/qkey-to-usdt', async (c) => {
       return c.json({ error: t(c, 'profile.required_fields') }, 400)
     }
 
-    // 최소 100 USDT 검증
-    if (amount < 100) {
+    // ★ 사장님 2026-05-15 지시: 쿠키코인(QKEY) 보유 수량 기준 USDT 스왑 가능
+    //   기존 최소 100 / 100 단위 제한 완화 → 최소 1 USDT 부터 1 단위로 스왑 허용
+    //   (출금 시점의 최소 100 USDT 가드는 그대로 유지)
+    if (amount < 1) {
       return c.json({ error: t(c, 'swap.min_amount') }, 400)
     }
-
-    // 100 단위 검증
-    if (amount % 100 !== 0) {
+    if (!Number.isInteger(amount) || amount <= 0) {
       return c.json({ error: t(c, 'swap.unit_error') }, 400)
     }
 
@@ -4574,10 +4574,17 @@ function getStakingAccrualDatesKst(
 
 // 출금 신청 창 체크
 // 룰: 매주 금요일 10:00~14:00 KST. 공휴일 여부 무관. 실제 지급 처리는 관리자가 수동으로 진행.
+// ★ 사장님 2026-05-15 1회성 지시: 2026-05-15 (금) 당일은 16:00 까지 연장
 function isWithdrawalWindowOpen(d: Date): boolean {
   const kst = new Date(d.getTime() + (9 * 60 * 60 * 1000))
   const day = kst.getUTCDay() // 0=일, 5=금
   const hour = kst.getUTCHours()
+  const dateStr = `${kst.getUTCFullYear()}-${String(kst.getUTCMonth()+1).padStart(2,'0')}-${String(kst.getUTCDate()).padStart(2,'0')}`
+  // 1회성 예외: 2026-05-15 (금) → 10:00 ~ 16:00 (사장님 직접 지시)
+  if (dateStr === '2026-05-15') {
+    return day === 5 && hour >= 10 && hour < 16
+  }
+  // 기본 룰: 매주 금요일 10:00 ~ 14:00 KST
   return day === 5 && hour >= 10 && hour < 14
 }
 
@@ -16262,14 +16269,14 @@ app.get('/dashboard', (c) => {
                         <p class="text-xs opacity-75 mt-1" id="stakingCount"></p>
                     </div>
                     
-                    <!-- USDT Balance (두 번째) — 옵션 A: 회사지급분 (출금가능분) -->
+                    <!-- USDT Balance (두 번째) — 사장님 2026-05-15 지시: 출금가능 / 출금불가 분리 표시 -->
                     <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.usdt_balance">USDT 잔액</span>
                             <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">회사지급 <span class="font-semibold">0</span> <span class="opacity-80">(출금가능 <span id="usdtWithdrawable" class="font-semibold">0</span>)</span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">출금가능 <span id="usdtWithdrawable" class="font-semibold">0</span> <span class="opacity-80">/ 출금불가 <span id="usdtNonWithdrawable" class="font-semibold">0</span></span></p>
                     </div>
                     
                     <!-- QTA (세 번째) — 옵션 A: 회사지급분 (출금가능분) -->
@@ -17052,16 +17059,22 @@ app.get('/dashboard', (c) => {
                         document.getElementById('usdtBalance').textContent = user.usdt_balance.toFixed(2);
 
                         // 옵션 A: 회사지급분 (출금가능분) — 영구 정책 source-tracking
+                        // 사장님 2026-05-15 지시: USDT = 출금가능 / 출금불가 분리 표시
                         const qtaInitEl = document.getElementById('qtaInitial');
                         const qtaWdEl = document.getElementById('qtaWithdrawable');
                         const qxInitEl = document.getElementById('qxInitial');
                         const qxWdEl = document.getElementById('qxWithdrawable');
                         const usdtWdEl = document.getElementById('usdtWithdrawable');
+                        const usdtNonWdEl = document.getElementById('usdtNonWithdrawable');
                         if (qtaInitEl) qtaInitEl.textContent = Math.floor(Number(user.qta_initial || 0)).toLocaleString();
                         if (qtaWdEl) qtaWdEl.textContent = Math.floor(Number(user.qta_withdrawable || 0)).toLocaleString();
                         if (qxInitEl) qxInitEl.textContent = Math.floor(Number(user.qx_initial || 0)).toLocaleString();
                         if (qxWdEl) qxWdEl.textContent = Math.floor(Number(user.qx_withdrawable || 0)).toLocaleString();
-                        if (usdtWdEl) usdtWdEl.textContent = Number(user.usdt_withdrawable || 0).toFixed(2);
+                        const _usdtBal = Number(user.usdt_balance || 0);
+                        const _usdtWd = Number(user.usdt_withdrawable || 0);
+                        const _usdtNonWd = Math.max(0, _usdtBal - _usdtWd);
+                        if (usdtWdEl) usdtWdEl.textContent = _usdtWd.toFixed(2);
+                        if (usdtNonWdEl) usdtNonWdEl.textContent = _usdtNonWd.toFixed(2);
                         
                         // 스왑 가능 QKEY 잔액 업데이트
                         const swapEl = document.getElementById('swapQkeyBalance');
@@ -17243,10 +17256,10 @@ app.get('/dashboard', (c) => {
                     var getAmount = v * rate.get;
                     document.getElementById('swapQkeyNeedText').textContent = needAmount.toLocaleString() + ' QKEY';
                     document.getElementById('swapQkeyGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
-                    // USDT일 때 label 힌트
+                    // ★ 사장님 2026-05-15 지시: USDT 스왑 1 단위부터 허용 (출금 시점에만 최소 100 USDT 가드)
                     var label = document.getElementById('swapQkeyInputLabel');
                     if (target === 'usdt') {
-                        label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' (Min 100, 100 unit)';
+                        label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' (Min 1, 출금은 100 USDT 이상)';
                     } else {
                         label.textContent = target.toUpperCase() + ' ' + I18N.t('dash.swap_amount_label');
                     }
@@ -17843,11 +17856,8 @@ app.get('/dashboard', (c) => {
                     target = document.getElementById('swapQkeyTarget').value;
                     amt = parseInt(document.getElementById('swapQkeyAmount').value) || 0;
                     if (amt <= 0) { alert(I18N.t('alert.enter_valid_amount')); return; }
-                    // USDT 스왑은 최소 100, 100 단위
-                    if (target === 'usdt') {
-                        if (amt < 100) { alert(I18N.t('swap.min_amount')); return; }
-                        if (amt % 100 !== 0) { alert(I18N.t('swap.unit_error')); return; }
-                    }
+                    // ★ 사장님 2026-05-15 지시: QKEY → USDT 스왑은 QKEY 보유 수량 기준으로 1 단위부터 가능
+                    //   (출금 시점에만 100 USDT 최소 가드 유지)
                     endpoint = '/api/swap/qkey-to-' + target;
                     var rate = swapRates.qkey[target];
                     confirmMsg = (amt * rate.need).toLocaleString() + ' QKEY → ' + (amt * rate.get).toLocaleString() + ' ' + target.toUpperCase();
@@ -31023,6 +31033,32 @@ app.post('/api/diag/migrate-source-tracking', async (c) => {
       else swapMap[uid][coin].out_sum = Math.abs(Number(r.sum_amount || 0))
     }
 
+    // ★ 사장님 2026-05-15 지시: USDT 출금 가능 = QKEY → USDT 스왑분만
+    //   기존 보유 USDT, 일반 입금 USDT, 수당 USDT 는 출금 불가
+    //   QKEY → USDT 스왑 거래 (description LIKE 'QKEY → USDT swap%') 만 누적
+    const qkeyToUsdtRes = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) as sum_amount
+      FROM transactions
+      WHERE type = 'swap_in' AND coin_type = 'USDT' AND description LIKE 'QKEY → USDT swap%'
+      GROUP BY user_id
+    `).all<any>()
+    const qkeyToUsdtMap: Record<number, number> = {}
+    for (const r of (qkeyToUsdtRes.results || [])) {
+      qkeyToUsdtMap[Number(r.user_id)] = Number(r.sum_amount || 0)
+    }
+
+    // QKEY → USDT 스왑분 중 이후 USDT → 타코인 스왑으로 빠져나간 차감액 (USDT 차감 시 withdrawable 도 차감됨)
+    const usdtOutRes = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) as sum_amount
+      FROM transactions
+      WHERE type = 'swap_out' AND coin_type = 'USDT'
+      GROUP BY user_id
+    `).all<any>()
+    const usdtOutMap: Record<number, number> = {}
+    for (const r of (usdtOutRes.results || [])) {
+      usdtOutMap[Number(r.user_id)] = Math.abs(Number(r.sum_amount || 0))
+    }
+
     // STEP 2: 계정별 마이그레이션 계획 산출
     const plan: any[] = []
     let executedCount = 0
@@ -31051,7 +31087,13 @@ app.post('/api/diag/migrate-source-tracking', async (c) => {
       const qtaInit = Math.max(0, qtaBal - qtaWd)
       const qxWd = Math.max(0, qxNet)
       const qxInit = Math.max(0, qxBal - qxWd)
-      const usdtWd = Math.max(0, usdtBal)  // 전액 withdrawable
+      // ★ 사장님 2026-05-15 지시: USDT 출금 가능 = QKEY→USDT 스왑분 - USDT 차감(스왑/출금)
+      //   기존 보유 USDT, 일반 USDT, 수당 USDT 는 출금 불가
+      const qkeyToUsdtIn = qkeyToUsdtMap[uid] || 0
+      const usdtOut = usdtOutMap[uid] || 0
+      const usdtWdRaw = qkeyToUsdtIn - usdtOut
+      // 보유 잔액 초과 금지 + 음수 차단
+      const usdtWd = Math.max(0, Math.min(usdtBal, usdtWdRaw))
 
       // 이미 마이그레이션 완료된 계정 식별 (initial+withdrawable 합이 balance 와 일치하면 skip)
       const prevQtaInit = Number(u.qta_initial || 0)
