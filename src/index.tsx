@@ -10755,6 +10755,202 @@ app.post('/api/diag/final-c-phase3-mirror', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 누락 배당 종합 진단 (사장님 2026-05-15 6차 지시) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "solbat 1대 1050/2대 1950 인데 덜 지급된거같다,
+//                 bang8241 4000$ 0.5% 데일리 3000 QKEY 인데 5/12·5/13 미지급 + 마이너스 잔액"
+//
+//   진단 범위:
+//     1. 모든 active staking 보유 회원의 5/12·5/13·5/14·5/15 일일배당(daily_rewards) 존재 여부
+//        - staking.start_date <= 해당일 AND (end_date IS NULL OR end_date > 해당일) 조건
+//        - 휴일 진입 첫평일 룰 적용 (5/11 부터 첫 평일 = 5/11 월요일)
+//     2. 각 회원의 L1/L2 매칭 누락 여부 (하부 회원 데일리 vs 매칭 보너스 비교)
+//     3. 잔액 마이너스 회원 전수 추출 + 누락 일자 진단
+//
+//   경로: GET /api/diag/missing-rewards-scan?key=ADMIN_PW&dates=2026-05-12,2026-05-13,2026-05-14,2026-05-15
+app.get('/api/diag/missing-rewards-scan', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const datesParam = c.req.query('dates') || '2026-05-12,2026-05-13,2026-05-14,2026-05-15'
+    const dates = datesParam.split(',').map(s => s.trim()).filter(Boolean)
+
+    // ============================================================
+    // 1) 모든 active staking 회원 + staking 정보
+    // ============================================================
+    const stakings = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.start_date, s.end_date,
+             u.email, u.name
+      FROM stakings s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.status = 'active' OR s.status IS NULL OR s.status = ''
+      ORDER BY s.user_id, s.id
+    `).all<any>()
+
+    // ============================================================
+    // 2) 각 날짜별 누락된 daily_rewards 진단
+    // ============================================================
+    const missingDailyByDate: Record<string, any[]> = {}
+    for (const dateStr of dates) {
+      missingDailyByDate[dateStr] = []
+      for (const s of (stakings.results || [])) {
+        // staking 활성 여부 (start_date <= dateStr AND (end_date IS NULL OR end_date > dateStr))
+        const start = (s.start_date || '').slice(0, 10)
+        const end = (s.end_date || '').slice(0, 10)
+        if (start > dateStr) continue
+        if (end && end !== '' && end <= dateStr) continue
+
+        // 휴일진입 첫평일 룰: 5/9(토)·5/10(일) 진입자는 5/11(월) 부터 데일리 시작
+        // 5/12·5/13·5/14·5/15 는 모두 5/11 이후이므로 정상 평일이면 무조건 지급되어야 함
+        // 단, 5/16(토)·5/17(일) 은 휴일이므로 스킵
+
+        // 평일 체크 (KST 기준 dateStr 의 요일)
+        const dt = new Date(dateStr + 'T12:00:00+09:00')
+        const dow = dt.getUTCDay() // KST 정오 기준이므로 UTC day = KST day
+        // 0=일, 6=토 = 휴일 (배당 안 함)
+        if (dow === 0 || dow === 6) continue
+
+        // 해당 일자에 daily_reward 존재하는지 체크
+        const dr = await db.prepare(`
+          SELECT id, usdt_amount FROM daily_rewards
+          WHERE user_id = ? AND staking_id = ? AND reward_date = ?
+          LIMIT 1
+        `).bind(s.user_id, s.staking_id, dateStr).first<any>()
+
+        if (!dr) {
+          // 예상 일일배당 = amount × daily_rate × 150
+          const expectedQkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+          missingDailyByDate[dateStr].push({
+            user_id: s.user_id,
+            email: s.email,
+            name: s.name,
+            staking_id: s.staking_id,
+            amount: s.amount,
+            daily_rate: s.daily_rate,
+            start_date: s.start_date,
+            expected_qkey: expectedQkey
+          })
+        }
+      }
+    }
+
+    // ============================================================
+    // 3) 마이너스 잔액 회원 전수 추출
+    // ============================================================
+    const negBalanceUsers = await db.prepare(`
+      SELECT id, email, name, qkey_balance
+      FROM users
+      WHERE qkey_balance < 0
+      ORDER BY qkey_balance ASC
+    `).all<any>()
+
+    // ============================================================
+    // 4) L1/L2 매칭 누락 진단 (각 날짜별)
+    //    각 referrer 에 대해: 하부(L1/L2) 데일리 합 × 0.20 / 0.10 vs 실제 referral_rewards 합 비교
+    // ============================================================
+    const missingMatchingByDate: Record<string, any[]> = {}
+    for (const dateStr of dates) {
+      missingMatchingByDate[dateStr] = []
+
+      // 평일만
+      const dt = new Date(dateStr + 'T12:00:00+09:00')
+      const dow = dt.getUTCDay()
+      if (dow === 0 || dow === 6) continue
+
+      // 모든 referrer (즉 다른 회원의 referrer_id 로 등록된 회원) 추출
+      const referrers = await db.prepare(`
+        SELECT DISTINCT u.id, u.email, u.name
+        FROM users u
+        WHERE EXISTS (SELECT 1 FROM users u2 WHERE u2.referrer_id = u.id)
+        ORDER BY u.id
+      `).all<any>()
+
+      for (const r of (referrers.results || [])) {
+        const referrerId = r.id
+
+        // L1 산하 회원들의 dateStr 일일배당 합
+        const l1DailySum = await db.prepare(`
+          SELECT COALESCE(SUM(dr.usdt_amount), 0) AS sum_qkey
+          FROM daily_rewards dr
+          JOIN users u ON u.id = dr.user_id
+          WHERE u.referrer_id = ? AND dr.reward_date = ?
+        `).bind(referrerId, dateStr).first<any>()
+
+        // L2 산하 회원들의 dateStr 일일배당 합 (referrer 의 손자)
+        const l2DailySum = await db.prepare(`
+          SELECT COALESCE(SUM(dr.usdt_amount), 0) AS sum_qkey
+          FROM daily_rewards dr
+          JOIN users u ON u.id = dr.user_id
+          JOIN users p ON p.id = u.referrer_id
+          WHERE p.referrer_id = ? AND dr.reward_date = ?
+        `).bind(referrerId, dateStr).first<any>()
+
+        const expectedL1 = Math.round(Number(l1DailySum?.sum_qkey || 0) * 0.20)
+        const expectedL2 = Math.round(Number(l2DailySum?.sum_qkey || 0) * 0.10)
+
+        // 실제 referral_rewards 합 (reward_date = dateStr 기준)
+        const actualL1 = await db.prepare(`
+          SELECT COALESCE(SUM(reward_amount), 0) AS sum_qkey
+          FROM referral_rewards
+          WHERE referrer_id = ? AND level = 1 AND reward_date = ?
+        `).bind(referrerId, dateStr).first<any>()
+
+        const actualL2 = await db.prepare(`
+          SELECT COALESCE(SUM(reward_amount), 0) AS sum_qkey
+          FROM referral_rewards
+          WHERE referrer_id = ? AND level = 2 AND reward_date = ?
+        `).bind(referrerId, dateStr).first<any>()
+
+        const l1Diff = expectedL1 - Number(actualL1?.sum_qkey || 0)
+        const l2Diff = expectedL2 - Number(actualL2?.sum_qkey || 0)
+
+        if (l1Diff !== 0 || l2Diff !== 0) {
+          missingMatchingByDate[dateStr].push({
+            referrer_id: referrerId,
+            email: r.email,
+            name: r.name,
+            l1_subordinate_daily_sum: Number(l1DailySum?.sum_qkey || 0),
+            l2_subordinate_daily_sum: Number(l2DailySum?.sum_qkey || 0),
+            l1_expected: expectedL1,
+            l1_actual: Number(actualL1?.sum_qkey || 0),
+            l1_diff: l1Diff,
+            l2_expected: expectedL2,
+            l2_actual: Number(actualL2?.sum_qkey || 0),
+            l2_diff: l2Diff
+          })
+        }
+      }
+    }
+
+    // ============================================================
+    // 5) 요약
+    // ============================================================
+    const summary: Record<string, any> = {}
+    for (const dateStr of dates) {
+      summary[dateStr] = {
+        missing_daily_count: missingDailyByDate[dateStr].length,
+        missing_daily_total_qkey: missingDailyByDate[dateStr].reduce((acc, x) => acc + x.expected_qkey, 0),
+        missing_matching_count: (missingMatchingByDate[dateStr] || []).length,
+        missing_matching_total_qkey: (missingMatchingByDate[dateStr] || []).reduce((acc, x) => acc + Math.max(0, x.l1_diff) + Math.max(0, x.l2_diff), 0)
+      }
+    }
+
+    return c.json({
+      success: true,
+      dates_scanned: dates,
+      summary,
+      missing_daily_by_date: missingDailyByDate,
+      missing_matching_by_date: missingMatchingByDate,
+      negative_balance_users: negBalanceUsers.results || []
+    })
+  } catch (error) {
+    console.error('missing-rewards-scan error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 5/15 transactions 전수 무결성 진단 (사장님 2026-05-15 결재) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 원문: "solbat 1대가 1050 2대가 1950 발생되어야 하는데 배당금은 두번발생되고, 일일배당 두번씩 중복 지급되었다"
