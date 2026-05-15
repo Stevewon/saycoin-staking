@@ -11782,6 +11782,132 @@ app.post('/api/diag/fix-tx-created-at', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-delete-tx-single: 단일 tx_id DELETE + users.qkey_balance 동시 차감 (중복 제거용) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: 사장님 한국시간 기준 중복지급 발견시 정확한 1건 DELETE
+//   안전성:
+//     - 반드시 user_id + tx_id + expected_amount + expected_ref_id + expected_type 5중 검증 후만 진행
+//     - 단일 tx 한정 (배열 입력 금지)
+//     - DRY_RUN 기본 / confirm=GO 명시시만 실행
+//     - DELETE 후 users.qkey_balance -= amount 자동 차감 (정합성 유지)
+//   경로 (POST):
+//     /api/diag/fix-delete-tx-single?key=ADMIN_PW
+//        &user_id=33
+//        &tx_id=4333
+//        &expected_amount=3000
+//        &expected_ref_id=306
+//        &expected_type=daily_qkey
+//        &dry_run=1   (또는 confirm=GO)
+app.post('/api/diag/fix-delete-tx-single', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const txId = parseInt(c.req.query('tx_id') || '0')
+    const expectedAmount = Number(c.req.query('expected_amount') || '0')
+    const expectedRefId = parseInt(c.req.query('expected_ref_id') || '0')
+    const expectedType = c.req.query('expected_type') || ''
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (!txId) return c.json({ error: 'tx_id required' }, 400)
+    if (!expectedAmount) return c.json({ error: 'expected_amount required' }, 400)
+    if (!expectedType) return c.json({ error: 'expected_type required' }, 400)
+
+    // user 확인
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    // tx 확인 + 5중 검증
+    const tx = await db.prepare(`
+      SELECT id, user_id, type, amount, coin_type, description, ref_id, created_at
+      FROM transactions WHERE id = ?
+    `).bind(txId).first<any>()
+
+    if (!tx) {
+      return c.json({ error: 'tx not found', tx_id: txId }, 404)
+    }
+
+    const validation: any = {
+      tx_id_match: tx.id === txId,
+      user_id_match: tx.user_id === userId,
+      type_match: tx.type === expectedType,
+      amount_match: Number(tx.amount) === expectedAmount,
+      ref_id_match: expectedRefId ? (tx.ref_id === expectedRefId) : true
+    }
+    const allValid = Object.values(validation).every(v => v === true)
+
+    if (!allValid) {
+      return c.json({
+        success: false,
+        error: 'VALIDATION_FAILED',
+        message: '5중 검증 실패 — 진행 중단',
+        tx_actual: {
+          id: tx.id, user_id: tx.user_id, type: tx.type, amount: tx.amount,
+          ref_id: tx.ref_id, coin_type: tx.coin_type, description: tx.description, created_at: tx.created_at
+        },
+        expected: {
+          user_id: userId, tx_id: txId, type: expectedType,
+          amount: expectedAmount, ref_id: expectedRefId
+        },
+        validation
+      }, 400)
+    }
+
+    const plan = {
+      action: 'DELETE_TX_AND_DEDUCT_BALANCE',
+      tx_id: tx.id,
+      user_id: tx.user_id,
+      type: tx.type,
+      amount: tx.amount,
+      ref_id: tx.ref_id,
+      description: tx.description,
+      created_at: tx.created_at,
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after: Number(user.qkey_balance) - Number(tx.amount)
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 추가',
+        user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance },
+        validation,
+        plan
+      })
+    }
+
+    // EXECUTE: DELETE tx + balance -= amount (atomic order: tx 삭제 후 balance 차감)
+    await db.prepare(`DELETE FROM transactions WHERE id = ? AND user_id = ?`).bind(txId, userId).run()
+    await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(tx.amount, userId).run()
+
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      user: {
+        id: user.id, email: user.email, name: user.name,
+        qkey_balance_before: user.qkey_balance,
+        qkey_balance_after: userAfter?.qkey_balance || null
+      },
+      validation,
+      result: {
+        deleted_tx_id: txId,
+        deducted_qkey: tx.amount,
+        note: 'tx 행 삭제됨 + users.qkey_balance 동시 차감 (정합성 유지). dr 행은 그대로 유지됨 (의도적).'
+      }
+    })
+  } catch (error) {
+    console.error('fix-delete-tx-single error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
