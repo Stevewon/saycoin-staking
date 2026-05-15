@@ -9102,6 +9102,181 @@ app.post('/api/diag/revert-backfill-may04', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 5/4 본인 데일리만 정밀 백필 (사장님 2026-05-15 C옵션 선택 1 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 결재 (2026-05-15):
+//     - 휴일진입자(5/3 일요일 진입) 18건의 첫 평일(5/4) 본인 데일리 1일치만 보정
+//     - L1/L2 매칭 INSERT 는 0건 (referrer 들은 이미 5/6 cron 에서 첫 매칭을 받았으므로,
+//       5/4 분 매칭을 또 INSERT 하면 "수정 대상이 아닌 기존 회원 매출 중복" 재발 → 절대 금지)
+//
+//   대상 staking_id: [44, 45, 46, 47, 48, 49, 53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65]
+//   reward_date='2026-05-04', paid_date='2026-05-04'
+//   처리량: 본인 데일리 18 × 750 = 13,500 QKEY (매칭 INSERT 0건)
+//
+//   안전장치:
+//     - dry_run=1 기본 (실행은 confirm=GO 명시 필요)
+//     - daily_rewards (user, staking, reward_date) EXISTS 가드 (재실행 안전)
+//     - 200% cap 검증 (영구룰)
+//     - description 영구룰 '일일 배당 (QKEY)' 사용
+//     - transactions mirror INSERT 시 (type, ref_id) UNIQUE 가드
+//
+//   경로: POST /api/diag/backfill-may04-self-only?key=ADMIN_PW&dry_run=1   (조회)
+//         POST /api/diag/backfill-may04-self-only?key=ADMIN_PW&confirm=GO  (실행)
+app.post('/api/diag/backfill-may04-self-only', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const confirm = c.req.query('confirm') === 'GO'
+    const dryRun = !confirm
+    const db = c.env.DB
+
+    const TARGET_STAKING_IDS = [44, 45, 46, 47, 48, 49, 53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65]
+    const REWARD_DATE = '2026-05-04'
+    const PAID_DATE = '2026-05-04'
+    const USD_TO_QKEY = 150
+
+    // 200% cap 검증 함수
+    async function isUserCapped(userId: number): Promise<{ capped: boolean, paidTotal: number, target: number }> {
+      const stakeRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
+      `).bind(userId).first() as any
+      const stakeTotal = Number(stakeRow?.total || 0)
+      if (stakeTotal <= 0) return { capped: false, paidTotal: 0, target: 0 }
+      const paidRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM transactions
+        WHERE user_id = ? AND coin_type = 'QKEY'
+          AND type IN ('daily_qkey', 'referral_reward')
+      `).bind(userId).first() as any
+      const paidTotal = Number(paidRow?.total || 0)
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      return { capped: paidTotal >= target, paidTotal, target }
+    }
+
+    const asOf = new Date('2026-05-04T00:00:00+09:00')
+    const results: any[] = []
+    let insertedCount = 0
+    let skippedCount = 0
+    let totalDailyQkey = 0
+
+    for (const stakingId of TARGET_STAKING_IDS) {
+      const row: any = { staking_id: stakingId, dry_run: dryRun, steps: [] as string[] }
+
+      const staking = await db.prepare(`
+        SELECT s.id as staking_id, s.user_id, s.amount, s.daily_rate, s.status,
+               s.start_date, s.end_date,
+               u.email as user_email, u.name as user_name
+        FROM staking s
+        LEFT JOIN users u ON u.id = s.user_id
+        WHERE s.id = ?
+      `).bind(stakingId).first() as any
+
+      if (!staking) {
+        row.error = 'staking not found'
+        results.push(row); skippedCount++; continue
+      }
+      row.user_id = staking.user_id
+      row.user_email = staking.user_email
+      row.user_name = staking.user_name
+      row.amount = staking.amount
+
+      // EXISTS guard — daily_rewards (user, staking, reward_date) 이미 있으면 skip
+      const exists = await db.prepare(`
+        SELECT COUNT(*) as count FROM daily_rewards
+        WHERE user_id = ? AND staking_id = ? AND reward_date = ?
+      `).bind(staking.user_id, stakingId, REWARD_DATE).first() as any
+      if ((exists?.count || 0) > 0) {
+        row.skip_reason = 'already_exists'
+        row.steps.push('EXISTS guard hit — daily_rewards 이미 존재')
+        results.push(row); skippedCount++; continue
+      }
+
+      // 200% cap 검증
+      const capState = await isUserCapped(staking.user_id as number)
+      row.cap_state = { capped: capState.capped, paid_total: capState.paidTotal, target: capState.target }
+      if (capState.capped) {
+        row.skip_reason = 'user_capped_200pct'
+        row.steps.push('200% cap 도달 — daily skip')
+        results.push(row); skippedCount++; continue
+      }
+
+      // 본인 데일리 금액 계산
+      const dailyRate = staking.daily_rate || getDailyRate(staking.amount, asOf)
+      const usdAmount = staking.amount * dailyRate
+      let qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
+      const remaining = capState.target - capState.paidTotal
+      if (qkeyAmount > remaining) {
+        qkeyAmount = Math.max(0, Math.floor(remaining))
+        row.steps.push(`partial payment (cap remaining=${remaining})`)
+      }
+      if (qkeyAmount <= 0) {
+        row.skip_reason = 'qkey_amount_zero'
+        results.push(row); skippedCount++; continue
+      }
+
+      row.daily_rate = dailyRate
+      row.qkey_amount = qkeyAmount
+
+      if (dryRun) {
+        row.steps.push(`[DRY] would INSERT daily_rewards + transactions (${qkeyAmount} QKEY)`)
+        row.steps.push(`[DRY] L1/L2 매칭 INSERT 는 0건 (선택 1 정책 — referrer 5/6 분 매칭 있어 중복 방지)`)
+        totalDailyQkey += qkeyAmount
+      } else {
+        // 1) daily_rewards INSERT
+        const drIns = await db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(staking.user_id, stakingId, qkeyAmount, REWARD_DATE, PAID_DATE).run()
+        const drId = (drIns as any)?.meta?.last_row_id ?? null
+        row.dr_id = drId
+
+        // 2) qkey_balance 가산
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(qkeyAmount, staking.user_id).run()
+
+        // 3) transactions mirror INSERT
+        const dqExists = await db.prepare(`SELECT id FROM transactions WHERE type = 'daily_qkey' AND ref_id = ? LIMIT 1`).bind(drId).first()
+        if (!dqExists) {
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+          `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId).run()
+        }
+
+        row.steps.push(`INSERT daily_rewards id=${drId}, ${qkeyAmount} QKEY, balance updated`)
+        row.steps.push(`L1/L2 매칭 INSERT 0건 (선택 1 정책)`)
+        insertedCount++
+        totalDailyQkey += qkeyAmount
+      }
+
+      results.push(row)
+    }
+
+    return c.json({
+      success: true,
+      mode: dryRun ? 'DRY_RUN' : 'EXECUTED',
+      policy: '선택 1 — 본인 데일리만 INSERT, L1/L2 매칭 0건 (referrer 5/6 매칭 중복 방지)',
+      reward_date: REWARD_DATE,
+      paid_date: PAID_DATE,
+      target_staking_ids: TARGET_STAKING_IDS,
+      summary: {
+        inserted_count: insertedCount,
+        skipped_count: skippedCount,
+        total_daily_qkey: totalDailyQkey,
+        total_l1_qkey: 0,
+        total_l2_qkey: 0,
+        grand_total_qkey: totalDailyQkey
+      },
+      results
+    })
+  } catch (error) {
+    console.error('backfill-may04-self-only error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧(u#44) L2 매칭 미러링 누락 2건 정밀 백필 (Phase 1, 2026-05-12 사장님 C안 결재) ★★★
 //   원장 referral_rewards 25건 / 9,150 QKEY  vs  transactions 미러링 23건 / 7,500 QKEY
 //   누락 2건: rr#347 (150 QKEY, 2026-05-06 referee u#49) + rr#524 (1,500 QKEY, 2026-05-06 referee u#76)
