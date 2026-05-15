@@ -11647,6 +11647,141 @@ app.post('/api/diag/fix-tx-for-dr', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-tx-created-at: 단일 사용자 한정, 특정 tx_id 들의 created_at 만 UPDATE (날짜 시각 보정) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: fix-tx-for-dr 로 INSERT된 tx 들이 created_at='now()' 로 박혀
+//        거래내역 화면에 오늘 여러건 표시되는 시각적 혼란 해결
+//   안전성:
+//     - amount/type/ref_id/description/coin_type 일체 손대지 않음 (UPDATE created_at만)
+//     - tx_id 와 expected_user_id 일치 확인 후만 진행 (다른 사용자 영향 0)
+//     - tx_id 와 expected_ref_id (dr_id) 일치 확인 후만 진행 (잘못된 tx 보정 방지)
+//     - DRY_RUN 기본 / confirm=GO 명시시만 실행
+//   경로 (POST):
+//     /api/diag/fix-tx-created-at?key=ADMIN_PW
+//        &user_id=33
+//        &mappings=4333:2026-05-11 22:08:37,4334:2026-05-12 13:17:41,4335:2026-05-13 02:58:22
+//        &expected_refs=4333:306,4334:510,4335:569
+//        &dry_run=1   (또는 confirm=GO)
+app.post('/api/diag/fix-tx-created-at', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const mappingsParam = c.req.query('mappings') || ''
+    const expectedRefsParam = c.req.query('expected_refs') || ''
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (!mappingsParam) return c.json({ error: 'mappings required (tx_id:created_at,tx_id:created_at,...)' }, 400)
+
+    // parse mappings: "4333:2026-05-11 22:08:37,4334:2026-05-12 13:17:41"
+    const mappings: { tx_id: number, new_created_at: string }[] = []
+    for (const pair of mappingsParam.split(',')) {
+      const idx = pair.indexOf(':')
+      if (idx < 0) continue
+      const txId = parseInt(pair.substring(0, idx).trim())
+      const newCreatedAt = pair.substring(idx + 1).trim()
+      if (txId && newCreatedAt) mappings.push({ tx_id: txId, new_created_at: newCreatedAt })
+    }
+    if (mappings.length === 0) return c.json({ error: 'no valid mappings parsed' }, 400)
+
+    // parse expected_refs: "4333:306,4334:510,4335:569"
+    const expectedRefs: Record<number, number> = {}
+    if (expectedRefsParam) {
+      for (const pair of expectedRefsParam.split(',')) {
+        const idx = pair.indexOf(':')
+        if (idx < 0) continue
+        const txId = parseInt(pair.substring(0, idx).trim())
+        const refId = parseInt(pair.substring(idx + 1).trim())
+        if (txId && refId) expectedRefs[txId] = refId
+      }
+    }
+
+    // user 확인
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    // 각 tx 검증 후 plan 생성
+    const plan: any[] = []
+    for (const m of mappings) {
+      const tx = await db.prepare(`
+        SELECT id, user_id, type, amount, coin_type, description, ref_id, created_at
+        FROM transactions WHERE id = ?
+      `).bind(m.tx_id).first<any>()
+      if (!tx) {
+        plan.push({ action: 'SKIP_TX_NOT_FOUND', tx_id: m.tx_id })
+        continue
+      }
+      if (tx.user_id !== userId) {
+        plan.push({ action: 'SKIP_USER_MISMATCH', tx_id: m.tx_id, tx_user_id: tx.user_id, expected_user_id: userId })
+        continue
+      }
+      if (expectedRefs[m.tx_id] && tx.ref_id !== expectedRefs[m.tx_id]) {
+        plan.push({
+          action: 'SKIP_REF_MISMATCH', tx_id: m.tx_id,
+          tx_ref_id: tx.ref_id, expected_ref_id: expectedRefs[m.tx_id]
+        })
+        continue
+      }
+      plan.push({
+        action: 'UPDATE_CREATED_AT',
+        tx_id: m.tx_id,
+        old_created_at: tx.created_at,
+        new_created_at: m.new_created_at,
+        type: tx.type,
+        amount: tx.amount,
+        ref_id: tx.ref_id,
+        description: tx.description
+      })
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 추가',
+        user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance },
+        plan,
+        plan_summary: {
+          to_update_count: plan.filter(p => p.action === 'UPDATE_CREATED_AT').length,
+          to_skip_count: plan.filter(p => p.action !== 'UPDATE_CREATED_AT').length
+        }
+      })
+    }
+
+    // EXECUTE: 각 tx 의 created_at 만 UPDATE (amount/balance 변동 없음)
+    let updatedCount = 0
+    const updatedIds: number[] = []
+    for (const item of plan) {
+      if (item.action === 'UPDATE_CREATED_AT') {
+        await db.prepare(`
+          UPDATE transactions SET created_at = ? WHERE id = ? AND user_id = ?
+        `).bind(item.new_created_at, item.tx_id, userId).run()
+        updatedCount++
+        updatedIds.push(item.tx_id)
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance },
+      plan,
+      result: {
+        updated_count: updatedCount,
+        updated_tx_ids: updatedIds,
+        note: 'qkey_balance/amount/ref_id 등 일체 변동 없음, created_at 만 보정됨'
+      }
+    })
+  } catch (error) {
+    console.error('fix-tx-created-at error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
