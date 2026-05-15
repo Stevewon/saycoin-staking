@@ -16269,14 +16269,14 @@ app.get('/dashboard', (c) => {
                         <p class="text-xs opacity-75 mt-1" id="stakingCount"></p>
                     </div>
                     
-                    <!-- USDT Balance (두 번째) — 사장님 2026-05-15 지시: 출금가능 / 출금불가 분리 표시 -->
+                    <!-- USDT Balance (두 번째) — 사장님 2026-05-15 (3차) 지시: 출금불가 완전 제거, 출금가능만 표시 -->
                     <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.usdt_balance">USDT 잔액</span>
                             <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">출금가능 <span id="usdtWithdrawable" class="font-semibold">0</span> <span class="opacity-80">/ 출금불가 <span id="usdtNonWithdrawable" class="font-semibold">0</span></span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">출금가능 <span id="usdtWithdrawable" class="font-semibold">0</span></p>
                     </div>
                     
                     <!-- QTA (세 번째) — 옵션 A: 회사지급분 (출금가능분) -->
@@ -17059,22 +17059,18 @@ app.get('/dashboard', (c) => {
                         document.getElementById('usdtBalance').textContent = user.usdt_balance.toFixed(2);
 
                         // 옵션 A: 회사지급분 (출금가능분) — 영구 정책 source-tracking
-                        // 사장님 2026-05-15 지시: USDT = 출금가능 / 출금불가 분리 표시
+                        // 사장님 2026-05-15 (3차) 지시: USDT 카드는 출금가능만 표시 (출금불가 항목 완전 제거)
                         const qtaInitEl = document.getElementById('qtaInitial');
                         const qtaWdEl = document.getElementById('qtaWithdrawable');
                         const qxInitEl = document.getElementById('qxInitial');
                         const qxWdEl = document.getElementById('qxWithdrawable');
                         const usdtWdEl = document.getElementById('usdtWithdrawable');
-                        const usdtNonWdEl = document.getElementById('usdtNonWithdrawable');
                         if (qtaInitEl) qtaInitEl.textContent = Math.floor(Number(user.qta_initial || 0)).toLocaleString();
                         if (qtaWdEl) qtaWdEl.textContent = Math.floor(Number(user.qta_withdrawable || 0)).toLocaleString();
                         if (qxInitEl) qxInitEl.textContent = Math.floor(Number(user.qx_initial || 0)).toLocaleString();
                         if (qxWdEl) qxWdEl.textContent = Math.floor(Number(user.qx_withdrawable || 0)).toLocaleString();
-                        const _usdtBal = Number(user.usdt_balance || 0);
                         const _usdtWd = Number(user.usdt_withdrawable || 0);
-                        const _usdtNonWd = Math.max(0, _usdtBal - _usdtWd);
                         if (usdtWdEl) usdtWdEl.textContent = _usdtWd.toFixed(2);
-                        if (usdtNonWdEl) usdtNonWdEl.textContent = _usdtNonWd.toFixed(2);
                         
                         // 스왑 가능 QKEY 잔액 업데이트
                         const swapEl = document.getElementById('swapQkeyBalance');
