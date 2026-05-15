@@ -9277,6 +9277,216 @@ app.post('/api/diag/backfill-may04-self-only', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 기존 사업자 중복 지급 전수 진단 (사장님 2026-05-15 긴급 지시 — 중요한 문제) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "기존사업자들중 중복으로 지급된 배당금 전부 원위치로 다시 수정해줘 이건 중요한 문제야"
+//
+//   진단 대상 — 같은 키 조합이 2건 이상 존재하면 중복:
+//     1) daily_rewards: (user_id, staking_id, reward_date) GROUP BY 후 COUNT > 1
+//     2) referral_rewards: (referrer_id, referee_id, level, reward_date) GROUP BY 후 COUNT > 1
+//     3) transactions: (type, ref_id) GROUP BY 후 COUNT > 1 (mirror 중복)
+//
+//   각 중복의 잔액 영향:
+//     - 첫 행 (가장 작은 id) = KEEP, 나머지 = DUPLICATE 로 분류
+//     - 중복 row 의 amount 만큼 qkey_balance 가 과다 가산된 상태
+//
+//   경로: GET /api/diag/audit-duplicate-rewards?key=ADMIN_PW
+app.get('/api/diag/audit-duplicate-rewards', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // ============================================================
+    // 1) daily_rewards 중복 — 같은 (user_id, staking_id, reward_date) 가 2건 이상
+    // ============================================================
+    const drDup = await db.prepare(`
+      SELECT user_id, staking_id, reward_date,
+             COUNT(*) as cnt,
+             GROUP_CONCAT(id, ',') as ids,
+             SUM(usdt_amount) as sum_qkey,
+             MIN(id) as keep_id,
+             MIN(usdt_amount) as keep_amount
+      FROM daily_rewards
+      GROUP BY user_id, staking_id, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY user_id, staking_id, reward_date
+    `).all() as any
+    const drDupRows = drDup?.results || []
+
+    // 각 중복의 상세 행 조회 (어떤 id 가 keep / 어떤 id 가 dup 인지 명시)
+    const drDupDetails: any[] = []
+    let drDupTotalExcess = 0
+    for (const g of drDupRows) {
+      const allRows = await db.prepare(`
+        SELECT id, user_id, staking_id, reward_date, paid_date, usdt_amount, created_at
+        FROM daily_rewards
+        WHERE user_id = ? AND staking_id = ? AND reward_date = ?
+        ORDER BY id ASC
+      `).bind(g.user_id, g.staking_id, g.reward_date).all() as any
+      const rows = allRows?.results || []
+      const keep = rows[0]
+      const dups = rows.slice(1)
+      const excessSum = dups.reduce((s: number, r: any) => s + Number(r.usdt_amount || 0), 0)
+      drDupTotalExcess += excessSum
+      drDupDetails.push({
+        user_id: g.user_id,
+        staking_id: g.staking_id,
+        reward_date: g.reward_date,
+        cnt: g.cnt,
+        keep: keep,
+        duplicates: dups,
+        excess_qkey: excessSum
+      })
+    }
+
+    // ============================================================
+    // 2) referral_rewards 중복 — 같은 (referrer_id, referee_id, level, reward_date) 가 2건 이상
+    // ============================================================
+    const rrDup = await db.prepare(`
+      SELECT referrer_id, referee_id, level, reward_date,
+             COUNT(*) as cnt,
+             GROUP_CONCAT(id, ',') as ids,
+             SUM(reward_amount) as sum_qkey,
+             MIN(id) as keep_id
+      FROM referral_rewards
+      GROUP BY referrer_id, referee_id, level, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY referrer_id, reward_date, level
+    `).all() as any
+    const rrDupRows = rrDup?.results || []
+
+    const rrDupDetails: any[] = []
+    let rrDupTotalExcess = 0
+    for (const g of rrDupRows) {
+      const allRows = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at
+        FROM referral_rewards
+        WHERE referrer_id = ? AND referee_id = ? AND level = ? AND reward_date = ?
+        ORDER BY id ASC
+      `).bind(g.referrer_id, g.referee_id, g.level, g.reward_date).all() as any
+      const rows = allRows?.results || []
+      const keep = rows[0]
+      const dups = rows.slice(1)
+      const excessSum = dups.reduce((s: number, r: any) => s + Number(r.reward_amount || 0), 0)
+      rrDupTotalExcess += excessSum
+
+      // referrer 이름 조회
+      const referrer = await db.prepare(`SELECT id, email, name FROM users WHERE id = ?`).bind(g.referrer_id).first() as any
+      const referee = await db.prepare(`SELECT id, email, name FROM users WHERE id = ?`).bind(g.referee_id).first() as any
+      rrDupDetails.push({
+        referrer_id: g.referrer_id,
+        referrer_name: referrer?.name || null,
+        referrer_email: referrer?.email || null,
+        referee_id: g.referee_id,
+        referee_name: referee?.name || null,
+        referee_email: referee?.email || null,
+        level: g.level,
+        reward_date: g.reward_date,
+        cnt: g.cnt,
+        keep: keep,
+        duplicates: dups,
+        excess_qkey: excessSum
+      })
+    }
+
+    // ============================================================
+    // 3) transactions mirror 중복 — 같은 (type, ref_id) 가 2건 이상
+    //    daily_qkey / referral_reward 만 점검 (다른 type 은 ref_id 의미 다름)
+    // ============================================================
+    const txDup = await db.prepare(`
+      SELECT type, ref_id,
+             COUNT(*) as cnt,
+             GROUP_CONCAT(id, ',') as ids,
+             SUM(amount) as sum_qkey,
+             MIN(id) as keep_id,
+             MIN(user_id) as user_id
+      FROM transactions
+      WHERE type IN ('daily_qkey', 'referral_reward') AND ref_id IS NOT NULL
+      GROUP BY type, ref_id
+      HAVING COUNT(*) > 1
+      ORDER BY type, ref_id
+    `).all() as any
+    const txDupRows = txDup?.results || []
+
+    const txDupDetails: any[] = []
+    let txDupTotalExcess = 0
+    for (const g of txDupRows) {
+      const allRows = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+        FROM transactions
+        WHERE type = ? AND ref_id = ?
+        ORDER BY id ASC
+      `).bind(g.type, g.ref_id).all() as any
+      const rows = allRows?.results || []
+      const keep = rows[0]
+      const dups = rows.slice(1)
+      const excessSum = dups.reduce((s: number, r: any) => s + Number(r.amount || 0), 0)
+      txDupTotalExcess += excessSum
+      txDupDetails.push({
+        type: g.type,
+        ref_id: g.ref_id,
+        user_id: g.user_id,
+        cnt: g.cnt,
+        keep: keep,
+        duplicates: dups,
+        excess_qkey: excessSum
+      })
+    }
+
+    // ============================================================
+    // 4) 사용자별 잔액 과다 가산 영향 집계
+    // ============================================================
+    const userExcess: Record<number, { daily: number, l1: number, l2: number, total: number, name?: string, email?: string }> = {}
+
+    for (const g of drDupDetails) {
+      const uid = Number(g.user_id)
+      if (!userExcess[uid]) userExcess[uid] = { daily: 0, l1: 0, l2: 0, total: 0 }
+      userExcess[uid].daily += Number(g.excess_qkey || 0)
+      userExcess[uid].total += Number(g.excess_qkey || 0)
+    }
+    for (const g of rrDupDetails) {
+      const uid = Number(g.referrer_id)
+      if (!userExcess[uid]) userExcess[uid] = { daily: 0, l1: 0, l2: 0, total: 0, name: g.referrer_name, email: g.referrer_email }
+      else { userExcess[uid].name = userExcess[uid].name || g.referrer_name; userExcess[uid].email = userExcess[uid].email || g.referrer_email }
+      if (Number(g.level) === 1) userExcess[uid].l1 += Number(g.excess_qkey || 0)
+      else if (Number(g.level) === 2) userExcess[uid].l2 += Number(g.excess_qkey || 0)
+      userExcess[uid].total += Number(g.excess_qkey || 0)
+    }
+
+    // 사용자 이름/이메일 보충
+    for (const uidStr of Object.keys(userExcess)) {
+      const uid = Number(uidStr)
+      if (!userExcess[uid].name) {
+        const u = await db.prepare(`SELECT name, email FROM users WHERE id = ?`).bind(uid).first() as any
+        if (u) { userExcess[uid].name = u.name; userExcess[uid].email = u.email }
+      }
+    }
+
+    return c.json({
+      success: true,
+      summary: {
+        daily_rewards_duplicate_groups: drDupRows.length,
+        daily_rewards_excess_qkey: drDupTotalExcess,
+        referral_rewards_duplicate_groups: rrDupRows.length,
+        referral_rewards_excess_qkey: rrDupTotalExcess,
+        transactions_duplicate_groups: txDupRows.length,
+        transactions_excess_qkey: txDupTotalExcess,
+        affected_users: Object.keys(userExcess).length,
+        total_balance_excess_qkey: Object.values(userExcess).reduce((s, v) => s + v.total, 0)
+      },
+      daily_rewards_duplicates: drDupDetails,
+      referral_rewards_duplicates: rrDupDetails,
+      transactions_duplicates: txDupDetails,
+      user_balance_excess: userExcess
+    })
+  } catch (error) {
+    console.error('audit-duplicate-rewards error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧(u#44) L2 매칭 미러링 누락 2건 정밀 백필 (Phase 1, 2026-05-12 사장님 C안 결재) ★★★
 //   원장 referral_rewards 25건 / 9,150 QKEY  vs  transactions 미러링 23건 / 7,500 QKEY
 //   누락 2건: rr#347 (150 QKEY, 2026-05-06 referee u#49) + rr#524 (1,500 QKEY, 2026-05-06 referee u#76)
