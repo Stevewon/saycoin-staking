@@ -31087,13 +31087,11 @@ app.post('/api/diag/migrate-source-tracking', async (c) => {
       const qtaInit = Math.max(0, qtaBal - qtaWd)
       const qxWd = Math.max(0, qxNet)
       const qxInit = Math.max(0, qxBal - qxWd)
-      // ★ 사장님 2026-05-15 지시: USDT 출금 가능 = QKEY→USDT 스왑분 - USDT 차감(스왑/출금)
-      //   기존 보유 USDT, 일반 USDT, 수당 USDT 는 출금 불가
+      // ★ 사장님 2026-05-15 (2차) 지시: USDT 는 전부 출금 가능 (신규/기존 구분 없음)
+      //   스왑된 USDT 든 기존 USDT 든 전부 usdt_withdrawable = usdt_balance
       const qkeyToUsdtIn = qkeyToUsdtMap[uid] || 0
       const usdtOut = usdtOutMap[uid] || 0
-      const usdtWdRaw = qkeyToUsdtIn - usdtOut
-      // 보유 잔액 초과 금지 + 음수 차단
-      const usdtWd = Math.max(0, Math.min(usdtBal, usdtWdRaw))
+      const usdtWd = usdtBal
 
       // 이미 마이그레이션 완료된 계정 식별 (initial+withdrawable 합이 balance 와 일치하면 skip)
       const prevQtaInit = Number(u.qta_initial || 0)
@@ -31104,10 +31102,9 @@ app.post('/api/diag/migrate-source-tracking', async (c) => {
 
       const qtaAlreadySet = (prevQtaInit + prevQtaWd) > 0 && Math.abs((prevQtaInit + prevQtaWd) - qtaBal) < 0.0001
       const qxAlreadySet = (prevQxInit + prevQxWd) > 0 && Math.abs((prevQxInit + prevQxWd) - qxBal) < 0.0001
-      // ★ 사장님 2026-05-15 지시: USDT 출금 가능 = QKEY→USDT 스왑분만
-      //   prev usdt_withdrawable 이 새 공식 결과(usdtWd)와 일치할 때만 skip
-      //   (옛 공식: usdtBal 전액 → 새 공식: QKEY→USDT 스왑분만 — 재계산 필수)
-      const usdtAlreadySet = Math.abs(prevUsdtWd - usdtWd) < 0.0001
+      // ★ 사장님 2026-05-15 (2차) 지시: USDT 는 전부 출금 가능 (구분 없음)
+      //   prev usdt_withdrawable 이 usdt_balance 와 일치할 때만 skip
+      const usdtAlreadySet = Math.abs(prevUsdtWd - usdtBal) < 0.0001
 
       const allSet = (qtaBal === 0 || qtaAlreadySet) && (qxBal === 0 || qxAlreadySet) && usdtAlreadySet
       if (allSet) {
@@ -31158,7 +31155,7 @@ app.post('/api/diag/migrate-source-tracking', async (c) => {
       formula: {
         QTA: 'withdrawable = max(0, swap_in - swap_out) / initial = max(0, balance - withdrawable)',
         QX:  'withdrawable = max(0, swap_in - swap_out) / initial = max(0, balance - withdrawable)',
-        USDT: 'withdrawable = max(0, min(balance, QKEY->USDT swap_in - USDT swap_out)) — 사장님 2026-05-15 지시',
+        USDT: 'withdrawable = usdt_balance (전액 출금 가능 — 사장님 2026-05-15 2차 지시)',
         QKEY: '컬럼 분리 없음 (qkey_balance 전체가 출금 가능 — 데일리/매칭/추천 합산)',
       },
       plan,
