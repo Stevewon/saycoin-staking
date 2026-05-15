@@ -11438,6 +11438,401 @@ app.get('/api/diag/user-staking-matrix-v2', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ daily_rewards 있는데 transactions 없는 case 전수 스캔 (사장님 2026-05-15 8차 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: bang8241 처럼 dr 행은 있는데 tx 행이 없는 case 전수 발굴
+//   원리: dr 와 tx 의 left join, tx.id IS NULL 인 dr 만 추출
+//
+//   경로: GET /api/diag/scan-dr-without-tx?key=ADMIN_PW&date_from=2026-05-11&date_to=2026-05-15
+app.get('/api/diag/scan-dr-without-tx', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dateFrom = c.req.query('date_from') || '2026-05-11'
+    const dateTo = c.req.query('date_to') || '2026-05-15'
+
+    // daily_rewards 있는데 type='daily_qkey' AND ref_id=dr.id 인 transactions 가 없는 행 모두 추출
+    const rows = await db.prepare(`
+      SELECT dr.id AS dr_id, dr.user_id, dr.staking_id, dr.usdt_amount AS qkey, dr.reward_date, dr.paid_date, dr.created_at AS dr_created,
+             u.email, u.name, u.qkey_balance,
+             s.amount AS staking_amount, s.daily_rate, s.status AS staking_status
+      FROM daily_rewards dr
+      JOIN users u ON u.id = dr.user_id
+      LEFT JOIN staking s ON s.id = dr.staking_id
+      LEFT JOIN transactions tx
+        ON tx.user_id = dr.user_id
+        AND tx.type = 'daily_qkey'
+        AND tx.ref_id = dr.id
+      WHERE dr.reward_date >= ? AND dr.reward_date <= ?
+        AND tx.id IS NULL
+      ORDER BY dr.user_id, dr.reward_date, dr.staking_id
+    `).bind(dateFrom, dateTo).all<any>()
+
+    // 사용자별 집계
+    const byUser: Record<string, any> = {}
+    for (const r of (rows.results || [])) {
+      const k = String(r.user_id)
+      if (!byUser[k]) {
+        byUser[k] = {
+          user_id: r.user_id, email: r.email, name: r.name, qkey_balance: r.qkey_balance,
+          total_missing_qkey: 0, missing_count: 0, items: []
+        }
+      }
+      byUser[k].total_missing_qkey += Number(r.qkey || 0)
+      byUser[k].missing_count += 1
+      byUser[k].items.push({
+        dr_id: r.dr_id, staking_id: r.staking_id, staking_amount: r.staking_amount,
+        daily_rate: r.daily_rate, staking_status: r.staking_status,
+        qkey: r.qkey, reward_date: r.reward_date, paid_date: r.paid_date, dr_created: r.dr_created
+      })
+    }
+
+    const userList = Object.values(byUser).sort((a: any, b: any) => b.total_missing_qkey - a.total_missing_qkey)
+    const totalMissing = userList.reduce((acc: number, u: any) => acc + u.total_missing_qkey, 0)
+
+    return c.json({
+      success: true,
+      date_from: dateFrom,
+      date_to: dateTo,
+      total_dr_without_tx_count: (rows.results || []).length,
+      total_missing_qkey: totalMissing,
+      affected_users_count: userList.length,
+      affected_users: userList
+    })
+  } catch (error) {
+    console.error('scan-dr-without-tx error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 단일 회원 단일 staking 단일 일자 정밀 tx 백필 (사장님 2026-05-15 8차 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: bang8241 (user 33) 5/12·5/13 staking 97 dr 행은 있는데 tx 누락 보정 같은 케이스
+//   안전: 단일 회원·단일 staking·단일 일자 명시 (전수 적용 금지)
+//        EXISTS guard 로 재호출 안전
+//        다른 회원·다른 staking·다른 일자 절대 0건 영향
+//
+//   경로: POST /api/diag/fix-tx-for-dr?key=ADMIN_PW&user_id=33&staking_id=97&dates=2026-05-12,2026-05-13&dry_run=1
+//        실행: confirm=GO 추가
+app.post('/api/diag/fix-tx-for-dr', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const stakingIdParam = c.req.query('staking_id') || ''
+    const datesParam = c.req.query('dates') || ''
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (!datesParam) return c.json({ error: 'dates required (comma-separated)' }, 400)
+
+    const dates = datesParam.split(',').map(s => s.trim()).filter(Boolean)
+    const stakingId = stakingIdParam ? parseInt(stakingIdParam) : null
+
+    // user 확인
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    // dr 행 + tx 존재 여부 조회
+    const plan: any[] = []
+    let totalToAdd = 0
+
+    for (const dateStr of dates) {
+      let drQuery = `
+        SELECT dr.id AS dr_id, dr.user_id, dr.staking_id, dr.usdt_amount AS qkey,
+               dr.reward_date, dr.paid_date, dr.created_at AS dr_created
+        FROM daily_rewards dr
+        WHERE dr.user_id = ? AND dr.reward_date = ?
+      `
+      const binds: any[] = [userId, dateStr]
+      if (stakingId !== null) {
+        drQuery += ` AND dr.staking_id = ?`
+        binds.push(stakingId)
+      }
+      drQuery += ` ORDER BY dr.staking_id, dr.id`
+
+      const drRows = await db.prepare(drQuery).bind(...binds).all<any>()
+
+      for (const dr of (drRows.results || [])) {
+        // 해당 dr.id 를 ref_id 로 하는 daily_qkey tx 존재?
+        const existingTx = await db.prepare(`
+          SELECT id, amount FROM transactions
+          WHERE user_id = ? AND type = 'daily_qkey' AND ref_id = ?
+          LIMIT 1
+        `).bind(userId, dr.dr_id).first<any>()
+
+        if (existingTx) {
+          plan.push({
+            action: 'SKIP_TX_EXISTS',
+            dr_id: dr.dr_id, staking_id: dr.staking_id, reward_date: dr.reward_date,
+            qkey: dr.qkey, existing_tx_id: existingTx.id
+          })
+        } else {
+          plan.push({
+            action: 'INSERT_TX',
+            dr_id: dr.dr_id, staking_id: dr.staking_id, reward_date: dr.reward_date,
+            qkey: dr.qkey, paid_date: dr.paid_date
+          })
+          totalToAdd += Number(dr.qkey || 0)
+        }
+      }
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 추가',
+        user: { id: user.id, email: user.email, name: user.name, qkey_balance_before: user.qkey_balance },
+        target: { user_id: userId, staking_id: stakingId, dates },
+        plan,
+        plan_summary: {
+          to_insert_tx_count: plan.filter(p => p.action === 'INSERT_TX').length,
+          to_skip_count: plan.filter(p => p.action === 'SKIP_TX_EXISTS').length,
+          qkey_to_add: totalToAdd,
+          qkey_balance_after: user.qkey_balance + totalToAdd
+        }
+      })
+    }
+
+    // EXECUTE
+    let insertedTxIds: number[] = []
+    let actualAdded = 0
+    for (const item of plan) {
+      if (item.action === 'INSERT_TX') {
+        // INSERT transactions
+        // description: 영구룰 — '일일 배당 (QKEY)' 만 사용 (변수 보간 0건)
+        const ins = await db.prepare(`
+          INSERT INTO transactions (user_id, type, amount, coin_type, description, ref_id, created_at)
+          VALUES (?, 'daily_qkey', ?, 'QKEY', '일일 배당 (QKEY)', ?, datetime('now'))
+        `).bind(userId, item.qkey, item.dr_id).run()
+
+        const newTxId = (ins as any).meta?.last_row_id || null
+        if (newTxId) insertedTxIds.push(newTxId)
+        actualAdded += Number(item.qkey || 0)
+      }
+    }
+
+    // users.qkey_balance += actualAdded
+    if (actualAdded > 0) {
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(actualAdded, userId).run()
+    }
+
+    // 최종 잔액 조회
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      user: { id: user.id, email: user.email, name: user.name,
+              qkey_balance_before: user.qkey_balance,
+              qkey_balance_after: userAfter?.qkey_balance || null },
+      target: { user_id: userId, staking_id: stakingId, dates },
+      plan,
+      result: {
+        inserted_tx_count: insertedTxIds.length,
+        inserted_tx_ids: insertedTxIds,
+        skipped_count: plan.filter(p => p.action === 'SKIP_TX_EXISTS').length,
+        qkey_added: actualAdded
+      }
+    })
+  } catch (error) {
+    console.error('fix-tx-for-dr error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
+//
+//   경로: GET /api/diag/scan-rr-without-tx?key=ADMIN_PW&date_from=2026-05-11&date_to=2026-05-15
+app.get('/api/diag/scan-rr-without-tx', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dateFrom = c.req.query('date_from') || '2026-05-11'
+    const dateTo = c.req.query('date_to') || '2026-05-15'
+
+    const rows = await db.prepare(`
+      SELECT rr.id AS rr_id, rr.referrer_id AS user_id, rr.referee_id, rr.level,
+             rr.original_amount, rr.reward_amount AS qkey, rr.reward_date, rr.paid_date, rr.created_at AS rr_created,
+             u.email, u.name, u.qkey_balance
+      FROM referral_rewards rr
+      JOIN users u ON u.id = rr.referrer_id
+      LEFT JOIN transactions tx
+        ON tx.user_id = rr.referrer_id
+        AND tx.type = 'referral_reward'
+        AND tx.ref_id = rr.id
+      WHERE rr.paid_date >= ? AND rr.paid_date <= ?
+        AND tx.id IS NULL
+      ORDER BY rr.referrer_id, rr.paid_date, rr.level
+    `).bind(dateFrom, dateTo).all<any>()
+
+    const byUser: Record<string, any> = {}
+    for (const r of (rows.results || [])) {
+      const k = String(r.user_id)
+      if (!byUser[k]) {
+        byUser[k] = {
+          user_id: r.user_id, email: r.email, name: r.name, qkey_balance: r.qkey_balance,
+          total_missing_qkey: 0, missing_count: 0, items: []
+        }
+      }
+      byUser[k].total_missing_qkey += Number(r.qkey || 0)
+      byUser[k].missing_count += 1
+      byUser[k].items.push({
+        rr_id: r.rr_id, referee_id: r.referee_id, level: r.level,
+        original_amount: r.original_amount, qkey: r.qkey,
+        reward_date: r.reward_date, paid_date: r.paid_date, rr_created: r.rr_created
+      })
+    }
+
+    const userList = Object.values(byUser).sort((a: any, b: any) => b.total_missing_qkey - a.total_missing_qkey)
+    const totalMissing = userList.reduce((acc: number, u: any) => acc + u.total_missing_qkey, 0)
+
+    return c.json({
+      success: true,
+      date_from: dateFrom,
+      date_to: dateTo,
+      total_rr_without_tx_count: (rows.results || []).length,
+      total_missing_qkey: totalMissing,
+      affected_users_count: userList.length,
+      affected_users: userList
+    })
+  } catch (error) {
+    console.error('scan-rr-without-tx error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 단일 회원 referral_rewards tx 백필 (solbat 같은 case 용) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   경로: POST /api/diag/fix-tx-for-rr?key=ADMIN_PW&user_id=44&paid_dates=2026-05-15&dry_run=1
+//        실행: confirm=GO 추가
+app.post('/api/diag/fix-tx-for-rr', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const paidDatesParam = c.req.query('paid_dates') || ''
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (!paidDatesParam) return c.json({ error: 'paid_dates required (comma-separated)' }, 400)
+
+    const paidDates = paidDatesParam.split(',').map(s => s.trim()).filter(Boolean)
+
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    const plan: any[] = []
+    let totalToAdd = 0
+
+    for (const pd of paidDates) {
+      const rrRows = await db.prepare(`
+        SELECT id AS rr_id, referrer_id AS user_id, referee_id, level,
+               original_amount, reward_amount AS qkey, reward_date, paid_date, created_at AS rr_created
+        FROM referral_rewards
+        WHERE referrer_id = ? AND paid_date = ?
+        ORDER BY id
+      `).bind(userId, pd).all<any>()
+
+      for (const rr of (rrRows.results || [])) {
+        const existingTx = await db.prepare(`
+          SELECT id, amount FROM transactions
+          WHERE user_id = ? AND type = 'referral_reward' AND ref_id = ?
+          LIMIT 1
+        `).bind(userId, rr.rr_id).first<any>()
+
+        if (existingTx) {
+          plan.push({
+            action: 'SKIP_TX_EXISTS',
+            rr_id: rr.rr_id, level: rr.level, paid_date: rr.paid_date, qkey: rr.qkey,
+            existing_tx_id: existingTx.id
+          })
+        } else {
+          plan.push({
+            action: 'INSERT_TX',
+            rr_id: rr.rr_id, level: rr.level, paid_date: rr.paid_date, qkey: rr.qkey,
+            reward_date: rr.reward_date, referee_id: rr.referee_id
+          })
+          totalToAdd += Number(rr.qkey || 0)
+        }
+      }
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 추가',
+        user: { id: user.id, email: user.email, name: user.name, qkey_balance_before: user.qkey_balance },
+        target: { user_id: userId, paid_dates: paidDates },
+        plan,
+        plan_summary: {
+          to_insert_tx_count: plan.filter(p => p.action === 'INSERT_TX').length,
+          to_skip_count: plan.filter(p => p.action === 'SKIP_TX_EXISTS').length,
+          qkey_to_add: totalToAdd,
+          qkey_balance_after: user.qkey_balance + totalToAdd
+        }
+      })
+    }
+
+    // EXECUTE
+    let insertedTxIds: number[] = []
+    let actualAdded = 0
+    for (const item of plan) {
+      if (item.action === 'INSERT_TX') {
+        // description: 영구룰 — '추천 보너스 (Level 1)' 또는 '추천 보너스 (Level 2)' 만
+        const desc = item.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+        const ins = await db.prepare(`
+          INSERT INTO transactions (user_id, type, amount, coin_type, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', ?, 'QKEY', ?, ?, datetime('now'))
+        `).bind(userId, item.qkey, desc, item.rr_id).run()
+
+        const newTxId = (ins as any).meta?.last_row_id || null
+        if (newTxId) insertedTxIds.push(newTxId)
+        actualAdded += Number(item.qkey || 0)
+      }
+    }
+
+    if (actualAdded > 0) {
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(actualAdded, userId).run()
+    }
+
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      user: { id: user.id, email: user.email, name: user.name,
+              qkey_balance_before: user.qkey_balance,
+              qkey_balance_after: userAfter?.qkey_balance || null },
+      target: { user_id: userId, paid_dates: paidDates },
+      plan,
+      result: {
+        inserted_tx_count: insertedTxIds.length,
+        inserted_tx_ids: insertedTxIds,
+        skipped_count: plan.filter(p => p.action === 'SKIP_TX_EXISTS').length,
+        qkey_added: actualAdded
+      }
+    })
+  } catch (error) {
+    console.error('fix-tx-for-rr error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 5/14 paid_date 보강 미러링 — A안 강행 (사장님 2026-05-15 결재 "A안으로 해줘") ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 원문: "A안으로 해줘" (5/14와 무조건 동일하게)
