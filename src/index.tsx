@@ -9972,6 +9972,154 @@ app.post('/api/diag/topup-may15-referrals', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 특정 회원 paid_date 전수 조사 (사장님 2026-05-15 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "예로 solbat 1대가 1050 2대가 1950 발생되어야 하는데 배당금은 두번발생되고, 일일배당 두번씩 중복 지급되었다"
+//
+//   처리: 특정 user_id 와 paid_date 에 대해
+//     - daily_rewards 전체 행 (reward_date 별 그룹)
+//     - referral_rewards 전체 행 (referrer 입장 + referee 입장)
+//     - transactions 전체 행 (type='daily_qkey' / 'referral_reward')
+//     - 합계 계산 (own / L1 / L2 / total)
+//   를 상세 출력하여 중복 여부를 한눈에 식별
+//
+//   경로: GET /api/diag/user-paid-date-detail?key=ADMIN_PW&user_id=44&paid_date=2026-05-15
+app.get('/api/diag/user-paid-date-detail', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const userId = Number(c.req.query('user_id') || '0')
+    const paidDate = c.req.query('paid_date') || ''
+    const email = c.req.query('email') || ''
+    if (!paidDate) return c.json({ error: 'paid_date required (YYYY-MM-DD)' }, 400)
+    const db = c.env.DB
+
+    let uid = userId
+    if (!uid && email) {
+      const u = await db.prepare('SELECT id FROM users WHERE email = ?').bind(email).first() as any
+      if (u) uid = Number(u.id)
+    }
+    if (!uid) return c.json({ error: 'user_id or email required' }, 400)
+
+    const userRow = await db.prepare('SELECT id, name, email, qkey_balance FROM users WHERE id = ?').bind(uid).first()
+
+    // 1) daily_rewards on this paid_date
+    const drRows = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE user_id = ? AND paid_date = ?
+      ORDER BY reward_date ASC, id ASC
+    `).bind(uid, paidDate).all()
+    const drList = (drRows.results || []) as any[]
+    const drByRewardDate: Record<string, any[]> = {}
+    for (const r of drList) {
+      const k = String(r.reward_date)
+      if (!drByRewardDate[k]) drByRewardDate[k] = []
+      drByRewardDate[k].push(r)
+    }
+    const drDupes: any[] = []
+    for (const [rd, rows] of Object.entries(drByRewardDate)) {
+      if (rows.length > 1) {
+        drDupes.push({
+          reward_date: rd,
+          count: rows.length,
+          rows: rows.map(r => ({ id: r.id, staking_id: r.staking_id, qkey: r.usdt_amount, created_at: r.created_at }))
+        })
+      }
+    }
+    const drTotal = drList.reduce((s, r) => s + Number(r.usdt_amount || 0), 0)
+
+    // 2) referral_rewards on this paid_date — as referrer (receiving)
+    const rrRcv = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE referrer_id = ? AND paid_date = ?
+      ORDER BY level ASC, reward_date ASC, id ASC
+    `).bind(uid, paidDate).all()
+    const rrRcvList = (rrRcv.results || []) as any[]
+    // L1, L2 합계 + 중복 그룹
+    const rrByKey: Record<string, any[]> = {}
+    for (const r of rrRcvList) {
+      const k = `${r.referee_id}|${r.level}|${r.reward_date}`
+      if (!rrByKey[k]) rrByKey[k] = []
+      rrByKey[k].push(r)
+    }
+    const rrDupes: any[] = []
+    for (const [k, rows] of Object.entries(rrByKey)) {
+      if (rows.length > 1) {
+        const [refereeId, level, rd] = k.split('|')
+        rrDupes.push({
+          referee_id: Number(refereeId),
+          level: Number(level),
+          reward_date: rd,
+          count: rows.length,
+          rows: rows.map(r => ({ id: r.id, original_amount: r.original_amount, reward_amount: r.reward_amount, created_at: r.created_at }))
+        })
+      }
+    }
+    const l1Total = rrRcvList.filter(r => Number(r.level) === 1).reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+    const l2Total = rrRcvList.filter(r => Number(r.level) === 2).reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+
+    // 3) referral_rewards on this paid_date — as referee (someone else got bonus FROM this user's daily)
+    const rrAsReferee = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE referee_id = ? AND paid_date = ?
+      ORDER BY level ASC, reward_date ASC, id ASC
+    `).bind(uid, paidDate).all()
+
+    // 4) transactions on this paid_date (DATE(created_at) ≈ paid_date)
+    const txRows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at, DATE(created_at) as tx_date
+      FROM transactions WHERE user_id = ? AND DATE(created_at) = ?
+        AND type IN ('daily_qkey', 'referral_reward')
+      ORDER BY created_at ASC, id ASC
+    `).bind(uid, paidDate).all()
+    const txList = (txRows.results || []) as any[]
+    // Group by type+ref_id to find duplicates
+    const txByKey: Record<string, any[]> = {}
+    for (const t of txList) {
+      const k = `${t.type}|${t.ref_id}`
+      if (!txByKey[k]) txByKey[k] = []
+      txByKey[k].push(t)
+    }
+    const txDupes: any[] = []
+    for (const [k, rows] of Object.entries(txByKey)) {
+      if (rows.length > 1) {
+        const [type, refId] = k.split('|')
+        txDupes.push({ type, ref_id: refId, count: rows.length, rows })
+      }
+    }
+    const txDailySum = txList.filter(t => t.type === 'daily_qkey').reduce((s, t) => s + Number(t.amount || 0), 0)
+    const txReferralSum = txList.filter(t => t.type === 'referral_reward').reduce((s, t) => s + Number(t.amount || 0), 0)
+
+    return c.json({
+      success: true,
+      user: userRow,
+      paid_date: paidDate,
+      summary: {
+        daily_rewards: { row_count: drList.length, qkey_total: drTotal, distinct_reward_dates: Object.keys(drByRewardDate).length, duplicate_groups: drDupes.length },
+        referral_rewards_received: { row_count: rrRcvList.length, l1_qkey_total: l1Total, l2_qkey_total: l2Total, duplicate_groups: rrDupes.length },
+        referral_rewards_as_referee: { row_count: (rrAsReferee.results || []).length },
+        transactions: { row_count: txList.length, daily_qkey_sum: txDailySum, referral_reward_sum: txReferralSum, duplicate_groups: txDupes.length },
+        grand_total_qkey_credited: drTotal + l1Total + l2Total
+      },
+      duplicates_found: {
+        daily_rewards: drDupes,
+        referral_rewards: rrDupes,
+        transactions: txDupes
+      },
+      raw: {
+        daily_rewards: drList,
+        referral_rewards_received: rrRcvList,
+        referral_rewards_as_referee: rrAsReferee.results || [],
+        transactions: txList
+      }
+    })
+  } catch (error) {
+    console.error('user-paid-date-detail error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 5/14 paid_date 보강 미러링 — A안 강행 (사장님 2026-05-15 결재 "A안으로 해줘") ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 원문: "A안으로 해줘" (5/14와 무조건 동일하게)
