@@ -8851,6 +8851,253 @@ app.post('/api/diag/backfill-may04-missing', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 5/4 백필 정밀 원상복구 (사장님 2026-05-15 긴급 지시 — 중복지급 발생, 즉시 원위치) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "휴일매출자들 수당지급을 수정해달라고 하니 기존매출자 매출이 중복으로 되었어
+//                  중복으로 된 부분 전부 원래 수정전으로 전산 원위치"
+//
+//   복구 fingerprint (백필 endpoint /api/diag/backfill-may04-missing 가 INSERT 한 것만 정확히 식별):
+//     1) daily_rewards: reward_date='2026-05-04' AND paid_date='2026-05-04'
+//                       AND staking_id IN (44,45,46,47,48,49,53,54,56,57,58,59,60,61,62,63,64,65)
+//     2) transactions:  type='daily_qkey' AND ref_id IN (위 dr_id)
+//     3) referral_rewards: reward_date='2026-05-04' AND paid_date='2026-05-04'
+//                          AND referee_id IN (백필 대상 staking 들의 user_id)
+//                          ※ 사전조건: 백필 외에는 5/4 reward_date + 5/4 paid_date 인 referral_rewards 가 존재해서는 안 됨
+//                          ※ 안전을 위해 referee_id IN (백필 user_id) AND reward_date='2026-05-04' AND paid_date='2026-05-04' 까지 추가 제한
+//     4) transactions:  type='referral_reward' AND ref_id IN (위 rr_id)
+//     5) users.qkey_balance: 차감 (각 INSERT 시 가산했던 amount 정확히 reverse)
+//
+//   안전장치:
+//     - dry_run=1 기본 (실행은 confirm=GO 명시 필요)
+//     - 각 행 삭제 전 fingerprint 재검증 (reward_date/paid_date/staking_id 모두 일치할 때만 처리)
+//     - 200% cap / 5/6 정상 cron 행 / 4/30 데이터 등 PREEXIST 데이터에는 절대 손대지 않음
+//     - 모든 작업은 동일 트랜잭션 단위 (실패 시 부분 적용 방지 — D1 batch 사용)
+//
+//   경로: POST /api/diag/revert-backfill-may04?key=ADMIN_PW&dry_run=1   (조회만)
+//         POST /api/diag/revert-backfill-may04?key=ADMIN_PW&confirm=GO  (실제 실행)
+app.post('/api/diag/revert-backfill-may04', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const confirm = c.req.query('confirm') === 'GO'
+    const dryRun = !confirm
+    const db = c.env.DB
+
+    // 백필 endpoint 가 사용한 정확한 target staking IDs (line 8608)
+    const BACKFILL_STAKING_IDS = [44, 45, 46, 47, 48, 49, 53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65]
+    const REWARD_DATE = '2026-05-04'
+    const PAID_DATE = '2026-05-04'
+
+    // ============================================================
+    // STEP 1: daily_rewards 백필 행 정확 식별
+    // ============================================================
+    // fingerprint: reward_date=5/4 AND paid_date=5/4 AND staking_id IN (백필 18건)
+    const drPlaceholders = BACKFILL_STAKING_IDS.map(() => '?').join(',')
+    const drRows = await db.prepare(`
+      SELECT dr.id as dr_id, dr.user_id, dr.staking_id, dr.usdt_amount as qkey_amount,
+             dr.reward_date, dr.paid_date,
+             u.email as user_email, u.name as user_name
+      FROM daily_rewards dr
+      LEFT JOIN users u ON u.id = dr.user_id
+      WHERE dr.reward_date = ? AND dr.paid_date = ?
+        AND dr.staking_id IN (${drPlaceholders})
+      ORDER BY dr.id ASC
+    `).bind(REWARD_DATE, PAID_DATE, ...BACKFILL_STAKING_IDS).all() as any
+    const dailyRowsToRevert = drRows?.results || []
+
+    // 각 daily_rewards 의 mirror transaction (daily_qkey) 식별
+    const dailyTxRows: any[] = []
+    for (const dr of dailyRowsToRevert) {
+      const tx = await db.prepare(`
+        SELECT id, user_id, amount, description, created_at
+        FROM transactions WHERE type = 'daily_qkey' AND ref_id = ? LIMIT 1
+      `).bind(dr.dr_id).first() as any
+      if (tx) dailyTxRows.push({ ...tx, dr_id: dr.dr_id })
+    }
+
+    // ============================================================
+    // STEP 2: referral_rewards 백필 행 정확 식별
+    // ============================================================
+    // fingerprint: reward_date=5/4 AND paid_date=5/4 AND referee_id IN (백필 user_id 목록)
+    //   ※ 백필 endpoint 는 referee_id 가 staking 의 user_id 임 (line 8758, 8807)
+    const backfillUserIds = Array.from(new Set(dailyRowsToRevert.map((r: any) => r.user_id)))
+    let rrL1Rows: any[] = []
+    let rrL2Rows: any[] = []
+    if (backfillUserIds.length > 0) {
+      const rrPlaceholders = backfillUserIds.map(() => '?').join(',')
+      const rrL1 = await db.prepare(`
+        SELECT rr.id as rr_id, rr.referrer_id, rr.referee_id, rr.level, rr.reward_amount,
+               rr.reward_date, rr.paid_date,
+               u.email as referrer_email, u.name as referrer_name
+        FROM referral_rewards rr
+        LEFT JOIN users u ON u.id = rr.referrer_id
+        WHERE rr.reward_date = ? AND rr.paid_date = ? AND rr.level = 1
+          AND rr.referee_id IN (${rrPlaceholders})
+        ORDER BY rr.id ASC
+      `).bind(REWARD_DATE, PAID_DATE, ...backfillUserIds).all() as any
+      rrL1Rows = rrL1?.results || []
+
+      const rrL2 = await db.prepare(`
+        SELECT rr.id as rr_id, rr.referrer_id, rr.referee_id, rr.level, rr.reward_amount,
+               rr.reward_date, rr.paid_date,
+               u.email as referrer_email, u.name as referrer_name
+        FROM referral_rewards rr
+        LEFT JOIN users u ON u.id = rr.referrer_id
+        WHERE rr.reward_date = ? AND rr.paid_date = ? AND rr.level = 2
+          AND rr.referee_id IN (${rrPlaceholders})
+        ORDER BY rr.id ASC
+      `).bind(REWARD_DATE, PAID_DATE, ...backfillUserIds).all() as any
+      rrL2Rows = rrL2?.results || []
+    }
+
+    // 각 referral_rewards 의 mirror transaction (referral_reward) 식별
+    const referralTxRows: any[] = []
+    for (const rr of [...rrL1Rows, ...rrL2Rows]) {
+      const tx = await db.prepare(`
+        SELECT id, user_id, amount, description, created_at
+        FROM transactions WHERE type = 'referral_reward' AND ref_id = ? LIMIT 1
+      `).bind(rr.rr_id).first() as any
+      if (tx) referralTxRows.push({ ...tx, rr_id: rr.rr_id, level: rr.level })
+    }
+
+    // ============================================================
+    // STEP 3: 합산 (검증용)
+    // ============================================================
+    const totalDailyQkey = dailyRowsToRevert.reduce((s: number, r: any) => s + Number(r.qkey_amount || 0), 0)
+    const totalL1Qkey = rrL1Rows.reduce((s: number, r: any) => s + Number(r.reward_amount || 0), 0)
+    const totalL2Qkey = rrL2Rows.reduce((s: number, r: any) => s + Number(r.reward_amount || 0), 0)
+    const grandTotal = totalDailyQkey + totalL1Qkey + totalL2Qkey
+
+    // ============================================================
+    // STEP 4: 사용자별 잔액 차감 계획 (qkey_balance)
+    // ============================================================
+    const balanceDeltas: Record<number, { daily: number, l1: number, l2: number, total: number }> = {}
+    for (const dr of dailyRowsToRevert) {
+      const uid = Number(dr.user_id)
+      if (!balanceDeltas[uid]) balanceDeltas[uid] = { daily: 0, l1: 0, l2: 0, total: 0 }
+      balanceDeltas[uid].daily += Number(dr.qkey_amount || 0)
+      balanceDeltas[uid].total += Number(dr.qkey_amount || 0)
+    }
+    for (const rr of rrL1Rows) {
+      const uid = Number(rr.referrer_id)
+      if (!balanceDeltas[uid]) balanceDeltas[uid] = { daily: 0, l1: 0, l2: 0, total: 0 }
+      balanceDeltas[uid].l1 += Number(rr.reward_amount || 0)
+      balanceDeltas[uid].total += Number(rr.reward_amount || 0)
+    }
+    for (const rr of rrL2Rows) {
+      const uid = Number(rr.referrer_id)
+      if (!balanceDeltas[uid]) balanceDeltas[uid] = { daily: 0, l1: 0, l2: 0, total: 0 }
+      balanceDeltas[uid].l2 += Number(rr.reward_amount || 0)
+      balanceDeltas[uid].total += Number(rr.reward_amount || 0)
+    }
+
+    // ============================================================
+    // STEP 5: DRY_RUN 이면 여기서 조회 결과만 반환
+    // ============================================================
+    if (dryRun) {
+      return c.json({
+        success: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 파라미터를 추가하세요',
+        fingerprint: {
+          reward_date: REWARD_DATE,
+          paid_date: PAID_DATE,
+          target_staking_ids: BACKFILL_STAKING_IDS
+        },
+        plan: {
+          daily_rewards_to_delete: dailyRowsToRevert.length,
+          daily_transactions_to_delete: dailyTxRows.length,
+          referral_rewards_l1_to_delete: rrL1Rows.length,
+          referral_rewards_l2_to_delete: rrL2Rows.length,
+          referral_transactions_to_delete: referralTxRows.length,
+          total_daily_qkey_to_revert: totalDailyQkey,
+          total_l1_qkey_to_revert: totalL1Qkey,
+          total_l2_qkey_to_revert: totalL2Qkey,
+          grand_total_qkey_to_revert: grandTotal,
+          affected_users: Object.keys(balanceDeltas).length
+        },
+        daily_rewards: dailyRowsToRevert,
+        daily_transactions: dailyTxRows,
+        referral_rewards_l1: rrL1Rows,
+        referral_rewards_l2: rrL2Rows,
+        referral_transactions: referralTxRows,
+        balance_deltas: balanceDeltas
+      })
+    }
+
+    // ============================================================
+    // STEP 6: 실제 실행 (confirm=GO)
+    // ============================================================
+    const executed: any = {
+      daily_transactions_deleted: 0,
+      daily_rewards_deleted: 0,
+      referral_transactions_deleted: 0,
+      referral_rewards_deleted: 0,
+      users_balance_updated: 0
+    }
+
+    // 6-1: daily_qkey transactions 삭제 (mirror 먼저)
+    for (const tx of dailyTxRows) {
+      const r = await db.prepare(`DELETE FROM transactions WHERE id = ? AND type = 'daily_qkey'`).bind(tx.id).run()
+      if ((r as any)?.meta?.changes > 0) executed.daily_transactions_deleted++
+    }
+
+    // 6-2: referral_reward transactions 삭제 (mirror 먼저)
+    for (const tx of referralTxRows) {
+      const r = await db.prepare(`DELETE FROM transactions WHERE id = ? AND type = 'referral_reward'`).bind(tx.id).run()
+      if ((r as any)?.meta?.changes > 0) executed.referral_transactions_deleted++
+    }
+
+    // 6-3: referral_rewards 삭제 (L1 + L2)
+    for (const rr of [...rrL1Rows, ...rrL2Rows]) {
+      const r = await db.prepare(`
+        DELETE FROM referral_rewards
+        WHERE id = ? AND reward_date = ? AND paid_date = ?
+      `).bind(rr.rr_id, REWARD_DATE, PAID_DATE).run()
+      if ((r as any)?.meta?.changes > 0) executed.referral_rewards_deleted++
+    }
+
+    // 6-4: daily_rewards 삭제
+    for (const dr of dailyRowsToRevert) {
+      const r = await db.prepare(`
+        DELETE FROM daily_rewards
+        WHERE id = ? AND reward_date = ? AND paid_date = ?
+      `).bind(dr.dr_id, REWARD_DATE, PAID_DATE).run()
+      if ((r as any)?.meta?.changes > 0) executed.daily_rewards_deleted++
+    }
+
+    // 6-5: users.qkey_balance 차감
+    for (const [uid, delta] of Object.entries(balanceDeltas)) {
+      const amount = delta.total
+      if (amount > 0) {
+        const r = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(amount, Number(uid)).run()
+        if ((r as any)?.meta?.changes > 0) executed.users_balance_updated++
+      }
+    }
+
+    return c.json({
+      success: true,
+      mode: 'EXECUTED',
+      fingerprint: {
+        reward_date: REWARD_DATE,
+        paid_date: PAID_DATE,
+        target_staking_ids: BACKFILL_STAKING_IDS
+      },
+      executed,
+      total_qkey_reverted: grandTotal,
+      total_daily_qkey_reverted: totalDailyQkey,
+      total_l1_qkey_reverted: totalL1Qkey,
+      total_l2_qkey_reverted: totalL2Qkey,
+      balance_deltas: balanceDeltas
+    })
+  } catch (error) {
+    console.error('revert-backfill-may04 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★★★ 솔밧(u#44) L2 매칭 미러링 누락 2건 정밀 백필 (Phase 1, 2026-05-12 사장님 C안 결재) ★★★
 //   원장 referral_rewards 25건 / 9,150 QKEY  vs  transactions 미러링 23건 / 7,500 QKEY
 //   누락 2건: rr#347 (150 QKEY, 2026-05-06 referee u#49) + rr#524 (1,500 QKEY, 2026-05-06 referee u#76)
