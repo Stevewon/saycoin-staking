@@ -12069,6 +12069,134 @@ app.post('/api/diag/fix-adjust-qkey-balance', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-insert-daily-qkey-tx-no-balance: dr 행 기반 누락된 daily_qkey tx 생성 (잔액 변동 없음) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적: daily_rewards 행은 존재하나 대응되는 type='daily_qkey' transactions 행이 없는 경우 보충
+//        (영구룰 위반 daily_reward 행을 삭제한 뒤 거래내역 화면 정합성 회복용)
+//   영구룰 100% 준수:
+//     - type = 'daily_qkey'
+//     - coin_type = 'QKEY'
+//     - description = '일일 배당 (QKEY)'
+//     - ref_id = dr.id (정수)
+//     - amount = dr.qkey_amount
+//     - created_at = dr.created_at (원본 dr 시각 그대로)
+//   안전성 (5중 검증):
+//     - user_id + dr_id (존재 확인 + dr.user_id 일치)
+//     - expected_amount == dr.qkey_amount
+//     - expected_reward_date == dr.reward_date
+//     - 동일 ref_id 의 type='daily_qkey' tx 가 이미 있으면 거부 (ALREADY_EXISTS)
+//     - 잔액 변동 0 (잔액은 이미 정확한 상태 전제)
+//   경로 (POST):
+//     /api/diag/fix-insert-daily-qkey-tx-no-balance?key=ADMIN_PW
+//        &user_id=40
+//        &dr_id=512
+//        &expected_amount=5250
+//        &expected_reward_date=2026-05-12
+//        &dry_run=1   (또는 confirm=GO)
+app.post('/api/diag/fix-insert-daily-qkey-tx-no-balance', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const drId = parseInt(c.req.query('dr_id') || '0')
+    const expectedAmount = Number(c.req.query('expected_amount') || 'NaN')
+    const expectedRewardDate = c.req.query('expected_reward_date') || ''
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (!drId) return c.json({ error: 'dr_id required' }, 400)
+    if (Number.isNaN(expectedAmount)) return c.json({ error: 'expected_amount required (number)' }, 400)
+    if (!expectedRewardDate) return c.json({ error: 'expected_reward_date required (YYYY-MM-DD)' }, 400)
+
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    const dr = await db.prepare(`
+      SELECT id, user_id, staking_id, qkey_amount, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE id = ?
+    `).bind(drId).first<any>()
+    if (!dr) return c.json({ error: 'daily_rewards row not found', dr_id: drId }, 404)
+
+    // 5중 검증
+    const validation = {
+      dr_exists: true,
+      dr_user_id_match: dr.user_id === userId,
+      dr_amount_match: Number(dr.qkey_amount) === expectedAmount,
+      dr_reward_date_match: String(dr.reward_date) === expectedRewardDate,
+      no_existing_daily_qkey_tx_for_this_dr: true // 아래에서 체크
+    }
+
+    // 이미 동일 ref_id 의 daily_qkey tx 가 있는지 확인
+    const existingTx = await db.prepare(`
+      SELECT id, type, amount, ref_id FROM transactions
+      WHERE user_id = ? AND type = 'daily_qkey' AND coin_type = 'QKEY' AND ref_id = ?
+    `).bind(userId, String(drId)).first<any>()
+    if (existingTx) {
+      validation.no_existing_daily_qkey_tx_for_this_dr = false
+    }
+
+    const allValid = Object.values(validation).every(v => v === true)
+    if (!allValid) {
+      return c.json({
+        success: false,
+        error: 'VALIDATION_FAILED',
+        message: '5중 검증 실패 — 진행 중단',
+        dr_actual: { id: dr.id, user_id: dr.user_id, qkey_amount: dr.qkey_amount, reward_date: dr.reward_date, created_at: dr.created_at },
+        expected: { user_id: userId, dr_id: drId, amount: expectedAmount, reward_date: expectedRewardDate },
+        existing_tx: existingTx || null,
+        validation
+      }, 400)
+    }
+
+    const plan = {
+      action: 'INSERT_DAILY_QKEY_TX_NO_BALANCE_CHANGE',
+      user_id: userId,
+      type: 'daily_qkey',
+      coin_type: 'QKEY',
+      amount: Number(dr.qkey_amount),
+      description: '일일 배당 (QKEY)',
+      ref_id: String(drId),
+      created_at: dr.created_at,
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after: user.qkey_balance,
+      balance_delta: 0
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({ success: true, mode: 'DRY_RUN', message: '실제 실행을 원하시면 confirm=GO 추가', user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance }, validation, plan })
+    }
+
+    // INSERT (잔액 변동 없음)
+    const insertResult = await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+      VALUES (?, 'daily_qkey', 'QKEY', ?, '일일 배당 (QKEY)', ?, ?)
+    `).bind(userId, Number(dr.qkey_amount), String(drId), dr.created_at).run()
+
+    const newTxId = (insertResult as any)?.meta?.last_row_id || null
+
+    return c.json({
+      success: true, mode: 'EXECUTED',
+      user: { id: user.id, email: user.email, name: user.name, qkey_balance_before: user.qkey_balance, qkey_balance_after: user.qkey_balance },
+      validation,
+      result: {
+        inserted_tx_id: newTxId,
+        dr_id: drId,
+        type: 'daily_qkey',
+        amount: Number(dr.qkey_amount),
+        created_at: dr.created_at,
+        balance_changed: false,
+        note: 'daily_qkey tx 삽입 완료. 잔액 변동 없음 (이미 정확한 잔액 전제).'
+      }
+    })
+  } catch (error) {
+    console.error('fix-insert-daily-qkey-tx-no-balance error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ scan-balance-mismatch-v2: swap_out 포함 정확한 잔액 검증식 전수 ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   영구룰 잔액 검증식:
