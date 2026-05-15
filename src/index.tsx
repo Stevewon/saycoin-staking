@@ -11333,10 +11333,11 @@ app.get('/api/diag/user-staking-matrix', async (c) => {
     }
     if (!user) return c.json({ error: 'user not found', email, user_id: userIdParam }, 404)
 
-    // 모든 staking (active + closed)
+    // 모든 staking (active + closed) — 확정 컬럼만 SELECT
     const stakings = await db.prepare(`
-      SELECT id, user_id, amount, daily_rate, duration_days, start_date, end_date, status,
-             total_received, accrued_qkey, last_reward_date, created_at
+      SELECT id, user_id, amount, daily_rate, period_days, period_months,
+             qta_reward, qx_reward, qkey_reward,
+             start_date, end_date, status, txid, reset_at, created_at
       FROM staking
       WHERE user_id = ?
       ORDER BY id ASC
