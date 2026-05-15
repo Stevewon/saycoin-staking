@@ -9972,6 +9972,211 @@ app.post('/api/diag/topup-may15-referrals', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 5/15 transactions 전수 무결성 진단 (사장님 2026-05-15 결재) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 원문: "solbat 1대가 1050 2대가 1950 발생되어야 하는데 배당금은 두번발생되고, 일일배당 두번씩 중복 지급되었다"
+//
+//   진단 목적: 5/15 transactions 중 다음 이상 패턴 전수 추출
+//     A. 동일 user + 동일 type (daily_qkey) 가 5/15 created_at 에 2건 이상 (일일배당 중복)
+//     B. transactions.ref_id 가 daily_rewards / referral_rewards 에 존재하지 않음 (orphan tx)
+//     C. transactions.ref_id 가 다른 paid_date 의 row 를 가리킴 (cross-date reference)
+//     D. user 단위로 5/15 daily_qkey tx 합 vs daily_rewards.usdt_amount 합 비교
+//
+//   경로: GET /api/diag/scan-may15-tx-integrity?key=ADMIN_PW
+app.get('/api/diag/scan-may15-tx-integrity', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const PAID_DATE = '2026-05-15'
+
+    // ============================================================
+    // 1) 5/15 transactions (daily_qkey + referral_reward) 전부 조회
+    // ============================================================
+    const txRows = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description, created_at, DATE(created_at) as tx_date
+      FROM transactions
+      WHERE DATE(created_at) = ? AND type IN ('daily_qkey', 'referral_reward')
+      ORDER BY user_id ASC, type ASC, id ASC
+    `).bind(PAID_DATE).all()
+    const txList = (txRows.results || []) as any[]
+
+    // ============================================================
+    // 2) 5/15 daily_rewards / referral_rewards 전부 조회
+    // ============================================================
+    const drRows = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE paid_date = ?
+    `).bind(PAID_DATE).all()
+    const drList = (drRows.results || []) as any[]
+    const drById: Record<number, any> = {}
+    for (const r of drList) drById[Number(r.id)] = r
+
+    const rrRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE paid_date = ?
+    `).bind(PAID_DATE).all()
+    const rrList = (rrRows.results || []) as any[]
+    const rrById: Record<number, any> = {}
+    for (const r of rrList) rrById[Number(r.id)] = r
+
+    // 다른 paid_date 의 row 도 참조 가능성 (cross-date) — ref_id 가 어디든 있는지 확인용
+    // 단순히 전체 daily_rewards / referral_rewards 의 id 집합만 가지면 됨
+    const drAnyDate = await db.prepare(`SELECT id, paid_date FROM daily_rewards`).all()
+    const drAnyById: Record<number, string> = {}
+    for (const r of (drAnyDate.results || []) as any[]) drAnyById[Number(r.id)] = String(r.paid_date)
+    const rrAnyDate = await db.prepare(`SELECT id, paid_date FROM referral_rewards`).all()
+    const rrAnyById: Record<number, string> = {}
+    for (const r of (rrAnyDate.results || []) as any[]) rrAnyById[Number(r.id)] = String(r.paid_date)
+
+    // ============================================================
+    // 3) 패턴 A — 동일 user + daily_qkey 가 2건 이상
+    // ============================================================
+    const dailyByUser: Record<number, any[]> = {}
+    for (const t of txList) {
+      if (t.type !== 'daily_qkey') continue
+      const uid = Number(t.user_id)
+      if (!dailyByUser[uid]) dailyByUser[uid] = []
+      dailyByUser[uid].push(t)
+    }
+    const patternA_dailyDup: any[] = []
+    for (const [uid, rows] of Object.entries(dailyByUser)) {
+      if (rows.length > 1) {
+        patternA_dailyDup.push({
+          user_id: Number(uid),
+          tx_count: rows.length,
+          total_amount: rows.reduce((s, r) => s + Number(r.amount || 0), 0),
+          rows: rows.map(r => ({
+            tx_id: r.id, amount: r.amount, ref_id: r.ref_id, created_at: r.created_at,
+            ref_dr_paid_date: drAnyById[Number(r.ref_id)] ?? null,
+            ref_exists_in_dr: drAnyById[Number(r.ref_id)] !== undefined,
+            ref_in_may15_dr: drById[Number(r.ref_id)] !== undefined
+          }))
+        })
+      }
+    }
+
+    // ============================================================
+    // 4) 패턴 B/C — transactions.ref_id 가 5/15 daily_rewards/referral_rewards 에 없음
+    // ============================================================
+    const patternB_orphanDailyTx: any[] = []
+    const patternB_orphanReferralTx: any[] = []
+    const patternC_crossDateRef: any[] = []
+
+    for (const t of txList) {
+      const refId = Number(t.ref_id || 0)
+      if (t.type === 'daily_qkey') {
+        if (!drById[refId]) {
+          // 5/15 daily_rewards 에 없음
+          const otherPaidDate = drAnyById[refId]
+          if (otherPaidDate) {
+            patternC_crossDateRef.push({
+              tx_id: t.id, user_id: t.user_id, type: 'daily_qkey', amount: t.amount,
+              ref_id: refId, ref_actual_paid_date: otherPaidDate,
+              created_at: t.created_at
+            })
+          } else {
+            patternB_orphanDailyTx.push({
+              tx_id: t.id, user_id: t.user_id, amount: t.amount,
+              ref_id: refId, created_at: t.created_at
+            })
+          }
+        }
+      } else if (t.type === 'referral_reward') {
+        if (!rrById[refId]) {
+          const otherPaidDate = rrAnyById[refId]
+          if (otherPaidDate) {
+            patternC_crossDateRef.push({
+              tx_id: t.id, user_id: t.user_id, type: 'referral_reward', amount: t.amount,
+              ref_id: refId, ref_actual_paid_date: otherPaidDate,
+              created_at: t.created_at
+            })
+          } else {
+            patternB_orphanReferralTx.push({
+              tx_id: t.id, user_id: t.user_id, amount: t.amount,
+              ref_id: refId, created_at: t.created_at
+            })
+          }
+        }
+      }
+    }
+
+    // ============================================================
+    // 5) 패턴 D — user 단위 tx 합 vs daily_rewards/referral_rewards 합 비교
+    // ============================================================
+    const txDailySumByUser: Record<number, number> = {}
+    const txReferralSumByUser: Record<number, number> = {}
+    for (const t of txList) {
+      const uid = Number(t.user_id)
+      if (t.type === 'daily_qkey') txDailySumByUser[uid] = (txDailySumByUser[uid] || 0) + Number(t.amount || 0)
+      if (t.type === 'referral_reward') txReferralSumByUser[uid] = (txReferralSumByUser[uid] || 0) + Number(t.amount || 0)
+    }
+    const drSumByUser: Record<number, number> = {}
+    for (const r of drList) {
+      const uid = Number(r.user_id)
+      drSumByUser[uid] = (drSumByUser[uid] || 0) + Number(r.usdt_amount || 0)
+    }
+    const rrSumByUser: Record<number, number> = {}
+    for (const r of rrList) {
+      const uid = Number(r.referrer_id)
+      rrSumByUser[uid] = (rrSumByUser[uid] || 0) + Number(r.reward_amount || 0)
+    }
+    const allUids = new Set<number>([
+      ...Object.keys(txDailySumByUser).map(Number),
+      ...Object.keys(txReferralSumByUser).map(Number),
+      ...Object.keys(drSumByUser).map(Number),
+      ...Object.keys(rrSumByUser).map(Number)
+    ])
+    const patternD_mismatch: any[] = []
+    for (const uid of allUids) {
+      const txDaily = txDailySumByUser[uid] || 0
+      const txReferral = txReferralSumByUser[uid] || 0
+      const drSum = drSumByUser[uid] || 0
+      const rrSum = rrSumByUser[uid] || 0
+      const dailyDiff = txDaily - drSum
+      const referralDiff = txReferral - rrSum
+      if (dailyDiff !== 0 || referralDiff !== 0) {
+        patternD_mismatch.push({
+          user_id: uid,
+          tx_daily_sum: txDaily, dr_sum: drSum, daily_diff: dailyDiff,
+          tx_referral_sum: txReferral, rr_sum: rrSum, referral_diff: referralDiff,
+          total_balance_excess: dailyDiff + referralDiff
+        })
+      }
+    }
+    patternD_mismatch.sort((a, b) => b.total_balance_excess - a.total_balance_excess)
+
+    return c.json({
+      success: true,
+      paid_date: PAID_DATE,
+      summary: {
+        total_tx_rows: txList.length,
+        total_dr_rows: drList.length,
+        total_rr_rows: rrList.length,
+        pattern_A_users_with_duplicate_daily_tx: patternA_dailyDup.length,
+        pattern_A_total_excess_qkey: patternA_dailyDup.reduce((s, u) => {
+          // excess = (rows count - 1) * row amount, assume same amount per row
+          return s + Number(u.rows[0]?.amount || 0) * (u.tx_count - 1)
+        }, 0),
+        pattern_B_orphan_daily_tx_count: patternB_orphanDailyTx.length,
+        pattern_B_orphan_referral_tx_count: patternB_orphanReferralTx.length,
+        pattern_C_cross_date_ref_count: patternC_crossDateRef.length,
+        pattern_D_user_mismatch_count: patternD_mismatch.length,
+        pattern_D_total_balance_excess: patternD_mismatch.reduce((s, u) => s + Number(u.total_balance_excess || 0), 0)
+      },
+      pattern_A_daily_tx_duplicates: patternA_dailyDup,
+      pattern_B_orphan_daily_tx: patternB_orphanDailyTx,
+      pattern_B_orphan_referral_tx: patternB_orphanReferralTx,
+      pattern_C_cross_date_refs: patternC_crossDateRef,
+      pattern_D_user_mismatches: patternD_mismatch
+    })
+  } catch (error) {
+    console.error('scan-may15-tx-integrity error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 특정 회원 paid_date 전수 조사 (사장님 2026-05-15 결재) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 원문: "예로 solbat 1대가 1050 2대가 1950 발생되어야 하는데 배당금은 두번발생되고, 일일배당 두번씩 중복 지급되었다"
