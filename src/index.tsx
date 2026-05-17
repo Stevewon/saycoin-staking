@@ -12400,6 +12400,111 @@ app.get('/api/diag/scan-illegal-tx-types', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ scan-thursday-missing-paid-on-friday: 목요일 dr 미지급 → 금요일 지급 영구룰 점검 ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   영구룰: 휴일(KST 토/일) 진입자 → 다음 첫 평일에 데일리 지급
+//          + 평일 사이 dr 누락 시 다음 평일에 합쳐서 지급
+//   사장님 직접 지시: "이전 휴일진입자들의 목요일치를 금요일날 지급해야된다"
+//   판정 로직:
+//     - active staking (KST 기준 reward 발생 가능 시점 도래)
+//     - reward_date='2026-05-14' (목) dr 행이 없음
+//     - reward_date='2026-05-15' (금) dr 행도 없음 (즉 5/15에 보충 지급 안됨)
+//   안전성: SELECT only
+//   경로: GET /api/diag/scan-thursday-missing-paid-on-friday?key=ADMIN_PW
+app.get('/api/diag/scan-thursday-missing-paid-on-friday', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // KST 기준 5/14(목), 5/15(금) dr 점검 — 모든 active staking 중 둘 다 없는 케이스 적발
+    const rows = await db.prepare(`
+      SELECT
+        s.id AS staking_id,
+        s.user_id,
+        u.email,
+        u.name,
+        s.amount,
+        s.daily_rate,
+        s.start_date,
+        datetime(s.start_date, '+9 hours') AS start_kst,
+        strftime('%w', datetime(s.start_date, '+9 hours')) AS start_dow_kst,
+        s.status,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-11') AS dr_511_cnt,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-12') AS dr_512_cnt,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-13') AS dr_513_cnt,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-14') AS dr_514_cnt,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-15') AS dr_515_cnt,
+        (SELECT SUM(qkey_amount) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-15') AS dr_515_sum
+      FROM stakings s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.status = 'active'
+        AND date(datetime(s.start_date, '+9 hours')) <= '2026-05-14'
+      ORDER BY s.user_id, s.id
+    `).all<any>()
+
+    const all = rows.results || []
+    // 5/14 목 누락 + 5/15 금에도 보충 없음 (영구룰 위반 핵심)
+    const thursdayMissingAndNotPaidFriday = all.filter((r: any) => r.dr_514_cnt === 0 && r.dr_515_cnt === 0)
+    // 5/14 목 누락이지만 5/15 금에는 받음 (영구룰 OK 가능성 — 금에 합산 지급된 경우)
+    const thursdayMissingButFridayOk = all.filter((r: any) => r.dr_514_cnt === 0 && r.dr_515_cnt >= 1)
+    // 5/15 금 자체 누락 (별도 케이스)
+    const fridayMissing = all.filter((r: any) => r.dr_515_cnt === 0)
+    // 5/15 금에 dr 가 2건 이상 = 목+금 합산 케이스 가능성
+    const fridayDouble = all.filter((r: any) => r.dr_515_cnt >= 2)
+
+    const expectedDailyAmount = (r: any) => Math.round(Number(r.amount) * Number(r.daily_rate) * 1.5 * 100) / 100
+
+    return c.json({
+      success: true,
+      kst_now: new Date(Date.now() + 9 * 3600 * 1000).toISOString(),
+      reward_rule: '영구룰: 휴일 진입자 → 다음 첫 평일 지급 / 목요일 미지급 → 금요일 합산 지급',
+      summary: {
+        total_active_stakings_started_by_514: all.length,
+        thursday_missing_AND_friday_missing: thursdayMissingAndNotPaidFriday.length,
+        thursday_missing_BUT_friday_ok: thursdayMissingButFridayOk.length,
+        friday_missing_total: fridayMissing.length,
+        friday_double_dr: fridayDouble.length
+      },
+      critical_targets_thursday_unpaid_friday_unpaid: thursdayMissingAndNotPaidFriday.map((r: any) => ({
+        staking_id: r.staking_id,
+        user_id: r.user_id,
+        email: r.email,
+        name: r.name,
+        amount: r.amount,
+        daily_rate: r.daily_rate,
+        start_kst: r.start_kst,
+        start_dow_kst: r.start_dow_kst, // 0=Sun,6=Sat
+        is_holiday_entry: r.start_dow_kst === '0' || r.start_dow_kst === '6',
+        expected_daily_qkey: expectedDailyAmount(r),
+        dr_511: r.dr_511_cnt, dr_512: r.dr_512_cnt, dr_513: r.dr_513_cnt,
+        dr_514: r.dr_514_cnt, dr_515: r.dr_515_cnt, dr_515_sum: r.dr_515_sum
+      })),
+      friday_missing_only: fridayMissing.filter((r: any) => r.dr_514_cnt >= 1).map((r: any) => ({
+        staking_id: r.staking_id,
+        user_id: r.user_id,
+        email: r.email,
+        name: r.name,
+        amount: r.amount,
+        start_kst: r.start_kst,
+        start_dow_kst: r.start_dow_kst,
+        expected_daily_qkey: expectedDailyAmount(r),
+        dr_514: r.dr_514_cnt, dr_515: r.dr_515_cnt
+      })),
+      friday_combined_pay_candidates: fridayDouble.map((r: any) => ({
+        staking_id: r.staking_id, user_id: r.user_id, email: r.email, name: r.name,
+        amount: r.amount, start_kst: r.start_kst, start_dow_kst: r.start_dow_kst,
+        expected_daily_qkey: expectedDailyAmount(r),
+        dr_514: r.dr_514_cnt, dr_515_cnt: r.dr_515_cnt, dr_515_sum: r.dr_515_sum
+      }))
+    })
+  } catch (error) {
+    console.error('scan-thursday-missing-paid-on-friday error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
