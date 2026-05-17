@@ -12897,6 +12897,196 @@ app.post('/api/diag/fix-insert-solbat-rd514-missing-rr', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-solbat-align-daily-3750: solbat 매일 본인 750 + L1 1050 + L2 1950 = 3750 정렬 ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   boss 영구룰: solbat 매일 본인 750 + L1 합 1050 + L2 합 1950 = 3750 QKEY
+//
+//   현 상태(EXECUTE 직전):
+//     5/11=3750(O)  5/12=3450(-300)  5/13=6000(+2250)  5/14=3825(+75)  5/15=750(-3000)
+//
+//   처리 (2 STEP):
+//     STEP A) UPDATE rr.reward_date — 잉여 12건을 reward_date=5/15로 이동 (balance 영향 0)
+//       5/13 rd & paid=5/15 인 9건 → rd=5/15
+//       5/14 rd & paid=5/15 인 3건 → rd=5/15
+//     STEP B) INSERT rr+tx — 부족 9건 보충 (balance +975)
+//       5/12: lis7239 L1 150, naim197059 L2 75, afhka L2 75 → +300
+//       5/13: lis7239 L1 150, naim197059 L2 75            → +225
+//       5/14: lis7239 L1 150, naim197059 L2 75            → +225
+//       5/15: lis7239 L1 150, naim197059 L2 75            → +225
+//
+//   EXECUTE 후 기대: 5/12~5/15 모두 = 3750 ✅, balance 39525 → 40500
+//
+//   경로: POST /api/diag/fix-solbat-align-daily-3750?key=ADMIN_PW&dry_run=1
+//        실행: POST /api/diag/fix-solbat-align-daily-3750?key=ADMIN_PW&confirm=GO
+app.post('/api/diag/fix-solbat-align-daily-3750', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') === '1' || c.req.query('dry_run') === 'true'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'confirm=GO 필요 (또는 dry_run=1)' }, 400)
+    }
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+
+    // STEP A: 재배치 12건 (rr_id 정확히 지정)
+    const relocates: Array<{ rr_id: number, level: number, referee_email: string, amt: number, from: string, to: string }> = [
+      { rr_id: 1687, level: 1, referee_email: 'aafhka',     amt: 150,  from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1699, level: 1, referee_email: 'csh',        amt: 150,  from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1744, level: 2, referee_email: 'cys',        amt: 75,   from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1724, level: 2, referee_email: 'lis7238',    amt: 1500, from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1682, level: 1, referee_email: 'naim1970',   amt: 150,  from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1686, level: 2, referee_email: 'pjb5818',    amt: 75,   from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1720, level: 2, referee_email: 'pputti',     amt: 75,   from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1741, level: 1, referee_email: 'psj7406',    amt: 150,  from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1680, level: 1, referee_email: 'qt1234',     amt: 150,  from: '2026-05-13', to: '2026-05-15' },
+      { rr_id: 1750, level: 2, referee_email: 'naim197059', amt: 75,   from: '2026-05-14', to: '2026-05-15' },
+      { rr_id: 1751, level: 1, referee_email: 'lis7239',    amt: 150,  from: '2026-05-14', to: '2026-05-15' },
+      { rr_id: 1764, level: 2, referee_email: 'afhka',      amt: 75,   from: '2026-05-14', to: '2026-05-15' },
+    ]
+
+    // STEP B: 부족 INSERT 9건
+    const inserts: Array<{ rd: string, pd: string, referee_id: number, referee_email: string, level: number, amount: number, orig: number }> = [
+      // 5/12 부족 -300
+      { rd: '2026-05-12', pd: '2026-05-13', referee_id: 45, referee_email: 'lis7239',    level: 1, amount: 150, orig: 750 },
+      { rd: '2026-05-12', pd: '2026-05-13', referee_id: 49, referee_email: 'naim197059', level: 2, amount: 75,  orig: 750 },
+      { rd: '2026-05-12', pd: '2026-05-13', referee_id: 93, referee_email: 'afhka',      level: 2, amount: 75,  orig: 750 },
+      // 5/13 부족 -225
+      { rd: '2026-05-13', pd: '2026-05-14', referee_id: 45, referee_email: 'lis7239',    level: 1, amount: 150, orig: 750 },
+      { rd: '2026-05-13', pd: '2026-05-14', referee_id: 49, referee_email: 'naim197059', level: 2, amount: 75,  orig: 750 },
+      // 5/14 부족 -225
+      { rd: '2026-05-14', pd: '2026-05-15', referee_id: 45, referee_email: 'lis7239',    level: 1, amount: 150, orig: 750 },
+      { rd: '2026-05-14', pd: '2026-05-15', referee_id: 49, referee_email: 'naim197059', level: 2, amount: 75,  orig: 750 },
+      // 5/15 부족 -225
+      { rd: '2026-05-15', pd: '2026-05-15', referee_id: 45, referee_email: 'lis7239',    level: 1, amount: 150, orig: 750 },
+      { rd: '2026-05-15', pd: '2026-05-15', referee_id: 49, referee_email: 'naim197059', level: 2, amount: 75,  orig: 750 },
+    ]
+
+    // ===== 사전 5중 검증 =====
+    const user: any = await db.prepare(`SELECT id, email, qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+    if (!user) return c.json({ error: 'solbat not found' }, 404)
+    if (user.email !== 'solbat') return c.json({ error: `email mismatch: ${user.email}` }, 400)
+
+    // STEP A 검증: 각 rr이 존재 + referrer=44 + reward_date=from + paid_date=to + reward_amount=amt
+    const aValidation: any[] = []
+    for (const rl of relocates) {
+      const row: any = await db.prepare(`SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date FROM referral_rewards WHERE id = ?`).bind(rl.rr_id).first()
+      if (!row) return c.json({ error: `rr#${rl.rr_id} not found (relocate STEP A)` }, 404)
+      const ok =
+        row.referrer_id === SOLBAT_ID &&
+        Number(row.level) === rl.level &&
+        Number(row.reward_amount) === rl.amt &&
+        row.reward_date === rl.from &&
+        row.paid_date === rl.to
+      if (!ok) return c.json({ error: `rr#${rl.rr_id} 5중 검증 실패 (실제 ${JSON.stringify(row)} vs 기대 ${JSON.stringify(rl)})` }, 400)
+      aValidation.push({ rr_id: rl.rr_id, ok: true })
+    }
+
+    // STEP B 검증: 각 referee 존재
+    const bValidation: any[] = []
+    for (const ins of inserts) {
+      const ref: any = await db.prepare(`SELECT id, email FROM users WHERE id = ?`).bind(ins.referee_id).first()
+      if (!ref) return c.json({ error: `referee ${ins.referee_id} (${ins.referee_email}) not found (insert STEP B)` }, 404)
+      if (ref.email !== ins.referee_email) return c.json({ error: `referee ${ins.referee_id} email mismatch: ${ref.email} vs ${ins.referee_email}` }, 400)
+      bValidation.push({ referee_id: ins.referee_id, email: ref.email, ok: true })
+    }
+
+    const totalInsertAmt = inserts.reduce((a, b) => a + b.amount, 0)
+
+    if (dryRun) {
+      return c.json({
+        ok: true, dry_run: true,
+        user: { id: user.id, email: user.email, balance_before: user.qkey_balance, balance_after_expected: Number(user.qkey_balance) + totalInsertAmt },
+        step_A_relocate: { count: relocates.length, balance_delta: 0, validation_ok: aValidation.length === relocates.length, items: relocates },
+        step_B_insert: { count: inserts.length, balance_delta: totalInsertAmt, validation_ok: bValidation.length === inserts.length, items: inserts },
+        expected_daily_3750: {
+          '5/12': 3450 + 300,
+          '5/13': 6000 - 2475 + 225,
+          '5/14': 3825 - 300 + 225,
+          '5/15': 750 + 2475 + 300 + 225,
+        }
+      })
+    }
+
+    // ===== EXECUTE =====
+    const results = { step_A: [] as any[], step_B: [] as any[], errors: [] as any[] }
+    const nowIso = new Date().toISOString().slice(0, 19).replace('T', ' ')
+
+    // STEP A: UPDATE rr.reward_date
+    for (const rl of relocates) {
+      try {
+        await db.prepare(`UPDATE referral_rewards SET reward_date = ? WHERE id = ? AND referrer_id = ?`).bind(rl.to, rl.rr_id, SOLBAT_ID).run()
+        results.step_A.push({ ok: true, rr_id: rl.rr_id, referee_email: rl.referee_email, level: rl.level, amt: rl.amt, rd_from: rl.from, rd_to: rl.to })
+      } catch (e) {
+        results.step_A.push({ ok: false, rr_id: rl.rr_id, error: String(e) })
+        results.errors.push({ step: 'A', rr_id: rl.rr_id, error: String(e) })
+      }
+    }
+
+    // STEP B: INSERT rr + tx + balance
+    for (const ins of inserts) {
+      try {
+        // 1) rr INSERT
+        const rrIns = await db.prepare(`
+          INSERT INTO referral_rewards
+            (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(SOLBAT_ID, ins.referee_id, ins.level, ins.orig, ins.amount, ins.rd, ins.pd, nowIso).run()
+        const newRrId = (rrIns as any).meta?.last_row_id
+
+        // 2) tx INSERT (영구룰 desc)
+        const desc = `추천 보너스 (Level ${ins.level})`
+        const txIns = await db.prepare(`
+          INSERT INTO transactions
+            (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+        `).bind(SOLBAT_ID, ins.amount, desc, String(newRrId), nowIso).run()
+        const newTxId = (txIns as any).meta?.last_row_id
+
+        // 3) balance +
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(ins.amount, SOLBAT_ID).run()
+
+        results.step_B.push({ ok: true, referee_email: ins.referee_email, level: ins.level, amount: ins.amount, rd: ins.rd, pd: ins.pd, new_rr_id: newRrId, new_tx_id: newTxId })
+      } catch (e) {
+        results.step_B.push({ ok: false, referee_email: ins.referee_email, error: String(e) })
+        results.errors.push({ step: 'B', referee_email: ins.referee_email, error: String(e) })
+      }
+    }
+
+    const userAfter: any = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+
+    // 사후 검증: 각 날짜 합계
+    const dailySums: any = {}
+    for (const d of ['2026-05-12', '2026-05-13', '2026-05-14', '2026-05-15']) {
+      const dr: any = await db.prepare(`SELECT IFNULL(SUM(usdt_amount),0) AS s FROM daily_rewards WHERE user_id = ? AND reward_date = ?`).bind(SOLBAT_ID, d).first()
+      const l1: any = await db.prepare(`SELECT IFNULL(SUM(reward_amount),0) AS s FROM referral_rewards WHERE referrer_id = ? AND level = 1 AND reward_date = ?`).bind(SOLBAT_ID, d).first()
+      const l2: any = await db.prepare(`SELECT IFNULL(SUM(reward_amount),0) AS s FROM referral_rewards WHERE referrer_id = ? AND level = 2 AND reward_date = ?`).bind(SOLBAT_ID, d).first()
+      dailySums[d] = { self: Number(dr?.s || 0), L1: Number(l1?.s || 0), L2: Number(l2?.s || 0), total: Number(dr?.s || 0) + Number(l1?.s || 0) + Number(l2?.s || 0) }
+    }
+
+    return c.json({
+      ok: results.errors.length === 0,
+      executed: true,
+      balance_before: user.qkey_balance,
+      balance_after: userAfter?.qkey_balance,
+      summary: { step_A_count: relocates.length, step_B_count: inserts.length, total_insert_amount: totalInsertAmt, errors: results.errors.length },
+      daily_sums_after: dailySums,
+      verification: {
+        '5/12_is_3750': dailySums['2026-05-12'].total === 3750,
+        '5/13_is_3750': dailySums['2026-05-13'].total === 3750,
+        '5/14_is_3750': dailySums['2026-05-14'].total === 3750,
+        '5/15_is_3750': dailySums['2026-05-15'].total === 3750,
+      },
+      results,
+    })
+  } catch (error) {
+    console.error('fix-solbat-align-daily-3750 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
