@@ -37237,4 +37237,102 @@ app.post('/api/diag/fix-solbat-clean-slate-3750', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ admin-block-today-cron: 오늘(KST) 자동 cron 즉시 차단 (daily_cron_lock manual_admin INSERT) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   boss directive (2026-05-18):
+//     "전부 오늘은 절대로 돌리지말것! 수동으로 진행 예정임"
+//
+//   동작:
+//     1) daily_cron_lock 에 (today_kst, 'manual_admin', note='사장님 18일 절대 차단 명령') INSERT
+//     2) 이미 lock 있으면 그대로 유지 (idempotent)
+//     3) 이후 KST 07:00 GitHub Actions cron 호출 시 existingLock.source='manual_admin' ≠ incoming='cron_auto'
+//        → 즉시 423 Locked 반환, 배당 처리 0건
+//     4) 사장님 수동 실행 시점에 ?force=GO&unlock=GO 로 해제 가능
+//
+//   경로: POST /api/diag/admin-block-today-cron?key=ADMIN_PW&confirm=GO
+//        (날짜 override: ?date=YYYY-MM-DD)
+app.post('/api/diag/admin-block-today-cron', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필수' }, 400)
+
+    const db = c.env.DB
+    const now = new Date()
+    const kstNow = new Date(now.getTime() + 9 * 3600 * 1000)
+    const todayKst = c.req.query('date') || kstNow.toISOString().slice(0, 10)
+    const note = c.req.query('note') || '사장님 절대 차단 명령 (수동 진행 예정)'
+
+    // 테이블 보장
+    try {
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS daily_cron_lock (
+          lock_date        TEXT PRIMARY KEY,
+          source           TEXT NOT NULL,
+          locked_at        TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by        TEXT,
+          note             TEXT,
+          last_finished_at TEXT
+        )
+      `).run()
+    } catch(e) {}
+
+    // 기존 lock 확인
+    const existing = await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note, last_finished_at
+      FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(todayKst).first<any>()
+
+    if (existing) {
+      return c.json({
+        ok: true,
+        mode: 'ALREADY_LOCKED',
+        message: `${todayKst} 는 이미 lock 되어 있습니다 (source=${existing.source}).`,
+        lock: existing
+      })
+    }
+
+    // 신규 lock INSERT — manual_admin 소스로 → cron_auto 호출 시 자동 차단
+    await db.prepare(`
+      INSERT INTO daily_cron_lock (lock_date, source, locked_by, note)
+      VALUES (?, 'manual_admin', 'admin-direct-block', ?)
+    `).bind(todayKst, note).run()
+
+    const lock = await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note
+      FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(todayKst).first<any>()
+
+    // daily_rewards 가 이미 생성된 게 있는지 추가 확인 (안심용)
+    const drCount = await db.prepare(`
+      SELECT COUNT(*) AS c, COALESCE(SUM(usdt_amount),0) AS total
+      FROM daily_rewards WHERE reward_date = ?
+    `).bind(todayKst).first<any>()
+
+    const txCount = await db.prepare(`
+      SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS total
+      FROM transactions
+      WHERE type = 'daily_qkey' AND date(created_at, '+9 hours') = ?
+    `).bind(todayKst).first<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'LOCKED',
+      message: `${todayKst} 자동 cron 차단 완료. KST 07:00 GitHub Actions 호출 시 즉시 423 Locked 반환됩니다.`,
+      lock,
+      verification: {
+        daily_rewards_with_today_rd: drCount,
+        daily_qkey_tx_today_kst: txCount,
+        note: '둘 다 0 이어야 정상 (아직 미실행)'
+      },
+      unlock_hint: '나중에 수동 진행 시: POST /api/admin/rewards/manual-daily-trigger?confirm=GO (Bearer 어드민 토큰 필요). 단, lock 이 manual_admin 이므로 그냥 통과됨 (같은 source).'
+    })
+  } catch (error) {
+    console.error('admin-block-today-cron error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 export default app
