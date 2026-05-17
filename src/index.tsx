@@ -12662,6 +12662,97 @@ app.post('/api/diag/fix-insert-thursday-dr-paid-friday', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ scan-thursday-friday-amount-mismatch: 5/14 dr sum vs 5/15 dr sum 전수 비교 ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   목적(boss directive): "5월14의 배당금액과 5월 15일의 배당금액이 신규 진입이 그 사이에
+//   일체 없었던 평일이어서 전부 모든 계정이 같아야 한다"
+//   → 5/14 ≤ 진입일인 active staking 전부에 대해 SUM(dr 5/14) == SUM(dr 5/15) 검증.
+//   불일치 발견 시 해당 staking 정보를 모두 반환.
+//
+//   경로: GET /api/diag/scan-thursday-friday-amount-mismatch?key=ADMIN_PW
+app.get('/api/diag/scan-thursday-friday-amount-mismatch', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // active + 5/14 이전 진입(=KST 기준) 인 staking 전수 + dr 5/14, 5/15 합계
+    const rows = await db.prepare(`
+      SELECT
+        s.id AS staking_id,
+        s.user_id,
+        u.email,
+        u.name,
+        s.amount AS staking_amount,
+        s.daily_rate,
+        s.status,
+        s.start_date,
+        date(datetime(s.start_date, '+9 hours')) AS start_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id=s.id AND reward_date='2026-05-14') AS cnt_514,
+        (SELECT IFNULL(SUM(usdt_amount),0) FROM daily_rewards WHERE staking_id=s.id AND reward_date='2026-05-14') AS sum_514,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id=s.id AND reward_date='2026-05-15') AS cnt_515,
+        (SELECT IFNULL(SUM(usdt_amount),0) FROM daily_rewards WHERE staking_id=s.id AND reward_date='2026-05-15') AS sum_515,
+        (SELECT IFNULL(SUM(usdt_amount),0) FROM daily_rewards WHERE staking_id=s.id AND reward_date='2026-05-13') AS sum_513,
+        (SELECT IFNULL(SUM(usdt_amount),0) FROM daily_rewards WHERE staking_id=s.id AND reward_date='2026-05-12') AS sum_512,
+        (SELECT IFNULL(SUM(usdt_amount),0) FROM daily_rewards WHERE staking_id=s.id AND reward_date='2026-05-11') AS sum_511
+      FROM staking s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.status = 'active'
+        AND date(datetime(s.start_date, '+9 hours')) <= '2026-05-14'
+      ORDER BY s.id ASC
+    `).all()
+
+    const all = rows.results || []
+    const totalActive = all.length
+
+    // 비교: 5/14 sum vs 5/15 sum
+    const mismatches: any[] = []
+    const matched: any[] = []
+    const both_zero: any[] = []
+    for (const r of all) {
+      const s514 = Number((r as any).sum_514 || 0)
+      const s515 = Number((r as any).sum_515 || 0)
+      if (s514 === 0 && s515 === 0) {
+        both_zero.push(r)
+        continue
+      }
+      // 소수점 노이즈 방지 0.01 tolerance
+      if (Math.abs(s514 - s515) < 0.01) {
+        matched.push(r)
+      } else {
+        const diff = Math.round((s515 - s514) * 100) / 100
+        const cat =
+          s514 === 0 ? 'thursday_missing' :
+          s515 === 0 ? 'friday_missing' :
+          s514 < s515 ? 'thursday_lower' :
+          'thursday_higher'
+        mismatches.push({ ...(r as any), diff_515_minus_514: diff, category: cat })
+      }
+    }
+
+    return c.json({
+      ok: true,
+      total_active_staking: totalActive,
+      matched_count: matched.length,
+      mismatch_count: mismatches.length,
+      both_zero_count: both_zero.length,
+      summary_by_category: {
+        thursday_missing: mismatches.filter((m: any) => m.category === 'thursday_missing').length,
+        friday_missing: mismatches.filter((m: any) => m.category === 'friday_missing').length,
+        thursday_lower: mismatches.filter((m: any) => m.category === 'thursday_lower').length,
+        thursday_higher: mismatches.filter((m: any) => m.category === 'thursday_higher').length,
+      },
+      mismatches,
+      both_zero_list: both_zero,
+      note: 'boss directive: 신규 진입이 없는 평일 5/14-5/15는 전부 모든 계정이 같아야 한다 — 불일치 staking 전수 반환'
+    })
+  } catch (error) {
+    console.error('scan-thursday-friday-amount-mismatch error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
