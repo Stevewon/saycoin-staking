@@ -12436,7 +12436,7 @@ app.get('/api/diag/scan-thursday-missing-paid-on-friday', async (c) => {
         (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-14') AS dr_514_cnt,
         (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-15') AS dr_515_cnt,
         (SELECT SUM(qkey_amount) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-15') AS dr_515_sum
-      FROM stakings s
+      FROM staking s
       JOIN users u ON u.id = s.user_id
       WHERE s.status = 'active'
         AND date(datetime(s.start_date, '+9 hours')) <= '2026-05-14'
