@@ -12753,6 +12753,239 @@ app.get('/api/diag/scan-thursday-friday-amount-mismatch', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ scan-duplicate-daily-qkey-on-date: 특정 날짜(KST) 에 daily_qkey tx 2건 이상 user 전수 ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   boss directive: "15일날 중복 지급된 계정 찾아서 1회로 줄이라고 깨끗하게"
+//   기준: date(tx.created_at, '+9 hours') = target_date AND type='daily_qkey'
+//   기본: target_date=2026-05-15
+//   경로: GET /api/diag/scan-duplicate-daily-qkey-on-date?key=ADMIN_PW&date=2026-05-15
+app.get('/api/diag/scan-duplicate-daily-qkey-on-date', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const targetDate = c.req.query('date') || '2026-05-15'
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      return c.json({ error: 'date=YYYY-MM-DD 필요' }, 400)
+    }
+
+    // 1) target_date 에 daily_qkey tx 2건 이상인 user_id 추출
+    const dupUsers = await db.prepare(`
+      SELECT user_id, COUNT(*) AS tx_cnt, SUM(amount) AS tx_sum
+      FROM transactions
+      WHERE type = 'daily_qkey'
+        AND date(created_at, '+9 hours') = ?
+      GROUP BY user_id
+      HAVING COUNT(*) >= 2
+      ORDER BY user_id ASC
+    `).bind(targetDate).all()
+
+    const dupList: any[] = []
+    for (const row of (dupUsers.results as any[])) {
+      const uid = row.user_id
+      const u = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(uid).first<any>()
+      const txs = await db.prepare(`
+        SELECT id, type, amount, description, ref_id,
+               datetime(created_at, '+9 hours') AS created_at_kst,
+               created_at AS created_at_utc
+        FROM transactions
+        WHERE user_id = ?
+          AND type = 'daily_qkey'
+          AND date(created_at, '+9 hours') = ?
+        ORDER BY datetime(created_at, '+9 hours') ASC, id ASC
+      `).bind(uid, targetDate).all()
+
+      // 각 tx 의 ref_id 에 해당하는 dr 매핑 조회
+      const txDetails: any[] = []
+      for (const t of (txs.results as any[])) {
+        let drInfo: any = null
+        if (t.ref_id) {
+          drInfo = await db.prepare(`
+            SELECT id, staking_id, reward_date, paid_date, usdt_amount
+            FROM daily_rewards WHERE id = ?
+          `).bind(t.ref_id).first<any>()
+        }
+        txDetails.push({
+          tx_id: t.id,
+          amount: t.amount,
+          created_at_kst: t.created_at_kst,
+          ref_id: t.ref_id,
+          dr: drInfo ? {
+            dr_id: drInfo.id, staking_id: drInfo.staking_id,
+            reward_date: drInfo.reward_date, paid_date: drInfo.paid_date,
+            amount: drInfo.usdt_amount
+          } : null
+        })
+      }
+
+      dupList.push({
+        user_id: uid,
+        email: u?.email, name: u?.name,
+        qkey_balance: u?.qkey_balance,
+        tx_count_on_date: row.tx_cnt,
+        tx_sum_on_date: row.tx_sum,
+        txs: txDetails
+      })
+    }
+
+    return c.json({
+      ok: true,
+      target_date_kst: targetDate,
+      total_duplicate_users: dupList.length,
+      duplicates: dupList,
+      note: 'date 기준 daily_qkey tx 2건 이상 user 전수. 각 tx 에 매핑된 dr.reward_date 로 어느 것이 휴일룰 보충 tx 인지 판별 가능.'
+    })
+  } catch (error) {
+    console.error('scan-duplicate-daily-qkey-on-date error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-bulk-delete-holiday-rule-duplicate-tx-515: 5/15 09:00 휴일룰 보충 tx 전수 DELETE ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   boss directive: "15일날 중복 지급된 계정 찾아서 1회로 줄이라고 깨끗하게"
+//
+//   대상: tx WHERE type='daily_qkey' AND created_at='2026-05-15 00:00:00' (UTC) = '2026-05-15 09:00' (KST)
+//     → 이전 휴일룰 보충 작업(어제) 에서 INSERT 된 tx 들. ref_id = dr.id where dr.reward_date='2026-05-14' AND dr.paid_date='2026-05-15'
+//
+//   5중 검증 (각 row):
+//     (a) tx.type = 'daily_qkey'
+//     (b) tx.created_at = '2026-05-15 00:00:00' (UTC) — 정확 매칭
+//     (c) tx.ref_id is not null
+//     (d) dr 행 존재 + dr.reward_date='2026-05-14' AND dr.paid_date='2026-05-15'
+//     (e) dr.usdt_amount = tx.amount
+//
+//   처리: 검증 통과한 tx 만 DELETE + users.qkey_balance -= tx.amount (atomic per-row, D1 트랜잭션 없음)
+//   dr 행은 의도적 유지 (rd=5/14 사실/감사 보존)
+//
+//   경로:
+//     DRY_RUN: POST /api/diag/fix-bulk-delete-holiday-rule-duplicate-tx-515?key=ADMIN_PW&dry_run=1
+//     실행:   POST /api/diag/fix-bulk-delete-holiday-rule-duplicate-tx-515?key=ADMIN_PW&confirm=GO
+app.post('/api/diag/fix-bulk-delete-holiday-rule-duplicate-tx-515', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    // 1) 대상 tx 후보 추출: type='daily_qkey' AND created_at='2026-05-15 00:00:00'
+    const candidates = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id, created_at, description
+      FROM transactions
+      WHERE type = 'daily_qkey'
+        AND created_at = '2026-05-15 00:00:00'
+      ORDER BY id ASC
+    `).all()
+
+    const plan: any[] = []
+    const validationFails: any[] = []
+
+    for (const t of (candidates.results as any[])) {
+      // 5중 검증
+      const v: any = {
+        type_match: t.type === 'daily_qkey',
+        created_at_match: t.created_at === '2026-05-15 00:00:00',
+        ref_id_not_null: !!t.ref_id,
+        dr_exists_and_rd514_pd515: false,
+        dr_amount_match: false
+      }
+      let dr: any = null
+      if (t.ref_id) {
+        dr = await db.prepare(`
+          SELECT id, user_id, staking_id, reward_date, paid_date, usdt_amount
+          FROM daily_rewards WHERE id = ?
+        `).bind(t.ref_id).first<any>()
+        if (dr) {
+          v.dr_exists_and_rd514_pd515 = (dr.reward_date === '2026-05-14' && dr.paid_date === '2026-05-15' && dr.user_id === t.user_id)
+          v.dr_amount_match = Number(dr.usdt_amount) === Number(t.amount)
+        }
+      }
+      const allValid = Object.values(v).every(x => x === true)
+
+      const row = {
+        tx_id: t.id,
+        user_id: t.user_id,
+        amount: t.amount,
+        ref_id: t.ref_id,
+        created_at: t.created_at,
+        dr: dr ? { dr_id: dr.id, rd: dr.reward_date, pd: dr.paid_date, amt: dr.usdt_amount, staking_id: dr.staking_id } : null,
+        validation: v,
+        valid: allValid
+      }
+      if (allValid) plan.push(row)
+      else validationFails.push(row)
+    }
+
+    // 사용자별 합계
+    const userMap: Record<number, { user_id: number, tx_count: number, total_deduct: number }> = {}
+    for (const p of plan) {
+      if (!userMap[p.user_id]) userMap[p.user_id] = { user_id: p.user_id, tx_count: 0, total_deduct: 0 }
+      userMap[p.user_id].tx_count += 1
+      userMap[p.user_id].total_deduct += Number(p.amount)
+    }
+    const userSummary = Object.values(userMap).sort((a, b) => a.user_id - b.user_id)
+    const totalDeleteCount = plan.length
+    const totalDeductAmount = plan.reduce((s, p) => s + Number(p.amount), 0)
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행을 원하시면 confirm=GO 추가',
+        candidates_found: (candidates.results as any[]).length,
+        validation_pass: plan.length,
+        validation_fail: validationFails.length,
+        total_delete_count: totalDeleteCount,
+        total_deduct_amount: totalDeductAmount,
+        affected_user_count: userSummary.length,
+        user_summary: userSummary,
+        plan_sample_first10: plan.slice(0, 10),
+        validation_fails: validationFails
+      })
+    }
+
+    // EXECUTE: atomic per-row (D1 트랜잭션 없음)
+    const executed: any[] = []
+    const errors: any[] = []
+    for (const p of plan) {
+      try {
+        // user balance before
+        const ub = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(p.user_id).first<any>()
+        const balanceBefore = Number(ub?.qkey_balance || 0)
+        // DELETE tx
+        await db.prepare(`DELETE FROM transactions WHERE id = ? AND user_id = ?`).bind(p.tx_id, p.user_id).run()
+        // balance 차감
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(p.amount, p.user_id).run()
+        const ua = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(p.user_id).first<any>()
+        executed.push({
+          tx_id: p.tx_id, user_id: p.user_id, amount: p.amount, ref_id: p.ref_id,
+          balance_before: balanceBefore, balance_after: Number(ua?.qkey_balance || 0)
+        })
+      } catch (e) {
+        errors.push({ tx_id: p.tx_id, user_id: p.user_id, error: String(e) })
+      }
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXECUTED',
+      total_delete_count: executed.length,
+      total_deduct_amount: executed.reduce((s, e) => s + Number(e.amount), 0),
+      affected_user_count: new Set(executed.map(e => e.user_id)).size,
+      executed,
+      errors,
+      validation_fails: validationFails,
+      note: 'tx DELETE + qkey_balance 차감 완료. dr 행은 그대로 유지 (의도적, rd=5/14 사실/감사 보존).'
+    })
+  } catch (error) {
+    console.error('fix-bulk-delete-holiday-rule-duplicate-tx-515 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ fix-insert-solbat-rd514-missing-rr: solbat 5/14 reward_date 누락 9건 rr+tx INSERT ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   boss directive: "5/13 기준으로 5/14 배당도 맞추라"
