@@ -12753,6 +12753,150 @@ app.get('/api/diag/scan-thursday-friday-amount-mismatch', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-insert-solbat-rd514-missing-rr: solbat 5/14 reward_date 누락 9건 rr+tx INSERT ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   boss directive: "5/13 기준으로 5/14 배당도 맞추라"
+//   → reward_date=5/13 unique 12개 referee+level 중 reward_date=5/14 에 없는 9개를 INSERT.
+//   영구룰: 5/14(목) 휴일 효과 → paid_date=2026-05-15 (금) 합산 지급
+//
+//   처리 단위: 단일 user(solbat=44) 하드코딩. 다른 회원 영향 0.
+//   허용 referee 9개 (필수 5중 검증):
+//     L1 referee_id ∈ {54, 52, 48, 89, 50} amount=150
+//     L2 referee_id ∈ {90, 76, 46, 73}     amount=75 (lis7238 76 만 1500)
+//
+//   경로: POST /api/diag/fix-insert-solbat-rd514-missing-rr?key=ADMIN_PW&dry_run=1
+//        실행: POST /api/diag/fix-insert-solbat-rd514-missing-rr?key=ADMIN_PW&confirm=GO
+app.post('/api/diag/fix-insert-solbat-rd514-missing-rr', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') === '1' || c.req.query('dry_run') === 'true'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'confirm=GO 필요 (또는 dry_run=1)' }, 400)
+    }
+    const db = c.env.DB
+    const SOLBAT_ID = 44
+
+    // 누락 9건 (referee_id, level, amount)
+    const inserts: Array<{ referee_id: number, level: number, amount: number }> = [
+      { referee_id: 54, level: 1, amount: 150 },  // aafhka
+      { referee_id: 52, level: 1, amount: 150 },  // csh
+      { referee_id: 48, level: 1, amount: 150 },  // naim1970
+      { referee_id: 89, level: 1, amount: 150 },  // psj7406
+      { referee_id: 50, level: 1, amount: 150 },  // qt1234
+      { referee_id: 90, level: 2, amount: 75 },   // cys
+      { referee_id: 76, level: 2, amount: 1500 }, // lis7238
+      { referee_id: 46, level: 2, amount: 75 },   // pjb5818
+      { referee_id: 73, level: 2, amount: 75 },   // pputti
+    ]
+
+    // ===== 5중 사전 검증 =====
+    // 1) solbat user 존재
+    const user: any = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+    if (!user) return c.json({ error: 'solbat(44) not found' }, 404)
+    if (user.email !== 'solbat') return c.json({ error: `user 44 email mismatch: ${user.email}` }, 400)
+
+    // 2) 각 referee 존재 확인 + 3) original_amount(추정 stake amount) 구하기
+    const refDetails: any[] = []
+    for (const ins of inserts) {
+      const ref: any = await db.prepare(`SELECT id, email, name FROM users WHERE id = ?`).bind(ins.referee_id).first()
+      if (!ref) return c.json({ error: `referee ${ins.referee_id} not found` }, 404)
+
+      // 4) reward_date=5/13 에 동일 referee+level rr 존재(=패턴 기준)
+      const has513: any = await db.prepare(`
+        SELECT COUNT(*) AS cnt, MAX(original_amount) AS orig_amt
+        FROM referral_rewards
+        WHERE referrer_id=? AND referee_id=? AND level=? AND reward_date='2026-05-13'
+      `).bind(SOLBAT_ID, ins.referee_id, ins.level).first()
+      if (!has513 || Number(has513.cnt) === 0) {
+        return c.json({ error: `referee ${ins.referee_id} L${ins.level} 5/13 rd 없음 → 패턴 위반` }, 400)
+      }
+
+      // 5) reward_date=5/14 에 중복 INSERT 방지 (이미 있으면 skip 또는 에러)
+      const has514: any = await db.prepare(`
+        SELECT COUNT(*) AS cnt
+        FROM referral_rewards
+        WHERE referrer_id=? AND referee_id=? AND level=? AND reward_date='2026-05-14'
+      `).bind(SOLBAT_ID, ins.referee_id, ins.level).first()
+      if (Number(has514.cnt) > 0) {
+        return c.json({ error: `referee ${ins.referee_id} L${ins.level} 5/14 rd 이미 존재 (중복 INSERT 방지)` }, 400)
+      }
+
+      refDetails.push({
+        referee_id: ins.referee_id, email: ref.email, level: ins.level, amount: ins.amount,
+        original_amount: Number(has513.orig_amt || 0),
+        rd_513_cnt: Number(has513.cnt),
+        rd_514_cnt_before: Number(has514.cnt),
+      })
+    }
+
+    const totalAmount = inserts.reduce((a, b) => a + b.amount, 0)
+
+    if (dryRun) {
+      return c.json({
+        ok: true, dry_run: true,
+        user: { id: user.id, email: user.email, balance_before: user.qkey_balance, balance_after_expected: Number(user.qkey_balance) + totalAmount },
+        validation: { solbat_user_match: true, all_referees_exist: true, all_have_rd513_pattern: true, no_rd514_duplicate: true, total_inserts: inserts.length },
+        plan: refDetails,
+        total_amount: totalAmount,
+        note: 'rd=2026-05-14, pd=2026-05-15 (영구룰 휴일 합산), tx description=영구룰 표기'
+      })
+    }
+
+    // ===== EXECUTE =====
+    const results: any[] = []
+    let okCount = 0
+    let errCount = 0
+    const nowIso = new Date().toISOString().slice(0, 19).replace('T', ' ')
+
+    for (const rd of refDetails) {
+      try {
+        // 1) referral_rewards INSERT
+        const rrIns = await db.prepare(`
+          INSERT INTO referral_rewards
+            (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, '2026-05-14', '2026-05-15', ?)
+        `).bind(SOLBAT_ID, rd.referee_id, rd.level, rd.original_amount, rd.amount, nowIso).run()
+        const newRrId = (rrIns as any).meta?.last_row_id
+
+        // 2) transactions INSERT (영구룰 desc: "추천 보너스 (Level 1/2)")
+        const desc = `추천 보너스 (Level ${rd.level})`
+        const txIns = await db.prepare(`
+          INSERT INTO transactions
+            (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+        `).bind(SOLBAT_ID, rd.amount, desc, String(newRrId), nowIso).run()
+        const newTxId = (txIns as any).meta?.last_row_id
+
+        // 3) users.qkey_balance += amount
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(rd.amount, SOLBAT_ID).run()
+
+        results.push({ ok: true, referee_id: rd.referee_id, email: rd.email, level: rd.level, amount: rd.amount, new_rr_id: newRrId, new_tx_id: newTxId })
+        okCount++
+      } catch (e) {
+        results.push({ ok: false, referee_id: rd.referee_id, email: rd.email, level: rd.level, error: String(e) })
+        errCount++
+      }
+    }
+
+    const userAfter: any = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(SOLBAT_ID).first()
+
+    return c.json({
+      ok: errCount === 0,
+      executed: true,
+      summary: { ok: okCount, err: errCount, total_amount_inserted: totalAmount },
+      balance_before: user.qkey_balance,
+      balance_after: userAfter?.qkey_balance,
+      results,
+    })
+  } catch (error) {
+    console.error('fix-insert-solbat-rd514-missing-rr error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ referral_rewards 있는데 transactions 없는 case 전수 스캔 (L1/L2 매칭 누락용) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   목적: solbat L1/L2 누락 case 처럼 rr 행은 있는데 tx 행이 없는 case 전수
