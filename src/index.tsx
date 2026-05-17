@@ -36831,4 +36831,410 @@ app.get('/api/diag/swap-balance-audit', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-solbat-display-align-3750: solbat 5/12~5/15 tx 화면 표시 영구룰 정렬 (balance 동시 정정) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   boss directive: "표시는 본인 750 / L1 1050 / L2 1950 으로 5/15까지 맞춰라 + 잔액도 무조건 같이"
+//   ※ user_id=44 (solbat) 단일 회원 하드코딩, 다른 회원 영향 0
+//
+//   작업:
+//     A) DELETE tx#3085 (5/12 L2 orphan 75, ref_id=None) → balance -75
+//     B) INSERT 4건 tx (rd=5/14 L1 ref45, rd=5/14 L2 ref49, rd=5/15 L1 ref45, rd=5/15 L2 ref49)
+//        각각 rr_id 매핑: rr#1779, rr#1780, rr#1781, rr#1782 (이미 rr 테이블에 존재, tx 만 누락)
+//        → balance +150+75+150+75 = +450
+//
+//   순 잔액 변화: -75 + 450 = +375 (39,750 → 40,125)
+//   최종 표시 결과: 5/12~5/15 매일 self=750 / L1=1050 / L2=1950 / total=3750 ✅
+//
+//   5중 검증:
+//     - DELETE: tx#3085 actual: user_id=44, type='referral_reward', amount=75, ref_id=None, created_at='2026-05-12 10:24:27'
+//     - INSERT 각 행: rr 존재 확인 + tx 미존재 확인 + referrer_id=44 + amount 일치 + level/desc 정확
+//
+//   경로:
+//     DRY: POST /api/diag/fix-solbat-display-align-3750?key=ADMIN_PW&dry_run=1
+//     GO:  POST /api/diag/fix-solbat-display-align-3750?key=ADMIN_PW&confirm=GO
+app.post('/api/diag/fix-solbat-display-align-3750', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    const USER_ID = 44
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(USER_ID).first<any>()
+    if (!user || user.email !== 'solbat') {
+      return c.json({ error: 'user_id=44 not solbat', user }, 400)
+    }
+
+    // ----- STEP A: DELETE tx#3085 (orphan L2 5/12 75) 5중 검증
+    const deleteTx = await db.prepare(`
+      SELECT id, user_id, type, amount, description, ref_id, created_at
+      FROM transactions WHERE id = 3085
+    `).first<any>()
+
+    const deleteValidation = {
+      tx_exists: !!deleteTx,
+      user_id_match: deleteTx?.user_id === USER_ID,
+      type_match: deleteTx?.type === 'referral_reward',
+      amount_match: Number(deleteTx?.amount) === 75,
+      ref_id_is_null: deleteTx?.ref_id === null,
+      desc_contains_level2: (deleteTx?.description || '').includes('Level 2'),
+      created_at_kst_512: (deleteTx?.created_at || '').startsWith('2026-05-12')
+    }
+    const deleteOK = Object.values(deleteValidation).every(v => v === true)
+
+    // ----- STEP B: INSERT 4 rr tx (rr#1779, 1780, 1781, 1782)
+    const insertPlan = [
+      { rr_id: 1779, level: 1, amount: 150, referee_id: 45, rd: '2026-05-14', pd: '2026-05-15' },
+      { rr_id: 1780, level: 2, amount: 75,  referee_id: 49, rd: '2026-05-14', pd: '2026-05-15' },
+      { rr_id: 1781, level: 1, amount: 150, referee_id: 45, rd: '2026-05-15', pd: '2026-05-15' },
+      { rr_id: 1782, level: 2, amount: 75,  referee_id: 49, rd: '2026-05-15', pd: '2026-05-15' }
+    ]
+
+    const insertValidations: any[] = []
+    for (const p of insertPlan) {
+      // rr 존재 검증
+      const rr = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date
+        FROM referral_rewards WHERE id = ?
+      `).bind(p.rr_id).first<any>()
+
+      // 동일 ref_id 의 tx 가 이미 있는지 확인
+      const exists = await db.prepare(`
+        SELECT id FROM transactions WHERE ref_id = ? AND type = 'referral_reward' AND user_id = ?
+      `).bind(String(p.rr_id), USER_ID).first<any>()
+
+      const v = {
+        rr_exists: !!rr,
+        rr_referrer_match: rr?.referrer_id === USER_ID,
+        rr_referee_match: rr?.referee_id === p.referee_id,
+        rr_level_match: rr?.level === p.level,
+        rr_amount_match: Number(rr?.reward_amount) === p.amount,
+        rr_rd_match: rr?.reward_date === p.rd,
+        rr_pd_match: rr?.paid_date === p.pd,
+        tx_not_yet_inserted: !exists
+      }
+      insertValidations.push({ plan: p, rr, validation: v, ok: Object.values(v).every(x => x === true) })
+    }
+
+    const allInsertOK = insertValidations.every(v => v.ok)
+    const totalDeductForDelete = deleteOK ? 75 : 0
+    const totalAddForInsert = insertPlan.reduce((s, p) => s + p.amount, 0)
+    const netBalanceDelta = -totalDeductForDelete + totalAddForInsert
+
+    const summary = {
+      action: 'fix-solbat-display-align-3750',
+      user_id: USER_ID, email: user.email,
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after_planned: Number(user.qkey_balance) + netBalanceDelta,
+      delete_count: deleteOK ? 1 : 0,
+      delete_tx_id: 3085,
+      delete_amount: 75,
+      insert_count: insertPlan.length,
+      insert_total_amount: totalAddForInsert,
+      net_balance_delta: netBalanceDelta
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행은 confirm=GO 추가',
+        delete_validation: deleteValidation,
+        delete_ok: deleteOK,
+        delete_tx_actual: deleteTx,
+        insert_validations: insertValidations,
+        all_insert_ok: allInsertOK,
+        summary,
+        proceed_safe: deleteOK && allInsertOK
+      })
+    }
+
+    if (!deleteOK || !allInsertOK) {
+      return c.json({
+        ok: false,
+        mode: 'EXECUTE_BLOCKED',
+        message: '5중 검증 실패 — 실행 중단',
+        delete_validation: deleteValidation,
+        insert_validations: insertValidations
+      }, 400)
+    }
+
+    // EXECUTE
+    const executed: any[] = []
+    const errors: any[] = []
+
+    // STEP A: DELETE tx#3085
+    try {
+      await db.prepare(`DELETE FROM transactions WHERE id = 3085 AND user_id = ?`).bind(USER_ID).run()
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - 75 WHERE id = ?`).bind(USER_ID).run()
+      executed.push({ step: 'A_DELETE', tx_id: 3085, balance_delta: -75 })
+    } catch (e) {
+      errors.push({ step: 'A_DELETE', error: String(e) })
+    }
+
+    // STEP B: INSERT 4 tx + balance +amount
+    for (const p of insertPlan) {
+      try {
+        // created_at: KST p.pd 의 08:00 = UTC p.pd-1day 23:00... 사장님 표시 영구룰 따라 KST p.rd 화면에 나타나야 함
+        // → tx.created_at(UTC) = p.rd 의 KST 08:00 (=UTC 23:00 of (rd-1))
+        //   p.rd='2026-05-14' → KST 2026-05-14 08:00 = UTC 2026-05-13 23:00
+        // 단순화: KST 08:00:00 일관 표시를 위해 SQL datetime 사용
+        const kstHour = '08:00:00'
+        const txCreatedAtUtc = await db.prepare(`SELECT datetime(?||' '||?, '-9 hours') AS u`).bind(p.rd, kstHour).first<any>()
+        const createdAt = txCreatedAtUtc?.u || `${p.rd} ${kstHour}`
+        const desc = `추천 보너스 (Level ${p.level})`
+
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', 'qkey', ?, ?, ?, ?)
+        `).bind(USER_ID, p.amount, desc, String(p.rr_id), createdAt).run()
+
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(p.amount, USER_ID).run()
+
+        executed.push({ step: 'B_INSERT', rr_id: p.rr_id, amount: p.amount, level: p.level, rd: p.rd, created_at: createdAt, balance_delta: p.amount })
+      } catch (e) {
+        errors.push({ step: 'B_INSERT', rr_id: p.rr_id, error: String(e) })
+      }
+    }
+
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(USER_ID).first<any>()
+
+    return c.json({
+      ok: errors.length === 0,
+      mode: 'EXECUTED',
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after: userAfter?.qkey_balance,
+      net_balance_delta: netBalanceDelta,
+      executed,
+      errors,
+      summary
+    })
+  } catch (error) {
+    console.error('fix-solbat-display-align-3750 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-solbat-clean-slate-3750: solbat 5/12~5/18 일일배당+추천수당 tx 전부 삭제 후 영구룰대로 재기록 ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   boss directive: "방법 1로 가" (5/12~5/18 일일/추천 tx 전부 삭제 + 5/12~5/15 영구룰대로 60건 재기록)
+//
+//   STEP A — DELETE 73건:
+//     - user_id=44 (solbat)
+//     - tx WHERE type IN ('daily_qkey','referral_reward')
+//     - date(tx.created_at, '+9 hours') BETWEEN '2026-05-12' AND '2026-05-18'
+//     - balance -= sum(amount) (18,075)
+//
+//   STEP B — INSERT 60건 (영구룰: 매일 self 750 + L1 1050 + L2 1950 = 3,750):
+//     - 4일 × (1 daily + 7 L1 + 7 L2) = 60건
+//     - 5/13 의 referee_id+level+amount 매핑을 표준으로 적용:
+//         L1 (7명, 150씩):  ref=45, 45, 48, 50, 52, 54, 89
+//         L2 (7명, 75 또는 1500): ref=46(75), 49(75), 49(75), 73(75), 76(1500), 90(75), 93(75)
+//     - tx.created_at = KST rd 08:00 (= UTC rd-day 23:00)
+//     - ref_id = null (재기록이므로 신규 rr 만들지 않음 — 단순 표시용)
+//     - balance += 15,000 (4 × 3,750)
+//
+//   순 잔액 변화: -18,075 + 15,000 = -3,075 (39,750 → 36,675)
+//
+//   경로:
+//     DRY: POST /api/diag/fix-solbat-clean-slate-3750?key=ADMIN_PW&dry_run=1
+//     GO:  POST /api/diag/fix-solbat-clean-slate-3750?key=ADMIN_PW&confirm=GO
+app.post('/api/diag/fix-solbat-clean-slate-3750', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    const USER_ID = 44
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(USER_ID).first<any>()
+    if (!user || user.email !== 'solbat') {
+      return c.json({ error: 'user not solbat', user }, 400)
+    }
+
+    // ----- STEP A: DELETE 대상 list
+    const deleteTargets = await db.prepare(`
+      SELECT id, type, amount, description, ref_id,
+             datetime(created_at, '+9 hours') AS created_at_kst,
+             created_at AS created_at_utc
+      FROM transactions
+      WHERE user_id = ?
+        AND type IN ('daily_qkey', 'referral_reward')
+        AND date(created_at, '+9 hours') BETWEEN '2026-05-12' AND '2026-05-18'
+      ORDER BY id ASC
+    `).bind(USER_ID).all()
+
+    const deleteList = deleteTargets.results as any[]
+    const totalDeleteAmount = deleteList.reduce((s, t) => s + Number(t.amount), 0)
+
+    // 5중 검증 (집계 레벨)
+    const deleteValidation = {
+      count_in_range: deleteList.length,
+      all_valid_types: deleteList.every(t => t.type === 'daily_qkey' || t.type === 'referral_reward'),
+      all_in_date_range: deleteList.every(t => {
+        const d = (t.created_at_kst || '').slice(0, 10)
+        return d >= '2026-05-12' && d <= '2026-05-18'
+      }),
+      all_user_id_44: true, // 위에서 user_id=? 로 필터됨
+      total_amount: totalDeleteAmount
+    }
+    const deleteOK = deleteList.length === 73 && totalDeleteAmount === 18075
+
+    // ----- STEP B: INSERT 60건 plan (4일 × 15건)
+    const standardMap = [
+      { kind: 'self', level: 0, amount: 750, referee_id: null },
+      { kind: 'l1',   level: 1, amount: 150, referee_id: 45 },
+      { kind: 'l1',   level: 1, amount: 150, referee_id: 45 },
+      { kind: 'l1',   level: 1, amount: 150, referee_id: 48 },
+      { kind: 'l1',   level: 1, amount: 150, referee_id: 50 },
+      { kind: 'l1',   level: 1, amount: 150, referee_id: 52 },
+      { kind: 'l1',   level: 1, amount: 150, referee_id: 54 },
+      { kind: 'l1',   level: 1, amount: 150, referee_id: 89 },
+      { kind: 'l2',   level: 2, amount: 75,  referee_id: 46 },
+      { kind: 'l2',   level: 2, amount: 75,  referee_id: 49 },
+      { kind: 'l2',   level: 2, amount: 75,  referee_id: 49 },
+      { kind: 'l2',   level: 2, amount: 75,  referee_id: 73 },
+      { kind: 'l2',   level: 2, amount: 1500, referee_id: 76 },
+      { kind: 'l2',   level: 2, amount: 75,  referee_id: 90 },
+      { kind: 'l2',   level: 2, amount: 75,  referee_id: 93 }
+    ]
+
+    const dates = ['2026-05-12', '2026-05-13', '2026-05-14', '2026-05-15']
+    const insertPlan: any[] = []
+    for (const rd of dates) {
+      // KST rd 08:00 = UTC (rd) 23:00 of previous day; 가장 단순한 SQL 처리는 datetime 매크로
+      // 더 단순: tx.created_at = rd + ' -1 day 23:00:00' ... 복잡하므로 KST 08:00 명세로 SQL 변환
+      let secOffset = 0
+      for (const m of standardMap) {
+        secOffset += 1
+        const kstHHmm = '08:00:' + String(secOffset).padStart(2, '0')
+        insertPlan.push({
+          rd,
+          kst_created_at: `${rd} ${kstHHmm}`,
+          type: m.kind === 'self' ? 'daily_qkey' : 'referral_reward',
+          amount: m.amount,
+          level: m.level,
+          referee_id: m.referee_id,
+          description: m.kind === 'self' ? '일일 배당 (QKEY)' : `추천 보너스 (Level ${m.level})`
+        })
+      }
+    }
+
+    const totalInsertAmount = insertPlan.reduce((s, p) => s + Number(p.amount), 0)
+    const netBalanceDelta = -totalDeleteAmount + totalInsertAmount
+    const plannedFinalBalance = Number(user.qkey_balance) + netBalanceDelta
+
+    const summary = {
+      action: 'fix-solbat-clean-slate-3750',
+      user_id: USER_ID, email: user.email,
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after_planned: plannedFinalBalance,
+      delete_count: deleteList.length,
+      delete_total_amount: totalDeleteAmount,
+      insert_count: insertPlan.length,
+      insert_total_amount: totalInsertAmount,
+      net_balance_delta: netBalanceDelta
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        message: '실제 실행은 confirm=GO 추가',
+        delete_validation: deleteValidation,
+        delete_ok: deleteOK,
+        delete_targets_sample: deleteList.slice(0, 10),
+        delete_targets_count: deleteList.length,
+        insert_plan_sample: insertPlan.slice(0, 15),
+        insert_plan_count: insertPlan.length,
+        summary,
+        proceed_safe: deleteOK
+      })
+    }
+
+    if (!deleteOK) {
+      return c.json({
+        ok: false, mode: 'EXECUTE_BLOCKED',
+        message: '검증 실패: delete count or total mismatch',
+        delete_validation: deleteValidation
+      }, 400)
+    }
+
+    // EXECUTE
+    const executed: any[] = []
+    const errors: any[] = []
+
+    // STEP A: 일괄 DELETE
+    try {
+      const deleteResult = await db.prepare(`
+        DELETE FROM transactions
+        WHERE user_id = ?
+          AND type IN ('daily_qkey', 'referral_reward')
+          AND date(created_at, '+9 hours') BETWEEN '2026-05-12' AND '2026-05-18'
+      `).bind(USER_ID).run()
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(totalDeleteAmount, USER_ID).run()
+      executed.push({ step: 'A_DELETE_ALL', deleted_count: deleteList.length, balance_delta: -totalDeleteAmount })
+    } catch (e) {
+      errors.push({ step: 'A_DELETE_ALL', error: String(e) })
+      return c.json({ ok: false, mode: 'EXECUTE_PARTIAL', executed, errors }, 500)
+    }
+
+    // STEP B: INSERT 60건 + balance += 15000
+    for (const p of insertPlan) {
+      try {
+        // created_at(UTC) = KST - 9h
+        const utcRow = await db.prepare(`SELECT datetime(?, '-9 hours') AS u`).bind(p.kst_created_at).first<any>()
+        const createdAt = utcRow?.u || p.kst_created_at
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, ?, 'qkey', ?, ?, NULL, ?)
+        `).bind(USER_ID, p.type, p.amount, p.description, createdAt).run()
+        executed.push({ step: 'B_INSERT', rd: p.rd, type: p.type, amount: p.amount, kst_created_at: p.kst_created_at, utc_created_at: createdAt })
+      } catch (e) {
+        errors.push({ step: 'B_INSERT', plan: p, error: String(e) })
+      }
+    }
+    // balance += totalInsertAmount
+    try {
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(totalInsertAmount, USER_ID).run()
+      executed.push({ step: 'B_BALANCE_ADD', delta: totalInsertAmount })
+    } catch (e) {
+      errors.push({ step: 'B_BALANCE_ADD', error: String(e) })
+    }
+
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(USER_ID).first<any>()
+
+    // 재검증: tx 표시 영구룰 확인
+    const verifyRows = await db.prepare(`
+      SELECT date(created_at, '+9 hours') AS rd_kst, type, description, SUM(amount) AS sum_amt, COUNT(*) AS cnt
+      FROM transactions
+      WHERE user_id = ?
+        AND type IN ('daily_qkey','referral_reward')
+        AND date(created_at, '+9 hours') BETWEEN '2026-05-12' AND '2026-05-18'
+      GROUP BY rd_kst, type, description
+      ORDER BY rd_kst, type, description
+    `).bind(USER_ID).all()
+
+    return c.json({
+      ok: errors.length === 0,
+      mode: 'EXECUTED',
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after: userAfter?.qkey_balance,
+      net_balance_delta: netBalanceDelta,
+      executed_count: executed.length,
+      errors_count: errors.length,
+      errors,
+      verification_tx_by_date: verifyRows.results,
+      summary
+    })
+  } catch (error) {
+    console.error('fix-solbat-clean-slate-3750 error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 export default app
