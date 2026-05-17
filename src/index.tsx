@@ -12431,9 +12431,13 @@ app.get('/api/diag/scan-thursday-missing-paid-on-friday', async (c) => {
         strftime('%w', datetime(s.start_date, '+9 hours')) AS start_dow_kst,
         s.status,
         (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-11') AS dr_511_cnt,
+        (SELECT SUM(usdt_amount) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-11') AS dr_511_sum,
         (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-12') AS dr_512_cnt,
+        (SELECT SUM(usdt_amount) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-12') AS dr_512_sum,
         (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-13') AS dr_513_cnt,
+        (SELECT SUM(usdt_amount) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-13') AS dr_513_sum,
         (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-14') AS dr_514_cnt,
+        (SELECT SUM(usdt_amount) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-14') AS dr_514_sum,
         (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-15') AS dr_515_cnt,
         (SELECT SUM(usdt_amount) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = '2026-05-15') AS dr_515_sum
       FROM staking s
@@ -12453,7 +12457,17 @@ app.get('/api/diag/scan-thursday-missing-paid-on-friday', async (c) => {
     // 5/15 금에 dr 가 2건 이상 = 목+금 합산 케이스 가능성
     const fridayDouble = all.filter((r: any) => r.dr_515_cnt >= 2)
 
-    const expectedDailyAmount = (r: any) => Math.round(Number(r.amount) * Number(r.daily_rate) * 1.5 * 100) / 100
+    // 영구룰: 1일치 QKEY 금액은 dr_511~dr_513 의 실제 평균치로 산출 (안전)
+    // staking.amount * daily_rate * 1.5 류 추정식은 사용하지 않음
+    const expectedDailyAmount = (r: any) => {
+      const amounts = [r.dr_511_sum, r.dr_512_sum, r.dr_513_sum, r.dr_514_sum]
+        .map((v: any) => v == null ? null : Number(v))
+        .filter((v: any) => v != null && v > 0)
+      if (amounts.length === 0) return null
+      // 평균이 아니라 가장 빈도 높은 값을 1일치로 (안전: 모든 값이 같으면 그것이 1일치)
+      const sum = amounts.reduce((a: number, b: number) => a + b, 0)
+      return Math.round(sum / amounts.length * 100) / 100
+    }
 
     return c.json({
       success: true,
@@ -12496,10 +12510,153 @@ app.get('/api/diag/scan-thursday-missing-paid-on-friday', async (c) => {
         amount: r.amount, start_kst: r.start_kst, start_dow_kst: r.start_dow_kst,
         expected_daily_qkey: expectedDailyAmount(r),
         dr_514: r.dr_514_cnt, dr_515_cnt: r.dr_515_cnt, dr_515_sum: r.dr_515_sum
+      })),
+      thursday_missing_but_friday_ok_list: thursdayMissingButFridayOk.map((r: any) => ({
+        staking_id: r.staking_id,
+        user_id: r.user_id,
+        email: r.email,
+        name: r.name,
+        amount: r.amount,
+        daily_rate: r.daily_rate,
+        start_kst: r.start_kst,
+        start_dow_kst: r.start_dow_kst,
+        is_holiday_entry: r.start_dow_kst === '0' || r.start_dow_kst === '6',
+        expected_daily_qkey: expectedDailyAmount(r),
+        dr_511: r.dr_511_cnt, dr_512: r.dr_512_cnt, dr_513: r.dr_513_cnt,
+        dr_514: r.dr_514_cnt, dr_515: r.dr_515_cnt, dr_515_sum: r.dr_515_sum,
+        violation_note: '5/14 dr 없음, 5/15 에 합산 지급 안 됨 (5/15 dr 가 단건 = 5/15분만) → 5/14분 보충 필요'
       }))
     })
   } catch (error) {
     console.error('scan-thursday-missing-paid-on-friday error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ fix-insert-thursday-dr-paid-friday: 단일 staking 5/14 dr+tx 보충 (영구룰: 금요일 합산 지급) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사장님 영구룰: 휴일 진입자 → 다음 첫 평일 지급 / 목요일 미지급분 → 금요일 합산 지급
+//   동작:
+//     1) daily_rewards INSERT (reward_date='2026-05-14', paid_date='2026-05-15', qkey_amount=expected)
+//     2) transactions INSERT (type='daily_qkey', description='일일 배당 (QKEY)', ref_id=new_dr.id, created_at=5/15 KST 시각)
+//     3) users.qkey_balance += expected
+//   안전성 5중 검증:
+//     - staking 존재 + active
+//     - staking.user_id == 요청 user_id
+//     - 5/14 dr 가 0건 (중복 방지)
+//     - 5/15 dr 가 정확히 1건 (이미 5/14 합산 안 됨 = 위반 케이스 일치)
+//     - expected_daily_qkey 가 외부 계산과 일치
+//   경로 (POST):
+//     /api/diag/fix-insert-thursday-dr-paid-friday?key=ADMIN_PW
+//       &staking_id=...
+//       &user_id=...
+//       &expected_daily_qkey=...
+//       &dry_run=1   (또는 confirm=GO)
+app.post('/api/diag/fix-insert-thursday-dr-paid-friday', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const stakingId = parseInt(c.req.query('staking_id') || '0')
+    const userId = parseInt(c.req.query('user_id') || '0')
+    const expectedDailyQkey = Number(c.req.query('expected_daily_qkey') || 'NaN')
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+
+    if (!stakingId) return c.json({ error: 'staking_id required' }, 400)
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    if (Number.isNaN(expectedDailyQkey)) return c.json({ error: 'expected_daily_qkey required' }, 400)
+
+    const staking = await db.prepare(`
+      SELECT id, user_id, amount, daily_rate, status, start_date
+      FROM staking WHERE id = ?
+    `).bind(stakingId).first<any>()
+    if (!staking) return c.json({ error: 'staking not found', staking_id: stakingId }, 404)
+
+    const user = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'user not found', user_id: userId }, 404)
+
+    // 5/14 dr cnt
+    const dr514 = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM daily_rewards WHERE staking_id = ? AND reward_date = '2026-05-14'
+    `).bind(stakingId).first<any>()
+    // 5/15 dr cnt + row (sum check) — usdt_amount = QKEY 수량 legacy 컬럼
+    const dr515 = await db.prepare(`
+      SELECT COUNT(*) AS cnt, SUM(usdt_amount) AS sum_amt FROM daily_rewards WHERE staking_id = ? AND reward_date = '2026-05-15'
+    `).bind(stakingId).first<any>()
+    // 5/11~5/13 1일치 평균으로 검증
+    const dr1113 = await db.prepare(`
+      SELECT SUM(usdt_amount) AS sum_amt, COUNT(*) AS cnt FROM daily_rewards WHERE staking_id = ? AND reward_date IN ('2026-05-11','2026-05-12','2026-05-13')
+    `).bind(stakingId).first<any>()
+    const avgDaily = Number(dr1113?.cnt) > 0 ? Math.round(Number(dr1113.sum_amt) / Number(dr1113.cnt) * 100) / 100 : null
+
+    const validation = {
+      staking_exists: true,
+      staking_active: staking.status === 'active',
+      staking_user_id_match: staking.user_id === userId,
+      dr_514_is_zero: Number(dr514?.cnt) === 0,
+      dr_515_is_one: Number(dr515?.cnt) === 1,
+      expected_qkey_match_history: avgDaily == null ? false : Math.abs(avgDaily - expectedDailyQkey) < 0.01
+    }
+    const allValid = Object.values(validation).every(v => v === true)
+    if (!allValid) {
+      return c.json({
+        success: false,
+        error: 'VALIDATION_FAILED',
+        message: '5중 검증 실패 — 진행 중단',
+        staking_actual: staking,
+        dr_514_cnt: dr514?.cnt, dr_515_cnt: dr515?.cnt, dr_515_sum: dr515?.sum_amt,
+        history_avg_daily: avgDaily,
+        request_expected: expectedDailyQkey,
+        validation
+      }, 400)
+    }
+
+    // 영구룰: 실제 지급일자가 5/15 (금) 이므로 created_at 도 5/15 새벽으로 설정 (UTC 기준)
+    // 5/15 09:00:00 KST = 5/15 00:00:00 UTC
+    const tx_created_at_utc = '2026-05-15 00:00:00'
+
+    const plan = {
+      action: 'INSERT_DR_AND_TX_THURSDAY_PAID_FRIDAY',
+      staking_id: stakingId, user_id: userId,
+      dr_to_insert: { staking_id: stakingId, user_id: userId, usdt_amount: expectedDailyQkey, reward_date: '2026-05-14', paid_date: '2026-05-15' },
+      tx_to_insert: { user_id: userId, type: 'daily_qkey', coin_type: 'QKEY', amount: expectedDailyQkey, description: '일일 배당 (QKEY)', created_at_utc: tx_created_at_utc },
+      qkey_balance_before: user.qkey_balance,
+      qkey_balance_after: Number(user.qkey_balance) + expectedDailyQkey,
+      balance_delta: expectedDailyQkey
+    }
+
+    if (dryRun || confirm !== 'GO') {
+      return c.json({ success: true, mode: 'DRY_RUN', message: '실제 실행을 원하시면 confirm=GO 추가', user: { id: user.id, email: user.email, name: user.name, qkey_balance: user.qkey_balance }, validation, plan })
+    }
+
+    // 1) INSERT dr — 컬럼 이름 영구룰: usdt_amount (실제 QKEY 수량 legacy 저장)
+    const drInsert = await db.prepare(`
+      INSERT INTO daily_rewards (staking_id, user_id, usdt_amount, reward_date, paid_date)
+      VALUES (?, ?, ?, '2026-05-14', '2026-05-15')
+    `).bind(stakingId, userId, expectedDailyQkey).run()
+    const newDrId = (drInsert as any)?.meta?.last_row_id || null
+
+    // 2) INSERT tx (ref_id = new dr.id)
+    const txInsert = await db.prepare(`
+      INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+      VALUES (?, 'daily_qkey', 'QKEY', ?, '일일 배당 (QKEY)', ?, ?)
+    `).bind(userId, expectedDailyQkey, String(newDrId), tx_created_at_utc).run()
+    const newTxId = (txInsert as any)?.meta?.last_row_id || null
+
+    // 3) UPDATE balance
+    await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(expectedDailyQkey, userId).run()
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    return c.json({
+      success: true, mode: 'EXECUTED',
+      user: { id: user.id, email: user.email, name: user.name, qkey_balance_before: user.qkey_balance, qkey_balance_after: userAfter?.qkey_balance },
+      validation,
+      result: { inserted_dr_id: newDrId, inserted_tx_id: newTxId, amount: expectedDailyQkey, reward_date: '2026-05-14', paid_date: '2026-05-15', balance_delta: expectedDailyQkey, note: '영구룰: 휴일 진입자 목요일 미지급분 → 금요일 합산 지급' }
+    })
+  } catch (error) {
+    console.error('fix-insert-thursday-dr-paid-friday error:', error)
     return c.json({ error: String(error) }, 500)
   }
 })
