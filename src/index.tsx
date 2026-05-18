@@ -43846,6 +43846,111 @@ app.post('/api/diag/recalc-day-dividend', async (c) => {
 })
 
 // ============================================================================
+// diag-staking-list: 사장님 명령 (2026-05-18)
+//   READ-ONLY. 특정 dividendDate (KST) 의 active staking 리스트를 두 쿼리 패턴으로
+//   각각 조회해서 차이를 명확히 보여준다.
+//   - PATTERN_A: status='active' 만 (recompute-bottom-up 기준)
+//   - PATTERN_B: status IN ('active','capped','completed') (recalc-day-dividend 기준)
+// ============================================================================
+app.get('/api/diag/staking-list', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'auth' }, 401)
+  const t0 = Date.now()
+  const db = c.env.DB
+  const dividendDate = c.req.query('dividendDate') || ''
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dividendDate)) {
+    return c.json({ error: 'dividendDate=YYYY-MM-DD' }, 400)
+  }
+
+  const patternA = await db.prepare(`
+    SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.status,
+           date(s.start_date,'+9 hours') AS start_kst,
+           date(s.end_date,'+9 hours') AS end_kst,
+           u.name, u.email, u.referrer_id
+    FROM staking s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.status = 'active'
+      AND date(s.start_date,'+9 hours') <= date(?)
+      AND date(s.end_date,'+9 hours') >= date(?)
+    ORDER BY s.id ASC
+  `).bind(dividendDate, dividendDate).all()
+
+  const patternB = await db.prepare(`
+    SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.status,
+           date(s.start_date,'+9 hours') AS start_kst,
+           date(s.end_date,'+9 hours') AS end_kst,
+           u.name, u.email, u.referrer_id
+    FROM staking s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.status IN ('active','capped','completed')
+      AND date(s.start_date,'+9 hours') <= ?
+      AND date(s.end_date,'+9 hours') >= ?
+    ORDER BY s.id ASC
+  `).bind(dividendDate, dividendDate).all()
+
+  const aRows = (patternA.results || []) as any[]
+  const bRows = (patternB.results || []) as any[]
+  const aIds = new Set(aRows.map((r: any) => r.staking_id))
+  const bIds = new Set(bRows.map((r: any) => r.staking_id))
+  const onlyA = aRows.filter((r: any) => !bIds.has(r.staking_id))
+  const onlyB = bRows.filter((r: any) => !aIds.has(r.staking_id))
+
+  // 추가: 그 사용자의 200% cap 도달 여부 (paid_total)
+  const allUserIds = Array.from(new Set([...aRows, ...bRows].map((r: any) => r.user_id)))
+  const paidByUser: Record<number, number> = {}
+  if (allUserIds.length > 0) {
+    const ph = allUserIds.map(() => '?').join(',')
+    const paidRows = await db.prepare(`
+      SELECT user_id, COALESCE(SUM(amount),0) AS paid_total
+      FROM transactions
+      WHERE user_id IN (${ph})
+        AND type IN ('daily_qkey','referral_reward','direct_referral')
+        AND amount > 0
+      GROUP BY user_id
+    `).bind(...allUserIds).all()
+    for (const r of (paidRows.results || []) as any[]) {
+      paidByUser[Number(r.user_id)] = Number(r.paid_total)
+    }
+  }
+
+  // staking 별 cap target (amount * 2 * 150) + paid_total 표시
+  const enrich = (rows: any[]) => rows.map((r: any) => {
+    const target = Number(r.amount) * 2 * 150
+    const paid = paidByUser[Number(r.user_id)] || 0
+    return {
+      staking_id: r.staking_id,
+      user_id: r.user_id,
+      name: r.name,
+      email: r.email,
+      amount: r.amount,
+      daily_rate: r.daily_rate,
+      status: r.status,
+      start_kst: r.start_kst,
+      end_kst: r.end_kst,
+      referrer_id: r.referrer_id,
+      cap_target_qkey: target,
+      paid_total_qkey: paid,
+      is_capped_at_query_time: paid >= target,
+    }
+  })
+
+  return c.json({
+    ok: true,
+    action: 'staking-list',
+    dividendDate,
+    pattern_A: { sql: "status='active'", count: aRows.length, rows: enrich(aRows) },
+    pattern_B: { sql: "status IN ('active','capped','completed')", count: bRows.length, rows: enrich(bRows) },
+    diff: {
+      only_in_A_count: onlyA.length,
+      only_in_B_count: onlyB.length,
+      only_in_A: enrich(onlyA),
+      only_in_B: enrich(onlyB),
+    },
+    duration_ms: Date.now() - t0,
+  })
+})
+
+// ============================================================================
 // purge-tx-by-time: 사장님 명령 (2026-05-18)
 //   "5/18 KST 17:53/17:54 의 referral_reward tx 105건 즉시 제거 + balance 차감"
 //
