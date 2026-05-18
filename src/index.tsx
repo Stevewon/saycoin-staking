@@ -41233,8 +41233,10 @@ app.get('/api/diag/scan-user-may15-dividend', async (c) => {
     if (!userQ && !emailQ) return c.json({ error: 'user=ID 또는 email=... 필요' }, 400)
 
     const db = c.env.DB
-    const REWARD_DATE = '2026-05-15'
-    const PAID_DATE = '2026-05-18'
+    // ★ 2026-05-18 일반화: dividendDate / payoutDate 쿼리 파라미터로 받음
+    //   기본값은 5/14 / 5/15 (이번 reverse-backfill 작업 기준)
+    const REWARD_DATE = c.req.query('dividendDate') || '2026-05-14'
+    const PAID_DATE = c.req.query('payoutDate') || '2026-05-15'
     const USD_TO_QKEY = 150
 
     // ─── 사용자 찾기 ───
