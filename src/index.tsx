@@ -44223,8 +44223,9 @@ async function diagPurgeRewardDateFully(c: any, mode: 'DRY_RUN' | 'EXEC') {
     }
 
     // ─── (1) DR 조회 ───
+    //   ★ daily_rewards 에는 qkey_amount 컬럼 없음 (스키마 0004). USD * 150 으로 환산.
     const drList = (await db.prepare(`
-      SELECT id, user_id, staking_id, usdt_amount, qkey_amount, reward_date, paid_date
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
       FROM daily_rewards
       WHERE reward_date = ?
     `).bind(rewardDate).all()).results as any[] || []
@@ -44294,7 +44295,10 @@ async function diagPurgeRewardDateFully(c: any, mode: 'DRY_RUN' | 'EXEC') {
     }
 
     // ─── 정합 검증: DR/RR 합계 vs tx 합계 ───
-    const drSumQkey = drList.reduce((s, r) => s + Number(r.qkey_amount || 0), 0)
+    //   DR.qkey = usdt * 150 (영구룰 dr.qkey_amount = amount * daily_rate * 150 — usdt_amount 가 이미 amount*daily_rate)
+    const USD_TO_QKEY = 150
+    const drSumUsdt = drList.reduce((s, r) => s + Number(r.usdt_amount || 0), 0)
+    const drSumQkey = drSumUsdt * USD_TO_QKEY
     const rrSumQkey = rrList.reduce((s, r) => s + Number(r.reward_amount || 0), 0)
 
     // ─── tx created_kst 분포 (사고 진단용) ───
