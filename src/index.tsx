@@ -20304,7 +20304,7 @@ app.get('/api/transactions/:userId', async (c) => {
         coin_type,
         amount,
         description,
-        datetime(created_at, '+9 hours') AS created_at,
+        strftime('%Y-%m-%dT%H:%M:%S', created_at, '+9 hours') AS created_at,
         date(created_at, '+9 hours') AS kst_date
       FROM transactions
       WHERE user_id = ?
