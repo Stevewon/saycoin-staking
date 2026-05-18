@@ -37832,21 +37832,15 @@ app.post('/api/diag/fix-missing-tx-from-dr-rr', async (c) => {
         const desc = `일일 배당 (QKEY) — ${rd}`
         const createdAt = dr.created_at  // 원래 시각 그대로 유지
 
-        // 영구룰 #중복지급금지: 6중 EXISTS 가드
-        //   (user_id, type='daily_qkey', coin_type='QKEY', amount, ref_id=dr_{dr.id})
-        //   또는 (user_id, type='daily_qkey', date(created_at)=reward_date)
+        // ref_id 정확 매칭만 (dr_id 기반 — 가장 정확한 멱등성)
         const exists = await db.prepare(`
           SELECT id FROM transactions
           WHERE user_id = ?
             AND type = 'daily_qkey'
             AND coin_type = 'QKEY'
-            AND (
-              ref_id = ?
-              OR date(created_at, '+9 hours') = ?
-              OR (amount = ? AND description = ?)
-            )
+            AND ref_id = ?
           LIMIT 1
-        `).bind(uid, refId, rd, amount, desc).first<any>()
+        `).bind(uid, refId).first<any>()
 
         if (exists) continue
 
@@ -37883,18 +37877,15 @@ app.post('/api/diag/fix-missing-tx-from-dr-rr', async (c) => {
           : `추천 보너스 (Level ${lvl}) — ${rd}`
         const createdAt = rr.created_at
 
+        // ref_id 정확 매칭만 (rr_id 기반 — 가장 정확한 멱등성)
         const exists = await db.prepare(`
           SELECT id FROM transactions
           WHERE user_id = ?
             AND type = 'referral_reward'
             AND coin_type = 'QKEY'
-            AND (
-              ref_id = ?
-              OR (amount = ? AND description = ?)
-              OR (amount = ? AND date(created_at, '+9 hours') = ? AND description LIKE ?)
-            )
+            AND ref_id = ?
           LIMIT 1
-        `).bind(uid, refId, amount, desc, amount, rd, `%Level ${lvl}%`).first<any>()
+        `).bind(uid, refId).first<any>()
 
         if (exists) continue
 
