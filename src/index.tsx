@@ -38594,4 +38594,209 @@ app.post('/api/diag/backfill-null-ref-tx', async (c) => {
   }
 })
 
+// ═══════════════════════════════════════════════════════════════════
+// /api/diag/scan-duplicate-dr-rr
+// 사장님 영구룰 #1회지급 (2026-05-18 확정):
+//   "1 user × 1 reward_date 당, 다음 3종이 각각 1회씩만 지급되어야 한다"
+//   - 본인 일일배당 (daily_rewards): (user_id, reward_date) 당 1건
+//   - L1 추천보너스 합산 (referral_rewards level=1): (referrer_id, reward_date, level=1) 당 1건
+//   - L2 추천보너스 합산 (referral_rewards level=2): (referrer_id, reward_date, level=2) 당 1건
+//
+// 이 룰을 위반한 데이터 (= 같은 그룹에 2건 이상) 전수조사.
+//
+// READ-ONLY — SELECT 만. DB 변경 없음.
+// 완전 set-based — for-loop 없음.
+//
+// 사용: GET /api/diag/scan-duplicate-dr-rr?key=ADMIN_PW
+// ═══════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-duplicate-dr-rr', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    console.log(`[REWARD_BATCH] start action=scan-duplicate-dr-rr mode=READ_ONLY no_per_row_exists=true set_based=true`)
+
+    // ─── 1. DR 중복 (daily_rewards) ───
+    //   영구룰: (user_id, reward_date) 1건만
+    //   위반: 같은 (user_id, reward_date) 에 row 2건 이상
+    const drDupStat = await db.prepare(`
+      WITH dup_groups AS (
+        SELECT user_id, reward_date, COUNT(*) AS cnt, MIN(id) AS keep_id, MAX(id) AS max_id,
+               COALESCE(SUM(usdt_amount), 0) AS sum_amount
+        FROM daily_rewards
+        GROUP BY user_id, reward_date
+        HAVING COUNT(*) > 1
+      )
+      SELECT
+        COUNT(*) AS violating_groups,
+        COALESCE(SUM(cnt), 0) AS total_violating_rows,
+        COALESCE(SUM(cnt - 1), 0) AS excess_rows,
+        COUNT(DISTINCT user_id) AS distinct_users,
+        COALESCE(SUM(sum_amount - (sum_amount / cnt)), 0) AS estimated_excess_amount
+      FROM dup_groups
+    `).first<any>()
+
+    // ─── 2. RR 중복 (referral_rewards) ───
+    //   영구룰: (referrer_id, reward_date, level) 1건만
+    //   위반: 같은 (referrer_id, reward_date, level) 에 row 2건 이상
+    const rrDupStat = await db.prepare(`
+      WITH dup_groups AS (
+        SELECT referrer_id, reward_date, level, COUNT(*) AS cnt,
+               MIN(id) AS keep_id, MAX(id) AS max_id,
+               COALESCE(SUM(reward_amount), 0) AS sum_amount
+        FROM referral_rewards
+        GROUP BY referrer_id, reward_date, level
+        HAVING COUNT(*) > 1
+      )
+      SELECT
+        COUNT(*) AS violating_groups,
+        COALESCE(SUM(cnt), 0) AS total_violating_rows,
+        COALESCE(SUM(cnt - 1), 0) AS excess_rows,
+        COUNT(DISTINCT referrer_id) AS distinct_users,
+        COALESCE(SUM(sum_amount - (sum_amount / cnt)), 0) AS estimated_excess_amount
+      FROM dup_groups
+    `).first<any>()
+
+    // ─── 3. DR 중복 그룹 샘플 (top 20) ───
+    const drDupSamples = await db.prepare(`
+      SELECT user_id, reward_date, COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id, ',') AS all_ids,
+             GROUP_CONCAT(usdt_amount, '|') AS all_amounts,
+             GROUP_CONCAT(created_at, '|') AS all_created
+      FROM daily_rewards
+      GROUP BY user_id, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, user_id, reward_date
+      LIMIT 20
+    `).all<any>()
+
+    // ─── 4. RR 중복 그룹 샘플 (top 20) ───
+    const rrDupSamples = await db.prepare(`
+      SELECT referrer_id, reward_date, level, COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id, ',') AS all_ids,
+             GROUP_CONCAT(reward_amount, '|') AS all_amounts,
+             GROUP_CONCAT(created_at, '|') AS all_created
+      FROM referral_rewards
+      GROUP BY referrer_id, reward_date, level
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, referrer_id, reward_date, level
+      LIMIT 20
+    `).all<any>()
+
+    // ─── 5. 사용자별 위반 카운트 (DR + RR 합산) ───
+    const userViolations = await db.prepare(`
+      SELECT u.id, u.email, u.name,
+        COALESCE(dr_v.excess, 0) AS dr_excess_rows,
+        COALESCE(rr_v.excess, 0) AS rr_excess_rows,
+        COALESCE(dr_v.excess, 0) + COALESCE(rr_v.excess, 0) AS total_excess
+      FROM users u
+      LEFT JOIN (
+        SELECT user_id, SUM(cnt - 1) AS excess
+        FROM (
+          SELECT user_id, reward_date, COUNT(*) AS cnt
+          FROM daily_rewards
+          GROUP BY user_id, reward_date
+          HAVING COUNT(*) > 1
+        )
+        GROUP BY user_id
+      ) dr_v ON dr_v.user_id = u.id
+      LEFT JOIN (
+        SELECT referrer_id, SUM(cnt - 1) AS excess
+        FROM (
+          SELECT referrer_id, reward_date, level, COUNT(*) AS cnt
+          FROM referral_rewards
+          GROUP BY referrer_id, reward_date, level
+          HAVING COUNT(*) > 1
+        )
+        GROUP BY referrer_id
+      ) rr_v ON rr_v.referrer_id = u.id
+      WHERE COALESCE(dr_v.excess, 0) + COALESCE(rr_v.excess, 0) > 0
+      ORDER BY total_excess DESC, u.id
+      LIMIT 50
+    `).all<any>()
+
+    // ─── 6. 영향받는 dangling tx 추정 (DELETE 될 dr/rr 의 ref_id 를 가리키는 tx) ───
+    // DELETE 대상 dr/rr 의 id 목록 → 그 id 를 가진 ref_id='dr_xxx'/'rr_xxx' tx 가 있으면 그것도 같이 DELETE 대상
+    const drDanglingTxStat = await db.prepare(`
+      WITH delete_dr_ids AS (
+        SELECT id FROM daily_rewards
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM daily_rewards GROUP BY user_id, reward_date
+        )
+      )
+      SELECT
+        COUNT(*) AS dangling_tx_count,
+        COALESCE(SUM(amount), 0) AS dangling_tx_sum
+      FROM transactions
+      WHERE type = 'daily_qkey' AND coin_type = 'QKEY'
+        AND ref_id IS NOT NULL
+        AND CAST(SUBSTR(ref_id, 4) AS INTEGER) IN (SELECT id FROM delete_dr_ids)
+        AND ref_id LIKE 'dr_%'
+    `).first<any>()
+
+    const rrDanglingTxStat = await db.prepare(`
+      WITH delete_rr_ids AS (
+        SELECT id FROM referral_rewards
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM referral_rewards GROUP BY referrer_id, reward_date, level
+        )
+      )
+      SELECT
+        COUNT(*) AS dangling_tx_count,
+        COALESCE(SUM(amount), 0) AS dangling_tx_sum
+      FROM transactions
+      WHERE type = 'referral_reward' AND coin_type = 'QKEY'
+        AND ref_id IS NOT NULL
+        AND CAST(SUBSTR(ref_id, 4) AS INTEGER) IN (SELECT id FROM delete_rr_ids)
+        AND ref_id LIKE 'rr_%'
+    `).first<any>()
+
+    const durMs = Date.now() - t0
+    console.log(`[REWARD_BATCH] scan-duplicate-dr-rr done dr_violations=${drDupStat?.violating_groups} rr_violations=${rrDupStat?.violating_groups} duration_ms=${durMs}`)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      action: 'scan-duplicate-dr-rr',
+      method: 'SET_BASED_GROUP_BY',
+      no_per_row_exists: true,
+      permanent_rule: '#1회지급 — (user_id, reward_date) 당 dr 1건 / (referrer_id, reward_date, level) 당 rr 1건',
+      summary: {
+        daily_rewards_violations: {
+          violating_groups: Number(drDupStat?.violating_groups || 0),
+          total_violating_rows: Number(drDupStat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(drDupStat?.excess_rows || 0),
+          distinct_users_affected: Number(drDupStat?.distinct_users || 0),
+          estimated_excess_amount: Number(drDupStat?.estimated_excess_amount || 0)
+        },
+        referral_rewards_violations: {
+          violating_groups: Number(rrDupStat?.violating_groups || 0),
+          total_violating_rows: Number(rrDupStat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(rrDupStat?.excess_rows || 0),
+          distinct_users_affected: Number(rrDupStat?.distinct_users || 0),
+          estimated_excess_amount: Number(rrDupStat?.estimated_excess_amount || 0)
+        },
+        dangling_tx_estimate: {
+          dr_dangling_tx_count: Number(drDanglingTxStat?.dangling_tx_count || 0),
+          dr_dangling_tx_sum: Number(drDanglingTxStat?.dangling_tx_sum || 0),
+          rr_dangling_tx_count: Number(rrDanglingTxStat?.dangling_tx_count || 0),
+          rr_dangling_tx_sum: Number(rrDanglingTxStat?.dangling_tx_sum || 0)
+        }
+      },
+      dr_duplicate_samples: drDupSamples.results || [],
+      rr_duplicate_samples: rrDupSamples.results || [],
+      user_violation_top50: userViolations.results || [],
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[REWARD_BATCH] ERROR action=scan-duplicate-dr-rr duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+})
+
 export default app
