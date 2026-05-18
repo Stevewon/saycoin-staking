@@ -42323,8 +42323,8 @@ app.get('/api/diag/scan-may18-full', async (c) => {
   if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
   const db = (c.env as any).DB as D1Database
 
-  // 5/18 KST date(created_at, '+9 hours') = '2026-05-18'
-  const KST_DATE = '2026-05-18'
+  // KST 날짜 — query param 'date' 로 override 가능 (기본 5/18)
+  const KST_DATE = c.req.query('date') || '2026-05-18'
 
   // 1. 5/18 KST 생성된 transactions 전체
   const txAll = await db.prepare(`
@@ -42335,23 +42335,23 @@ app.get('/api/diag/scan-may18-full', async (c) => {
     ORDER BY id ASC
   `).bind(KST_DATE).all()
 
-  // 2. DR rows with paid_date=2026-05-18 or reward_date=2026-05-18
+  // 2. DR rows with paid_date=KST_DATE or reward_date=KST_DATE
   const drRows = await db.prepare(`
     SELECT *,
            datetime(created_at, '+9 hours') as created_kst
     FROM daily_rewards
-    WHERE paid_date = '2026-05-18' OR reward_date = '2026-05-18'
+    WHERE paid_date = ? OR reward_date = ?
     ORDER BY id ASC
-  `).all()
+  `).bind(KST_DATE, KST_DATE).all()
 
-  // 3. RR rows with paid_date=2026-05-18 or reward_date=2026-05-18
+  // 3. RR rows with paid_date=KST_DATE or reward_date=KST_DATE
   const rrRows = await db.prepare(`
     SELECT *,
            datetime(created_at, '+9 hours') as created_kst
     FROM referral_rewards
-    WHERE paid_date = '2026-05-18' OR reward_date = '2026-05-18'
+    WHERE paid_date = ? OR reward_date = ?
     ORDER BY id ASC
-  `).all()
+  `).bind(KST_DATE, KST_DATE).all()
 
   // tx 분류: type, ref_id 매칭, description 마커
   const txByType: Record<string, { count: number, total: number, sample_ids: number[] }> = {}
