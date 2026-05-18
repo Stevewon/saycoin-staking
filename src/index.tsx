@@ -37948,4 +37948,83 @@ app.post('/api/diag/fix-missing-tx-from-dr-rr', async (c) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────
+// /api/diag/rollback-fix-missing-tx
+// 사장님 명령 (2026-05-18): 방금 fix-missing-tx-from-dr-rr 으로 INSERT 된 모든 tx 일괄 롤백
+//   - ref_id LIKE 'dr_%' (daily_qkey) 또는 ref_id LIKE 'rr_%' (referral_reward) tx 만 DELETE
+//   - 영향받은 사용자들의 잔고 재계산
+// DRY: POST /api/diag/rollback-fix-missing-tx?key=ADMIN_PW&dry_run=1
+// GO:  POST /api/diag/rollback-fix-missing-tx?key=ADMIN_PW&confirm=GO
+// ─────────────────────────────────────────────────────────────────
+app.post('/api/diag/rollback-fix-missing-tx', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') return c.json({ error: 'confirm=GO 또는 dry_run=1 필요' }, 400)
+
+    const db = c.env.DB
+
+    // 영향받은 user_id 미리 조회
+    const affected = await db.prepare(`
+      SELECT user_id, COUNT(*) AS cnt, SUM(amount) AS sum_amt
+      FROM transactions
+      WHERE (ref_id LIKE 'dr\\_%' ESCAPE '\\' OR ref_id LIKE 'rr\\_%' ESCAPE '\\')
+      GROUP BY user_id ORDER BY user_id
+    `).all<any>()
+    const items = (affected.results || []) as any[]
+    const totalCnt = items.reduce((s, x) => s + Number(x.cnt), 0)
+    const totalSum = items.reduce((s, x) => s + Number(x.sum_amt), 0)
+
+    if (dryRun) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        affected_users: items.length,
+        total_tx_to_delete: totalCnt,
+        total_qkey_to_remove: totalSum,
+        per_user: items
+      })
+    }
+
+    // DELETE
+    const del = await db.prepare(`
+      DELETE FROM transactions
+      WHERE (ref_id LIKE 'dr\\_%' ESCAPE '\\' OR ref_id LIKE 'rr\\_%' ESCAPE '\\')
+    `).run()
+    const deleted = del.meta?.changes || 0
+
+    // 영향받은 사용자들 잔고 재계산
+    const userChanges: any[] = []
+    for (const it of items) {
+      const uid = Number(it.user_id)
+      const before = await db.prepare(`SELECT email, name, qkey_balance FROM users WHERE id=?`).bind(uid).first<any>()
+      const sum = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS t FROM transactions WHERE user_id=? AND coin_type='QKEY'`).bind(uid).first<any>()
+      const newBal = Number(sum?.t || 0)
+      await db.prepare(`UPDATE users SET qkey_balance=? WHERE id=?`).bind(newBal, uid).run()
+      userChanges.push({
+        user_id: uid,
+        email: before?.email,
+        name: before?.name,
+        balance_before: Number(before?.qkey_balance || 0),
+        balance_after: newBal,
+        balance_diff: newBal - Number(before?.qkey_balance || 0)
+      })
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXECUTED',
+      tx_deleted: deleted,
+      qkey_removed_total: totalSum,
+      balance_updated: userChanges.length,
+      user_changes: userChanges
+    })
+  } catch (error) {
+    console.error('rollback-fix-missing-tx error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 export default app
