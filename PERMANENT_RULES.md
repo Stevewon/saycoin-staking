@@ -1,8 +1,37 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-18
+**최종 업데이트**: 2026-05-18 (★ 영구룰 #스테이킹별독립 추가)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
+
+---
+
+## ⭐ 영구룰 #스테이킹별독립 (MOST CRITICAL — 다른 영구룰의 전제)
+
+> **동일인이라도 스테이킹 금액이 같든 다르든, 같은 날짜든 다른 날짜든, 각 스테이킹은 완전히 별개로 취급한다.**
+
+### 정확한 의미
+- **스테이킹 = 정산 단위**
+- user 가 active staking 2개를 보유 중이면 → 매일 **dr 2건이 정상** (스테이킹별로 1건씩)
+- L1/L2 referral 도 마찬가지 — **referee 의 staking_id 별로 별개 row 가 정상**
+- L0 (direct_referral) 도 staking 별 별개 (이미 staking_id 로 식별됨)
+
+### 1건의 진짜 기준 (정정)
+| 지급 종류 | 1건의 기준 |
+|---|---|
+| 직접매출 10% 쿠키 (L0) | **(referrer_id, referee_id, staking_id)** — 기존과 동일 |
+| 본인 데일리 (daily_qkey) | **(user_id, staking_id, reward_date)** ← ★ staking_id 추가 |
+| L1 20% (referral_reward L=1) | **(referrer_id, referee_id, referee_staking_id, reward_date)** ← ★ |
+| L2 10% (referral_reward L=2) | **(referrer_id, referee_id, referee_staking_id, reward_date)** ← ★ |
+
+### 중복 vs 정상 판별
+- **정상**: 같은 (user_id, reward_date) 에 dr 여러 건 — 단, `distinct staking_id` 가 row 수와 같음
+- **중복**: 같은 (user_id, staking_id, reward_date) 에 dr 2건 이상 → 영구룰 위반
+
+**⚠️ 사장님 직접 인용 (2026-05-18)**:
+> "동일인 이라도 스테이킹 금액이 같던 틀리던 같은 날짜던 다른 날짜던 완전 별개로 취급하라니깐!!!!"
+
+**이 영구룰은 다른 모든 영구룰의 전제다. 다른 영구룰의 '1건 기준' 은 모두 이 룰에 따라 staking 별로 독립이다.**
 
 ---
 
@@ -47,8 +76,8 @@
 | **금액** | **`staking.amount × daily_rate × 150`** QKEY |
 | `daily_rewards.usdt_amount` | 위 금액 (legacy 컬럼명, 실제는 QKEY) |
 | `transactions.type` | `daily_qkey` |
-| **1건의 기준** | **`(user_id, reward_date)`** |
-| **하루 최대 건수** | **1건** (스테이킹 여러 개 있어도 합산되어 1건) |
+| **1건의 기준** | **`(user_id, staking_id, reward_date)`** ← ★ 영구룰 #스테이킹별독립 |
+| **하루 최대 건수** | **active staking 개수만큼** (스테이킹별 1건씩) |
 | 지급 시점 | 익일처리 (영구룰 #익일처리 참조) |
 
 ---
@@ -59,11 +88,11 @@
 |---|---|
 | 트리거 | cron 매일 실행 |
 | 수령자 | 직접 추천한 사람들이 있는 사용자 |
-| **금액** | **`SUM(직접추천인 모두의 그날 daily_qkey) × 0.20`** |
+| **금액** | **`referee 의 그날 그 staking 의 daily_qkey × 0.20`** (staking 별 독립 계산) |
 | `transactions.type` | `referral_reward` |
 | `referral_rewards.level` | **`1`** |
-| **1건의 기준** | **`(referrer_id, reward_date, level=1)`** |
-| **하루 최대 건수** | **1건** (모든 L1 하위 합산되어 1건) |
+| **1건의 기준** | **`(referrer_id, referee_id, referee_staking_id, reward_date, level=1)`** ← ★ 영구룰 #스테이킹별독립 |
+| **하루 최대 건수** | **referee 들의 active staking 총 개수만큼** (referee 의 staking 별 1건씩) |
 | 지급 시점 | 익일처리 |
 
 ---
@@ -74,11 +103,11 @@
 |---|---|
 | 트리거 | cron 매일 실행 |
 | 수령자 | L2 하위가 있는 사용자 (= 내가 추천한 사람이 추천한 사람) |
-| **금액** | **`SUM(L2회원들의 그날 daily_qkey) × 0.10`** |
+| **금액** | **`L2회원의 그날 그 staking 의 daily_qkey × 0.10`** (staking 별 독립 계산) |
 | `transactions.type` | `referral_reward` |
 | `referral_rewards.level` | **`2`** |
-| **1건의 기준** | **`(referrer_id, reward_date, level=2)`** |
-| **하루 최대 건수** | **1건** (모든 L2 하위 합산되어 1건) |
+| **1건의 기준** | **`(referrer_id, referee_id, referee_staking_id, reward_date, level=2)`** ← ★ 영구룰 #스테이킹별독립 |
+| **하루 최대 건수** | **L2 회원들의 active staking 총 개수만큼** |
 | 지급 시점 | 익일처리 |
 
 ---
@@ -202,6 +231,7 @@ strftime('%Y-%m-%dT%H:%M:%S', created_at, '+9 hours')  -- KST ISO 8601 (Safari �
 | 일자 | 사고 | 원인 | 영구룰 |
 |---|---|---|---|
 | 2026-05-18 | fix-missing-tx 중복 INSERT 560건 / 1,759,845 QKEY | EXISTS-loop + ref_id 가드 완화 | #중복지급금지 |
+| 2026-05-18 | scan-duplicate-dr-rr v1/v2 오진단 (484건 → 위반 분류 오류) | (user_id, reward_date) 기준으로 그룹화하여 staking 별 정상 row 를 위반으로 오분류 | #스테이킹별독립 |
 | 이전 다수 | 클라이언트 inline JS SyntaxError | 백틱 안 이스케이프 시퀀스 깨짐 | (CRITICAL_RULES.md 참조) |
 
 ---

@@ -39036,4 +39036,280 @@ app.get('/api/diag/scan-duplicate-dr-rr-v2', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/scan-duplicate-dr-rr-v3
+// ----------------------------------------------------------------
+// ★ 영구룰 #스테이킹별독립 (2026-05-18) 적용
+//
+// v2 의 치명적 오류 정정:
+//   - v2: (user_id, reward_date) 당 1건 으로 그룹핑 → multi_staking 정상 row 를 위반으로 오분류
+//   - v3: (user_id, staking_id, reward_date) 당 1건 → 스테이킹 별 독립 진단
+//
+// 진단 항목:
+//   - DR: (user_id, staking_id, reward_date) GROUP BY HAVING COUNT(*) > 1
+//   - RR L1: (referrer_id, referee_id, COALESCE(staking_id,-1), reward_date, level=1) GROUP BY HAVING COUNT(*) > 1
+//     ※ staking_id NULL (legacy 2026-05-13 이전) → -1 로 fallback. 단, NULL 이면 별도 reporting
+//   - RR L2: (referrer_id, referee_id, COALESCE(staking_id,-1), reward_date, level=2)
+//   - RR L0: (referrer_id, referee_id, COALESCE(staking_id,-1)) — staking 단위. 같은 staking 2번 ≠ 정상
+//
+// READ-ONLY. DB 변경 없음.
+// 사용: GET /api/diag/scan-duplicate-dr-rr-v3?key=ADMIN_PW
+// ============================================================
+app.get('/api/diag/scan-duplicate-dr-rr-v3', async (c) => {
+  const t0 = Date.now()
+  if (c.req.query('key') !== c.env.ADMIN_PW) return c.json({ error: 'forbidden' }, 403)
+  const db = c.env.DB
+
+  try {
+    console.log(`[REWARD_BATCH] start action=scan-duplicate-dr-rr-v3 mode=READ_ONLY permanent_rule=스테이킹별독립`)
+
+    // ────────────────────────────────────────────
+    // DR: daily_rewards. 1건의 기준 = (user_id, staking_id, reward_date)
+    //   - staking_id NULL 가능성 점검 (legacy daily_rewards 일부 NULL 일 수 있음)
+    //   - 진짜 위반 = 같은 (user_id, staking_id, reward_date) 에 2개 이상
+    // ────────────────────────────────────────────
+    const drStat = await db.prepare(`
+      WITH grp AS (
+        SELECT user_id, staking_id, reward_date, COUNT(*) AS cnt
+        FROM daily_rewards
+        GROUP BY user_id, staking_id, reward_date
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN 1 ELSE 0 END), 0) AS violating_groups,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt ELSE 0 END), 0) AS total_violating_rows,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0) AS excess_rows,
+        COUNT(DISTINCT CASE WHEN cnt > 1 THEN user_id END) AS distinct_users,
+        COALESCE(SUM(CASE WHEN staking_id IS NULL AND cnt > 1 THEN 1 ELSE 0 END), 0) AS null_staking_groups
+      FROM grp
+    `).first<{
+      violating_groups: number, total_violating_rows: number, excess_rows: number,
+      distinct_users: number, null_staking_groups: number
+    }>()
+
+    // DR 위반 샘플
+    const drSamples = await db.prepare(`
+      SELECT user_id, staking_id, reward_date,
+             COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id) AS all_ids,
+             GROUP_CONCAT(usdt_amount, '|') AS all_amounts,
+             GROUP_CONCAT(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours'), '|') AS all_created
+      FROM daily_rewards
+      GROUP BY user_id, staking_id, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY user_id, staking_id, reward_date
+      LIMIT 30
+    `).all<any>()
+
+    // DR 전체 정상성 진단 (다른 staking 다른 row 는 정상)
+    const drTotal = await db.prepare(`
+      SELECT
+        COUNT(*) AS total_rows,
+        COUNT(DISTINCT user_id || ':' || COALESCE(staking_id, 'NULL') || ':' || reward_date) AS distinct_user_staking_date,
+        COALESCE(SUM(CASE WHEN staking_id IS NULL THEN 1 ELSE 0 END), 0) AS null_staking_rows
+      FROM daily_rewards
+    `).first<any>()
+
+    // ────────────────────────────────────────────
+    // RR Level 1: (referrer_id, referee_id, COALESCE(staking_id,-1), reward_date, level=1)
+    // ────────────────────────────────────────────
+    const rrL1Stat = await db.prepare(`
+      WITH grp AS (
+        SELECT referrer_id, referee_id, COALESCE(staking_id, -1) AS sid, reward_date, COUNT(*) AS cnt,
+               SUM(CASE WHEN staking_id IS NULL THEN 1 ELSE 0 END) AS null_sid_rows
+        FROM referral_rewards
+        WHERE level = 1
+        GROUP BY referrer_id, referee_id, COALESCE(staking_id, -1), reward_date
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN 1 ELSE 0 END), 0) AS violating_groups,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt ELSE 0 END), 0) AS total_violating_rows,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0) AS excess_rows,
+        COUNT(DISTINCT CASE WHEN cnt > 1 THEN referrer_id END) AS distinct_users,
+        COALESCE(SUM(CASE WHEN cnt > 1 AND null_sid_rows = cnt THEN 1 ELSE 0 END), 0) AS legacy_null_staking_groups
+      FROM grp
+    `).first<any>()
+
+    const rrL1Samples = await db.prepare(`
+      SELECT referrer_id, referee_id,
+             staking_id,
+             reward_date,
+             COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id) AS all_ids,
+             GROUP_CONCAT(reward_amount, '|') AS all_amounts,
+             GROUP_CONCAT(original_amount, '|') AS all_originals,
+             GROUP_CONCAT(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours'), '|') AS all_created
+      FROM referral_rewards
+      WHERE level = 1
+      GROUP BY referrer_id, referee_id, COALESCE(staking_id, -1), reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, referrer_id, reward_date
+      LIMIT 30
+    `).all<any>()
+
+    // ────────────────────────────────────────────
+    // RR Level 2
+    // ────────────────────────────────────────────
+    const rrL2Stat = await db.prepare(`
+      WITH grp AS (
+        SELECT referrer_id, referee_id, COALESCE(staking_id, -1) AS sid, reward_date, COUNT(*) AS cnt,
+               SUM(CASE WHEN staking_id IS NULL THEN 1 ELSE 0 END) AS null_sid_rows
+        FROM referral_rewards
+        WHERE level = 2
+        GROUP BY referrer_id, referee_id, COALESCE(staking_id, -1), reward_date
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN 1 ELSE 0 END), 0) AS violating_groups,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt ELSE 0 END), 0) AS total_violating_rows,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0) AS excess_rows,
+        COUNT(DISTINCT CASE WHEN cnt > 1 THEN referrer_id END) AS distinct_users,
+        COALESCE(SUM(CASE WHEN cnt > 1 AND null_sid_rows = cnt THEN 1 ELSE 0 END), 0) AS legacy_null_staking_groups
+      FROM grp
+    `).first<any>()
+
+    const rrL2Samples = await db.prepare(`
+      SELECT referrer_id, referee_id,
+             staking_id,
+             reward_date,
+             COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id) AS all_ids,
+             GROUP_CONCAT(reward_amount, '|') AS all_amounts,
+             GROUP_CONCAT(original_amount, '|') AS all_originals,
+             GROUP_CONCAT(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours'), '|') AS all_created
+      FROM referral_rewards
+      WHERE level = 2
+      GROUP BY referrer_id, referee_id, COALESCE(staking_id, -1), reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, referrer_id, reward_date
+      LIMIT 30
+    `).all<any>()
+
+    // ────────────────────────────────────────────
+    // RR Level 0 (direct_referral): (referrer_id, referee_id, COALESCE(staking_id,-1)) — staking 별
+    //   - 정책: 1 staking 승인 = 1건. staking 같으면 중복.
+    //   - reward_date 와 무관 (1 staking = 1번만 직접추천 지급)
+    // ────────────────────────────────────────────
+    const rrL0Stat = await db.prepare(`
+      WITH grp AS (
+        SELECT referrer_id, referee_id, COALESCE(staking_id, -1) AS sid, COUNT(*) AS cnt,
+               SUM(CASE WHEN staking_id IS NULL THEN 1 ELSE 0 END) AS null_sid_rows
+        FROM referral_rewards
+        WHERE level = 0
+        GROUP BY referrer_id, referee_id, COALESCE(staking_id, -1)
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN 1 ELSE 0 END), 0) AS violating_groups,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt ELSE 0 END), 0) AS total_violating_rows,
+        COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0) AS excess_rows,
+        COUNT(DISTINCT CASE WHEN cnt > 1 THEN referrer_id END) AS distinct_users,
+        COALESCE(SUM(CASE WHEN cnt > 1 AND null_sid_rows = cnt THEN 1 ELSE 0 END), 0) AS legacy_null_staking_groups
+      FROM grp
+    `).first<any>()
+
+    const rrL0Samples = await db.prepare(`
+      SELECT referrer_id, referee_id,
+             staking_id,
+             COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id) AS all_ids,
+             GROUP_CONCAT(reward_amount, '|') AS all_amounts,
+             GROUP_CONCAT(original_amount, '|') AS all_originals,
+             GROUP_CONCAT(reward_date, '|') AS all_dates,
+             GROUP_CONCAT(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours'), '|') AS all_created
+      FROM referral_rewards
+      WHERE level = 0
+      GROUP BY referrer_id, referee_id, COALESCE(staking_id, -1)
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, referrer_id
+      LIMIT 30
+    `).all<any>()
+
+    // RR 전체 정상성 진단
+    const rrTotal = await db.prepare(`
+      SELECT level,
+             COUNT(*) AS total_rows,
+             COALESCE(SUM(reward_amount), 0) AS total_amount,
+             COALESCE(SUM(CASE WHEN staking_id IS NULL THEN 1 ELSE 0 END), 0) AS null_staking_rows,
+             MIN(reward_date) AS min_date,
+             MAX(reward_date) AS max_date
+      FROM referral_rewards
+      GROUP BY level
+      ORDER BY level
+    `).all<any>()
+
+    const durMs = Date.now() - t0
+    console.log(`[REWARD_BATCH] done action=scan-duplicate-dr-rr-v3 duration_ms=${durMs}`)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      action: 'scan-duplicate-dr-rr-v3',
+      method: 'SET_BASED_BY_STAKING_ID',
+      permanent_rule: '#스테이킹별독립 (2026-05-18)',
+      no_per_row_exists: true,
+      rule_keys: {
+        daily_qkey: '(user_id, staking_id, reward_date) 당 1건',
+        referral_reward_L0: '(referrer_id, referee_id, staking_id) 당 1건 — staking 승인 1회 = 1건',
+        referral_reward_L1: '(referrer_id, referee_id, staking_id, reward_date, level=1) 당 1건',
+        referral_reward_L2: '(referrer_id, referee_id, staking_id, reward_date, level=2) 당 1건',
+        note_null_staking: 'staking_id NULL = 2026-05-13 migration 이전 legacy. COALESCE(staking_id,-1) 로 그룹핑 → NULL 끼리는 같은 그룹'
+      },
+      summary: {
+        daily_rewards: {
+          violating_groups: Number(drStat?.violating_groups || 0),
+          total_violating_rows: Number(drStat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(drStat?.excess_rows || 0),
+          distinct_users: Number(drStat?.distinct_users || 0),
+          null_staking_groups_in_violations: Number(drStat?.null_staking_groups || 0),
+          total_rows: Number(drTotal?.total_rows || 0),
+          distinct_user_staking_date: Number(drTotal?.distinct_user_staking_date || 0),
+          null_staking_rows_overall: Number(drTotal?.null_staking_rows || 0)
+        },
+        referral_rewards_level0: {
+          violating_groups: Number(rrL0Stat?.violating_groups || 0),
+          total_violating_rows: Number(rrL0Stat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(rrL0Stat?.excess_rows || 0),
+          distinct_users: Number(rrL0Stat?.distinct_users || 0),
+          legacy_null_staking_groups: Number(rrL0Stat?.legacy_null_staking_groups || 0)
+        },
+        referral_rewards_level1: {
+          violating_groups: Number(rrL1Stat?.violating_groups || 0),
+          total_violating_rows: Number(rrL1Stat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(rrL1Stat?.excess_rows || 0),
+          distinct_users: Number(rrL1Stat?.distinct_users || 0),
+          legacy_null_staking_groups: Number(rrL1Stat?.legacy_null_staking_groups || 0)
+        },
+        referral_rewards_level2: {
+          violating_groups: Number(rrL2Stat?.violating_groups || 0),
+          total_violating_rows: Number(rrL2Stat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(rrL2Stat?.excess_rows || 0),
+          distinct_users: Number(rrL2Stat?.distinct_users || 0),
+          legacy_null_staking_groups: Number(rrL2Stat?.legacy_null_staking_groups || 0)
+        },
+        rr_total_by_level: (rrTotal?.results || []).map((r: any) => ({
+          level: Number(r.level),
+          total_rows: Number(r.total_rows),
+          total_amount: Number(r.total_amount),
+          null_staking_rows: Number(r.null_staking_rows),
+          min_date: r.min_date,
+          max_date: r.max_date
+        }))
+      },
+      samples: {
+        dr_duplicates: (drSamples?.results || []),
+        rr_level0_violations: (rrL0Samples?.results || []),
+        rr_level1_violations: (rrL1Samples?.results || []),
+        rr_level2_violations: (rrL2Samples?.results || [])
+      },
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[REWARD_BATCH] ERROR action=scan-duplicate-dr-rr-v3 duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+})
+
 export default app
