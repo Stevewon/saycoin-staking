@@ -46377,6 +46377,150 @@ app.get('/api/diag/balance-vs-tx-audit', async (c) => {
   }
 })
 
+// balance-sync-to-tx: positive_diff 사용자 balance := tx_sum 강제 동기화
+// 영구룰: balance UPDATE 만, tx INSERT 없음 (중복지급금지)
+// 음수 diff (balance < tx_sum) 사용자는 제외 — 별도 처리
+//   GET /api/diag/balance-sync-to-tx?key=ADMIN_PW                   (DRY-RUN, default coin=QKEY)
+//   GET /api/diag/balance-sync-to-tx?key=ADMIN_PW&exec=true         (EXEC, default coin=QKEY)
+//   GET /api/diag/balance-sync-to-tx?key=ADMIN_PW&coin=QX&exec=true (다른 coin)
+app.get('/api/diag/balance-sync-to-tx', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const coin = (c.req.query('coin') || 'QKEY').toUpperCase()
+    const exec = (c.req.query('exec') || '').toLowerCase() === 'true'
+
+    let balanceCol = 'qkey_balance'
+    if (coin === 'QX') balanceCol = 'qx_balance'
+    else if (coin === 'QTA') balanceCol = 'qta_balance'
+    else if (coin === 'QKEY') balanceCol = 'qkey_balance'
+    else return c.json({ error: 'invalid coin (QKEY|QX|QTA)' }, 400)
+
+    const db = c.env.DB
+
+    // 1) 전 사용자 balance vs tx_sum 조회 (audit endpoint 와 동일)
+    const rows = await db.prepare(`
+      SELECT u.id, u.name, u.email,
+             u.${balanceCol} AS balance,
+             COALESCE((SELECT SUM(amount) FROM transactions
+                       WHERE user_id=u.id AND coin_type=?), 0) AS tx_sum
+      FROM users u
+      ORDER BY u.id ASC
+    `).bind(coin).all()
+
+    const all = (rows.results || []) as any[]
+
+    // 2) positive_diff 만 추출 (balance > tx_sum)
+    const targets: any[] = []
+    let skip_negative = 0
+    let skip_matched = 0
+    for (const r of all) {
+      const balance = Number(r.balance) || 0
+      const txSum = Number(r.tx_sum) || 0
+      const diff = balance - txSum
+      if (diff === 0) { skip_matched++; continue }
+      if (diff < 0) { skip_negative++; continue }
+      targets.push({
+        user_id: Number(r.id),
+        name: String(r.name || ''),
+        email: String(r.email || ''),
+        balance_before: balance,
+        tx_sum: txSum,
+        balance_after: txSum, // balance := tx_sum
+        diff_removed: diff,
+      })
+    }
+
+    // 3) DRY-RUN: 작업 계획만 반환
+    if (!exec) {
+      const totalRemoved = targets.reduce((s, t) => s + t.diff_removed, 0)
+      return c.json({
+        ok: true,
+        mode: 'DRY-RUN',
+        coin,
+        balance_col: balanceCol,
+        plan: {
+          users_total: all.length,
+          skip_matched,
+          skip_negative,
+          targets_count: targets.length,
+          total_balance_to_remove: totalRemoved,
+        },
+        targets,
+        note: 'EXEC 하려면 &exec=true 추가',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // 4) EXEC: balance UPDATE (batch)
+    const stmts: any[] = []
+    for (const t of targets) {
+      stmts.push(
+        db.prepare(`UPDATE users SET ${balanceCol} = ? WHERE id = ?`)
+          .bind(t.balance_after, t.user_id)
+      )
+    }
+    if (stmts.length > 0) {
+      await db.batch(stmts)
+    }
+
+    // 5) verify: 동일 쿼리로 재검증
+    const verifyRows = await db.prepare(`
+      SELECT u.id, u.name,
+             u.${balanceCol} AS balance,
+             COALESCE((SELECT SUM(amount) FROM transactions
+                       WHERE user_id=u.id AND coin_type=?), 0) AS tx_sum
+      FROM users u
+      ORDER BY u.id ASC
+    `).bind(coin).all()
+
+    const verifyAll = (verifyRows.results || []) as any[]
+    const verify_mismatched: any[] = []
+    let verify_positive = 0
+    let verify_negative = 0
+    for (const r of verifyAll) {
+      const diff = Number(r.balance) - Number(r.tx_sum)
+      if (diff !== 0) {
+        if (diff > 0) verify_positive++
+        else verify_negative++
+        verify_mismatched.push({
+          user_id: Number(r.id), name: String(r.name || ''),
+          balance: Number(r.balance), tx_sum: Number(r.tx_sum), diff
+        })
+      }
+    }
+
+    const totalRemoved = targets.reduce((s, t) => s + t.diff_removed, 0)
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      coin,
+      balance_col: balanceCol,
+      summary: {
+        users_updated: targets.length,
+        total_balance_removed: totalRemoved,
+        skip_matched,
+        skip_negative,
+      },
+      verify: {
+        users_total: verifyAll.length,
+        still_mismatched_count: verify_mismatched.length,
+        still_positive: verify_positive,
+        still_negative: verify_negative,
+        still_mismatched_list: verify_mismatched,
+      },
+      verdict: verify_positive === 0
+        ? '✅ positive_diff 완전 청산. 잔여 음수만 별도 처리 필요'
+        : '🚨 일부 positive_diff 잔존 (예상 외)',
+      targets,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 app.get('/api/diag/user-reward-audit', async (c) => {
   const t0 = Date.now()
   try {
