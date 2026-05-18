@@ -42061,15 +42061,19 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
     console.log(`[ROLLBACK_RB] start mode=${mode}`)
     const db = c.env.DB
 
+    // ── 마커 패턴 — query param 으로 받음 (기본: REVERSE_BACKFILL) ──
+    //   사장님 명령: [RECONCILE 도 같은 코드로 들어내기
+    const markerPattern = c.req.query('marker') || 'REVERSE_BACKFILL'
+    const likePattern = `%[${markerPattern}%`
+
     // ─── PHASE 1: 마커 tx 수집 ───
-    //   description LIKE '%[REVERSE_BACKFILL%' 모든 tx
     const txMarkerRaw = await db.prepare(`
       SELECT id, user_id, type, amount, description, ref_id,
              datetime(created_at, '+9 hours') AS created_kst
       FROM transactions
-      WHERE description LIKE '%[REVERSE_BACKFILL%'
+      WHERE description LIKE ?
       ORDER BY id ASC
-    `).all()
+    `).bind(likePattern).all()
     const txMarkerList = (txMarkerRaw.results || []) as any[]
 
     if (txMarkerList.length === 0) {
@@ -42077,7 +42081,8 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
         ok: true,
         mode,
         action: 'rollback-reverse-backfill-marker',
-        message: '[REVERSE_BACKFILL] 마커 tx 0건 — 롤백할 것 없음',
+        marker_pattern: markerPattern,
+        message: `[${markerPattern}] 마커 tx 0건 — 롤백할 것 없음`,
         duration_ms: Date.now() - t0,
       })
     }
