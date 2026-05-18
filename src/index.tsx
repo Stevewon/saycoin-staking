@@ -47734,6 +47734,105 @@ app.get('/api/diag/balance-force-sync-all', async (c) => {
   }
 })
 
+// ============================================================================
+// dup-prevention-precheck: UNIQUE INDEX 적용 사전 검증
+// 영구룰 #중복지급금지 영구 차단을 위한 DB-level UNIQUE INDEX 적용 가능 여부 진단
+// 검사:
+//   1) ref_id NULL 인 daily_qkey / referral_reward tx 개수
+//   2) (user_id, type, ref_id) 기준 중복 행 존재 여부 (NULL ref_id 제외)
+//   3) coin_type 대소문자 분포 (소문자 'qkey' 잔여 확인)
+// 사용: GET /api/diag/dup-prevention-precheck?key=ADMIN_PW
+// ============================================================================
+app.get('/api/diag/dup-prevention-precheck', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+  const t0 = Date.now()
+  try {
+    // 1) ref_id NULL 분포
+    const nullRef = await db.prepare(`
+      SELECT type,
+             COUNT(*) AS total_cnt,
+             SUM(CASE WHEN ref_id IS NULL THEN 1 ELSE 0 END) AS null_ref_cnt,
+             SUM(CASE WHEN ref_id IS NULL THEN 0 ELSE 1 END) AS with_ref_cnt
+      FROM transactions
+      WHERE type IN ('daily_qkey','referral_reward')
+      GROUP BY type
+    `).all()
+
+    // 2) (user_id, type, ref_id) 중복 (NULL 제외)
+    const dups = await db.prepare(`
+      SELECT user_id, type, ref_id, COUNT(*) AS dup_cnt
+      FROM transactions
+      WHERE type IN ('daily_qkey','referral_reward')
+        AND ref_id IS NOT NULL
+      GROUP BY user_id, type, ref_id
+      HAVING COUNT(*) > 1
+      ORDER BY dup_cnt DESC, user_id ASC
+      LIMIT 50
+    `).all()
+
+    // 3) coin_type 대소문자 분포
+    const coinCase = await db.prepare(`
+      SELECT coin_type, COUNT(*) AS cnt
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey'
+      GROUP BY coin_type
+      ORDER BY cnt DESC
+    `).all()
+
+    // 4) NULL ref_id 인 tx 상세 (어떤 description, 어떤 user, 어느 날짜)
+    const nullDetail = await db.prepare(`
+      SELECT type, COUNT(*) AS cnt,
+             MIN(datetime(created_at,'+9 hours')) AS first_kst,
+             MAX(datetime(created_at,'+9 hours')) AS last_kst,
+             COUNT(DISTINCT user_id) AS users,
+             COUNT(DISTINCT description) AS descs
+      FROM transactions
+      WHERE type IN ('daily_qkey','referral_reward')
+        AND ref_id IS NULL
+      GROUP BY type
+    `).all()
+
+    const nullRefRows = (nullRef.results || []) as any[]
+    const dupRows = (dups.results || []) as any[]
+    const coinRows = (coinCase.results || []) as any[]
+    const nullDetailRows = (nullDetail.results || []) as any[]
+
+    const totalNullRef = nullRefRows.reduce((s, r) => s + Number(r.null_ref_cnt || 0), 0)
+    const totalDupRows = dupRows.length
+    const totalDupExcess = dupRows.reduce((s, r) => s + (Number(r.dup_cnt) - 1), 0)
+    const hasLowercase = coinRows.some((r: any) => r.coin_type !== 'QKEY')
+
+    const canApplyUnique = totalDupRows === 0 // null_ref OK (UNIQUE INDEX with NULL doesn't conflict)
+    const verdict = canApplyUnique
+      ? (hasLowercase
+          ? '⚠️ UNIQUE 적용 가능, 단 coin_type 소문자 잔여 → 정리 권장'
+          : '✅ UNIQUE INDEX 즉시 적용 가능 (중복/소문자 모두 클린)')
+      : `🚨 중복 행 ${totalDupRows}개 (excess: ${totalDupExcess}) → 정리 후 재시도 필요`
+
+    return c.json({
+      ok: true,
+      kst_now: new Date(Date.now() + 9 * 3600 * 1000).toISOString(),
+      summary: {
+        total_null_ref: totalNullRef,
+        total_dup_groups: totalDupRows,
+        total_dup_excess: totalDupExcess,
+        has_lowercase_coin_type: hasLowercase,
+        can_apply_unique_index: canApplyUnique,
+      },
+      verdict,
+      ref_id_distribution: nullRefRows,
+      null_ref_detail: nullDetailRows,
+      coin_type_case: coinRows,
+      duplicates_top50: dupRows,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 // fix-duplicate-qkey-tx-v2: 전수 QKEY 보상 중복 제거 (대소문자 무시, 일일배당 + 추천보상)
 // 영구룰 #중복지급금지 위반 tx 제거
 // 알고리즘:
