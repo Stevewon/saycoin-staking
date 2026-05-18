@@ -46288,6 +46288,95 @@ app.post('/api/diag/recalc-may-seven', async (c) => {
   return diagRecalcMaySeven(c, 'EXEC')
 })
 
+// ============================================================================
+// balance-vs-tx-audit: 전수 사용자의 qkey_balance vs tx 합계 정합 검사 (READ-ONLY)
+//
+//   사장님 명령 (2026-05-18 / 정인숙 사고):
+//     "6750 있어야 하는데 7500 있음. 합산 잔액을 전수 검사해서 보고하라"
+//
+//   영구룰 #지급항목 4종:
+//     - daily_qkey, referral_reward, direct_referral, 관리자 조정 (admin_adjust)
+//     - 영구룰 합산: balance = SUM(all QKEY tx)
+//   이 안 맞으면 → 영구룰 #중복지급금지 또는 ghost balance 사고
+//
+//   엔드포인트:
+//     GET /api/diag/balance-vs-tx-audit?key=ADMIN_PW
+//     GET /api/diag/balance-vs-tx-audit?key=ADMIN_PW&coin=QKEY (default QKEY)
+// ============================================================================
+app.get('/api/diag/balance-vs-tx-audit', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const coin = (c.req.query('coin') || 'QKEY').toUpperCase()
+    const balanceCol = coin === 'QKEY' ? 'qkey_balance' : coin === 'QX' ? 'qx_balance' : coin === 'QTA' ? 'qta_balance' : ''
+    if (!balanceCol) return c.json({ error: 'coin=QKEY|QX|QTA' }, 400)
+    const db = c.env.DB
+
+    // 모든 사용자 + tx 합계 (coin 별)
+    const rows = await db.prepare(`
+      SELECT u.id, u.name, u.email,
+             u.${balanceCol} AS balance,
+             COALESCE((SELECT SUM(amount) FROM transactions
+                       WHERE user_id=u.id AND coin_type=?), 0) AS tx_sum,
+             COALESCE((SELECT COUNT(*) FROM transactions
+                       WHERE user_id=u.id AND coin_type=?), 0) AS tx_count
+      FROM users u
+      ORDER BY u.id ASC
+    `).bind(coin, coin).all()
+    const userList = (rows.results || []) as any[]
+
+    const matched: any[] = []
+    const mismatched: any[] = []
+    let totalBalance = 0, totalTxSum = 0
+
+    for (const u of userList) {
+      const bal = Number(u.balance || 0)
+      const txSum = Number(u.tx_sum || 0)
+      const diff = bal - txSum
+      totalBalance += bal
+      totalTxSum += txSum
+      const row = {
+        user_id: Number(u.id), name: u.name, email: u.email,
+        balance: bal, tx_sum: txSum, tx_count: Number(u.tx_count || 0), diff,
+      }
+      if (diff === 0) matched.push(row)
+      else mismatched.push(row)
+    }
+
+    // 차이 큰 순으로 정렬
+    mismatched.sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff))
+
+    // 차이 합계
+    const totalDiff = totalBalance - totalTxSum
+    const positiveDiff = mismatched.filter(r => r.diff > 0)  // balance > tx_sum (ghost 양수)
+    const negativeDiff = mismatched.filter(r => r.diff < 0)  // balance < tx_sum (지급 손실)
+
+    return c.json({
+      ok: true,
+      action: 'balance-vs-tx-audit',
+      coin,
+      stats: {
+        users_total: userList.length,
+        matched: matched.length,
+        mismatched: mismatched.length,
+        total_balance: totalBalance,
+        total_tx_sum: totalTxSum,
+        total_diff: totalDiff,
+        positive_diff_users: positiveDiff.length,
+        positive_diff_total: positiveDiff.reduce((s, r) => s + r.diff, 0),
+        negative_diff_users: negativeDiff.length,
+        negative_diff_total: negativeDiff.reduce((s, r) => s + r.diff, 0),
+      },
+      verdict: mismatched.length === 0 ? '✅ 전 사용자 balance ↔ tx 정합' : '🚨 정합 깨진 사용자 발견',
+      mismatched_all: mismatched,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 app.get('/api/diag/user-reward-audit', async (c) => {
   const t0 = Date.now()
   try {
