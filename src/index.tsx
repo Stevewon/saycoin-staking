@@ -41215,4 +41215,186 @@ app.post('/api/diag/insert-may15-dividend', async (c) => {
   return diagInsertMay15Dividend(c, 'EXEC')
 })
 
+// ============================================================================
+// scan-user-may15-dividend: 특정 사용자의 5/15 배당 예상치 상세 조회
+//   READ-ONLY scan — DB 변경 0
+//   ?user=44 (또는 ?email=...)
+// ============================================================================
+app.get('/api/diag/scan-user-may15-dividend', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const userQ = c.req.query('user') || ''
+    const emailQ = c.req.query('email') || ''
+    if (!userQ && !emailQ) return c.json({ error: 'user=ID 또는 email=... 필요' }, 400)
+
+    const db = c.env.DB
+    const REWARD_DATE = '2026-05-15'
+    const PAID_DATE = '2026-05-18'
+    const USD_TO_QKEY = 150
+
+    // ─── 사용자 찾기 ───
+    let userRow: any
+    if (userQ) {
+      userRow = await db.prepare(`SELECT id, name, email, referrer_id FROM users WHERE id = ?`).bind(userQ).first()
+    } else {
+      userRow = await db.prepare(`SELECT id, name, email, referrer_id FROM users WHERE email = ?`).bind(emailQ).first()
+    }
+    if (!userRow) return c.json({ error: 'user not found' }, 404)
+    const uid = Number(userRow.id)
+
+    // ─── 1. 본인 5/15 active staking ───
+    const ownStakings = await db.prepare(`
+      SELECT id, amount, daily_rate, period_days, period_months,
+             date(start_date,'+9 hours') AS start_kst,
+             date(end_date,'+9 hours') AS end_kst, status
+      FROM staking
+      WHERE user_id = ? AND status = 'active'
+        AND date(start_date,'+9 hours') <= date(?)
+        AND date(end_date,'+9 hours') >= date(?)
+      ORDER BY id
+    `).bind(uid, REWARD_DATE, REWARD_DATE).all()
+    const myStakings = (ownStakings.results || []) as any[]
+
+    let ownDailyTotal = 0
+    const ownBreakdown = myStakings.map((s: any) => {
+      const amt = Number(s.amount) || 0
+      const rate = Number(s.daily_rate) || 0
+      const qkey = Math.round(amt * rate * USD_TO_QKEY)
+      ownDailyTotal += qkey
+      return {
+        staking_id: s.id, amount: amt, daily_rate: rate,
+        formula: `${amt} × ${rate} × ${USD_TO_QKEY} = ${qkey}`,
+        qkey_amount: qkey,
+      }
+    })
+
+    // ─── 2. L1 (내가 직접 추천한 사람들의 5/15 own_daily × 20%) ───
+    //    referee 의 5/15 active staking 각각에 대해 별개 1건
+    const l1Referees = await db.prepare(`
+      SELECT id, name, email FROM users WHERE referrer_id = ?
+    `).bind(uid).all()
+    const l1RefList = (l1Referees.results || []) as any[]
+
+    let l1Total = 0
+    const l1Breakdown: any[] = []
+    for (const ref of l1RefList) {
+      const refStakings = await db.prepare(`
+        SELECT id, amount, daily_rate FROM staking
+        WHERE user_id = ? AND status = 'active'
+          AND date(start_date,'+9 hours') <= date(?)
+          AND date(end_date,'+9 hours') >= date(?)
+      `).bind(ref.id, REWARD_DATE, REWARD_DATE).all()
+      for (const s of (refStakings.results || []) as any[]) {
+        const refOwn = Math.round(Number(s.amount) * Number(s.daily_rate) * USD_TO_QKEY)
+        const l1Reward = Math.round(refOwn * 0.20)
+        l1Total += l1Reward
+        l1Breakdown.push({
+          referee_id: ref.id, referee_name: ref.name, referee_email: ref.email,
+          referee_staking_id: s.id, referee_amount: Number(s.amount),
+          referee_own_qkey: refOwn,
+          l1_reward: l1Reward,
+          formula: `${refOwn} × 0.20 = ${l1Reward}`,
+        })
+      }
+    }
+
+    // ─── 3. L2 (내 추천인의 추천인들의 5/15 own_daily × 10%) ───
+    //    L1 referees 각자의 referees 의 5/15 staking 각각
+    let l2Total = 0
+    const l2Breakdown: any[] = []
+    for (const l1Ref of l1RefList) {
+      const l2Refs = await db.prepare(`
+        SELECT id, name, email FROM users WHERE referrer_id = ?
+      `).bind(l1Ref.id).all()
+      for (const l2Ref of (l2Refs.results || []) as any[]) {
+        const l2RefStakings = await db.prepare(`
+          SELECT id, amount, daily_rate FROM staking
+          WHERE user_id = ? AND status = 'active'
+            AND date(start_date,'+9 hours') <= date(?)
+            AND date(end_date,'+9 hours') >= date(?)
+        `).bind(l2Ref.id, REWARD_DATE, REWARD_DATE).all()
+        for (const s of (l2RefStakings.results || []) as any[]) {
+          const l2RefOwn = Math.round(Number(s.amount) * Number(s.daily_rate) * USD_TO_QKEY)
+          const l2Reward = Math.round(l2RefOwn * 0.10)
+          l2Total += l2Reward
+          l2Breakdown.push({
+            l1_referee_id: l1Ref.id,
+            l2_referee_id: l2Ref.id, l2_referee_name: l2Ref.name, l2_referee_email: l2Ref.email,
+            referee_staking_id: s.id, referee_amount: Number(s.amount),
+            referee_own_qkey: l2RefOwn,
+            l2_reward: l2Reward,
+            formula: `${l2RefOwn} × 0.10 = ${l2Reward}`,
+          })
+        }
+      }
+    }
+
+    // ─── 4. 200% Cap 정보 ───
+    const stakeTotalRow = await db.prepare(`
+      SELECT COALESCE(SUM(amount),0) AS total FROM staking
+      WHERE user_id = ? AND status IN ('active','completed','capped')
+    `).bind(uid).first() as any
+    const paidTotalRow = await db.prepare(`
+      SELECT COALESCE(SUM(amount),0) AS total FROM transactions
+      WHERE user_id = ? AND coin_type = 'QKEY' AND type IN ('daily_qkey','referral_reward')
+    `).bind(uid).first() as any
+    const stakeTotal = Number(stakeTotalRow?.total || 0)
+    const paidTotal = Number(paidTotalRow?.total || 0)
+    const target = stakeTotal * 2 * USD_TO_QKEY
+    const remaining = Math.max(0, target - paidTotal)
+    const grossExpected = ownDailyTotal + l1Total + l2Total
+    const actualAfterCap = Math.min(grossExpected, remaining)
+    const capWillTrigger = grossExpected > remaining
+
+    return c.json({
+      ok: true,
+      action: 'scan-user-may15-dividend',
+      reward_date: REWARD_DATE,
+      paid_date: PAID_DATE,
+      user: {
+        id: uid, name: userRow.name, email: userRow.email,
+        referrer_id: userRow.referrer_id,
+      },
+      breakdown: {
+        own_daily: {
+          stakings_count: myStakings.length,
+          total_qkey: ownDailyTotal,
+          per_staking: ownBreakdown,
+        },
+        l1_20pct: {
+          referees_count: l1RefList.length,
+          rewards_count: l1Breakdown.length,
+          total_qkey: l1Total,
+          per_reward: l1Breakdown,
+        },
+        l2_10pct: {
+          rewards_count: l2Breakdown.length,
+          total_qkey: l2Total,
+          per_reward: l2Breakdown,
+        },
+      },
+      summary: {
+        own_daily_total: ownDailyTotal,
+        l1_total: l1Total,
+        l2_total: l2Total,
+        gross_expected_qkey: grossExpected,
+        cap_info: {
+          stake_total_usd: stakeTotal,
+          target_qkey_200pct: target,
+          paid_total_qkey_so_far: paidTotal,
+          remaining_qkey: remaining,
+          cap_will_trigger: capWillTrigger,
+        },
+        actual_expected_after_cap: actualAfterCap,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 export default app
