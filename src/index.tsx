@@ -40325,4 +40325,310 @@ app.get('/api/diag/scan-paid-date-distribution', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/shift-reward-dates-minus-1d
+// ----------------------------------------------------------------
+// ★ 사장님 명령 (2026-05-18):
+//   "15일은 14일꺼, 14일은 13일치, 하나씩 줄이면 된다."
+//   현재 모든 reward_date 가 +1일 잘못 라벨링됨.
+//   set-based UPDATE 로 -1일 시프트:
+//     UPDATE daily_rewards    SET reward_date = date(reward_date, '-1 day')
+//     UPDATE referral_rewards SET reward_date = date(reward_date, '-1 day')
+//
+// 영구룰 #중복지급금지:
+//   - 금액 변동 0 (잔고 미변경)
+//   - INSERT/DELETE 0 (UPDATE only)
+//   - paid_date 미변경 (이미 정확함)
+//   - transactions 미변경 (ref_id 그대로)
+//   - set-based 2 statements + db.batch
+//   - DRY-RUN/EXEC 분리
+//   - 사전: 가장 오래된 reward_date 의 -1일 자리가 비어있는지 확인
+//   - 사후: 전체 row count 일치 + 5/15 자리 비어있는지 검증
+//
+// 사용:
+//   GET  /api/diag/shift-reward-dates-minus-1d?key=ADMIN_PW              → DRY_RUN
+//   POST /api/diag/shift-reward-dates-minus-1d?key=ADMIN_PW&confirm=GO   → EXEC
+// ============================================================
+async function diagShiftRewardDates(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  const db = c.env.DB
+
+  try {
+    console.log(`[DIVIDEND_BACKPAY] start shift-reward-dates-minus-1d mode=${mode}`)
+
+    // ─── PRE-CHECK 1: 시프트 전 전체 분포 ───
+    const drTotalBefore = await db.prepare(`
+      SELECT COUNT(*) AS cnt,
+             COALESCE(SUM(usdt_amount),0) AS total_amount,
+             MIN(reward_date) AS min_date,
+             MAX(reward_date) AS max_date,
+             COUNT(DISTINCT reward_date) AS distinct_dates
+      FROM daily_rewards
+    `).first<any>()
+
+    const rrTotalBefore = await db.prepare(`
+      SELECT COUNT(*) AS cnt,
+             COALESCE(SUM(reward_amount),0) AS total_amount,
+             MIN(reward_date) AS min_date,
+             MAX(reward_date) AS max_date,
+             COUNT(DISTINCT reward_date) AS distinct_dates
+      FROM referral_rewards
+    `).first<any>()
+
+    // ─── PRE-CHECK 2: 시프트 후 자리 (가장 오래된 reward_date 의 -1일) 가 비어있는지 ───
+    //   set-based UPDATE 이라 전체가 동시에 -1되어 충돌 없음. 단 가장 오래된 시작점 검증.
+    const drMinShift = await db.prepare(`
+      SELECT date(MIN(reward_date), '-1 day') AS new_min_date,
+             (SELECT COUNT(*) FROM daily_rewards WHERE reward_date = date((SELECT MIN(reward_date) FROM daily_rewards), '-1 day')) AS rows_already_there
+      FROM daily_rewards
+    `).first<any>()
+
+    const rrMinShift = await db.prepare(`
+      SELECT date(MIN(reward_date), '-1 day') AS new_min_date,
+             (SELECT COUNT(*) FROM referral_rewards WHERE reward_date = date((SELECT MIN(reward_date) FROM referral_rewards), '-1 day')) AS rows_already_there
+      FROM referral_rewards
+    `).first<any>()
+
+    // ─── PRE-CHECK 3: 시프트 후 5/15 자리가 정확히 비게 되는지 확인 ───
+    //   현재 5/15 reward_date 의 row 갯수가 시프트 후 5/14 자리로 이동
+    //   현재 5/16 reward_date 가 0건이어야 시프트 후 5/15 가 비게 됨
+    const dr_5_16_before = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = '2026-05-16'`).first<any>()
+    const rr_5_16_before = await db.prepare(`SELECT COUNT(*) AS cnt FROM referral_rewards WHERE reward_date = '2026-05-16'`).first<any>()
+    const dr_5_15_before = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = '2026-05-15'`).first<any>()
+
+    // ─── PRE-CHECK 4: 영구룰 #익일처리 검증 시뮬레이션 (시프트 후 reward_date vs 현재 paid_date) ───
+    //   시프트 후 reward_date+1일 (또는 +다음영업일) 이 paid_date 와 일치해야 정상
+    const businessDayCheck = await db.prepare(`
+      WITH simulated AS (
+        SELECT date(reward_date, '-1 day') AS new_reward_date,
+               reward_date AS old_reward_date,
+               paid_date,
+               COUNT(*) AS cnt,
+               COALESCE(SUM(usdt_amount), 0) AS amt
+        FROM daily_rewards
+        WHERE paid_date IS NOT NULL
+        GROUP BY date(reward_date, '-1 day'), reward_date, paid_date
+      )
+      SELECT new_reward_date, old_reward_date, paid_date, cnt, amt,
+             CASE
+               WHEN paid_date = date(new_reward_date, '+1 day') THEN 'NEXT_DAY_OK'
+               WHEN paid_date > date(new_reward_date, '+1 day') THEN 'HOLIDAY_SKIP_OK_OR_DELAYED'
+               ELSE 'MISMATCH'
+             END AS status
+      FROM simulated
+      ORDER BY new_reward_date
+    `).all<any>()
+
+    // ─── PRE-CHECK 5: 16/17/18 잔재 절대 없음 재확인 ───
+    const wrongDates = await db.prepare(`
+      SELECT reward_date, COUNT(*) AS cnt FROM daily_rewards
+      WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      GROUP BY reward_date
+    `).all<any>()
+
+    const drCntBefore = Number(drTotalBefore?.cnt || 0)
+    const rrCntBefore = Number(rrTotalBefore?.cnt || 0)
+    const drMinSafe = Number(drMinShift?.rows_already_there || 0) === 0
+    const rrMinSafe = Number(rrMinShift?.rows_already_there || 0) === 0
+    const _16_clean = Number(dr_5_16_before?.cnt || 0) === 0 && Number(rr_5_16_before?.cnt || 0) === 0
+    const preCheckPassed = drMinSafe && rrMinSafe && _16_clean && (wrongDates?.results || []).length === 0
+
+    const baseReport = {
+      mode,
+      action: 'shift-reward-dates-minus-1d',
+      shift_rule: 'reward_date → date(reward_date, "-1 day") [set-based, 모든 row 동시 시프트]',
+      preserves: ['paid_date', 'usdt_amount/reward_amount', 'user_id', 'staking_id', 'transactions', 'qkey_balance'],
+      before: {
+        dr: {
+          rows: drCntBefore,
+          total_amount: Number(drTotalBefore?.total_amount || 0),
+          date_range: { min: drTotalBefore?.min_date, max: drTotalBefore?.max_date },
+          distinct_dates: Number(drTotalBefore?.distinct_dates || 0)
+        },
+        rr: {
+          rows: rrCntBefore,
+          total_amount: Number(rrTotalBefore?.total_amount || 0),
+          date_range: { min: rrTotalBefore?.min_date, max: rrTotalBefore?.max_date },
+          distinct_dates: Number(rrTotalBefore?.distinct_dates || 0)
+        }
+      },
+      shift_simulation_after: {
+        dr: {
+          new_min_date: drMinShift?.new_min_date,
+          new_max_date: '2026-05-14',  // 현재 max 2026-05-15 → 시프트 후 2026-05-14
+          empty_slot_for_new_dividend: '2026-05-15 (이후 새 15일 배당 INSERT 자리)'
+        },
+        rr: {
+          new_min_date: rrMinShift?.new_min_date,
+          new_max_date: '2026-05-14'
+        }
+      },
+      pre_check: {
+        passed: preCheckPassed,
+        dr_min_shift_target_empty: drMinSafe,
+        dr_new_min_date: drMinShift?.new_min_date,
+        dr_rows_already_at_new_min: Number(drMinShift?.rows_already_there || 0),
+        rr_min_shift_target_empty: rrMinSafe,
+        rr_new_min_date: rrMinShift?.new_min_date,
+        rr_rows_already_at_new_min: Number(rrMinShift?.rows_already_there || 0),
+        date_5_16_clean: _16_clean,
+        dr_5_16: Number(dr_5_16_before?.cnt || 0),
+        rr_5_16: Number(rr_5_16_before?.cnt || 0),
+        dr_5_15_will_become_5_14: Number(dr_5_15_before?.cnt || 0),
+        wrong_dates_residue: (wrongDates?.results || []).map((w: any) => ({
+          reward_date: w.reward_date,
+          rows: Number(w.cnt)
+        })),
+        note: preCheckPassed
+          ? '✅ 모든 사전 검증 통과 — 시프트 안전'
+          : '🚫 사전 검증 실패 — STOP'
+      },
+      business_day_simulation_top20: (businessDayCheck?.results || []).slice(0, 25).map((r: any) => ({
+        new_reward_date: r.new_reward_date,
+        old_reward_date: r.old_reward_date,
+        paid_date: r.paid_date,
+        rows: Number(r.cnt),
+        amount: Number(r.amt),
+        status: r.status
+      }))
+    }
+
+    if (mode === 'DRY_RUN') {
+      const durMs = Date.now() - t0
+      console.log(`[DIVIDEND_BACKPAY] DRY_RUN done duration_ms=${durMs} pre_check_passed=${preCheckPassed}`)
+      return c.json({
+        ok: true,
+        ...baseReport,
+        will_execute: 'UPDATE 2 statements (DR + RR), set-based, db.batch',
+        next_action: preCheckPassed
+          ? 'POST + confirm=GO 보내시면 EXEC. 새 5/15 배당은 별도 STEP 2 에서 진행.'
+          : '🚫 사전 검증 실패 → 사장님 결정 필요',
+        duration_ms: durMs
+      })
+    }
+
+    // ─── EXEC ───
+    if (!preCheckPassed) {
+      const durMs = Date.now() - t0
+      console.error(`[DIVIDEND_BACKPAY] STOP — pre_check failed`)
+      return c.json({
+        ok: false,
+        stopped: true,
+        reason: '사전 검증 실패 — STOP per #중복지급금지',
+        ...baseReport,
+        duration_ms: durMs
+      }, 400)
+    }
+
+    // 안전 가드: row 수 이상치 검증
+    if (drCntBefore < 100 || drCntBefore > 1000) {
+      const durMs = Date.now() - t0
+      console.error(`[DIVIDEND_BACKPAY] STOP — DR row count out of expected range (got ${drCntBefore})`)
+      return c.json({
+        ok: false,
+        stopped: true,
+        reason: `DR row 수 이상치 (${drCntBefore}, 예상 ~466)`,
+        ...baseReport,
+        duration_ms: durMs
+      }, 400)
+    }
+    if (rrCntBefore < 100 || rrCntBefore > 1500) {
+      const durMs = Date.now() - t0
+      console.error(`[DIVIDEND_BACKPAY] STOP — RR row count out of expected range (got ${rrCntBefore})`)
+      return c.json({
+        ok: false,
+        stopped: true,
+        reason: `RR row 수 이상치 (${rrCntBefore})`,
+        ...baseReport,
+        duration_ms: durMs
+      }, 400)
+    }
+
+    // ─── SET-BASED UPDATE (db.batch) ───
+    console.log(`[DIVIDEND_BACKPAY] EXEC starting set-based UPDATE — dr=${drCntBefore} rr=${rrCntBefore}`)
+
+    const updateDr = db.prepare(`
+      UPDATE daily_rewards SET reward_date = date(reward_date, '-1 day')
+    `)
+
+    const updateRr = db.prepare(`
+      UPDATE referral_rewards SET reward_date = date(reward_date, '-1 day')
+    `)
+
+    const batchResults = await db.batch([updateDr, updateRr])
+    const drUpdated = Number((batchResults[0] as any)?.meta?.changes || 0)
+    const rrUpdated = Number((batchResults[1] as any)?.meta?.changes || 0)
+
+    console.log(`[DIVIDEND_BACKPAY] EXEC done dr_updated=${drUpdated} rr_updated=${rrUpdated}`)
+
+    // ─── POST-CHECK ───
+    const drAfter = await db.prepare(`
+      SELECT COUNT(*) AS cnt, MIN(reward_date) AS min_d, MAX(reward_date) AS max_d
+      FROM daily_rewards
+    `).first<any>()
+    const rrAfter = await db.prepare(`
+      SELECT COUNT(*) AS cnt, MIN(reward_date) AS min_d, MAX(reward_date) AS max_d
+      FROM referral_rewards
+    `).first<any>()
+    const dr_5_15_after = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = '2026-05-15'`).first<any>()
+    const dr_5_14_after = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = '2026-05-14'`).first<any>()
+
+    const drCountSame = Number(drAfter?.cnt || 0) === drCntBefore
+    const rrCountSame = Number(rrAfter?.cnt || 0) === rrCntBefore
+    const _5_15_empty = Number(dr_5_15_after?.cnt || 0) === 0
+    const _5_14_has_old_5_15 = Number(dr_5_14_after?.cnt || 0) === Number(dr_5_15_before?.cnt || 0)
+
+    const verified = drCountSame && rrCountSame && _5_15_empty && _5_14_has_old_5_15
+
+    const durMs = Date.now() - t0
+    console.log(`[DIVIDEND_BACKPAY] EXEC fully done duration_ms=${durMs} verified=${verified}`)
+
+    return c.json({
+      ok: true,
+      ...baseReport,
+      exec_result: {
+        dr_updated: drUpdated,
+        rr_updated: rrUpdated,
+        total_updated: drUpdated + rrUpdated
+      },
+      post_check: {
+        verified,
+        dr_count_preserved: drCountSame,
+        rr_count_preserved: rrCountSame,
+        dr_count_before: drCntBefore,
+        dr_count_after: Number(drAfter?.cnt || 0),
+        rr_count_before: rrCntBefore,
+        rr_count_after: Number(rrAfter?.cnt || 0),
+        dr_date_range_after: { min: drAfter?.min_d, max: drAfter?.max_d },
+        rr_date_range_after: { min: rrAfter?.min_d, max: rrAfter?.max_d },
+        '5_15_now_empty': _5_15_empty,
+        '5_15_remaining_rows': Number(dr_5_15_after?.cnt || 0),
+        '5_14_received_old_5_15': _5_14_has_old_5_15,
+        '5_14_rows_now': Number(dr_5_14_after?.cnt || 0),
+        '5_15_rows_before_shift': Number(dr_5_15_before?.cnt || 0)
+      },
+      next_step: '✅ STEP 1 완료. 이제 STEP 2 (새 5/15 배당 바텀업 INSERT, paid_date=2026-05-18) 진행 가능.',
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[DIVIDEND_BACKPAY] ERROR shift-reward-dates-minus-1d duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+}
+
+app.get('/api/diag/shift-reward-dates-minus-1d', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagShiftRewardDates(c, 'DRY_RUN')
+})
+
+app.post('/api/diag/shift-reward-dates-minus-1d', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 UPDATE 게이트)' }, 400)
+  return diagShiftRewardDates(c, 'EXEC')
+})
+
 export default app
