@@ -43851,6 +43851,19 @@ app.post('/api/diag/recalc-day-dividend', async (c) => {
   if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
   const confirm = c.req.query('confirm') || ''
   if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 변경 게이트)' }, 400)
+
+  // ★★★ 사장님 명령 (2026-05-18): 5/11 EXEC 만 허용. 다른날 절대 금지 ★★★
+  //   "다른날 지금 잘 먹히고 있는데 절대 건들면 안된다"
+  //   화이트리스트 가드 — 5/11 EXEC 완료 후 봉인 처리 예정
+  const ALLOWED_DIVIDEND_DATES = ['2026-05-11']
+  const reqDividend = c.req.query('dividendDate') || ''
+  if (!ALLOWED_DIVIDEND_DATES.includes(reqDividend)) {
+    return c.json({
+      error: 'EXEC 차단됨 — 다른날 절대 금지 (사장님 영구 명령)',
+      detail: `dividendDate=${reqDividend} 는 화이트리스트에 없음. 허용 목록: ${ALLOWED_DIVIDEND_DATES.join(', ')}`,
+      hint: '다른 reward_date 는 정규 cron 으로 이미 정합 상태. 어드민 recalc 절대 금지.',
+    }, 403)
+  }
   return diagRecalcDayDividend(c, 'EXEC')
 })
 
