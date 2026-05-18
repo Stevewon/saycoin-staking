@@ -38130,4 +38130,468 @@ app.post('/api/diag/rollback-fix-missing-tx', async (c) => {
   }
 })
 
+// ═══════════════════════════════════════════════════════════════════
+// /api/diag/scan-null-ref-tx
+// 사장님 명령 (2026-05-18) — 옵션 B 1단계: legacy NULL-ref tx 실태조사
+//
+// 목적:
+//   - transactions.ref_id IS NULL 인 daily_qkey / referral_reward tx 가 몇 건인지
+//   - 그 중 dr/rr 와 1:1 정확 매칭 가능한 건수 (백필 후보)
+//   - 매칭 모호 (후보 다수) 건수 — 사장님 보고 대상
+//
+// READ-ONLY — 모든 SQL 은 SELECT 만. DB 변경 없음.
+// 완전 set-based — 사용자별 for-loop 없음.
+//
+// 사용: GET /api/diag/scan-null-ref-tx?key=ADMIN_PW
+// ═══════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-null-ref-tx', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    console.log(`[REWARD_BATCH] start action=scan-null-ref-tx mode=READ_ONLY no_per_row_exists=true set_based=true`)
+
+    // ─── 1. NULL-ref tx 전체 통계 ───
+    const drNullStat = await db.prepare(`
+      SELECT
+        COUNT(*) AS cnt,
+        COALESCE(SUM(amount), 0) AS sum_amount,
+        COUNT(DISTINCT user_id) AS user_cnt
+      FROM transactions
+      WHERE type = 'daily_qkey' AND coin_type = 'QKEY' AND ref_id IS NULL
+    `).first<any>()
+
+    const rrNullStat = await db.prepare(`
+      SELECT
+        COUNT(*) AS cnt,
+        COALESCE(SUM(amount), 0) AS sum_amount,
+        COUNT(DISTINCT user_id) AS user_cnt
+      FROM transactions
+      WHERE type = 'referral_reward' AND coin_type = 'QKEY' AND ref_id IS NULL
+    `).first<any>()
+
+    // ─── 2. DR 1:1 매칭 후보 산출 ───
+    // 한 NULL-ref daily_qkey tx 에 대해:
+    //   user_id + amount + (DATE(created_at) = reward_date OR paid_date) 로 dr 후보 검색
+    //   tx 쪽에서 후보가 정확히 1개, dr 쪽에서도 동일 tx 가 후보가 정확히 1개여야 1:1
+    //
+    // 양방향 1:1 카운트를 set-based 로:
+    //   - tx 별 후보 dr 수 (tx_to_dr_count) 와 dr 별 후보 tx 수 (dr_to_tx_count)
+    //   - 양쪽 다 1 인 row 만 백필 가능
+    const drPairs = await db.prepare(`
+      WITH candidate_pairs AS (
+        SELECT
+          tx.id   AS tx_id,
+          dr.id   AS dr_id,
+          tx.user_id,
+          tx.amount,
+          tx.created_at AS tx_created_at,
+          dr.reward_date,
+          dr.paid_date
+        FROM transactions tx
+        JOIN daily_rewards dr
+          ON dr.user_id = tx.user_id
+         AND dr.usdt_amount = tx.amount
+         AND (
+              DATE(tx.created_at) = dr.reward_date
+           OR DATE(tx.created_at) = dr.paid_date
+         )
+        LEFT JOIN transactions t2
+          ON t2.ref_id = 'dr_' || dr.id
+        WHERE tx.type = 'daily_qkey'
+          AND tx.coin_type = 'QKEY'
+          AND tx.ref_id IS NULL
+          AND t2.id IS NULL   -- 그 dr_id 가 이미 ref_id 로 다른 tx 에 점유돼 있으면 제외
+      ),
+      tx_candidate_count AS (
+        SELECT tx_id, COUNT(*) AS n_dr FROM candidate_pairs GROUP BY tx_id
+      ),
+      dr_candidate_count AS (
+        SELECT dr_id, COUNT(*) AS n_tx FROM candidate_pairs GROUP BY dr_id
+      )
+      SELECT
+        COUNT(*) AS total_pairs,
+        SUM(CASE WHEN tcc.n_dr = 1 AND dcc.n_tx = 1 THEN 1 ELSE 0 END) AS one_to_one,
+        SUM(CASE WHEN tcc.n_dr > 1 OR dcc.n_tx > 1 THEN 1 ELSE 0 END) AS ambiguous,
+        COUNT(DISTINCT cp.tx_id) AS distinct_tx,
+        COUNT(DISTINCT cp.dr_id) AS distinct_dr
+      FROM candidate_pairs cp
+      JOIN tx_candidate_count tcc ON tcc.tx_id = cp.tx_id
+      JOIN dr_candidate_count dcc ON dcc.dr_id = cp.dr_id
+    `).first<any>()
+
+    // 매칭 안 되는 NULL-ref daily_qkey tx 수 = 전체 NULL-ref - 1:1 매칭 가능 tx 수
+    // (모호 매칭 tx 는 매칭 안 된 것으로 분류 — 백필 안 함)
+    const drNullCnt = Number(drNullStat?.cnt || 0)
+    const drOneToOneTx = Number(drPairs?.one_to_one || 0) // 1:1 pair 수 = 백필 가능 tx 수
+    const drUnmatched = drNullCnt - drOneToOneTx
+
+    // ─── 3. RR 1:1 매칭 후보 산출 (동일 패턴) ───
+    const rrPairs = await db.prepare(`
+      WITH candidate_pairs AS (
+        SELECT
+          tx.id  AS tx_id,
+          rr.id  AS rr_id,
+          tx.user_id,
+          tx.amount,
+          tx.created_at AS tx_created_at,
+          rr.reward_date,
+          rr.paid_date
+        FROM transactions tx
+        JOIN referral_rewards rr
+          ON rr.referrer_id = tx.user_id
+         AND rr.reward_amount = tx.amount
+         AND (
+              DATE(tx.created_at) = rr.reward_date
+           OR DATE(tx.created_at) = rr.paid_date
+         )
+        LEFT JOIN transactions t2
+          ON t2.ref_id = 'rr_' || rr.id
+        WHERE tx.type = 'referral_reward'
+          AND tx.coin_type = 'QKEY'
+          AND tx.ref_id IS NULL
+          AND t2.id IS NULL
+      ),
+      tx_candidate_count AS (
+        SELECT tx_id, COUNT(*) AS n_rr FROM candidate_pairs GROUP BY tx_id
+      ),
+      rr_candidate_count AS (
+        SELECT rr_id, COUNT(*) AS n_tx FROM candidate_pairs GROUP BY rr_id
+      )
+      SELECT
+        COUNT(*) AS total_pairs,
+        SUM(CASE WHEN tcc.n_rr = 1 AND rcc.n_tx = 1 THEN 1 ELSE 0 END) AS one_to_one,
+        SUM(CASE WHEN tcc.n_rr > 1 OR rcc.n_tx > 1 THEN 1 ELSE 0 END) AS ambiguous,
+        COUNT(DISTINCT cp.tx_id) AS distinct_tx,
+        COUNT(DISTINCT cp.rr_id) AS distinct_rr
+      FROM candidate_pairs cp
+      JOIN tx_candidate_count tcc ON tcc.tx_id = cp.tx_id
+      JOIN rr_candidate_count rcc ON rcc.rr_id = cp.rr_id
+    `).first<any>()
+
+    const rrNullCnt = Number(rrNullStat?.cnt || 0)
+    const rrOneToOneTx = Number(rrPairs?.one_to_one || 0)
+    const rrUnmatched = rrNullCnt - rrOneToOneTx
+
+    // ─── 4. 샘플 — 매칭 모호 / 매칭 불가 tx 10건씩 (사장님 보고용) ───
+    const drAmbiguousSamples = await db.prepare(`
+      WITH null_tx AS (
+        SELECT id, user_id, amount, created_at
+        FROM transactions
+        WHERE type = 'daily_qkey' AND coin_type = 'QKEY' AND ref_id IS NULL
+      )
+      SELECT
+        nt.id AS tx_id, nt.user_id, nt.amount, nt.created_at,
+        COUNT(dr.id) AS dr_candidate_count
+      FROM null_tx nt
+      LEFT JOIN daily_rewards dr
+        ON dr.user_id = nt.user_id
+       AND dr.usdt_amount = nt.amount
+       AND (DATE(nt.created_at) = dr.reward_date OR DATE(nt.created_at) = dr.paid_date)
+      GROUP BY nt.id
+      HAVING dr_candidate_count <> 1
+      LIMIT 10
+    `).all<any>()
+
+    const durMs = Date.now() - t0
+    console.log(`[REWARD_BATCH] scan-null-ref-tx done dr_null=${drNullCnt} dr_1to1=${drOneToOneTx} rr_null=${rrNullCnt} rr_1to1=${rrOneToOneTx} duration_ms=${durMs}`)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      action: 'scan-null-ref-tx',
+      method: 'SET_BASED_ANTI_JOIN',
+      no_per_row_exists: true,
+      summary: {
+        daily_qkey: {
+          null_ref_tx_count: drNullCnt,
+          null_ref_sum_amount: Number(drNullStat?.sum_amount || 0),
+          null_ref_distinct_users: Number(drNullStat?.user_cnt || 0),
+          one_to_one_matchable: drOneToOneTx,
+          unmatched_or_ambiguous: drUnmatched
+        },
+        referral_reward: {
+          null_ref_tx_count: rrNullCnt,
+          null_ref_sum_amount: Number(rrNullStat?.sum_amount || 0),
+          null_ref_distinct_users: Number(rrNullStat?.user_cnt || 0),
+          one_to_one_matchable: rrOneToOneTx,
+          unmatched_or_ambiguous: rrUnmatched
+        }
+      },
+      dr_pair_stats: drPairs,
+      rr_pair_stats: rrPairs,
+      ambiguous_or_unmatched_dr_samples: (drAmbiguousSamples.results || []).slice(0, 10),
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[REWARD_BATCH] ERROR action=scan-null-ref-tx duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// /api/diag/backfill-null-ref-tx
+// 사장님 명령 (2026-05-18) — 옵션 B 2단계:
+//   legacy NULL-ref tx 에 dr_{id} / rr_{id} ref_id 백필
+//
+// 안전 규칙:
+//   ✅ 1:1 정확 매칭만 백필 (tx→dr 후보 1개 AND dr→tx 후보 1개)
+//   ✅ 양방향 1:1 검증 — CTE 안에서 set-based 로
+//   ✅ 그 dr_id 가 다른 tx 의 ref_id 로 이미 점유 시 제외 (이중 매칭 방지)
+//   ✅ ref_id IS NULL 인 tx 만 대상 — 기존 ref_id 절대 덮어쓰지 않음
+//   ✅ UPDATE 만 — INSERT/DELETE 절대 없음
+//   ✅ 사용자별 for-loop 없음 (완전 set-based)
+//
+// 사용:
+//   DRY: POST /api/diag/backfill-null-ref-tx?key=ADMIN_PW&dry_run=1
+//   GO:  POST /api/diag/backfill-null-ref-tx?key=ADMIN_PW&confirm=GO
+// ═══════════════════════════════════════════════════════════════════
+app.post('/api/diag/backfill-null-ref-tx', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'confirm=GO 또는 dry_run=1 필요' }, 400)
+    }
+
+    const db = c.env.DB
+    console.log(`[REWARD_BATCH] start action=backfill-null-ref-tx mode=${dryRun ? 'DRY_RUN' : 'EXECUTED'} method=SET_BASED_UPDATE no_per_row_exists=true`)
+
+    // ════════════════════════════════════════════════════════════════
+    // 매칭 대상 산출 — CTE 로 양방향 1:1 검증 (DR)
+    //
+    // 안전성:
+    //   - candidate_pairs: NULL-ref tx ↔ 점유되지 않은 dr 의 모든 후보 쌍
+    //   - tx_to_dr_count = 1 AND dr_to_tx_count = 1 인 쌍만 백필 대상
+    //   - 백필 안 되면 NULL 그대로 유지 (안전)
+    // ════════════════════════════════════════════════════════════════
+
+    // ─── DR 백필 대상 1:1 쌍 카운트 (DRY+EXEC 공통 사전 진단) ───
+    const drCountRes = await db.prepare(`
+      WITH candidate_pairs AS (
+        SELECT tx.id AS tx_id, dr.id AS dr_id
+        FROM transactions tx
+        JOIN daily_rewards dr
+          ON dr.user_id = tx.user_id
+         AND dr.usdt_amount = tx.amount
+         AND (DATE(tx.created_at) = dr.reward_date OR DATE(tx.created_at) = dr.paid_date)
+        LEFT JOIN transactions t2
+          ON t2.ref_id = 'dr_' || dr.id
+        WHERE tx.type = 'daily_qkey'
+          AND tx.coin_type = 'QKEY'
+          AND tx.ref_id IS NULL
+          AND t2.id IS NULL
+      ),
+      tcc AS (SELECT tx_id, COUNT(*) AS n FROM candidate_pairs GROUP BY tx_id),
+      dcc AS (SELECT dr_id, COUNT(*) AS n FROM candidate_pairs GROUP BY dr_id)
+      SELECT COUNT(*) AS one_to_one_count
+      FROM candidate_pairs cp
+      JOIN tcc ON tcc.tx_id = cp.tx_id
+      JOIN dcc ON dcc.dr_id = cp.dr_id
+      WHERE tcc.n = 1 AND dcc.n = 1
+    `).first<any>()
+    const drOneToOneCount = Number(drCountRes?.one_to_one_count || 0)
+
+    // ─── RR 백필 대상 1:1 쌍 카운트 ───
+    const rrCountRes = await db.prepare(`
+      WITH candidate_pairs AS (
+        SELECT tx.id AS tx_id, rr.id AS rr_id
+        FROM transactions tx
+        JOIN referral_rewards rr
+          ON rr.referrer_id = tx.user_id
+         AND rr.reward_amount = tx.amount
+         AND (DATE(tx.created_at) = rr.reward_date OR DATE(tx.created_at) = rr.paid_date)
+        LEFT JOIN transactions t2
+          ON t2.ref_id = 'rr_' || rr.id
+        WHERE tx.type = 'referral_reward'
+          AND tx.coin_type = 'QKEY'
+          AND tx.ref_id IS NULL
+          AND t2.id IS NULL
+      ),
+      tcc AS (SELECT tx_id, COUNT(*) AS n FROM candidate_pairs GROUP BY tx_id),
+      rcc AS (SELECT rr_id, COUNT(*) AS n FROM candidate_pairs GROUP BY rr_id)
+      SELECT COUNT(*) AS one_to_one_count
+      FROM candidate_pairs cp
+      JOIN tcc ON tcc.tx_id = cp.tx_id
+      JOIN rcc ON rcc.rr_id = cp.rr_id
+      WHERE tcc.n = 1 AND rcc.n = 1
+    `).first<any>()
+    const rrOneToOneCount = Number(rrCountRes?.one_to_one_count || 0)
+
+    // ─── DRY_RUN: 카운트만 보고. UPDATE 금지 ───
+    if (dryRun) {
+      const durMs = Date.now() - t0
+      console.log(`[REWARD_BATCH] DRY_RUN done dr_would_backfill=${drOneToOneCount} rr_would_backfill=${rrOneToOneCount} duration_ms=${durMs}`)
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'backfill-null-ref-tx',
+        method: 'SET_BASED_UPDATE',
+        no_per_row_exists: true,
+        summary: {
+          dr_would_backfill: drOneToOneCount,
+          rr_would_backfill: rrOneToOneCount,
+          total_would_backfill: drOneToOneCount + rrOneToOneCount
+        },
+        note: '1:1 정확 매칭만 백필. 후보 다수(ambiguous) 또는 매칭 불가(unmatched) tx 는 NULL 유지.',
+        duration_ms: durMs
+      })
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // EXECUTE — set-based UPDATE 2개를 db.batch 로 묶음
+    //
+    // 핵심 안전 패턴:
+    //   UPDATE transactions
+    //   SET ref_id = 'dr_' || (SELECT dr_id FROM one_to_one_pairs WHERE tx_id = transactions.id)
+    //   WHERE id IN (SELECT tx_id FROM one_to_one_pairs)
+    //
+    // SQLite 는 CTE 안의 UPDATE 를 지원하지 않으므로, 대신:
+    //   UPDATE transactions
+    //   SET ref_id = (SELECT 'dr_' || dr.id FROM ... 1:1 인 dr WHERE ... = transactions.id LIMIT 1)
+    //   WHERE id IN ( ... 1:1 tx_id 목록 ... )
+    // ════════════════════════════════════════════════════════════════
+
+    // DR UPDATE — set-based
+    const stmtDrBackfill = db.prepare(`
+      UPDATE transactions
+      SET ref_id = 'dr_' || (
+        SELECT cp.dr_id FROM (
+          WITH candidate_pairs AS (
+            SELECT tx.id AS tx_id, dr.id AS dr_id
+            FROM transactions tx
+            JOIN daily_rewards dr
+              ON dr.user_id = tx.user_id
+             AND dr.usdt_amount = tx.amount
+             AND (DATE(tx.created_at) = dr.reward_date OR DATE(tx.created_at) = dr.paid_date)
+            LEFT JOIN transactions t2 ON t2.ref_id = 'dr_' || dr.id
+            WHERE tx.type = 'daily_qkey' AND tx.coin_type = 'QKEY'
+              AND tx.ref_id IS NULL AND t2.id IS NULL
+          ),
+          tcc AS (SELECT tx_id, COUNT(*) AS n FROM candidate_pairs GROUP BY tx_id),
+          dcc AS (SELECT dr_id, COUNT(*) AS n FROM candidate_pairs GROUP BY dr_id)
+          SELECT cp.tx_id, cp.dr_id
+          FROM candidate_pairs cp
+          JOIN tcc ON tcc.tx_id = cp.tx_id
+          JOIN dcc ON dcc.dr_id = cp.dr_id
+          WHERE tcc.n = 1 AND dcc.n = 1
+        ) cp
+        WHERE cp.tx_id = transactions.id
+      )
+      WHERE id IN (
+        WITH candidate_pairs AS (
+          SELECT tx.id AS tx_id, dr.id AS dr_id
+          FROM transactions tx
+          JOIN daily_rewards dr
+            ON dr.user_id = tx.user_id
+           AND dr.usdt_amount = tx.amount
+           AND (DATE(tx.created_at) = dr.reward_date OR DATE(tx.created_at) = dr.paid_date)
+          LEFT JOIN transactions t2 ON t2.ref_id = 'dr_' || dr.id
+          WHERE tx.type = 'daily_qkey' AND tx.coin_type = 'QKEY'
+            AND tx.ref_id IS NULL AND t2.id IS NULL
+        ),
+        tcc AS (SELECT tx_id, COUNT(*) AS n FROM candidate_pairs GROUP BY tx_id),
+        dcc AS (SELECT dr_id, COUNT(*) AS n FROM candidate_pairs GROUP BY dr_id)
+        SELECT cp.tx_id
+        FROM candidate_pairs cp
+        JOIN tcc ON tcc.tx_id = cp.tx_id
+        JOIN dcc ON dcc.dr_id = cp.dr_id
+        WHERE tcc.n = 1 AND dcc.n = 1
+      )
+        AND ref_id IS NULL  -- 이중 안전가드: 기존 ref_id 절대 덮어쓰지 않음
+    `)
+
+    // RR UPDATE — set-based (동일 패턴)
+    const stmtRrBackfill = db.prepare(`
+      UPDATE transactions
+      SET ref_id = 'rr_' || (
+        SELECT cp.rr_id FROM (
+          WITH candidate_pairs AS (
+            SELECT tx.id AS tx_id, rr.id AS rr_id
+            FROM transactions tx
+            JOIN referral_rewards rr
+              ON rr.referrer_id = tx.user_id
+             AND rr.reward_amount = tx.amount
+             AND (DATE(tx.created_at) = rr.reward_date OR DATE(tx.created_at) = rr.paid_date)
+            LEFT JOIN transactions t2 ON t2.ref_id = 'rr_' || rr.id
+            WHERE tx.type = 'referral_reward' AND tx.coin_type = 'QKEY'
+              AND tx.ref_id IS NULL AND t2.id IS NULL
+          ),
+          tcc AS (SELECT tx_id, COUNT(*) AS n FROM candidate_pairs GROUP BY tx_id),
+          rcc AS (SELECT rr_id, COUNT(*) AS n FROM candidate_pairs GROUP BY rr_id)
+          SELECT cp.tx_id, cp.rr_id
+          FROM candidate_pairs cp
+          JOIN tcc ON tcc.tx_id = cp.tx_id
+          JOIN rcc ON rcc.rr_id = cp.rr_id
+          WHERE tcc.n = 1 AND rcc.n = 1
+        ) cp
+        WHERE cp.tx_id = transactions.id
+      )
+      WHERE id IN (
+        WITH candidate_pairs AS (
+          SELECT tx.id AS tx_id, rr.id AS rr_id
+          FROM transactions tx
+          JOIN referral_rewards rr
+            ON rr.referrer_id = tx.user_id
+           AND rr.reward_amount = tx.amount
+           AND (DATE(tx.created_at) = rr.reward_date OR DATE(tx.created_at) = rr.paid_date)
+          LEFT JOIN transactions t2 ON t2.ref_id = 'rr_' || rr.id
+          WHERE tx.type = 'referral_reward' AND tx.coin_type = 'QKEY'
+            AND tx.ref_id IS NULL AND t2.id IS NULL
+        ),
+        tcc AS (SELECT tx_id, COUNT(*) AS n FROM candidate_pairs GROUP BY tx_id),
+        rcc AS (SELECT rr_id, COUNT(*) AS n FROM candidate_pairs GROUP BY rr_id)
+        SELECT cp.tx_id
+        FROM candidate_pairs cp
+        JOIN tcc ON tcc.tx_id = cp.tx_id
+        JOIN rcc ON rcc.rr_id = cp.rr_id
+        WHERE tcc.n = 1 AND rcc.n = 1
+      )
+        AND ref_id IS NULL  -- 이중 안전가드
+    `)
+
+    // db.batch — 2 statement 묶음
+    const batchResults: any[] = await db.batch([stmtDrBackfill, stmtRrBackfill])
+    const drBackfilled = Number(batchResults[0]?.meta?.changes ?? batchResults[0]?.changes ?? 0)
+    const rrBackfilled = Number(batchResults[1]?.meta?.changes ?? batchResults[1]?.changes ?? 0)
+
+    // 사후 검증 — 남은 NULL-ref tx 수
+    const afterDrNull = await db.prepare(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IS NULL`).first<any>()
+    const afterRrNull = await db.prepare(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IS NULL`).first<any>()
+
+    const durMs = Date.now() - t0
+    console.log(`[REWARD_BATCH] EXECUTED done dr_backfilled=${drBackfilled} rr_backfilled=${rrBackfilled} remaining_dr_null=${afterDrNull?.cnt} remaining_rr_null=${afterRrNull?.cnt} duration_ms=${durMs}`)
+
+    return c.json({
+      ok: true,
+      mode: 'EXECUTED',
+      action: 'backfill-null-ref-tx',
+      method: 'SET_BASED_UPDATE',
+      no_per_row_exists: true,
+      summary: {
+        dr_backfilled: drBackfilled,
+        rr_backfilled: rrBackfilled,
+        total_backfilled: drBackfilled + rrBackfilled,
+        pre_scan_expected_dr: drOneToOneCount,
+        pre_scan_expected_rr: rrOneToOneCount
+      },
+      after_state: {
+        remaining_dr_null_ref: Number(afterDrNull?.cnt || 0),
+        remaining_rr_null_ref: Number(afterRrNull?.cnt || 0)
+      },
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[REWARD_BATCH] ERROR action=backfill-null-ref-tx duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+})
+
 export default app
