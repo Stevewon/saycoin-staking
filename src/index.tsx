@@ -39057,7 +39057,8 @@ app.get('/api/diag/scan-duplicate-dr-rr-v2', async (c) => {
 // ============================================================
 app.get('/api/diag/scan-duplicate-dr-rr-v3', async (c) => {
   const t0 = Date.now()
-  if (c.req.query('key') !== c.env.ADMIN_PW) return c.json({ error: 'forbidden' }, 403)
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
   const db = c.env.DB
 
   try {
