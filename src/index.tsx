@@ -42066,6 +42066,12 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
     const markerPattern = c.req.query('marker') || 'REVERSE_BACKFILL'
     const likePattern = `%[${markerPattern}%`
 
+    // ★ 2026-05-18 추가: tx_only=true → transactions 마커 row 만 DELETE
+    //   사용 시점: 이미 rollback EXEC 가 RR/balance 차감 끝났는데 tx 만 안 지워진 경우 (버그)
+    //   동작: balance 보정/RR DELETE/DR DELETE 모두 SKIP, transactions DELETE 만 실행
+    //   이중 차감 방지용
+    const txOnly = c.req.query('tx_only') === 'true'
+
     // ─── PHASE 1: 마커 tx 수집 ───
     const txMarkerRaw = await db.prepare(`
       SELECT id, user_id, type, amount, description, ref_id,
@@ -42201,6 +42207,7 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
         mode: 'DRY_RUN',
         action: 'rollback-reverse-backfill-marker',
         marker_pattern: `description LIKE ${likePattern}`,
+        tx_only: txOnly,
         summary,
         affected_users_balance_top20: userBalanceSim.slice(0, 20),
         negative_balance_warning: {
@@ -42222,21 +42229,23 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
     // ═══════════════ EXEC ═══════════════
     const CHUNK_SIZE = 80
 
-    // ── (1) users.qkey_balance 보정 ──
+    // ── (1) users.qkey_balance 보정 ── (tx_only 일 땐 SKIP — 이중 차감 방지)
     let balanceAdjusted = 0
-    const balEntries = Array.from(balanceDelta.entries())
-    for (let i = 0; i < balEntries.length; i += CHUNK_SIZE) {
-      const chunk = balEntries.slice(i, i + CHUNK_SIZE)
-      const stmts = chunk.map(([uid, delta]) =>
-        db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
-      )
-      await db.batch(stmts)
-      balanceAdjusted += chunk.length
+    if (!txOnly) {
+      const balEntries = Array.from(balanceDelta.entries())
+      for (let i = 0; i < balEntries.length; i += CHUNK_SIZE) {
+        const chunk = balEntries.slice(i, i + CHUNK_SIZE)
+        const stmts = chunk.map(([uid, delta]) =>
+          db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
+        )
+        await db.batch(stmts)
+        balanceAdjusted += chunk.length
+      }
     }
 
-    // ── (2) referral_rewards DELETE ──
+    // ── (2) referral_rewards DELETE ── (tx_only 일 땐 SKIP)
     let rrDeleted = 0
-    if (rrIdsToDelete.length > 0) {
+    if (!txOnly && rrIdsToDelete.length > 0) {
       for (let i = 0; i < rrIdsToDelete.length; i += CHUNK_SIZE) {
         const chunk = rrIdsToDelete.slice(i, i + CHUNK_SIZE)
         const placeholders = chunk.map(() => '?').join(',')
@@ -42245,9 +42254,9 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
       }
     }
 
-    // ── (3) daily_rewards DELETE ──
+    // ── (3) daily_rewards DELETE ── (tx_only 일 땐 SKIP)
     let drDeleted = 0
-    if (drIdsToDelete.length > 0) {
+    if (!txOnly && drIdsToDelete.length > 0) {
       for (let i = 0; i < drIdsToDelete.length; i += CHUNK_SIZE) {
         const chunk = drIdsToDelete.slice(i, i + CHUNK_SIZE)
         const placeholders = chunk.map(() => '?').join(',')
@@ -42256,7 +42265,7 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
       }
     }
 
-    // ── (4) transactions DELETE (마커 row 들) ──
+    // ── (4) transactions DELETE (마커 row 들) ── ★ tx_only 일 땐 이것만 실행 ★
     //   ★ likePattern (query param 으로 받은 marker 패턴) 사용
     const txDelRes = await db.prepare(`DELETE FROM transactions WHERE description LIKE ?`).bind(likePattern).run()
     const txDeleted = (txDelRes as any)?.meta?.changes || 0
@@ -42277,9 +42286,10 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
     }
 
     return c.json({
-      ok: postTxCount === 0 && postRrExistCount === 0,
+      ok: postTxCount === 0,
       mode: 'EXEC',
       action: 'rollback-reverse-backfill-marker',
+      tx_only: txOnly,
       pre_summary: summary,
       exec_result: {
         balance_adjusted_users: balanceAdjusted,
@@ -42289,8 +42299,8 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
       },
       post_check: {
         tx_marker_remaining: postTxCount,
-        rr_id_remaining: postRrExistCount,
-        verified: postTxCount === 0 && postRrExistCount === 0,
+        rr_id_remaining: txOnly ? 'SKIPPED' : postRrExistCount,
+        verified: postTxCount === 0 && (txOnly || postRrExistCount === 0),
       },
       duration_ms: Date.now() - t0,
     })
@@ -43138,6 +43148,633 @@ app.post('/api/diag/reconcile-bottom-up-dividend', async (c) => {
   const confirm = c.req.query('confirm') || ''
   if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 변경 게이트)' }, 400)
   return diagReconcileBottomUpDividend(c, 'EXEC')
+})
+
+// ============================================================================
+// recalc-day-dividend: 사장님 영구룰 #바텀업정산 정확 구현 (2026-05-18 확정)
+// ============================================================================
+//
+//   사장님 영구룰 원문 (직전 격노):
+//   > "영구룰이 바텀업 방식이고 내가 정해줬으면 해당날짜의 사용자수와 진입금액을
+//   >  다 따져보고 바닥부터 위로 올라가서 정산하고 끝내라니깐!"
+//
+//   알고리즘:
+//   ─────────────────────────────────────────────────────────────
+//   입력: dividendDate (예: 2026-05-12) — reward 발생일
+//   처리:
+//     ① dividendDate 가 휴일(토/일/공휴일)이면 → 전부 0 (skip)
+//     ② payoutDate = PAID_CALENDAR[dividendDate] (그 다음 영업일)
+//     ③ 그 날짜의 active staking 모두 조회
+//        (start_date <= dividendDate AND end_date >= dividendDate, status='active')
+//     ④ 바텀업 영구룰 계산 (200% Cap 적용 — B 옵션):
+//        - 각 staking 의 own_DR = amount × daily_rate × 150
+//        - referrer(L1) 가 active 면 → L1_RR = own_DR × 0.20 (수신자 cap 체크)
+//        - referrer 의 referrer(L2) 가 active 면 → L2_RR = own_DR × 0.10 (cap 체크)
+//        - cap 도달 시: 본인 staking status='capped' 처리, 신규 reward 0
+//     ⑤ EXEC (그 reward_date 통째로 삭제 후 새로 INSERT):
+//        a. DELETE FROM daily_rewards WHERE reward_date=dividendDate
+//           (영향 ref_id 수집해서 tx 도 매칭 삭제)
+//        b. DELETE FROM referral_rewards WHERE reward_date=dividendDate
+//           (영향 ref_id 수집해서 tx 도 매칭 삭제)
+//        c. DELETE FROM transactions
+//           WHERE (type='daily_qkey' AND ref_id IN <삭제된 dr.id>)
+//              OR (type='referral_reward' AND ref_id IN <삭제된 rr.id>)
+//        d. balance 복구: 삭제된 tx amount 만큼 user.qkey_balance 차감
+//        e. INSERT 새 DR/RR (영구룰 amount, 마커 없는 description)
+//        f. balance 가산: 새 INSERT amount 만큼 user.qkey_balance 가산
+//        g. tx INSERT (description: '일일 배당 (QKEY)' / '추천 보너스 (Level 1)' / '추천 보너스 (Level 2)')
+//     ⑥ POST-CHECK
+//
+//   사장님 절대 명령:
+//     - description 에 마커 박지 말 것 (이전 [RECONCILE / REVERSE_BACKFILL 사고)
+//     - 그 dividendDate 의 모든 DR/RR/tx 통째 삭제 후 새 INSERT
+//     - 200% Cap 무조건 적용
+//     - 매 dividendDate 한 번에 완결
+//
+//   엔드포인트:
+//     GET  /api/diag/recalc-day-dividend?key=ADMIN_PW&dividendDate=YYYY-MM-DD     → DRY_RUN
+//     POST /api/diag/recalc-day-dividend?key=ADMIN_PW&dividendDate=YYYY-MM-DD&confirm=GO  → EXEC
+//
+//   PAID_CALENDAR (어드민이 직접 지정한 경우 payoutDate query param 으로 override 가능):
+//     dividendDate 평일 → payoutDate = 다음 영업일 (자동)
+//     dividendDate 휴일 → expected 0, skip
+// ============================================================================
+async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  try {
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+    const dividendDate = c.req.query('dividendDate') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dividendDate)) {
+      return c.json({ error: 'dividendDate=YYYY-MM-DD 필수' }, 400)
+    }
+
+    // ─── (0) dividendDate 휴일 여부 체크 ───
+    //   isKoreanBusinessDay 는 Date 객체를 받음 (UTC 시각이지만 +9h 보정 내부 처리)
+    //   KST 자정의 UTC 시각: dividendDate T 00:00:00 KST = (dividendDate - 1) T 15:00:00 UTC
+    //   하지만 isKoreanBusinessDay 의 내부 +9h 보정 때문에 그냥 (dividendDate T 00:00:00 UTC) 넘겨도 OK
+    //   (확인됨: getStakingAccrualDatesKst 도 같은 방식 사용)
+    const ddObj = new Date(dividendDate + 'T00:00:00Z')
+    const ddCheck = new Date(ddObj.getTime() - 9 * 60 * 60 * 1000)
+    const { isBusinessDay: ddIsBiz, reason: ddReason } = isKoreanBusinessDay(ddCheck)
+
+    if (!ddIsBiz) {
+      return c.json({
+        ok: true,
+        mode,
+        action: 'recalc-day-dividend',
+        dividendDate,
+        is_business_day: false,
+        reason: ddReason,
+        message: `${dividendDate} 는 ${ddReason} — 영구룰 #휴일발생금지: expected reward 0건`,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─── (1) payoutDate 계산 ───
+    //   사장님 PAID_CALENDAR: dividendDate 의 다음 영업일
+    //   query param payoutDate 로 override 가능 (수동 백필 등)
+    let payoutDate = c.req.query('payoutDate') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(payoutDate)) {
+      // 자동 계산: dividendDate 의 다음 영업일
+      let cursor = new Date(ddObj.getTime() + 24 * 60 * 60 * 1000)
+      let safety = 0
+      while (safety < 14) {
+        const cursorCheck = new Date(cursor.getTime() - 9 * 60 * 60 * 1000)
+        const { isBusinessDay } = isKoreanBusinessDay(cursorCheck)
+        if (isBusinessDay) {
+          payoutDate = cursor.toISOString().split('T')[0]
+          break
+        }
+        cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000)
+        safety++
+      }
+      if (!payoutDate) {
+        return c.json({ error: 'payoutDate 자동 계산 실패' }, 500)
+      }
+    }
+
+    // ─── (2) 그 dividendDate 의 active staking 모두 조회 ───
+    //   period_days 가 활성화된 staking 의 start_date_kst <= dividendDate <= end_date_kst
+    const activeStakings = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.period_days,
+             date(s.start_date,'+9 hours') AS start_kst,
+             date(s.end_date,'+9 hours') AS end_kst,
+             s.status,
+             u.referrer_id
+      FROM staking s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.status IN ('active','capped','completed')
+        AND date(s.start_date,'+9 hours') <= ?
+        AND date(s.end_date,'+9 hours') >= ?
+      ORDER BY s.id ASC
+    `).bind(dividendDate, dividendDate).all()
+    const stakingList = (activeStakings.results || []) as any[]
+
+    // ─── (3) 영구룰 expected 계산 (200% Cap 적용 — B 옵션, 바텀업 순서) ───
+    //   바닥 (각 staking 의 own_daily) 부터 올라가서 L1/L2 가산
+    //   200% Cap: 사용자 단위 paidTotal + 이번 round 누적 reward >= target 이면 차단/부분지급
+    //
+    //   ★ 중요: cap 계산 시 paidTotal 은 "현재 DB 상태의 daily_qkey + referral_reward 합계"
+    //         하지만 이번 EXEC 에서 이 dividendDate row 들을 통째 삭제 후 새로 INSERT 하므로
+    //         "cap 기준 paidTotal" 은 "기존 DB - 이번 dividendDate 의 기존 row 합계" 로 계산해야
+    //         재계산 시 cap 도달 위치가 일관됨
+
+    //   ① 각 사용자의 stake_total (cap target)
+    const userStakeTotal = new Map<number, number>()
+    {
+      const allUserIds = new Set<number>()
+      for (const s of stakingList) allUserIds.add(Number(s.user_id))
+      // 추가로 referrer / referrer.referrer 도 미리 수집 (cap 계산용)
+      for (const s of stakingList) {
+        if (s.referrer_id) allUserIds.add(Number(s.referrer_id))
+      }
+      // L2 referrer 까지 한 번에 조회
+      const allIdsArr = Array.from(allUserIds)
+      if (allIdsArr.length > 0) {
+        const placeholders = allIdsArr.map(() => '?').join(',')
+        const refRows = await db.prepare(`SELECT id, referrer_id FROM users WHERE id IN (${placeholders})`).bind(...allIdsArr).all()
+        for (const u of (refRows.results || []) as any[]) {
+          if (u.referrer_id) allUserIds.add(Number(u.referrer_id))
+        }
+      }
+      // 모든 후보 사용자의 stake_total 조회
+      const allIdsArr2 = Array.from(allUserIds)
+      if (allIdsArr2.length > 0) {
+        const CHUNK = 100
+        for (let i = 0; i < allIdsArr2.length; i += CHUNK) {
+          const chunk = allIdsArr2.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() => '?').join(',')
+          const rows = await db.prepare(`
+            SELECT user_id, COALESCE(SUM(amount),0) AS total
+            FROM staking WHERE user_id IN (${placeholders})
+              AND status IN ('active','completed','capped')
+            GROUP BY user_id
+          `).bind(...chunk).all()
+          for (const r of (rows.results || []) as any[]) {
+            userStakeTotal.set(Number(r.user_id), Number(r.total))
+          }
+        }
+      }
+    }
+
+    //   ② 각 사용자의 paidTotal_excluding_thisDate = (현재 DB paidTotal) - (이번 dividendDate 의 기존 row 합계)
+    //     - 기존 dr/rr row 가 cron 사고로 잘못 들어있을 수 있으니
+    //     - 재계산 기준은 "이 dividendDate 빼면 paid 가 얼마였나" 로 잡아야 cap 위치 일관
+    //     - reward_date=dividendDate 인 dr/rr 의 amount 합계 사용자별
+    const userPaidExcl = new Map<number, number>()
+    {
+      const allCandidateIds = Array.from(userStakeTotal.keys())
+      if (allCandidateIds.length > 0) {
+        const CHUNK = 100
+        for (let i = 0; i < allCandidateIds.length; i += CHUNK) {
+          const chunk = allCandidateIds.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() => '?').join(',')
+          // 현재 paidTotal (daily_qkey + referral_reward in transactions)
+          const txTotalRows = await db.prepare(`
+            SELECT user_id, COALESCE(SUM(amount),0) AS total
+            FROM transactions
+            WHERE user_id IN (${placeholders}) AND coin_type='QKEY'
+              AND type IN ('daily_qkey','referral_reward')
+            GROUP BY user_id
+          `).bind(...chunk).all()
+          const txTotal = new Map<number, number>()
+          for (const r of (txTotalRows.results || []) as any[]) {
+            txTotal.set(Number(r.user_id), Number(r.total))
+          }
+          // 이번 dividendDate 의 기존 dr/rr amount 합계 사용자별
+          //   dr: daily_rewards.user_id, usdt_amount
+          //   rr: referral_rewards.referrer_id, reward_amount
+          const drExcl = await db.prepare(`
+            SELECT user_id, COALESCE(SUM(usdt_amount),0) AS total
+            FROM daily_rewards
+            WHERE user_id IN (${placeholders}) AND reward_date = ?
+            GROUP BY user_id
+          `).bind(...chunk, dividendDate).all()
+          const rrExcl = await db.prepare(`
+            SELECT referrer_id AS user_id, COALESCE(SUM(reward_amount),0) AS total
+            FROM referral_rewards
+            WHERE referrer_id IN (${placeholders}) AND reward_date = ?
+            GROUP BY referrer_id
+          `).bind(...chunk, dividendDate).all()
+          const exclMap = new Map<number, number>()
+          for (const r of (drExcl.results || []) as any[]) {
+            exclMap.set(Number(r.user_id), (exclMap.get(Number(r.user_id)) || 0) + Number(r.total))
+          }
+          for (const r of (rrExcl.results || []) as any[]) {
+            exclMap.set(Number(r.user_id), (exclMap.get(Number(r.user_id)) || 0) + Number(r.total))
+          }
+          for (const uid of chunk) {
+            const tt = txTotal.get(uid) || 0
+            const ex = exclMap.get(uid) || 0
+            userPaidExcl.set(uid, Math.max(0, tt - ex))
+          }
+        }
+      }
+    }
+
+    // 헬퍼: 그 사용자에게 reward 를 amount 만큼 줄 수 있나? (cap 적용 후 실 amount 반환)
+    //   round 누적용 — userPaidRound 에 이번 round 누적 가산
+    const userPaidRound = new Map<number, number>()
+    function tryGiveReward(uid: number, requestedAmount: number): { granted: number, capped: boolean } {
+      const stakeTotal = userStakeTotal.get(uid) || 0
+      if (stakeTotal <= 0) return { granted: 0, capped: true } // 진입 0인 사용자에겐 reward 안 줌
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      const paidExcl = userPaidExcl.get(uid) || 0
+      const paidRound = userPaidRound.get(uid) || 0
+      const current = paidExcl + paidRound
+      if (current >= target) return { granted: 0, capped: true }
+      const remaining = target - current
+      const granted = Math.min(requestedAmount, Math.floor(remaining))
+      if (granted > 0) {
+        userPaidRound.set(uid, paidRound + granted)
+      }
+      return { granted, capped: granted < requestedAmount }
+    }
+
+    // ③ 각 staking 별 own_DR/L1/L2 계산 (바텀업)
+    type ExpectedDR = { user_id: number, staking_id: number, amount: number }
+    type ExpectedRR = { referrer_id: number, referee_id: number, level: number, staking_id: number, original_amount: number, reward_amount: number }
+    const expectedDRs: ExpectedDR[] = []
+    const expectedRRs: ExpectedRR[] = []
+    const cappedSummary = { dr_capped_users: new Set<number>(), l1_capped_users: new Set<number>(), l2_capped_users: new Set<number>() }
+
+    for (const s of stakingList) {
+      const stakingId = Number(s.staking_id)
+      const uid = Number(s.user_id)
+      const amt = Number(s.amount) || 0
+      const rate = Number(s.daily_rate) || 0
+      const ownReqQkey = Math.round(amt * rate * USD_TO_QKEY)
+      if (ownReqQkey <= 0) continue
+
+      // 본인 own DR (cap 적용)
+      const ownGrant = tryGiveReward(uid, ownReqQkey)
+      if (ownGrant.granted > 0) {
+        expectedDRs.push({ user_id: uid, staking_id: stakingId, amount: ownGrant.granted })
+      }
+      if (ownGrant.capped && ownGrant.granted < ownReqQkey) {
+        cappedSummary.dr_capped_users.add(uid)
+      }
+
+      // L1 (referrer 20%) — own_DR (cap 적용 전 원금 ownReqQkey 기준!)
+      //   영구룰: 매칭은 referee 의 self-daily (cap 무관 원금) 기준 20% / 10%
+      //   ★ 단, referrer 가 active staking 보유해야만 매칭 자격 (스테이킹별독립 룰)
+      const refRow1 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(uid).first() as any
+      const l1Uid = refRow1?.referrer_id ? Number(refRow1.referrer_id) : 0
+      if (l1Uid > 0) {
+        // L1 가 dividendDate 시점 active 인지 확인
+        const l1Active = await db.prepare(`
+          SELECT id FROM staking
+          WHERE user_id = ? AND status IN ('active','capped','completed')
+            AND date(start_date,'+9 hours') <= ?
+            AND date(end_date,'+9 hours') >= ?
+          LIMIT 1
+        `).bind(l1Uid, dividendDate, dividendDate).first()
+        if (l1Active) {
+          const l1Req = Math.round(ownReqQkey * 0.20)
+          if (l1Req > 0) {
+            const l1Grant = tryGiveReward(l1Uid, l1Req)
+            if (l1Grant.granted > 0) {
+              expectedRRs.push({
+                referrer_id: l1Uid, referee_id: uid, level: 1,
+                staking_id: stakingId,
+                original_amount: ownReqQkey,
+                reward_amount: l1Grant.granted,
+              })
+            }
+            if (l1Grant.capped && l1Grant.granted < l1Req) {
+              cappedSummary.l1_capped_users.add(l1Uid)
+            }
+          }
+        }
+
+        // L2 (referrer.referrer 10%)
+        const refRow2 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(l1Uid).first() as any
+        const l2Uid = refRow2?.referrer_id ? Number(refRow2.referrer_id) : 0
+        if (l2Uid > 0) {
+          const l2Active = await db.prepare(`
+            SELECT id FROM staking
+            WHERE user_id = ? AND status IN ('active','capped','completed')
+              AND date(start_date,'+9 hours') <= ?
+              AND date(end_date,'+9 hours') >= ?
+            LIMIT 1
+          `).bind(l2Uid, dividendDate, dividendDate).first()
+          if (l2Active) {
+            const l2Req = Math.round(ownReqQkey * 0.10)
+            if (l2Req > 0) {
+              const l2Grant = tryGiveReward(l2Uid, l2Req)
+              if (l2Grant.granted > 0) {
+                expectedRRs.push({
+                  referrer_id: l2Uid, referee_id: uid, level: 2,
+                  staking_id: stakingId,
+                  original_amount: ownReqQkey,
+                  reward_amount: l2Grant.granted,
+                })
+              }
+              if (l2Grant.capped && l2Grant.granted < l2Req) {
+                cappedSummary.l2_capped_users.add(l2Uid)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ─── (4) 그 dividendDate 의 기존 DR/RR/tx 수집 (삭제 대상) ───
+    const existingDRs = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE reward_date = ?
+    `).bind(dividendDate).all()
+    const existingRRs = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id, original_amount, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE reward_date = ?
+    `).bind(dividendDate).all()
+    const exDRs = (existingDRs.results || []) as any[]
+    const exRRs = (existingRRs.results || []) as any[]
+    const exDRIds = exDRs.map(r => Number(r.id))
+    const exRRIds = exRRs.map(r => Number(r.id))
+
+    // 매칭되는 tx 수집 (ref_id 1:1)
+    let exTxList: any[] = []
+    if (exDRIds.length > 0) {
+      const CHUNK = 100
+      for (let i = 0; i < exDRIds.length; i += CHUNK) {
+        const chunk = exDRIds.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT id, user_id, type, amount, description, ref_id
+          FROM transactions
+          WHERE type = 'daily_qkey' AND ref_id IN (${placeholders})
+        `).bind(...chunk).all()
+        exTxList.push(...((rows.results || []) as any[]))
+      }
+    }
+    if (exRRIds.length > 0) {
+      const CHUNK = 100
+      for (let i = 0; i < exRRIds.length; i += CHUNK) {
+        const chunk = exRRIds.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT id, user_id, type, amount, description, ref_id
+          FROM transactions
+          WHERE type = 'referral_reward' AND ref_id IN (${placeholders})
+        `).bind(...chunk).all()
+        exTxList.push(...((rows.results || []) as any[]))
+      }
+    }
+
+    // ─── (5) balance 변동 계산 ───
+    //   existing tx amount 만큼 차감 + expected 새 INSERT amount 만큼 가산
+    const balanceDelta = new Map<number, number>()
+    for (const tx of exTxList) {
+      const uid = Number(tx.user_id)
+      balanceDelta.set(uid, (balanceDelta.get(uid) || 0) - Number(tx.amount))
+    }
+    for (const dr of expectedDRs) {
+      balanceDelta.set(dr.user_id, (balanceDelta.get(dr.user_id) || 0) + dr.amount)
+    }
+    for (const rr of expectedRRs) {
+      balanceDelta.set(rr.referrer_id, (balanceDelta.get(rr.referrer_id) || 0) + rr.reward_amount)
+    }
+
+    // ─── (6) 요약 ───
+    const expectedDRTotal = expectedDRs.reduce((s, r) => s + r.amount, 0)
+    const expectedL1Total = expectedRRs.filter(r => r.level === 1).reduce((s, r) => s + r.reward_amount, 0)
+    const expectedL2Total = expectedRRs.filter(r => r.level === 2).reduce((s, r) => s + r.reward_amount, 0)
+    const existingDRTotal = exDRs.reduce((s, r) => s + Number(r.usdt_amount), 0)
+    const existingL1Total = exRRs.filter(r => Number(r.level) === 1).reduce((s, r) => s + Number(r.reward_amount), 0)
+    const existingL2Total = exRRs.filter(r => Number(r.level) === 2).reduce((s, r) => s + Number(r.reward_amount), 0)
+    const existingTxTotal = exTxList.reduce((s, r) => s + Number(r.amount), 0)
+    const newTxTotal = expectedDRTotal + expectedL1Total + expectedL2Total
+
+    const summary = {
+      dividendDate,
+      payoutDate,
+      active_staking_count: stakingList.length,
+      expected: {
+        dr_count: expectedDRs.length, dr_total: expectedDRTotal,
+        l1_count: expectedRRs.filter(r => r.level === 1).length, l1_total: expectedL1Total,
+        l2_count: expectedRRs.filter(r => r.level === 2).length, l2_total: expectedL2Total,
+        gross_total: newTxTotal,
+      },
+      existing: {
+        dr_count: exDRs.length, dr_total: existingDRTotal,
+        l1_count: exRRs.filter(r => Number(r.level) === 1).length, l1_total: existingL1Total,
+        l2_count: exRRs.filter(r => Number(r.level) === 2).length, l2_total: existingL2Total,
+        tx_count: exTxList.length, tx_total: existingTxTotal,
+      },
+      net_delta: {
+        balance_total_change: newTxTotal - existingTxTotal,
+        dr_diff: expectedDRTotal - existingDRTotal,
+        l1_diff: expectedL1Total - existingL1Total,
+        l2_diff: expectedL2Total - existingL2Total,
+      },
+      cap_info: {
+        dr_capped_users: cappedSummary.dr_capped_users.size,
+        l1_capped_users: cappedSummary.l1_capped_users.size,
+        l2_capped_users: cappedSummary.l2_capped_users.size,
+      },
+      affected_users_count: balanceDelta.size,
+    }
+
+    // ═══════════════ DRY-RUN ═══════════════
+    if (mode === 'DRY_RUN') {
+      // 사용자별 balance 변동 시뮬레이션
+      const userIds = Array.from(balanceDelta.keys()).sort((a, b) => a - b)
+      const userSim: any[] = []
+      if (userIds.length > 0) {
+        const CHUNK = 100
+        for (let i = 0; i < userIds.length; i += CHUNK) {
+          const chunk = userIds.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() => '?').join(',')
+          const rows = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id IN (${placeholders})`).bind(...chunk).all()
+          for (const u of (rows.results || []) as any[]) {
+            const delta = balanceDelta.get(Number(u.id)) || 0
+            userSim.push({
+              user_id: Number(u.id), name: u.name, email: u.email,
+              current_balance: Number(u.qkey_balance),
+              delta,
+              post_balance: Number(u.qkey_balance) + delta,
+              will_go_negative: (Number(u.qkey_balance) + delta) < 0,
+            })
+          }
+        }
+      }
+      const negAfter = userSim.filter(u => u.will_go_negative)
+
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'recalc-day-dividend',
+        is_business_day: true,
+        summary,
+        expected_dr_sample_top10: expectedDRs.slice(0, 10),
+        expected_rr_l1_sample_top10: expectedRRs.filter(r => r.level === 1).slice(0, 10),
+        expected_rr_l2_sample_top10: expectedRRs.filter(r => r.level === 2).slice(0, 10),
+        existing_dr_sample_top10: exDRs.slice(0, 10),
+        existing_rr_sample_top10: exRRs.slice(0, 10),
+        existing_tx_sample_top10: exTxList.slice(0, 10).map(t => ({
+          id: t.id, user_id: t.user_id, type: t.type, amount: t.amount,
+          description: t.description, ref_id: t.ref_id,
+        })),
+        balance_sim_top20: userSim.slice(0, 20),
+        negative_after: { count: negAfter.length, samples: negAfter.slice(0, 10) },
+        next_action: 'POST + confirm=GO 보내시면 EXEC. 그 dividendDate 의 기존 DR/RR/tx 통째 삭제 후 영구룰 바텀업 새 INSERT.',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ═══════════════ EXEC ═══════════════
+    const CHUNK_SIZE = 80
+
+    // (E1) tx DELETE (ref_id 매칭) + balance 차감
+    let txDeleted = 0
+    if (exDRIds.length > 0) {
+      for (let i = 0; i < exDRIds.length; i += CHUNK_SIZE) {
+        const chunk = exDRIds.slice(i, i + CHUNK_SIZE)
+        const placeholders = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`DELETE FROM transactions WHERE type='daily_qkey' AND ref_id IN (${placeholders})`).bind(...chunk).run()
+        txDeleted += (r as any)?.meta?.changes || 0
+      }
+    }
+    if (exRRIds.length > 0) {
+      for (let i = 0; i < exRRIds.length; i += CHUNK_SIZE) {
+        const chunk = exRRIds.slice(i, i + CHUNK_SIZE)
+        const placeholders = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`DELETE FROM transactions WHERE type='referral_reward' AND ref_id IN (${placeholders})`).bind(...chunk).run()
+        txDeleted += (r as any)?.meta?.changes || 0
+      }
+    }
+
+    // (E2) referral_rewards / daily_rewards DELETE (그 reward_date 의 모든 row)
+    let rrDeleted = 0
+    let drDeleted = 0
+    {
+      const r1 = await db.prepare(`DELETE FROM referral_rewards WHERE reward_date = ?`).bind(dividendDate).run()
+      rrDeleted = (r1 as any)?.meta?.changes || 0
+      const r2 = await db.prepare(`DELETE FROM daily_rewards WHERE reward_date = ?`).bind(dividendDate).run()
+      drDeleted = (r2 as any)?.meta?.changes || 0
+    }
+
+    // (E3) balance 차감 (existing tx amount 만큼)
+    //   balance_delta 는 (existing 차감) + (expected 가산) 의 net 이므로
+    //   여기서는 net 한번에 처리
+    let balanceAdjusted = 0
+    {
+      const balEntries = Array.from(balanceDelta.entries())
+      for (let i = 0; i < balEntries.length; i += CHUNK_SIZE) {
+        const chunk = balEntries.slice(i, i + CHUNK_SIZE)
+        const stmts = chunk.map(([uid, delta]) =>
+          db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
+        )
+        await db.batch(stmts)
+        balanceAdjusted += chunk.length
+      }
+    }
+
+    // (E4) 새 DR INSERT + tx INSERT (description 마커 없이)
+    let drInserted = 0
+    let drTxInserted = 0
+    for (let i = 0; i < expectedDRs.length; i += CHUNK_SIZE) {
+      const chunk = expectedDRs.slice(i, i + CHUNK_SIZE)
+      // DR INSERT 하나씩 (last_row_id 캡처 필요)
+      for (const dr of chunk) {
+        const drIns = await db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(dr.user_id, dr.staking_id, dr.amount, dividendDate, payoutDate).run()
+        const drId = (drIns as any)?.meta?.last_row_id ?? null
+        drInserted++
+        // 매칭 tx INSERT — description 마커 없이, 정상 cron 과 동일
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+        `).bind(dr.user_id, dr.amount, '일일 배당 (QKEY)', drId).run()
+        drTxInserted++
+      }
+    }
+
+    // (E5) 새 RR INSERT + tx INSERT (description 마커 없이)
+    let rrInserted = 0
+    let rrTxInserted = 0
+    for (let i = 0; i < expectedRRs.length; i += CHUNK_SIZE) {
+      const chunk = expectedRRs.slice(i, i + CHUNK_SIZE)
+      for (const rr of chunk) {
+        const rrIns = await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(rr.referrer_id, rr.referee_id, rr.level, rr.original_amount, rr.reward_amount, dividendDate, payoutDate, rr.staking_id).run()
+        const rrId = (rrIns as any)?.meta?.last_row_id ?? null
+        rrInserted++
+        const desc = rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(rr.referrer_id, rr.reward_amount, desc, rrId).run()
+        rrTxInserted++
+      }
+    }
+
+    // ─── POST-CHECK ───
+    const postDR = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total FROM daily_rewards WHERE reward_date = ?`).bind(dividendDate).first() as any
+    const postRR = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total FROM referral_rewards WHERE reward_date = ?`).bind(dividendDate).first() as any
+
+    // 마커 잔존 체크 (RECONCILE / REVERSE_BACKFILL 0건 확인)
+    const markerCheck = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM transactions
+      WHERE description LIKE '%[RECONCILE%' OR description LIKE '%[REVERSE_BACKFILL%'
+    `).first() as any
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      action: 'recalc-day-dividend',
+      dividendDate,
+      payoutDate,
+      pre_summary: summary,
+      exec_result: {
+        existing_deleted: {
+          tx: txDeleted,
+          rr: rrDeleted,
+          dr: drDeleted,
+        },
+        new_inserted: {
+          dr: drInserted,
+          dr_tx: drTxInserted,
+          rr: rrInserted,
+          rr_tx: rrTxInserted,
+        },
+        balance_adjusted_users: balanceAdjusted,
+      },
+      post_check: {
+        dr_count_after: Number(postDR?.cnt || 0),
+        dr_total_after: Number(postDR?.total || 0),
+        rr_count_after: Number(postRR?.cnt || 0),
+        rr_total_after: Number(postRR?.total || 0),
+        marker_residual: Number(markerCheck?.cnt || 0),
+        expected_match: Number(postDR?.cnt || 0) === expectedDRs.length && Number(postRR?.cnt || 0) === expectedRRs.length,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[RECALC_DAY] ERROR mode=${mode} duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+}
+
+app.get('/api/diag/recalc-day-dividend', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagRecalcDayDividend(c, 'DRY_RUN')
+})
+
+app.post('/api/diag/recalc-day-dividend', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 변경 게이트)' }, 400)
+  return diagRecalcDayDividend(c, 'EXEC')
 })
 
 
