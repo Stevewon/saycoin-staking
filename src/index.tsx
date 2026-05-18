@@ -46521,6 +46521,60 @@ app.get('/api/diag/balance-sync-to-tx', async (c) => {
   }
 })
 
+// user-tx-list: 특정 사용자의 coin 거래내역 전수 조회 (READ-ONLY)
+// GET /api/diag/user-tx-list?key=ADMIN_PW&userId=52&coin=QKEY
+app.get('/api/diag/user-tx-list', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const userId = Number(c.req.query('userId') || '0')
+    if (!userId) return c.json({ error: 'userId required' }, 400)
+    const coin = (c.req.query('coin') || 'QKEY').toUpperCase()
+
+    const db = c.env.DB
+    let balanceCol = 'qkey_balance'
+    if (coin === 'QX') balanceCol = 'qx_balance'
+    else if (coin === 'QTA') balanceCol = 'qta_balance'
+
+    const u = await db.prepare(`SELECT id, name, email, ${balanceCol} AS balance FROM users WHERE id=?`).bind(userId).first()
+    if (!u) return c.json({ error: 'user not found' }, 404)
+
+    const rows = await db.prepare(`
+      SELECT id, amount, description, ref_id, ref_table, created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM transactions
+      WHERE user_id=? AND coin_type=?
+      ORDER BY created_at ASC, id ASC
+    `).bind(userId, coin).all()
+    const txs = (rows.results || []) as any[]
+
+    let sum = 0
+    for (const t of txs) sum += Number(t.amount) || 0
+
+    return c.json({
+      ok: true,
+      user: { id: Number(u.id), name: String(u.name || ''), email: String(u.email || ''), balance: Number(u.balance) || 0 },
+      coin,
+      tx_count: txs.length,
+      tx_sum: sum,
+      diff: Number(u.balance) - sum,
+      transactions: txs.map(t => ({
+        id: Number(t.id),
+        amount: Number(t.amount),
+        description: String(t.description || ''),
+        ref_id: t.ref_id != null ? Number(t.ref_id) : null,
+        ref_table: t.ref_table != null ? String(t.ref_table) : null,
+        kst_at: String(t.kst_at || ''),
+        created_at_utc: String(t.created_at || ''),
+      })),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 app.get('/api/diag/user-reward-audit', async (c) => {
   const t0 = Date.now()
   try {
