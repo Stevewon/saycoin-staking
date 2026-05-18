@@ -40246,4 +40246,83 @@ app.get('/api/diag/scan-date-shift-range', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/scan-paid-date-distribution
+// ----------------------------------------------------------------
+// ★ 사장님 질문 (2026-05-18): "13일꺼 배당을 언제하지?"
+//   영구룰 #익일처리: 13일(수) → 14일(목) 지급, 14일(목) → 15일(금) 지급
+//   현재 reward_date 시프트 -1일 작업 전, paid_date 분포를 확인하여
+//   시프트 후 영구룰 #익일처리 적합성 검증 가능 여부 진단.
+//
+// READ-ONLY.
+// ============================================================
+app.get('/api/diag/scan-paid-date-distribution', async (c) => {
+  const t0 = Date.now()
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+
+  try {
+    // DR (reward_date, paid_date) 분포
+    const drMatrix = await db.prepare(`
+      SELECT reward_date, paid_date,
+             COUNT(*) AS cnt,
+             COALESCE(SUM(usdt_amount), 0) AS total_amount
+      FROM daily_rewards
+      GROUP BY reward_date, paid_date
+      ORDER BY reward_date, paid_date
+    `).all<any>()
+
+    // RR (reward_date, paid_date, level) 분포
+    const rrMatrix = await db.prepare(`
+      SELECT reward_date, paid_date, level,
+             COUNT(*) AS cnt,
+             COALESCE(SUM(reward_amount), 0) AS total_amount
+      FROM referral_rewards
+      GROUP BY reward_date, paid_date, level
+      ORDER BY reward_date, paid_date, level
+    `).all<any>()
+
+    // DR paid_date NULL 갯수
+    const drNullPaid = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE paid_date IS NULL`).first<any>()
+    const rrNullPaid = await db.prepare(`SELECT COUNT(*) AS cnt FROM referral_rewards WHERE paid_date IS NULL`).first<any>()
+
+    // 시프트 후 (-1일) 영구룰 #익일처리 검증 시뮬레이션
+    // 시프트 후 reward_date 별로 적합한 paid_date 가 있어야 함
+    //   - 수/목/월/화 → 다음날 paid
+    //   - 금 → 다음 월요일 paid
+    //   - 토/일 → 배당 없어야 함
+
+    return c.json({
+      ok: true,
+      action: 'scan-paid-date-distribution',
+      reward_dates_explained: {
+        '2026-05-13 (Wed)': 'paid 2026-05-14 (Thu) — 영구룰 #익일처리',
+        '2026-05-14 (Thu)': 'paid 2026-05-15 (Fri) — 영구룰 #익일처리',
+        '2026-05-15 (Fri)': 'paid 2026-05-18 (Mon) — 영구룰 #익일처리 + 휴일',
+        '2026-05-16 (Sat)': '배당 없음 (휴일)',
+        '2026-05-17 (Sun)': '배당 없음 (휴일)'
+      },
+      dr_matrix: (drMatrix?.results || []).map((r: any) => ({
+        reward_date: r.reward_date,
+        paid_date: r.paid_date,
+        rows: Number(r.cnt),
+        total_amount: Number(r.total_amount)
+      })),
+      rr_matrix: (rrMatrix?.results || []).map((r: any) => ({
+        reward_date: r.reward_date,
+        paid_date: r.paid_date,
+        level: Number(r.level),
+        rows: Number(r.cnt),
+        total_amount: Number(r.total_amount)
+      })),
+      dr_null_paid: Number(drNullPaid?.cnt || 0),
+      rr_null_paid: Number(rrNullPaid?.cnt || 0),
+      duration_ms: Date.now() - t0
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 export default app
