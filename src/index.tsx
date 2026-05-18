@@ -40669,11 +40669,13 @@ async function diagInsertMay15Dividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
     const rr515PreCount = Number(rr515Pre?.cnt || 0)
 
     // ─── PRE-CHECK B: paid_date=5/18 잔재 없는지 (이중 지급 방지) ───
+    //   ★ level=0 (직접매출 10% 쿠키, L0) 제외 — L0 는 staking 승인 즉시 발생 (휴일 무관)
+    //   우리가 INSERT 할 것은 DR + L1 + L2 (level 1, 2). L0 와 절대 충돌 안 함
     const dr518Pre = await db.prepare(`
       SELECT COUNT(*) AS cnt FROM daily_rewards WHERE paid_date = ?
     `).bind(PAID_DATE).first() as any
     const rr518Pre = await db.prepare(`
-      SELECT COUNT(*) AS cnt FROM referral_rewards WHERE paid_date = ?
+      SELECT COUNT(*) AS cnt FROM referral_rewards WHERE paid_date = ? AND level IN (1, 2)
     `).bind(PAID_DATE).first() as any
     const dr518PreCount = Number(dr518Pre?.cnt || 0)
     const rr518PreCount = Number(rr518Pre?.cnt || 0)
