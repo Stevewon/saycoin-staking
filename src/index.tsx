@@ -40123,4 +40123,127 @@ app.get('/api/diag/scan-may14-vs-may15', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/scan-date-shift-range
+// ----------------------------------------------------------------
+// ★ 사장님 명령 (2026-05-18):
+//   "15일은 14일꺼, 14일은 13일치, 하나씩 줄이면 된다."
+//
+// 모든 reward_date 를 -1일 시프트해야 정상 상태가 됨.
+// 시프트 범위 확인 (가장 오래된 reward_date 까지).
+// READ-ONLY.
+// ============================================================
+app.get('/api/diag/scan-date-shift-range', async (c) => {
+  const t0 = Date.now()
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+
+  try {
+    // 1. DR 모든 reward_date 별 row 수
+    const drByDate = await db.prepare(`
+      SELECT reward_date,
+             COUNT(*) AS cnt,
+             COUNT(DISTINCT user_id) AS distinct_users,
+             COUNT(DISTINCT staking_id) AS distinct_stakings,
+             COALESCE(SUM(usdt_amount), 0) AS total_amount,
+             MIN(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours')) AS min_created,
+             MAX(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours')) AS max_created
+      FROM daily_rewards
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).all<any>()
+
+    // 2. RR 모든 reward_date 별 row 수 (level별)
+    const rrByDate = await db.prepare(`
+      SELECT reward_date, level,
+             COUNT(*) AS cnt,
+             COUNT(DISTINCT referrer_id) AS distinct_refs,
+             COALESCE(SUM(reward_amount), 0) AS total_amount
+      FROM referral_rewards
+      GROUP BY reward_date, level
+      ORDER BY reward_date, level
+    `).all<any>()
+
+    // 3. 가장 오래된 reward_date 확인 (시프트 시 안전한 시작점)
+    const drMinDate = await db.prepare(`SELECT MIN(reward_date) AS d FROM daily_rewards`).first<any>()
+    const drMaxDate = await db.prepare(`SELECT MAX(reward_date) AS d FROM daily_rewards`).first<any>()
+    const rrMinDate = await db.prepare(`SELECT MIN(reward_date) AS d FROM referral_rewards`).first<any>()
+    const rrMaxDate = await db.prepare(`SELECT MAX(reward_date) AS d FROM referral_rewards`).first<any>()
+
+    // 4. 시프트 후 충돌 검증 — 가장 오래된 날짜의 하루 전이 비어있는지
+    //    DR 가장 오래된 날짜 = drMinDate.d → 시프트 후 = date(drMinDate.d, '-1 day')
+    //    그 새 날짜에 이미 row 가 있으면 시프트 충돌
+    const drShiftConflict = await db.prepare(`
+      WITH all_dates AS (
+        SELECT DISTINCT reward_date FROM daily_rewards
+      ),
+      shifted AS (
+        SELECT reward_date, date(reward_date, '-1 day') AS new_date FROM all_dates
+      )
+      SELECT s.reward_date AS old_date, s.new_date,
+             (SELECT COUNT(*) FROM daily_rewards WHERE reward_date = s.new_date) AS rows_on_new_date
+      FROM shifted s
+      WHERE s.new_date NOT IN (SELECT reward_date FROM all_dates)
+      ORDER BY s.reward_date
+    `).all<any>()
+
+    // 5. transactions ref_id 매칭 통계
+    const txDrCount = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM transactions
+      WHERE type = 'daily_qkey' AND ref_id IS NOT NULL
+    `).first<any>()
+    const txRrCount = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM transactions
+      WHERE type = 'referral_reward' AND ref_id IS NOT NULL
+    `).first<any>()
+
+    return c.json({
+      ok: true,
+      action: 'scan-date-shift-range',
+      shift_plan: 'reward_date 를 -1일 시프트 (15→14, 14→13, 13→12, ...)',
+      dr_summary: {
+        min_date: drMinDate?.d,
+        max_date: drMaxDate?.d,
+        distinct_dates: (drByDate?.results || []).length,
+        total_rows: (drByDate?.results || []).reduce((a: number, r: any) => a + Number(r.cnt), 0),
+        total_amount: (drByDate?.results || []).reduce((a: number, r: any) => a + Number(r.total_amount), 0),
+        rows_per_date: (drByDate?.results || []).map((r: any) => ({
+          reward_date: r.reward_date,
+          rows: Number(r.cnt),
+          distinct_users: Number(r.distinct_users),
+          distinct_stakings: Number(r.distinct_stakings),
+          total_amount: Number(r.total_amount),
+          created_kst_range: { min: r.min_created, max: r.max_created }
+        }))
+      },
+      rr_summary: {
+        min_date: rrMinDate?.d,
+        max_date: rrMaxDate?.d,
+        distinct_dates: new Set((rrByDate?.results || []).map((r: any) => r.reward_date)).size,
+        total_rows: (rrByDate?.results || []).reduce((a: number, r: any) => a + Number(r.cnt), 0),
+        rows_per_date_level: (rrByDate?.results || []).map((r: any) => ({
+          reward_date: r.reward_date,
+          level: Number(r.level),
+          rows: Number(r.cnt),
+          distinct_referrers: Number(r.distinct_refs),
+          total_amount: Number(r.total_amount)
+        }))
+      },
+      shift_pre_check_dr: {
+        first_safe_shift_target: drShiftConflict?.results?.[0] || null,
+        note: 'shift 시 가장 오래된 reward_date 의 -1일 자리가 비어 있는지 확인'
+      },
+      tx_overall: {
+        daily_qkey_tx_rows: Number(txDrCount?.cnt || 0),
+        referral_reward_tx_rows: Number(txRrCount?.cnt || 0),
+        note: 'transactions 는 ref_id 로 dr/rr 와 매핑됨. reward_date 만 UPDATE 하면 tx 영향 없음 (ref_id 그대로)'
+      },
+      duration_ms: Date.now() - t0
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 export default app
