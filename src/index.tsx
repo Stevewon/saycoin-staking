@@ -38799,4 +38799,241 @@ app.get('/api/diag/scan-duplicate-dr-rr', async (c) => {
   }
 })
 
+// ═══════════════════════════════════════════════════════════════════
+// /api/diag/scan-duplicate-dr-rr-v2
+// 사장님 영구룰 #지급항목 확정 (2026-05-18):
+//
+//   📌 level=0 (direct_referral, 직접매출 10% 쿠키):
+//      "10명이면 10건을 당일 다 받는다. 건당 1회"
+//      = (referrer_id, referee_id, staking_id) 당 1건. 하루 최대 건수 무제한.
+//      = 영구룰 #1회지급 의 예외!
+//
+//   📌 level=1 (L1 배당의 20%): (referrer_id, reward_date, level=1) 당 1건
+//   📌 level=2 (L2 배당의 10%): (referrer_id, reward_date, level=2) 당 1건
+//   📌 daily_qkey (본인 배당): (user_id, reward_date) 당 1건
+//
+// 즉 v1 의 RR 위반 484건 중 일부는 level=0 정상 데이터일 수 있음.
+// v2 는 level 별로 분리하여 진짜 영구룰 위반만 골라낸다.
+//
+// READ-ONLY — SELECT 만. DB 변경 없음.
+// 사용: GET /api/diag/scan-duplicate-dr-rr-v2?key=ADMIN_PW
+// ═══════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-duplicate-dr-rr-v2', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    console.log(`[REWARD_BATCH] start action=scan-duplicate-dr-rr-v2 mode=READ_ONLY no_per_row_exists=true set_based=true`)
+
+    // ─── DR 중복: (user_id, reward_date) 당 1건 영구룰 ───
+    const drDupStat = await db.prepare(`
+      WITH dup_groups AS (
+        SELECT user_id, reward_date, COUNT(*) AS cnt, MIN(id) AS keep_id,
+               COALESCE(SUM(usdt_amount), 0) AS sum_amount,
+               COUNT(DISTINCT staking_id) AS distinct_stakings
+        FROM daily_rewards
+        GROUP BY user_id, reward_date
+        HAVING COUNT(*) > 1
+      )
+      SELECT
+        COUNT(*) AS violating_groups,
+        COALESCE(SUM(cnt), 0) AS total_violating_rows,
+        COALESCE(SUM(cnt - 1), 0) AS excess_rows,
+        COUNT(DISTINCT user_id) AS distinct_users,
+        SUM(CASE WHEN distinct_stakings > 1 THEN 1 ELSE 0 END) AS multi_staking_groups,
+        SUM(CASE WHEN distinct_stakings = 1 THEN cnt - 1 ELSE 0 END) AS same_staking_excess
+      FROM dup_groups
+    `).first<any>()
+
+    // ─── RR Level 1 (L1 보너스): (referrer_id, reward_date, level=1) 당 1건 ───
+    const rrL1Stat = await db.prepare(`
+      WITH dup_groups AS (
+        SELECT referrer_id, reward_date, COUNT(*) AS cnt, MIN(id) AS keep_id,
+               COALESCE(SUM(reward_amount), 0) AS sum_amount
+        FROM referral_rewards
+        WHERE level = 1
+        GROUP BY referrer_id, reward_date
+        HAVING COUNT(*) > 1
+      )
+      SELECT
+        COUNT(*) AS violating_groups,
+        COALESCE(SUM(cnt), 0) AS total_violating_rows,
+        COALESCE(SUM(cnt - 1), 0) AS excess_rows,
+        COUNT(DISTINCT referrer_id) AS distinct_users
+      FROM dup_groups
+    `).first<any>()
+
+    // ─── RR Level 2 (L2 보너스): (referrer_id, reward_date, level=2) 당 1건 ───
+    const rrL2Stat = await db.prepare(`
+      WITH dup_groups AS (
+        SELECT referrer_id, reward_date, COUNT(*) AS cnt, MIN(id) AS keep_id,
+               COALESCE(SUM(reward_amount), 0) AS sum_amount
+        FROM referral_rewards
+        WHERE level = 2
+        GROUP BY referrer_id, reward_date
+        HAVING COUNT(*) > 1
+      )
+      SELECT
+        COUNT(*) AS violating_groups,
+        COALESCE(SUM(cnt), 0) AS total_violating_rows,
+        COALESCE(SUM(cnt - 1), 0) AS excess_rows,
+        COUNT(DISTINCT referrer_id) AS distinct_users
+      FROM dup_groups
+    `).first<any>()
+
+    // ─── RR Level 0 (직접매출 쿠키): (referrer, referee, staking_id 또는 reward_date) 1건 ───
+    // 사장님 룰: "10명이면 10건 받는다 건당 1회"
+    // → 같은 사람한테 같은 referee 의 같은 staking 으로 2번 지급되면 위반
+    // → 하지만 같은 staking_id 가 referral_rewards 에 저장되는지 확인 필요 — 일단 (referrer, referee, reward_date) 로 검사
+    const rrL0Stat = await db.prepare(`
+      WITH dup_groups AS (
+        SELECT referrer_id, referee_id, reward_date, COUNT(*) AS cnt, MIN(id) AS keep_id,
+               COALESCE(SUM(reward_amount), 0) AS sum_amount,
+               COUNT(DISTINCT original_amount) AS distinct_amounts
+        FROM referral_rewards
+        WHERE level = 0
+        GROUP BY referrer_id, referee_id, reward_date
+        HAVING COUNT(*) > 1
+      )
+      SELECT
+        COUNT(*) AS suspect_groups,
+        COALESCE(SUM(cnt), 0) AS total_suspect_rows,
+        COALESCE(SUM(cnt - 1), 0) AS excess_rows_if_strict,
+        COUNT(DISTINCT referrer_id) AS distinct_users,
+        SUM(CASE WHEN distinct_amounts > 1 THEN 1 ELSE 0 END) AS multi_amount_groups
+      FROM dup_groups
+    `).first<any>()
+
+    // ─── 전체 RR 건수 (level별) ───
+    const rrTotalByLevel = await db.prepare(`
+      SELECT level, COUNT(*) AS total_rows, COALESCE(SUM(reward_amount), 0) AS total_amount
+      FROM referral_rewards
+      GROUP BY level
+      ORDER BY level
+    `).all<any>()
+
+    // ─── L1 위반 샘플 ───
+    const rrL1Samples = await db.prepare(`
+      SELECT referrer_id, reward_date, COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id, ',') AS all_ids,
+             GROUP_CONCAT(reward_amount, '|') AS all_amounts,
+             GROUP_CONCAT(referee_id, '|') AS all_referees
+      FROM referral_rewards
+      WHERE level = 1
+      GROUP BY referrer_id, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC
+      LIMIT 10
+    `).all<any>()
+
+    // ─── L2 위반 샘플 ───
+    const rrL2Samples = await db.prepare(`
+      SELECT referrer_id, reward_date, COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id, ',') AS all_ids,
+             GROUP_CONCAT(reward_amount, '|') AS all_amounts,
+             GROUP_CONCAT(referee_id, '|') AS all_referees
+      FROM referral_rewards
+      WHERE level = 2
+      GROUP BY referrer_id, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC
+      LIMIT 10
+    `).all<any>()
+
+    // ─── L0 의심 샘플 ───
+    const rrL0Samples = await db.prepare(`
+      SELECT referrer_id, referee_id, reward_date, COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             GROUP_CONCAT(id, ',') AS all_ids,
+             GROUP_CONCAT(reward_amount, '|') AS all_amounts,
+             GROUP_CONCAT(original_amount, '|') AS all_originals
+      FROM referral_rewards
+      WHERE level = 0
+      GROUP BY referrer_id, referee_id, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC
+      LIMIT 10
+    `).all<any>()
+
+    // ─── DR 위반 샘플 (multi-staking 인 경우와 같은 staking 중복 구분) ───
+    const drSamples = await db.prepare(`
+      SELECT user_id, reward_date, COUNT(*) AS cnt,
+             MIN(id) AS keep_id,
+             COUNT(DISTINCT staking_id) AS distinct_stakings,
+             GROUP_CONCAT(id, ',') AS all_ids,
+             GROUP_CONCAT(usdt_amount, '|') AS all_amounts,
+             GROUP_CONCAT(staking_id, '|') AS all_stakings,
+             GROUP_CONCAT(created_at, '|') AS all_created
+      FROM daily_rewards
+      GROUP BY user_id, reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY user_id, reward_date
+      LIMIT 30
+    `).all<any>()
+
+    const durMs = Date.now() - t0
+    console.log(`[REWARD_BATCH] scan-v2 done dr_violations=${drDupStat?.violating_groups} L1_violations=${rrL1Stat?.violating_groups} L2_violations=${rrL2Stat?.violating_groups} L0_suspects=${rrL0Stat?.suspect_groups} duration_ms=${durMs}`)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      action: 'scan-duplicate-dr-rr-v2',
+      method: 'SET_BASED_GROUP_BY_BY_LEVEL',
+      no_per_row_exists: true,
+      permanent_rules_applied: {
+        daily_qkey: '(user_id, reward_date) 당 1건',
+        referral_reward_L0: '(referrer, referee, staking) 당 1건. 하루 다건 정상 (10명=10건)',
+        referral_reward_L1: '(referrer_id, reward_date, level=1) 당 1건 (하부 합산)',
+        referral_reward_L2: '(referrer_id, reward_date, level=2) 당 1건 (하부 합산)'
+      },
+      summary: {
+        daily_rewards: {
+          violating_groups: Number(drDupStat?.violating_groups || 0),
+          total_violating_rows: Number(drDupStat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(drDupStat?.excess_rows || 0),
+          distinct_users: Number(drDupStat?.distinct_users || 0),
+          multi_staking_groups: Number(drDupStat?.multi_staking_groups || 0),
+          same_staking_excess_rows: Number(drDupStat?.same_staking_excess || 0)
+        },
+        referral_rewards_level1: {
+          violating_groups: Number(rrL1Stat?.violating_groups || 0),
+          total_violating_rows: Number(rrL1Stat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(rrL1Stat?.excess_rows || 0),
+          distinct_users: Number(rrL1Stat?.distinct_users || 0)
+        },
+        referral_rewards_level2: {
+          violating_groups: Number(rrL2Stat?.violating_groups || 0),
+          total_violating_rows: Number(rrL2Stat?.total_violating_rows || 0),
+          excess_rows_to_delete: Number(rrL2Stat?.excess_rows || 0),
+          distinct_users: Number(rrL2Stat?.distinct_users || 0)
+        },
+        referral_rewards_level0_suspects: {
+          suspect_groups: Number(rrL0Stat?.suspect_groups || 0),
+          total_suspect_rows: Number(rrL0Stat?.total_suspect_rows || 0),
+          excess_rows_if_strict: Number(rrL0Stat?.excess_rows_if_strict || 0),
+          distinct_users: Number(rrL0Stat?.distinct_users || 0),
+          multi_amount_groups: Number(rrL0Stat?.multi_amount_groups || 0),
+          note: '동일 (referrer, referee, reward_date) 에 2건 이상. 단, 한 사람이 같은 날 두 staking 으로 진입했으면 정상. multi_amount_groups > 0 이면 staking 다른 가능성 높음.'
+        },
+        rr_total_by_level: rrTotalByLevel.results || []
+      },
+      samples: {
+        dr_duplicates: drSamples.results || [],
+        rr_level1_violations: rrL1Samples.results || [],
+        rr_level2_violations: rrL2Samples.results || [],
+        rr_level0_suspects: rrL0Samples.results || []
+      },
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[REWARD_BATCH] ERROR action=scan-duplicate-dr-rr-v2 duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+})
+
 export default app
