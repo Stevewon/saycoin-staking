@@ -44222,21 +44222,24 @@ app.get('/api/diag/verify-paid-date', async (c) => {
     const USD_TO_QKEY = 150
 
     // ─── ① daily_rewards 중복 체크 ───
+    //   사장님 영구룰 #스테이킹별독립: 1건 기준 = (user_id, staking_id, reward_date)
+    //   ★ paid_date 가 아니라 reward_date 기준이어야 함 (5/8 + 5/11 휴일 합산 익일처리는 정상)
     const drDupRaw = await db.prepare(`
-      SELECT user_id, staking_id, paid_date, COUNT(*) AS cnt, SUM(usdt_amount) AS total_amt
+      SELECT user_id, staking_id, reward_date, paid_date, COUNT(*) AS cnt, SUM(usdt_amount) AS total_amt
       FROM daily_rewards
       WHERE paid_date = ?
-      GROUP BY user_id, staking_id, paid_date
+      GROUP BY user_id, staking_id, reward_date
       HAVING cnt > 1
     `).bind(paidDate).all()
     const drDuplicates = (drDupRaw.results || []) as any[]
 
     // ─── ② referral_rewards 중복 체크 ───
+    //   영구룰 #스테이킹별독립: 1건 기준 = (referrer_id, referee_id, referee_staking_id, reward_date, level)
     const rrDupRaw = await db.prepare(`
-      SELECT referrer_id, referee_id, level, staking_id, paid_date, COUNT(*) AS cnt, SUM(reward_amount) AS total_amt
+      SELECT referrer_id, referee_id, level, staking_id, reward_date, paid_date, COUNT(*) AS cnt, SUM(reward_amount) AS total_amt
       FROM referral_rewards
       WHERE paid_date = ?
-      GROUP BY referrer_id, referee_id, level, staking_id, paid_date
+      GROUP BY referrer_id, referee_id, level, staking_id, reward_date
       HAVING cnt > 1
     `).bind(paidDate).all()
     const rrDuplicates = (rrDupRaw.results || []) as any[]
@@ -44270,10 +44273,14 @@ app.get('/api/diag/verify-paid-date', async (c) => {
       WHERE type='daily_qkey' AND coin_type='QKEY'
         AND ref_id IN (SELECT id FROM daily_rewards WHERE paid_date = ?)
     `).bind(paidDate).first() as any
+    // ★ 영구룰 #지급항목: RR 은 level=0 (direct_referral) + level=1,2 (referral_reward) 두 종류
+    //   level=0 → tx.type='direct_referral', ref_id 는 prefix 없는 숫자 (referral_rewards.id 직접)
+    //   level=1,2 → tx.type='referral_reward', ref_id 는 referral_rewards.id 직접
+    //   둘 다 합쳐서 RR row 총합 ↔ tx 총합 비교해야 정합 정확
     const txRrRow = await db.prepare(`
       SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total
       FROM transactions
-      WHERE type='referral_reward' AND coin_type='QKEY'
+      WHERE type IN ('referral_reward','direct_referral') AND coin_type='QKEY'
         AND ref_id IN (SELECT id FROM referral_rewards WHERE paid_date = ?)
     `).bind(paidDate).first() as any
 
