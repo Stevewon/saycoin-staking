@@ -44192,6 +44192,290 @@ app.post('/api/diag/purge-tx-by-time', async (c) => {
 })
 
 // ============================================================================
+// purge-reward-date-fully: 사장님 명령 (2026-05-18)
+//   특정 reward_date 의 DR + RR + 매칭 tx + balance 전부 reverse
+//
+//   배경: recalc-day-dividend EXEC 가 tx.created_at 을 EXEC 시각으로 INSERT 한 사고
+//        → 사용자 거래내역에 5/18 KST 19:04 등 오늘 시각으로 잉여 tx 가 다량 표시
+//        → 사장님 격노 + 명령: "전부 다 지우고 18일은 15일 확정액만 넣어"
+//
+//   동작 (영구룰 #1일1정산 + #스테이킹별독립 정합 유지):
+//     ① 그 reward_date 의 모든 DR/RR 조회 → id 목록 + 사용자별 sum
+//     ② 매칭 tx (type='daily_qkey' AND ref_id IN DR.id) + (type IN 'referral_reward','direct_referral' AND ref_id IN RR.id)
+//        → 사용자별 amount 합계 (balance 차감 기준 = 실제 INSERT 된 액수)
+//     ③ balance 차감 (tx 기준)
+//     ④ DELETE matching tx (id 기반 — 정확)
+//     ⑤ DELETE RR WHERE reward_date=?
+//     ⑥ DELETE DR WHERE reward_date=?
+//     ⑦ POST-CHECK: reward_date 의 DR/RR/매칭 tx 모두 0건 확인
+//
+//   엔드포인트:
+//     GET  /api/diag/purge-reward-date-fully?key=ADMIN_PW&rewardDate=YYYY-MM-DD          → DRY_RUN
+//     POST /api/diag/purge-reward-date-fully?key=ADMIN_PW&rewardDate=YYYY-MM-DD&confirm=GO → EXEC
+// ============================================================================
+async function diagPurgeRewardDateFully(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  try {
+    const db = c.env.DB
+    const rewardDate = c.req.query('rewardDate') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(rewardDate)) {
+      return c.json({ error: 'rewardDate=YYYY-MM-DD 필수' }, 400)
+    }
+
+    // ─── (1) DR 조회 ───
+    const drList = (await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, qkey_amount, reward_date, paid_date
+      FROM daily_rewards
+      WHERE reward_date = ?
+    `).bind(rewardDate).all()).results as any[] || []
+
+    // ─── (2) RR 조회 ───
+    const rrList = (await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id, reward_amount, reward_date, paid_date
+      FROM referral_rewards
+      WHERE reward_date = ?
+    `).bind(rewardDate).all()).results as any[] || []
+
+    const drIds = drList.map(r => Number(r.id))
+    const rrIds = rrList.map(r => Number(r.id))
+
+    if (drIds.length === 0 && rrIds.length === 0) {
+      return c.json({
+        ok: true, mode, action: 'purge-reward-date-fully',
+        reward_date: rewardDate,
+        message: '해당 reward_date 의 DR/RR 0건 — 제거할 것 없음',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─── (3) 매칭 tx 수집 ───
+    const CHUNK = 80
+    const drTxList: any[] = []
+    for (let i = 0; i < drIds.length; i += CHUNK) {
+      const chunk = drIds.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      const rows = await db.prepare(`
+        SELECT id, user_id, type, amount, description, ref_id,
+               datetime(created_at,'+9 hours') AS created_kst
+        FROM transactions
+        WHERE type = 'daily_qkey' AND coin_type = 'QKEY'
+          AND ref_id IN (${placeholders})
+      `).bind(...chunk).all()
+      drTxList.push(...((rows.results || []) as any[]))
+    }
+    const rrTxList: any[] = []
+    for (let i = 0; i < rrIds.length; i += CHUNK) {
+      const chunk = rrIds.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      const rows = await db.prepare(`
+        SELECT id, user_id, type, amount, description, ref_id,
+               datetime(created_at,'+9 hours') AS created_kst
+        FROM transactions
+        WHERE type IN ('referral_reward','direct_referral') AND coin_type = 'QKEY'
+          AND ref_id IN (${placeholders})
+      `).bind(...chunk).all()
+      rrTxList.push(...((rows.results || []) as any[]))
+    }
+
+    // ─── (4) 사용자별 balance 차감액 계산 (tx 기준) ───
+    const balanceDelta = new Map<number, number>()
+    let drTxTotal = 0, rrTxTotal = 0
+    for (const tx of drTxList) {
+      const uid = Number(tx.user_id)
+      const amt = Number(tx.amount)
+      drTxTotal += amt
+      balanceDelta.set(uid, (balanceDelta.get(uid) || 0) - amt)
+    }
+    for (const tx of rrTxList) {
+      const uid = Number(tx.user_id)
+      const amt = Number(tx.amount)
+      rrTxTotal += amt
+      balanceDelta.set(uid, (balanceDelta.get(uid) || 0) - amt)
+    }
+
+    // ─── 정합 검증: DR/RR 합계 vs tx 합계 ───
+    const drSumQkey = drList.reduce((s, r) => s + Number(r.qkey_amount || 0), 0)
+    const rrSumQkey = rrList.reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+
+    // ─── tx created_kst 분포 (사고 진단용) ───
+    const allTx = [...drTxList, ...rrTxList]
+    const kstHistogram = new Map<string, number>()
+    for (const tx of allTx) {
+      const minKey = String(tx.created_kst || '').slice(0, 16) // YYYY-MM-DD HH:MM
+      kstHistogram.set(minKey, (kstHistogram.get(minKey) || 0) + 1)
+    }
+    const kstHistoTop = Array.from(kstHistogram.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([t, c]) => ({ kst_minute: t, count: c }))
+
+    const summary = {
+      reward_date: rewardDate,
+      dr_count: drList.length,
+      rr_count: rrList.length,
+      dr_sum_qkey: drSumQkey,
+      rr_sum_qkey: rrSumQkey,
+      dr_tx_count: drTxList.length,
+      rr_tx_count: rrTxList.length,
+      dr_tx_total: drTxTotal,
+      rr_tx_total: rrTxTotal,
+      all_tx_count: allTx.length,
+      all_tx_total: drTxTotal + rrTxTotal,
+      affected_users_count: balanceDelta.size,
+      tx_created_kst_top: kstHistoTop,
+    }
+
+    // ═══════════════ DRY-RUN ═══════════════
+    if (mode === 'DRY_RUN') {
+      const userIds = Array.from(balanceDelta.keys())
+      const userSim: any[] = []
+      for (let i = 0; i < userIds.length; i += CHUNK) {
+        const chunk = userIds.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id IN (${placeholders})`).bind(...chunk).all()
+        for (const u of (rows.results || []) as any[]) {
+          const delta = balanceDelta.get(Number(u.id)) || 0
+          userSim.push({
+            user_id: Number(u.id), name: u.name, email: u.email,
+            current_balance: Number(u.qkey_balance),
+            delta,
+            post_balance: Number(u.qkey_balance) + delta,
+            will_go_negative: (Number(u.qkey_balance) + delta) < 0,
+          })
+        }
+      }
+      const negAfter = userSim.filter(u => u.will_go_negative)
+
+      // 다른 reward_date 와 섞여있지 않은지 확인 (안전)
+      const drPaidDates = Array.from(new Set(drList.map(r => String(r.paid_date))))
+      const rrPaidDates = Array.from(new Set(rrList.map(r => String(r.paid_date))))
+
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'purge-reward-date-fully',
+        summary,
+        paid_dates_distribution: {
+          dr_paid_dates: drPaidDates,
+          rr_paid_dates: rrPaidDates,
+        },
+        balance_sim_top20: userSim.slice(0, 20),
+        negative_after: { count: negAfter.length, samples: negAfter.slice(0, 10) },
+        dr_tx_sample_top5: drTxList.slice(0, 5).map(t => ({
+          id: t.id, user_id: t.user_id, type: t.type, amount: t.amount,
+          ref_id: t.ref_id, description: t.description, created_kst: t.created_kst,
+        })),
+        rr_tx_sample_top5: rrTxList.slice(0, 5).map(t => ({
+          id: t.id, user_id: t.user_id, type: t.type, amount: t.amount,
+          ref_id: t.ref_id, description: t.description, created_kst: t.created_kst,
+        })),
+        warnings: [
+          drSumQkey !== drTxTotal ? `DR sum (${drSumQkey}) != DR tx total (${drTxTotal}) — balance 차감은 tx 기준` : null,
+          rrSumQkey !== rrTxTotal ? `RR sum (${rrSumQkey}) != RR tx total (${rrTxTotal}) — balance 차감은 tx 기준` : null,
+        ].filter(Boolean),
+        next_action: 'POST + confirm=GO 보내시면 EXEC. tx DELETE + balance 차감 + RR DELETE + DR DELETE.',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ═══════════════ EXEC ═══════════════
+    // ── (a) balance 차감 ──
+    let balanceAdjusted = 0
+    const balEntries = Array.from(balanceDelta.entries())
+    for (let i = 0; i < balEntries.length; i += CHUNK) {
+      const chunk = balEntries.slice(i, i + CHUNK)
+      const stmts = chunk.map(([uid, delta]) =>
+        db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
+      )
+      await db.batch(stmts)
+      balanceAdjusted += chunk.length
+    }
+
+    // ── (b) tx DELETE (id 기반 — 정확) ──
+    const allTxIds = [...drTxList.map(t => Number(t.id)), ...rrTxList.map(t => Number(t.id))]
+    let txDeleted = 0
+    for (let i = 0; i < allTxIds.length; i += CHUNK) {
+      const chunk = allTxIds.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...chunk).run()
+      txDeleted += (r as any)?.meta?.changes || 0
+    }
+
+    // ── (c) RR DELETE (reward_date 기반 — set-based) ──
+    const rrDelRes = await db.prepare(`DELETE FROM referral_rewards WHERE reward_date = ?`).bind(rewardDate).run()
+    const rrDeleted = (rrDelRes as any)?.meta?.changes || 0
+
+    // ── (d) DR DELETE (reward_date 기반 — set-based) ──
+    const drDelRes = await db.prepare(`DELETE FROM daily_rewards WHERE reward_date = ?`).bind(rewardDate).run()
+    const drDeleted = (drDelRes as any)?.meta?.changes || 0
+
+    // ─── POST-CHECK ───
+    const drRemain = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = ?`).bind(rewardDate).first() as any
+    const rrRemain = await db.prepare(`SELECT COUNT(*) AS cnt FROM referral_rewards WHERE reward_date = ?`).bind(rewardDate).first() as any
+    // 매칭 tx 잔여 (DR/RR id 가 다 지워졌으니 매칭은 0이 자연스러움)
+    let drTxRemain = 0, rrTxRemain = 0
+    for (let i = 0; i < drIds.length; i += CHUNK) {
+      const chunk = drIds.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT COUNT(*) AS cnt FROM transactions
+        WHERE type = 'daily_qkey' AND coin_type = 'QKEY' AND ref_id IN (${placeholders})
+      `).bind(...chunk).first() as any
+      drTxRemain += Number(r?.cnt || 0)
+    }
+    for (let i = 0; i < rrIds.length; i += CHUNK) {
+      const chunk = rrIds.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT COUNT(*) AS cnt FROM transactions
+        WHERE type IN ('referral_reward','direct_referral') AND coin_type = 'QKEY' AND ref_id IN (${placeholders})
+      `).bind(...chunk).first() as any
+      rrTxRemain += Number(r?.cnt || 0)
+    }
+
+    const allClean = Number(drRemain?.cnt || 0) === 0 && Number(rrRemain?.cnt || 0) === 0 && drTxRemain === 0 && rrTxRemain === 0
+
+    return c.json({
+      ok: allClean,
+      mode: 'EXEC',
+      action: 'purge-reward-date-fully',
+      reward_date: rewardDate,
+      pre_summary: summary,
+      exec_result: {
+        balance_adjusted_users: balanceAdjusted,
+        tx_deleted: txDeleted,
+        rr_deleted: rrDeleted,
+        dr_deleted: drDeleted,
+      },
+      post_check: {
+        dr_remaining: Number(drRemain?.cnt || 0),
+        rr_remaining: Number(rrRemain?.cnt || 0),
+        dr_tx_remaining: drTxRemain,
+        rr_tx_remaining: rrTxRemain,
+        verified: allClean,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+}
+
+app.get('/api/diag/purge-reward-date-fully', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagPurgeRewardDateFully(c, 'DRY_RUN')
+})
+
+app.post('/api/diag/purge-reward-date-fully', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 변경 게이트)' }, 400)
+  return diagPurgeRewardDateFully(c, 'EXEC')
+})
+
+// ============================================================================
 // verify-paid-date: 사장님 영구룰 검수 endpoint
 //   특정 paid_date 의 DR/RR/tx 정합 + 중복 확인 (READ-ONLY)
 //
