@@ -39313,4 +39313,218 @@ app.get('/api/diag/scan-duplicate-dr-rr-v3', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/scan-may15-status
+// ----------------------------------------------------------------
+// ★ 사장님 명령 (2026-05-18): 2026-05-15 기준 배당 → 2026-05-18 (월) 지급
+//   영구룰 #익일처리: 15일(금) → 16일(토)/17일(일) skip → 18일(월) 지급
+//   영구룰 #스테이킹별독립: staking 별 독립 진단
+//
+// 진단 항목 (READ-ONLY):
+//   1. 2026-05-15 active 상태였던 staking 전체 (대상자 기준)
+//   2. 이미 reward_date='2026-05-15' 으로 들어가 있는 dr/rr 현황 (이중지급 방지)
+//   3. 남은 미지급 대상 (staking 별)
+//   4. 16/17/18 기준 dr/rr 가 있다면 별도 경고 (영구룰 위반 가능성)
+//
+// 사용: GET /api/diag/scan-may15-status?key=ADMIN_PW
+// ============================================================
+app.get('/api/diag/scan-may15-status', async (c) => {
+  const t0 = Date.now()
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+
+  const REWARD_DATE = '2026-05-15'
+
+  try {
+    console.log(`[DIVIDEND_BACKPAY] start scan-may15-status dividendDate=${REWARD_DATE} payoutDate=2026-05-18`)
+
+    // 1. 2026-05-15 시점 active staking 전체
+    const activeStakings = await db.prepare(`
+      SELECT
+        s.id AS staking_id,
+        s.user_id,
+        u.name AS nickname,
+        u.email,
+        s.amount,
+        s.daily_rate,
+        s.period_days,
+        date(s.start_date, '+9 hours') AS start_kst,
+        date(s.end_date, '+9 hours') AS end_kst,
+        s.status,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id) AS rewarded_count_total,
+        (SELECT COUNT(*) FROM daily_rewards dr WHERE dr.staking_id = s.id AND dr.reward_date = ?) AS rewarded_on_target,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) AS last_reward_date,
+        (SELECT usdt_amount FROM daily_rewards WHERE staking_id = s.id AND reward_date = ? LIMIT 1) AS existing_amount
+      FROM staking s
+      LEFT JOIN users u ON u.id = s.user_id
+      WHERE s.status IN ('active', 'capped')
+        AND date(s.start_date, '+9 hours') <= ?
+        AND date(s.end_date, '+9 hours') >= ?
+      ORDER BY s.user_id ASC, s.id ASC
+    `).bind(REWARD_DATE, REWARD_DATE, REWARD_DATE, REWARD_DATE).all<any>()
+
+    const stakings = (activeStakings.results || []) as any[]
+
+    // 2. dr 현황 (reward_date='2026-05-15')
+    const drExist = await db.prepare(`
+      SELECT
+        COUNT(*) AS total_rows,
+        COUNT(DISTINCT user_id) AS distinct_users,
+        COUNT(DISTINCT staking_id) AS distinct_stakings,
+        COALESCE(SUM(usdt_amount), 0) AS total_amount,
+        MIN(paid_date) AS min_paid_date,
+        MAX(paid_date) AS max_paid_date
+      FROM daily_rewards
+      WHERE reward_date = ?
+    `).bind(REWARD_DATE).first<any>()
+
+    // 3. rr 현황 (reward_date='2026-05-15')
+    const rrExist = await db.prepare(`
+      SELECT
+        level,
+        COUNT(*) AS total_rows,
+        COUNT(DISTINCT referrer_id) AS distinct_referrers,
+        COALESCE(SUM(reward_amount), 0) AS total_amount,
+        MIN(paid_date) AS min_paid_date,
+        MAX(paid_date) AS max_paid_date
+      FROM referral_rewards
+      WHERE reward_date = ?
+      GROUP BY level
+      ORDER BY level
+    `).bind(REWARD_DATE).all<any>()
+
+    // 4. 16/17/18 reward_date 가 있다면 경고 (영구룰 위반)
+    const wrongDates = await db.prepare(`
+      SELECT reward_date, COUNT(*) AS cnt, COALESCE(SUM(usdt_amount), 0) AS total_amount
+      FROM daily_rewards
+      WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).all<any>()
+
+    const wrongRRDates = await db.prepare(`
+      SELECT reward_date, level, COUNT(*) AS cnt, COALESCE(SUM(reward_amount), 0) AS total_amount
+      FROM referral_rewards
+      WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      GROUP BY reward_date, level
+      ORDER BY reward_date, level
+    `).all<any>()
+
+    // 5. 미지급 대상자 산출 (스테이킹 별)
+    const pending: any[] = []
+    const alreadyPaid: any[] = []
+    const userMap = new Map<number, { uid: number, nickname: string, email: string, stakings: any[] }>()
+
+    for (const s of stakings) {
+      const uid = Number(s.user_id)
+      const sid = Number(s.staking_id)
+      const amount = Number(s.amount) || 0
+      const rate = Number(s.daily_rate) || 0
+      const expectedQkey = Math.round(amount * rate * 150)
+      const alreadyOnTarget = Number(s.rewarded_on_target) > 0
+
+      const stakeInfo = {
+        staking_id: sid,
+        amount,
+        daily_rate: rate,
+        expected_qkey: expectedQkey,
+        existing_amount: s.existing_amount != null ? Number(s.existing_amount) : null,
+        last_reward_date: s.last_reward_date,
+        start_kst: s.start_kst,
+        end_kst: s.end_kst,
+        status: s.status,
+        already_paid: alreadyOnTarget
+      }
+
+      if (!userMap.has(uid)) {
+        userMap.set(uid, {
+          uid,
+          nickname: s.nickname || '',
+          email: s.email || '',
+          stakings: []
+        })
+      }
+      userMap.get(uid)!.stakings.push(stakeInfo)
+
+      if (alreadyOnTarget) {
+        alreadyPaid.push({ user_id: uid, staking_id: sid, existing_amount: stakeInfo.existing_amount })
+      } else {
+        pending.push({ user_id: uid, staking_id: sid, expected_qkey: expectedQkey, amount, rate })
+      }
+    }
+
+    // 사용자별 합산 (DR 기준)
+    const userSummary = Array.from(userMap.values()).map(u => ({
+      user_id: u.uid,
+      nickname: u.nickname,
+      email: u.email,
+      staking_count: u.stakings.length,
+      pending_stakings: u.stakings.filter(s => !s.already_paid).length,
+      paid_stakings: u.stakings.filter(s => s.already_paid).length,
+      expected_dr_total: u.stakings.filter(s => !s.already_paid).reduce((acc, s) => acc + s.expected_qkey, 0),
+      stakings: u.stakings
+    })).sort((a, b) => a.user_id - b.user_id)
+
+    const distinctUserCount = userMap.size
+    const pendingUserCount = userSummary.filter(u => u.pending_stakings > 0).length
+    const allPaidUserCount = userSummary.filter(u => u.pending_stakings === 0).length
+
+    const totalExpectedDR = pending.reduce((acc, p) => acc + p.expected_qkey, 0)
+
+    const durMs = Date.now() - t0
+    console.log(`[DIVIDEND_BACKPAY] scan-may15-status done duration_ms=${durMs} active_stakings=${stakings.length} pending=${pending.length} alreadyPaid=${alreadyPaid.length}`)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      action: 'scan-may15-status',
+      dividendDate: REWARD_DATE,
+      payoutDate: '2026-05-18',
+      businessDayRule: 'next_business_day',
+      summary: {
+        active_stakings_on_target: stakings.length,
+        distinct_users: distinctUserCount,
+        pending_users: pendingUserCount,
+        all_paid_users: allPaidUserCount,
+        pending_stakings: pending.length,
+        already_paid_stakings: alreadyPaid.length,
+        expected_dr_total_qkey: totalExpectedDR
+      },
+      existing_dr_on_2026_05_15: {
+        total_rows: Number(drExist?.total_rows || 0),
+        distinct_users: Number(drExist?.distinct_users || 0),
+        distinct_stakings: Number(drExist?.distinct_stakings || 0),
+        total_amount: Number(drExist?.total_amount || 0),
+        paid_date_range: { min: drExist?.min_paid_date, max: drExist?.max_paid_date }
+      },
+      existing_rr_on_2026_05_15: (rrExist?.results || []).map((r: any) => ({
+        level: Number(r.level),
+        total_rows: Number(r.total_rows),
+        distinct_referrers: Number(r.distinct_referrers),
+        total_amount: Number(r.total_amount),
+        paid_date_range: { min: r.min_paid_date, max: r.max_paid_date }
+      })),
+      WARNING_wrong_dates_dr: (wrongDates?.results || []).map((w: any) => ({
+        reward_date: w.reward_date,
+        rows: Number(w.cnt),
+        amount: Number(w.total_amount)
+      })),
+      WARNING_wrong_dates_rr: (wrongRRDates?.results || []).map((w: any) => ({
+        reward_date: w.reward_date,
+        level: Number(w.level),
+        rows: Number(w.cnt),
+        amount: Number(w.total_amount)
+      })),
+      users_pending: userSummary.filter(u => u.pending_stakings > 0),
+      users_all_paid: userSummary.filter(u => u.pending_stakings === 0).slice(0, 20),
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[DIVIDEND_BACKPAY] ERROR scan-may15-status duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+})
+
 export default app
