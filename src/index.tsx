@@ -45198,4 +45198,157 @@ app.get('/api/diag/verify-paid-date', async (c) => {
 })
 
 
+// ============================================================================
+// inspect-paid-date-window: 특정 paid_date / KST 시각 범위의 항목 정체 진단 (READ-ONLY)
+//
+//   사장님 명령:
+//     "5/12 18:09 / 18:10 daily_qkey 49건의 정체가 뭔지 확인하라"
+//
+//   파라미터:
+//     paidDate=YYYY-MM-DD       (필수, 검사 대상 paid_date)
+//     kstFrom=HH:MM             (옵션, KST 시각 시작, 기본 00:00)
+//     kstTo=HH:MM               (옵션, KST 시각 종료, 기본 23:59)
+//
+//   반환 내용:
+//     - tx 항목별 상세 (id, type, user_id, ref_id, amount, created_at, description)
+//     - DR / RR 매핑 (ref_id 로 추적해 reward_date / staking_id 확인)
+//     - user_id 별 집계
+//     - reward_date 별 집계 (legacy 가 어느 날짜의 reward 인지 정체 확정)
+// ============================================================================
+app.get('/api/diag/inspect-paid-date-window', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const paidDate = c.req.query('paidDate') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(paidDate)) {
+      return c.json({ error: 'paidDate=YYYY-MM-DD required' }, 400)
+    }
+    const kstFrom = c.req.query('kstFrom') || '00:00'
+    const kstTo = c.req.query('kstTo') || '23:59'
+    if (!/^\d{2}:\d{2}$/.test(kstFrom) || !/^\d{2}:\d{2}$/.test(kstTo)) {
+      return c.json({ error: 'kstFrom/kstTo=HH:MM format' }, 400)
+    }
+    const db = c.env.DB
+
+    // KST window -> UTC range (KST = UTC+9)
+    // ex) paidDate=2026-05-12, kstFrom=18:00, kstTo=18:30
+    //     -> KST 2026-05-12 18:00 ~ 18:30
+    //     -> UTC 2026-05-12 09:00 ~ 09:30
+    const kstStart = `${paidDate} ${kstFrom}:00`
+    const kstEnd = `${paidDate} ${kstTo}:59`
+
+    // tx 상세 (KST window 안)
+    const txRaw = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id, description,
+             created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM transactions
+      WHERE coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward','direct_referral')
+        AND datetime(created_at, '+9 hours') >= ?
+        AND datetime(created_at, '+9 hours') <= ?
+      ORDER BY created_at ASC, id ASC
+      LIMIT 500
+    `).bind(kstStart, kstEnd).all()
+    const txList = (txRaw.results || []) as any[]
+
+    // type 별 집계
+    const txByType: Record<string, { cnt: number, total: number }> = {}
+    for (const t of txList) {
+      const k = String(t.type)
+      if (!txByType[k]) txByType[k] = { cnt: 0, total: 0 }
+      txByType[k].cnt += 1
+      txByType[k].total += Number(t.amount || 0)
+    }
+
+    // ref_id 수집
+    const dqRefIds = txList.filter((t: any) => t.type === 'daily_qkey' && t.ref_id != null).map((t: any) => Number(t.ref_id))
+    const rrRefIds = txList.filter((t: any) => (t.type === 'referral_reward' || t.type === 'direct_referral') && t.ref_id != null).map((t: any) => Number(t.ref_id))
+
+    // DR lookup (ref_id -> daily_rewards row)
+    let drRows: any[] = []
+    if (dqRefIds.length > 0) {
+      const placeholders = dqRefIds.map(() => '?').join(',')
+      const sql = `SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at,
+                          datetime(created_at,'+9 hours') AS kst_at
+                   FROM daily_rewards WHERE id IN (${placeholders})`
+      const res = await db.prepare(sql).bind(...dqRefIds).all()
+      drRows = (res.results || []) as any[]
+    }
+
+    // RR lookup
+    let rrRows: any[] = []
+    if (rrRefIds.length > 0) {
+      const placeholders = rrRefIds.map(() => '?').join(',')
+      const sql = `SELECT id, referrer_id, referee_id, level, staking_id, original_amount, reward_amount,
+                          reward_date, paid_date, created_at,
+                          datetime(created_at,'+9 hours') AS kst_at
+                   FROM referral_rewards WHERE id IN (${placeholders})`
+      const res = await db.prepare(sql).bind(...rrRefIds).all()
+      rrRows = (res.results || []) as any[]
+    }
+
+    // DR: reward_date 별 집계
+    const drByRewardDate: Record<string, { cnt: number, total: number }> = {}
+    for (const r of drRows) {
+      const k = String(r.reward_date)
+      if (!drByRewardDate[k]) drByRewardDate[k] = { cnt: 0, total: 0 }
+      drByRewardDate[k].cnt += 1
+      drByRewardDate[k].total += Number(r.usdt_amount || 0) * 150
+    }
+
+    // RR: reward_date 별 집계
+    const rrByRewardDate: Record<string, { cnt: number, total: number }> = {}
+    for (const r of rrRows) {
+      const k = String(r.reward_date)
+      if (!rrByRewardDate[k]) rrByRewardDate[k] = { cnt: 0, total: 0 }
+      rrByRewardDate[k].cnt += 1
+      rrByRewardDate[k].total += Number(r.reward_amount || 0)
+    }
+
+    // user_id 별 tx 집계
+    const txByUser: Record<string, { cnt: number, total: number }> = {}
+    for (const t of txList) {
+      const k = String(t.user_id)
+      if (!txByUser[k]) txByUser[k] = { cnt: 0, total: 0 }
+      txByUser[k].cnt += 1
+      txByUser[k].total += Number(t.amount || 0)
+    }
+
+    // description 패턴 별 집계 (사고 흔적 추적용)
+    const txByDesc: Record<string, number> = {}
+    for (const t of txList) {
+      const d = String(t.description || '').slice(0, 80)
+      txByDesc[d] = (txByDesc[d] || 0) + 1
+    }
+
+    return c.json({
+      ok: true,
+      action: 'inspect-paid-date-window',
+      window: { paid_date_kst: paidDate, kst_from: kstFrom, kst_to: kstTo },
+      summary: {
+        tx_total: txList.length,
+        tx_by_type: txByType,
+        dr_rows_found: drRows.length,
+        rr_rows_found: rrRows.length,
+      },
+      reward_date_distribution: {
+        dr: drByRewardDate,
+        rr: rrByRewardDate,
+      },
+      user_distribution: txByUser,
+      description_patterns: txByDesc,
+      tx_samples_first10: txList.slice(0, 10),
+      tx_samples_last10: txList.slice(-10),
+      dr_samples_first10: drRows.slice(0, 10),
+      rr_samples_first10: rrRows.slice(0, 10),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
