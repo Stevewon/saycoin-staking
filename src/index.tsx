@@ -47208,6 +47208,100 @@ app.get('/api/diag/user-tx-list', async (c) => {
   }
 })
 
+// user-rr-dup-check: 특정 user (referrer) 의 referral_rewards 중복 점검 (READ-ONLY)
+// 영구룰 #스테이킹별독립: 같은 (referrer_id, referee_id, level, staking_id, reward_date) 중복 0 이어야 함
+// GET /api/diag/user-rr-dup-check?key=ADMIN_PW&userId=44
+app.get('/api/diag/user-rr-dup-check', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const userId = Number(c.req.query('userId') || '0')
+    if (!userId) return c.json({ error: 'userId required' }, 400)
+    const db = c.env.DB
+
+    // 1) referrer 로서 모든 RR 조회
+    const rrAsReferrer = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id, reward_amount,
+             reward_date, paid_date, created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM referral_rewards
+      WHERE referrer_id = ?
+      ORDER BY reward_date ASC, id ASC
+    `).bind(userId).all()
+    const rrs = (rrAsReferrer.results || []) as any[]
+
+    // 2) 중복 그룹화: (referee_id, level, staking_id, reward_date) 키
+    const groups: Record<string, any[]> = {}
+    for (const r of rrs) {
+      const key2 = `${r.referee_id}|L${r.level}|stk${r.staking_id}|${r.reward_date}`
+      if (!groups[key2]) groups[key2] = []
+      groups[key2].push(r)
+    }
+    const dupGroups: any[] = []
+    for (const k of Object.keys(groups)) {
+      if (groups[k].length > 1) {
+        dupGroups.push({
+          key: k,
+          count: groups[k].length,
+          total_reward: groups[k].reduce((s,x) => s + (Number(x.reward_amount)||0), 0),
+          rows: groups[k].map(x => ({
+            id: Number(x.id), referee_id: Number(x.referee_id), level: Number(x.level),
+            staking_id: Number(x.staking_id), reward_amount: Number(x.reward_amount),
+            reward_date: String(x.reward_date), paid_date: String(x.paid_date),
+            kst_at: String(x.kst_at || ''),
+          }))
+        })
+      }
+    }
+
+    // 3) 추가: (referee_id, level, reward_date) 키 (staking_id 무관, 영구룰 #1일1정산 검증)
+    const groupsBydate: Record<string, any[]> = {}
+    for (const r of rrs) {
+      const key3 = `${r.referee_id}|L${r.level}|${r.reward_date}`
+      if (!groupsBydate[key3]) groupsBydate[key3] = []
+      groupsBydate[key3].push(r)
+    }
+    const dupByDate: any[] = []
+    for (const k of Object.keys(groupsBydate)) {
+      if (groupsBydate[k].length > 1) {
+        dupByDate.push({
+          key: k,
+          count: groupsBydate[k].length,
+          stakings: Array.from(new Set(groupsBydate[k].map(x => Number(x.staking_id)))),
+          total_reward: groupsBydate[k].reduce((s,x) => s + (Number(x.reward_amount)||0), 0),
+          rows: groupsBydate[k].map(x => ({
+            id: Number(x.id), staking_id: Number(x.staking_id),
+            reward_amount: Number(x.reward_amount), kst_at: String(x.kst_at || ''),
+          }))
+        })
+      }
+    }
+
+    return c.json({
+      ok: true,
+      user_id: userId,
+      total_rr_as_referrer: rrs.length,
+      total_reward: rrs.reduce((s,r) => s + (Number(r.reward_amount)||0), 0),
+      dup_by_referee_level_staking_date: {
+        count: dupGroups.length,
+        verdict: dupGroups.length === 0
+          ? '✅ (referee, level, staking, reward_date) 영구룰 #스테이킹별독립 OK'
+          : '🚨 중복 발견 (영구룰 위반)',
+        groups: dupGroups,
+      },
+      dup_by_referee_level_date_only: {
+        count: dupByDate.length,
+        note: '같은 reward_date 에 같은 referee 의 같은 level 보너스가 2개 이상 (다른 staking_id) 인 경우. 영구룰 상 referee 가 같은 날 여러 staking 활성이면 정상',
+        groups: dupByDate,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 // fix-irregular-time-tx: 영구룰 #정규시각(15:15 KST = 06:15 UTC) 위반 일일배당 tx 만 created_at 정정
 // 보호: 다른 날짜/다른 종류 tx 절대 보호. 영구룰 준수 tx 도 보호.
 // 대상 KST 날짜: 2026-05-07, 2026-05-11 (사장님 명령으로 고정)
