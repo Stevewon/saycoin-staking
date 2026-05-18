@@ -47208,6 +47208,79 @@ app.get('/api/diag/user-tx-list', async (c) => {
   }
 })
 
+// user-balance-trace: 특정 사용자의 QKEY 거래내역 전수 + balance 정합 추적 (READ-ONLY)
+// 대소문자 무시. type 별 집계. balance vs tx_sum 비교.
+// GET /api/diag/user-balance-trace?key=ADMIN_PW&userId=44
+app.get('/api/diag/user-balance-trace', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const userId = Number(c.req.query('userId') || '0')
+    if (!userId) return c.json({ error: 'userId required' }, 400)
+    const db = c.env.DB
+
+    const u = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id=?`).bind(userId).first() as any
+    if (!u) return c.json({ error: 'user not found' }, 404)
+    const balance = Number(u.qkey_balance) || 0
+
+    // 모든 QKEY tx (대소문자 무시)
+    const allRows = await db.prepare(`
+      SELECT id, type, coin_type, amount, description, created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM transactions
+      WHERE user_id=? AND LOWER(coin_type)='qkey'
+      ORDER BY created_at ASC, id ASC
+    `).bind(userId).all()
+    const txs = (allRows.results || []) as any[]
+
+    let txSum = 0
+    const byType: Record<string, { count: number; sum: number; positive_sum: number; negative_sum: number }> = {}
+    for (const t of txs) {
+      const amt = Number(t.amount) || 0
+      txSum += amt
+      const tp = String(t.type || 'unknown')
+      if (!byType[tp]) byType[tp] = { count: 0, sum: 0, positive_sum: 0, negative_sum: 0 }
+      byType[tp].count += 1
+      byType[tp].sum += amt
+      if (amt > 0) byType[tp].positive_sum += amt
+      else if (amt < 0) byType[tp].negative_sum += amt
+    }
+
+    // 의심 패턴 검사: 같은 (kst_date, type, amount, description) 중복
+    const dupKey: Record<string, any[]> = {}
+    for (const t of txs) {
+      const k = `${String(t.kst_at).slice(0,10)}|${t.type}|${t.amount}|${t.description}`
+      if (!dupKey[k]) dupKey[k] = []
+      dupKey[k].push({ id: Number(t.id), amount: Number(t.amount), kst: String(t.kst_at), desc: String(t.description||'') })
+    }
+    const dupGroups = Object.entries(dupKey).filter(([_, v]) => v.length > 1).map(([k, v]) => ({ key: k, count: v.length, rows: v }))
+
+    return c.json({
+      ok: true,
+      user: { id: Number(u.id), name: String(u.name||''), email: String(u.email||''), qkey_balance: balance },
+      tx_count: txs.length,
+      tx_sum: txSum,
+      diff: balance - txSum,
+      verdict: balance === txSum ? '✅ 정합' : (balance < txSum ? `🚨 balance 부족 ${balance - txSum}` : `🚨 balance 초과 +${balance - txSum}`),
+      by_type: byType,
+      dup_groups_remaining: dupGroups.length,
+      dup_groups: dupGroups,
+      transactions: txs.map(t => ({
+        id: Number(t.id),
+        type: String(t.type),
+        coin: String(t.coin_type),
+        amount: Number(t.amount),
+        kst: String(t.kst_at || ''),
+        desc: String(t.description || ''),
+      })),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 // user-rr-dup-check: 특정 user (referrer) 의 referral_rewards 중복 점검 (READ-ONLY)
 // 영구룰 #스테이킹별독립: 같은 (referrer_id, referee_id, level, staking_id, reward_date) 중복 0 이어야 함
 // GET /api/diag/user-rr-dup-check?key=ADMIN_PW&userId=44
