@@ -42309,5 +42309,145 @@ app.post('/api/diag/rollback-reverse-backfill-marker', async (c) => {
   return diagRollbackReverseBackfillMarker(c, 'EXEC')
 })
 
+// ============================================================================
+// scan-may18-full: 2026-05-18 KST 일자 거래내역 + 보상 row 전체 분류
+//   - tx (transactions): 5/18 KST 생성된 거 전부
+//   - dr (daily_rewards): paid_date=5/18 또는 reward_date=5/18 또는 created 5/18 KST
+//   - rr (referral_rewards): 위와 동일
+//   - 각 row 의 tx 매칭 여부, description 마커, 시간대 분류
+//
+//   READ-ONLY, DB 변경 절대 없음
+// ============================================================================
+app.get('/api/diag/scan-may18-full', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = (c.env as any).DB as D1Database
+
+  // 5/18 KST = 5/17 15:00 UTC ~ 5/18 14:59:59 UTC
+  const kstStart = '2026-05-17T15:00:00.000Z'
+  const kstEnd = '2026-05-18T14:59:59.999Z'
+
+  // 1. 5/18 KST 생성된 transactions 전체
+  const txAll = await db.prepare(`
+    SELECT id, user_id, type, amount, description, ref_id, created_at,
+           datetime(created_at, '+9 hours') as created_kst
+    FROM transactions
+    WHERE created_at >= ? AND created_at <= ?
+    ORDER BY id ASC
+  `).bind(kstStart, kstEnd).all()
+
+  // 2. DR rows with paid_date=2026-05-18 or reward_date=2026-05-18
+  const drRows = await db.prepare(`
+    SELECT id, user_id, staking_id, reward_date, paid_date, amount, daily_rate,
+           datetime(created_at, '+9 hours') as created_kst
+    FROM daily_rewards
+    WHERE paid_date = '2026-05-18' OR reward_date = '2026-05-18'
+    ORDER BY id ASC
+  `).all()
+
+  // 3. RR rows with paid_date=2026-05-18 or reward_date=2026-05-18
+  const rrRows = await db.prepare(`
+    SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+           reward_date, paid_date, staking_id,
+           datetime(created_at, '+9 hours') as created_kst
+    FROM referral_rewards
+    WHERE paid_date = '2026-05-18' OR reward_date = '2026-05-18'
+    ORDER BY id ASC
+  `).all()
+
+  // tx 분류: type, ref_id 매칭, description 마커
+  const txByType: Record<string, { count: number, total: number, sample_ids: number[] }> = {}
+  const txByHour: Record<string, { count: number, total: number }> = {}
+  const txMarkers: Record<string, number> = {}
+  for (const tx of (txAll.results || []) as any[]) {
+    const t = String(tx.type)
+    if (!txByType[t]) txByType[t] = { count: 0, total: 0, sample_ids: [] }
+    txByType[t].count++
+    txByType[t].total += Number(tx.amount || 0)
+    if (txByType[t].sample_ids.length < 5) txByType[t].sample_ids.push(tx.id)
+
+    const hh = String(tx.created_kst || '').substring(11, 13)
+    const hkey = `${hh}:00`
+    if (!txByHour[hkey]) txByHour[hkey] = { count: 0, total: 0 }
+    txByHour[hkey].count++
+    txByHour[hkey].total += Number(tx.amount || 0)
+
+    const desc = String(tx.description || '')
+    if (desc.includes('[REVERSE')) txMarkers['[REVERSE*]'] = (txMarkers['[REVERSE*]'] || 0) + 1
+    if (desc.includes('[BACKFILL')) txMarkers['[BACKFILL*]'] = (txMarkers['[BACKFILL*]'] || 0) + 1
+    if (desc.includes('[REDO')) txMarkers['[REDO*]'] = (txMarkers['[REDO*]'] || 0) + 1
+    if (desc.includes('재정산')) txMarkers['재정산'] = (txMarkers['재정산'] || 0) + 1
+    if (desc.includes('보정')) txMarkers['보정'] = (txMarkers['보정'] || 0) + 1
+  }
+
+  // DR/RR 분류
+  const drBuckets: Record<string, { rows: number, total: number }> = {}
+  for (const d of (drRows.results || []) as any[]) {
+    const k = `reward=${d.reward_date} / paid=${d.paid_date}`
+    if (!drBuckets[k]) drBuckets[k] = { rows: 0, total: 0 }
+    drBuckets[k].rows++
+    drBuckets[k].total += Number(d.amount || 0)
+  }
+  const rrBuckets: Record<string, { rows: number, total: number, staking_null: number }> = {}
+  for (const r of (rrRows.results || []) as any[]) {
+    const k = `reward=${r.reward_date} / paid=${r.paid_date} / L${r.level}`
+    if (!rrBuckets[k]) rrBuckets[k] = { rows: 0, total: 0, staking_null: 0 }
+    rrBuckets[k].rows++
+    rrBuckets[k].total += Number(r.reward_amount || 0)
+    if (r.staking_id == null) rrBuckets[k].staking_null++
+  }
+
+  // tx <-> DR/RR 매칭: type=daily_reward 면 ref_id=DR.id, type=referral_reward 면 ref_id=RR.id
+  const drIds = new Set<number>((drRows.results || []).map((r: any) => r.id))
+  const rrIds = new Set<number>((rrRows.results || []).map((r: any) => r.id))
+  const txMatched = { daily: 0, referral: 0, orphan_daily: 0, orphan_referral: 0, other: 0 }
+  for (const tx of (txAll.results || []) as any[]) {
+    if (tx.type === 'daily_reward') {
+      if (tx.ref_id && drIds.has(tx.ref_id)) txMatched.daily++
+      else txMatched.orphan_daily++
+    } else if (tx.type === 'referral_reward') {
+      if (tx.ref_id && rrIds.has(tx.ref_id)) txMatched.referral++
+      else txMatched.orphan_referral++
+    } else {
+      txMatched.other++
+    }
+  }
+
+  // 시간대 buckets — 15시 (STEP 2) / 15:33 (REVERSE 사고) / 그 외 분류
+  const txByMinute: Record<string, { count: number, total: number, types: Record<string, number> }> = {}
+  for (const tx of (txAll.results || []) as any[]) {
+    const ts = String(tx.created_kst || '')
+    const mm = ts.substring(11, 16)  // HH:MM
+    if (!txByMinute[mm]) txByMinute[mm] = { count: 0, total: 0, types: {} }
+    txByMinute[mm].count++
+    txByMinute[mm].total += Number(tx.amount || 0)
+    txByMinute[mm].types[tx.type] = (txByMinute[mm].types[tx.type] || 0) + 1
+  }
+  const minuteSorted = Object.entries(txByMinute)
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 30)
+    .map(([k, v]) => ({ kst_minute: k, ...v }))
+
+  return c.json({
+    ok: true,
+    mode: 'READ_ONLY_SCAN',
+    action: 'scan-may18-full',
+    kst_window: { start: '2026-05-18 00:00:00 KST', end: '2026-05-18 23:59:59 KST' },
+    tx_total: {
+      count: (txAll.results || []).length,
+      total_amount: ((txAll.results || []) as any[]).reduce((s, r) => s + Number(r.amount || 0), 0),
+    },
+    tx_by_type: txByType,
+    tx_markers_found: txMarkers,
+    tx_matched_to_dr_rr: txMatched,
+    tx_top_minutes: minuteSorted,
+    dr_buckets: drBuckets,
+    rr_buckets: rrBuckets,
+    tx_sample_first_20: (txAll.results || []).slice(0, 20),
+    tx_sample_last_20: (txAll.results || []).slice(-20),
+    duration_ms: 0,
+  })
+})
+
 
 export default app
