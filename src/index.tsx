@@ -46947,17 +46947,18 @@ app.get('/api/diag/balance-vs-tx-audit', async (c) => {
     if (!balanceCol) return c.json({ error: 'coin=QKEY|QX|QTA' }, 400)
     const db = c.env.DB
 
-    // 모든 사용자 + tx 합계 (coin 별)
+    // 모든 사용자 + tx 합계 (coin 별, 대소문자 무시)
+    const coinLower = coin.toLowerCase()
     const rows = await db.prepare(`
       SELECT u.id, u.name, u.email,
              u.${balanceCol} AS balance,
              COALESCE((SELECT SUM(amount) FROM transactions
-                       WHERE user_id=u.id AND coin_type=?), 0) AS tx_sum,
+                       WHERE user_id=u.id AND LOWER(coin_type)=?), 0) AS tx_sum,
              COALESCE((SELECT COUNT(*) FROM transactions
-                       WHERE user_id=u.id AND coin_type=?), 0) AS tx_count
+                       WHERE user_id=u.id AND LOWER(coin_type)=?), 0) AS tx_count
       FROM users u
       ORDER BY u.id ASC
-    `).bind(coin, coin).all()
+    `).bind(coinLower, coinLower).all()
     const userList = (rows.results || []) as any[]
 
     const matched: any[] = []
