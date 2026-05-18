@@ -42200,7 +42200,7 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
         ok: true,
         mode: 'DRY_RUN',
         action: 'rollback-reverse-backfill-marker',
-        marker_pattern: 'description LIKE %[REVERSE_BACKFILL%',
+        marker_pattern: `description LIKE ${likePattern}`,
         summary,
         affected_users_balance_top20: userBalanceSim.slice(0, 20),
         negative_balance_warning: {
@@ -42257,11 +42257,12 @@ async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC
     }
 
     // ── (4) transactions DELETE (마커 row 들) ──
-    const txDelRes = await db.prepare(`DELETE FROM transactions WHERE description LIKE '%[REVERSE_BACKFILL%'`).run()
+    //   ★ likePattern (query param 으로 받은 marker 패턴) 사용
+    const txDelRes = await db.prepare(`DELETE FROM transactions WHERE description LIKE ?`).bind(likePattern).run()
     const txDeleted = (txDelRes as any)?.meta?.changes || 0
 
     // ─── POST-CHECK ───
-    const postTxRaw = await db.prepare(`SELECT COUNT(*) AS cnt FROM transactions WHERE description LIKE '%[REVERSE_BACKFILL%'`).first() as any
+    const postTxRaw = await db.prepare(`SELECT COUNT(*) AS cnt FROM transactions WHERE description LIKE ?`).bind(likePattern).first() as any
     const postTxCount = Number(postTxRaw?.cnt || 0)
 
     let postRrExistCount = 0
