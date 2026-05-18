@@ -45654,6 +45654,640 @@ app.post('/api/diag/recalc-single-reward-date', async (c) => {
 //     GET /api/diag/user-reward-audit?key=ADMIN_PW&paidDate=2026-05-12&names=이현우,김주성
 //     GET /api/diag/user-reward-audit?key=ADMIN_PW&paidDate=2026-05-12&userIds=1,2,3
 // ============================================================================
+// ============================================================================
+// recalc-may-seven: 사장님 명령 (2026-05-18 / 깊은 밤)
+//
+//   "5월 7일 확정분을 5월 8일자 지급했는데 기존꺼 무시하고 내 영구룰로 다시 정산하라!"
+//
+//   영구룰 위반 청산 + 재정산:
+//     - PURGE: reward_date='2026-05-07' AND paid_date='2026-05-08' 의 모든 항목
+//       + paid_date='2026-05-08' 의 모든 tx (DR/RR id 매칭 + 패턴 매칭)
+//     - RECALC: reward_date='2026-05-07' 영구룰 정확 (DR + L1 + L2 + 200% Cap)
+//     - PAID: paid_date='2026-05-08', created_at = '2026-05-08 06:15:00 UTC' (KST 15:15)
+//
+//   대상자: 5/6 이전 가입자 (5/7 평일, 휴일 진입자 이슈 없음)
+//
+//   절대 보호 (BEFORE/AFTER snapshot 비교):
+//     - reward_date IN ('2026-05-08','5-09','5-10','5-11','5-12','5-13','5-14','5-15')
+//
+//   엔드포인트:
+//     GET  /api/diag/recalc-may-seven?key=ADMIN_PW          → DRY_RUN
+//     POST /api/diag/recalc-may-seven?key=ADMIN_PW&confirm=GO → EXEC
+// ============================================================================
+async function diagRecalcMaySeven(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  try {
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+
+    // ★ 하드코딩 ★
+    const TARGET_REWARD_DATE = '2026-05-07'
+    const TARGET_PAID_DATE = '2026-05-08'
+    const PROTECTED_REWARD_DATES = [
+      '2026-05-08','2026-05-09','2026-05-10','2026-05-11',
+      '2026-05-12','2026-05-13','2026-05-14','2026-05-15',
+    ]
+
+    // ─── PROTECT BASELINE (BEFORE) ───
+    const protectBaseline: any[] = []
+    for (const pd of PROTECTED_REWARD_DATES) {
+      const drB = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total FROM daily_rewards WHERE reward_date = ?`).bind(pd).first() as any
+      const rrB = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total FROM referral_rewards WHERE reward_date = ?`).bind(pd).first() as any
+      protectBaseline.push({
+        reward_date: pd,
+        dr_count: Number(drB?.cnt || 0), dr_total: Number(drB?.total || 0),
+        rr_count: Number(rrB?.cnt || 0), rr_total: Number(rrB?.total || 0),
+      })
+    }
+
+    // ═══════════════════════════════════════════════
+    // PHASE 1: PURGE 대상 수집 (3 종류)
+    //   (a) DR/RR rows: reward_date=2026-05-07 인 모든 row
+    //   (b) DR/RR rows: paid_date=2026-05-08 인 모든 row (혹시 reward_date 가 다른 것 있을 수 있음)
+    //   (c) tx: paid_date=2026-05-08 인 DR/RR 의 ref_id 매칭 + paid_date 가 KST 5/8 인 daily_qkey/referral_reward/direct_referral
+    // ═══════════════════════════════════════════════
+
+    // (a) reward_date=5/7 의 DR/RR
+    const drByRewardDate = (await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE reward_date = ?
+    `).bind(TARGET_REWARD_DATE).all()).results as any[] || []
+
+    const rrByRewardDate = (await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE reward_date = ?
+    `).bind(TARGET_REWARD_DATE).all()).results as any[] || []
+
+    // (b) paid_date=5/8 의 DR/RR (혹시 reward_date 다른 잡것 있는지)
+    const drByPaidDate = (await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE paid_date = ?
+    `).bind(TARGET_PAID_DATE).all()).results as any[] || []
+
+    const rrByPaidDate = (await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id, reward_amount, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date = ?
+    `).bind(TARGET_PAID_DATE).all()).results as any[] || []
+
+    // PURGE 대상 DR/RR id 통합 (중복 제거)
+    const drIdSet = new Set<number>()
+    for (const r of drByRewardDate) drIdSet.add(Number(r.id))
+    for (const r of drByPaidDate) drIdSet.add(Number(r.id))
+    const rrIdSet = new Set<number>()
+    for (const r of rrByRewardDate) rrIdSet.add(Number(r.id))
+    for (const r of rrByPaidDate) rrIdSet.add(Number(r.id))
+    const drIds = Array.from(drIdSet)
+    const rrIds = Array.from(rrIdSet)
+
+    // 안전 검사: PURGE 대상의 reward_date 가 모두 5/7 이거나 PROTECT 외인지 확인
+    // (만약 paid_date=5/8 인데 reward_date 가 5/11 같은 PROTECT 날짜면 STOP)
+    const drToPurgeAll = [...drByRewardDate, ...drByPaidDate]
+    const rrToPurgeAll = [...rrByRewardDate, ...rrByPaidDate]
+    const drDistinctRewardDates = Array.from(new Set(drToPurgeAll.map(r => String(r.reward_date))))
+    const rrDistinctRewardDates = Array.from(new Set(rrToPurgeAll.map(r => String(r.reward_date))))
+    const dangerousDr = drDistinctRewardDates.filter(d => PROTECTED_REWARD_DATES.includes(d))
+    const dangerousRr = rrDistinctRewardDates.filter(d => PROTECTED_REWARD_DATES.includes(d))
+    if (dangerousDr.length > 0 || dangerousRr.length > 0) {
+      return c.json({
+        ok: false,
+        error: '🚨 SAFETY STOP — PURGE 대상에 PROTECTED reward_date 포함됨',
+        dangerous_dr_reward_dates: dangerousDr,
+        dangerous_rr_reward_dates: dangerousRr,
+        hint: '이건 다른 날 reward 가 잘못 5/8 에 paid 된 사고. 사장님 명령 필요.',
+      }, 400)
+    }
+
+    // (c) tx 수집 — 3가지 경로
+    //   c1: paid_date=5/8 의 DR id 에 매칭되는 daily_qkey tx
+    //   c2: paid_date=5/8 의 RR id 에 매칭되는 referral_reward / direct_referral tx
+    //   c3: KST 5/8 에 발생한 모든 daily_qkey/referral_reward/direct_referral tx (잡것)
+    const CHUNK = 80
+    const txIdSet = new Set<number>()
+    const txDetail: any[] = []
+
+    // c1
+    if (drIds.length > 0) {
+      for (let i = 0; i < drIds.length; i += CHUNK) {
+        const chunk = drIds.slice(i, i + CHUNK)
+        const ph = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT id, user_id, type, amount, ref_id, description,
+                 datetime(created_at,'+9 hours') AS kst_at
+          FROM transactions
+          WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all()
+        for (const t of (rows.results || []) as any[]) {
+          if (!txIdSet.has(Number(t.id))) { txIdSet.add(Number(t.id)); txDetail.push(t) }
+        }
+      }
+    }
+
+    // c2
+    if (rrIds.length > 0) {
+      for (let i = 0; i < rrIds.length; i += CHUNK) {
+        const chunk = rrIds.slice(i, i + CHUNK)
+        const ph = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT id, user_id, type, amount, ref_id, description,
+                 datetime(created_at,'+9 hours') AS kst_at
+          FROM transactions
+          WHERE type IN ('referral_reward','direct_referral') AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all()
+        for (const t of (rows.results || []) as any[]) {
+          if (!txIdSet.has(Number(t.id))) { txIdSet.add(Number(t.id)); txDetail.push(t) }
+        }
+      }
+    }
+
+    // c3 — KST 5/8 의 모든 reward tx (DR/RR 매칭 없는 잡것도 포함 — ref_id 가 잘못된 사고분)
+    {
+      const rows = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id, description,
+               datetime(created_at,'+9 hours') AS kst_at
+        FROM transactions
+        WHERE coin_type='QKEY'
+          AND type IN ('daily_qkey','referral_reward','direct_referral')
+          AND date(created_at,'+9 hours') = ?
+      `).bind(TARGET_PAID_DATE).all()
+      for (const t of (rows.results || []) as any[]) {
+        if (!txIdSet.has(Number(t.id))) { txIdSet.add(Number(t.id)); txDetail.push(t) }
+      }
+    }
+
+    const txIds = Array.from(txIdSet)
+
+    // PURGE balance delta (음수)
+    const purgeBalanceDelta = new Map<number, number>()
+    let purgeTxTotal = 0
+    for (const t of txDetail) {
+      const uid = Number(t.user_id), amt = Number(t.amount)
+      purgeTxTotal += amt
+      purgeBalanceDelta.set(uid, (purgeBalanceDelta.get(uid) || 0) - amt)
+    }
+
+    // ═══════════════════════════════════════════════
+    // PHASE 2: RECALC EXPECTED 계산 (reward_date = 5/7 만)
+    // ═══════════════════════════════════════════════
+
+    // staking 조회: 5/7 발생 대상
+    const stakingRows = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.period_days,
+             date(s.start_date,'+9 hours') AS start_kst,
+             date(s.end_date,'+9 hours') AS end_kst,
+             s.status,
+             u.referrer_id
+      FROM staking s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.status IN ('active','capped','completed')
+        AND date(s.start_date,'+9 hours') <= ?
+        AND date(s.end_date,'+9 hours') >= ?
+      ORDER BY s.id ASC
+    `).bind(TARGET_REWARD_DATE, TARGET_REWARD_DATE).all()
+    const stakingList = (stakingRows.results || []) as any[]
+
+    // refMap + stakeTotal + activeUserSet
+    const candidateUids = new Set<number>()
+    for (const s of stakingList) {
+      candidateUids.add(Number(s.user_id))
+      if (s.referrer_id) candidateUids.add(Number(s.referrer_id))
+    }
+    const refMap = new Map<number, number>()
+    {
+      const uidsArr = Array.from(candidateUids)
+      for (let i = 0; i < uidsArr.length; i += 100) {
+        const chunk = uidsArr.slice(i, i + 100)
+        const ph = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`SELECT id, referrer_id FROM users WHERE id IN (${ph})`).bind(...chunk).all()
+        for (const u of (rows.results || []) as any[]) {
+          refMap.set(Number(u.id), u.referrer_id ? Number(u.referrer_id) : 0)
+          if (u.referrer_id) candidateUids.add(Number(u.referrer_id))
+        }
+      }
+      const missing = Array.from(candidateUids).filter(u => !refMap.has(u))
+      for (let i = 0; i < missing.length; i += 100) {
+        const chunk = missing.slice(i, i + 100)
+        const ph = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`SELECT id, referrer_id FROM users WHERE id IN (${ph})`).bind(...chunk).all()
+        for (const u of (rows.results || []) as any[]) {
+          refMap.set(Number(u.id), u.referrer_id ? Number(u.referrer_id) : 0)
+        }
+      }
+    }
+
+    const userStakeTotal = new Map<number, number>()
+    {
+      const uidsArr = Array.from(candidateUids)
+      for (let i = 0; i < uidsArr.length; i += 100) {
+        const chunk = uidsArr.slice(i, i + 100)
+        const ph = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT user_id, COALESCE(SUM(amount),0) AS total
+          FROM staking WHERE user_id IN (${ph})
+            AND status IN ('active','completed','capped')
+          GROUP BY user_id
+        `).bind(...chunk).all()
+        for (const r of (rows.results || []) as any[]) {
+          userStakeTotal.set(Number(r.user_id), Number(r.total))
+        }
+      }
+    }
+    const activeUserSet = new Set<number>()
+    {
+      const aRows = await db.prepare(`
+        SELECT DISTINCT user_id FROM staking
+        WHERE status IN ('active','capped','completed')
+      `).all()
+      for (const r of (aRows.results || []) as any[]) activeUserSet.add(Number(r.user_id))
+    }
+
+    // paidExcl: 현재 DB tx 합계 - PURGE 대상 tx 합계
+    const userPaidExcl = new Map<number, number>()
+    {
+      const uidsArr = Array.from(userStakeTotal.keys())
+      for (let i = 0; i < uidsArr.length; i += 100) {
+        const chunk = uidsArr.slice(i, i + 100)
+        const ph = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT user_id, COALESCE(SUM(amount),0) AS total
+          FROM transactions
+          WHERE user_id IN (${ph}) AND coin_type='QKEY'
+            AND type IN ('daily_qkey','referral_reward','direct_referral')
+          GROUP BY user_id
+        `).bind(...chunk).all()
+        for (const r of (rows.results || []) as any[]) {
+          userPaidExcl.set(Number(r.user_id), Math.max(0, Number(r.total)))
+        }
+      }
+      // PURGE 대상 tx 합계 차감
+      for (const t of txDetail) {
+        const uid = Number(t.user_id)
+        userPaidExcl.set(uid, Math.max(0, (userPaidExcl.get(uid) || 0) - Number(t.amount)))
+      }
+    }
+
+    // Bottom-up 정산 (DR + L1 + L2 + Cap)
+    const expectedDRs: { user_id: number, staking_id: number, amount: number }[] = []
+    const expectedRRs: { referrer_id: number, referee_id: number, level: number, staking_id: number, original_amount: number, reward_amount: number }[] = []
+    const userPaidRound = new Map<number, number>()
+    const dr_capped = new Set<number>()
+    const l1_capped = new Set<number>()
+    const l2_capped = new Set<number>()
+    const entryDateCount = { before_0506: 0, on_0506: 0, on_0507: 0, other: 0 }
+
+    function tryGive(uid: number, requested: number): { granted: number, capped: boolean } {
+      const stakeTotal = userStakeTotal.get(uid) || 0
+      if (stakeTotal <= 0) return { granted: 0, capped: true }
+      const target = stakeTotal * 2 * USD_TO_QKEY
+      const paidExcl = userPaidExcl.get(uid) || 0
+      const paidRound = userPaidRound.get(uid) || 0
+      const current = paidExcl + paidRound
+      if (current >= target) return { granted: 0, capped: true }
+      const remaining = target - current
+      const granted = Math.min(requested, Math.floor(remaining))
+      if (granted > 0) userPaidRound.set(uid, paidRound + granted)
+      return { granted, capped: granted < requested }
+    }
+
+    for (const s of stakingList) {
+      const stakingId = Number(s.staking_id)
+      const uid = Number(s.user_id)
+      const amt = Number(s.amount) || 0
+      const rate = Number(s.daily_rate) || 0
+      const startKst = String(s.start_kst || '')
+      if (startKst < '2026-05-06') entryDateCount.before_0506 += 1
+      else if (startKst === '2026-05-06') entryDateCount.on_0506 += 1
+      else if (startKst === '2026-05-07') entryDateCount.on_0507 += 1
+      else entryDateCount.other += 1
+
+      const ownReqQkey = Math.round(amt * rate * USD_TO_QKEY)
+      if (ownReqQkey <= 0) continue
+
+      const ownGrant = tryGive(uid, ownReqQkey)
+      if (ownGrant.granted > 0) expectedDRs.push({ user_id: uid, staking_id: stakingId, amount: ownGrant.granted })
+      if (ownGrant.capped && ownGrant.granted < ownReqQkey) dr_capped.add(uid)
+
+      const l1Uid = refMap.get(uid) || 0
+      if (l1Uid > 0 && activeUserSet.has(l1Uid)) {
+        const l1Req = Math.round(ownReqQkey * 0.20)
+        if (l1Req > 0) {
+          const l1Grant = tryGive(l1Uid, l1Req)
+          if (l1Grant.granted > 0) expectedRRs.push({
+            referrer_id: l1Uid, referee_id: uid, level: 1, staking_id: stakingId,
+            original_amount: ownReqQkey, reward_amount: l1Grant.granted,
+          })
+          if (l1Grant.capped && l1Grant.granted < l1Req) l1_capped.add(l1Uid)
+        }
+      }
+
+      const l2Uid = l1Uid > 0 ? (refMap.get(l1Uid) || 0) : 0
+      if (l2Uid > 0 && activeUserSet.has(l2Uid)) {
+        const l2Req = Math.round(ownReqQkey * 0.10)
+        if (l2Req > 0) {
+          const l2Grant = tryGive(l2Uid, l2Req)
+          if (l2Grant.granted > 0) expectedRRs.push({
+            referrer_id: l2Uid, referee_id: uid, level: 2, staking_id: stakingId,
+            original_amount: ownReqQkey, reward_amount: l2Grant.granted,
+          })
+          if (l2Grant.capped && l2Grant.granted < l2Req) l2_capped.add(l2Uid)
+        }
+      }
+    }
+
+    const drExpTotal = expectedDRs.reduce((s, r) => s + r.amount, 0)
+    const l1ExpTotal = expectedRRs.filter(r => r.level === 1).reduce((s, r) => s + r.reward_amount, 0)
+    const l2ExpTotal = expectedRRs.filter(r => r.level === 2).reduce((s, r) => s + r.reward_amount, 0)
+    const grandInsert = drExpTotal + l1ExpTotal + l2ExpTotal
+    const netBalanceDelta = grandInsert - purgeTxTotal
+
+    // net user delta
+    const netUserDelta = new Map<number, number>()
+    for (const [uid, d] of purgeBalanceDelta.entries()) {
+      netUserDelta.set(uid, (netUserDelta.get(uid) || 0) + d)
+    }
+    for (const dr of expectedDRs) {
+      netUserDelta.set(dr.user_id, (netUserDelta.get(dr.user_id) || 0) + dr.amount)
+    }
+    for (const rr of expectedRRs) {
+      netUserDelta.set(rr.referrer_id, (netUserDelta.get(rr.referrer_id) || 0) + rr.reward_amount)
+    }
+
+    const summary = {
+      config: { reward_date: TARGET_REWARD_DATE, paid_date: TARGET_PAID_DATE },
+      purge: {
+        dr_rows_to_delete: drIds.length,
+        rr_rows_to_delete: rrIds.length,
+        tx_rows_to_delete: txIds.length,
+        tx_total_to_subtract: purgeTxTotal,
+        affected_users: purgeBalanceDelta.size,
+        dr_reward_dates_seen: drDistinctRewardDates,
+        rr_reward_dates_seen: rrDistinctRewardDates,
+      },
+      recalc: {
+        staking_count: stakingList.length,
+        entry_date_breakdown: entryDateCount,
+        dr_expected: expectedDRs.length, dr_total: drExpTotal,
+        l1_expected: expectedRRs.filter(r => r.level === 1).length, l1_total: l1ExpTotal,
+        l2_expected: expectedRRs.filter(r => r.level === 2).length, l2_total: l2ExpTotal,
+        tx_to_insert: expectedDRs.length + expectedRRs.length,
+        gross_total_to_add: grandInsert,
+        cap_info: { dr_capped: dr_capped.size, l1_capped: l1_capped.size, l2_capped: l2_capped.size },
+      },
+      net: {
+        users_affected: netUserDelta.size,
+        net_balance_delta_total: netBalanceDelta,
+      },
+    }
+
+    // ═══════════════ DRY-RUN ═══════════════
+    if (mode === 'DRY_RUN') {
+      const userIds = Array.from(netUserDelta.keys())
+      const userSim: any[] = []
+      for (let i = 0; i < userIds.length; i += 100) {
+        const chunk = userIds.slice(i, i + 100)
+        const ph = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id IN (${ph})`).bind(...chunk).all()
+        for (const u of (rows.results || []) as any[]) {
+          const delta = netUserDelta.get(Number(u.id)) || 0
+          userSim.push({
+            user_id: Number(u.id), name: u.name, email: u.email,
+            current_balance: Number(u.qkey_balance),
+            net_delta: delta,
+            post_balance: Number(u.qkey_balance) + delta,
+            will_go_negative: (Number(u.qkey_balance) + delta) < 0,
+          })
+        }
+      }
+      const negAfter = userSim.filter(u => u.will_go_negative)
+
+      // tx 패턴 분석 (영구룰 위반 흔적)
+      const txByMinute: Record<string, { cnt: number, total: number }> = {}
+      for (const t of txDetail) {
+        const k = String(t.kst_at || '').slice(0, 16)
+        if (!txByMinute[k]) txByMinute[k] = { cnt: 0, total: 0 }
+        txByMinute[k].cnt += 1
+        txByMinute[k].total += Number(t.amount)
+      }
+      const txByMinuteTop = Object.entries(txByMinute)
+        .sort((a, b) => b[1].cnt - a[1].cnt)
+        .slice(0, 15)
+        .map(([k, v]) => ({ kst_minute: k, ...v }))
+
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'recalc-may-seven',
+        summary,
+        protect_baseline: protectBaseline,
+        purge_tx_kst_distribution: txByMinuteTop,
+        balance_sim_top20: userSim.sort((a, b) => Math.abs(b.net_delta) - Math.abs(a.net_delta)).slice(0, 20),
+        negative_after: { count: negAfter.length, samples: negAfter.slice(0, 10) },
+        next_action: 'POST + confirm=GO 보내시면 PURGE + RECALC + balance 조정 1번에 실행',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ═══════════════ EXEC ═══════════════
+    // (a) balance 차감
+    let balanceUpdated = 0
+    {
+      const balEntries = Array.from(purgeBalanceDelta.entries())
+      for (let i = 0; i < balEntries.length; i += CHUNK) {
+        const chunk = balEntries.slice(i, i + CHUNK)
+        const stmts = chunk.map(([uid, delta]) =>
+          db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
+        )
+        if (stmts.length > 0) await db.batch(stmts)
+        balanceUpdated += chunk.length
+      }
+    }
+
+    // (b) tx DELETE
+    let txPurgedCnt = 0
+    for (let i = 0; i < txIds.length; i += CHUNK) {
+      const chunk = txIds.slice(i, i + CHUNK)
+      const ph = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...chunk).run()
+      txPurgedCnt += (r as any)?.meta?.changes || 0
+    }
+
+    // (c) RR DELETE — id 기반 (reward_date 5/7 + paid_date 5/8 통합)
+    let rrPurgedCnt = 0
+    for (let i = 0; i < rrIds.length; i += CHUNK) {
+      const chunk = rrIds.slice(i, i + CHUNK)
+      const ph = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`DELETE FROM referral_rewards WHERE id IN (${ph})`).bind(...chunk).run()
+      rrPurgedCnt += (r as any)?.meta?.changes || 0
+    }
+
+    // (d) DR DELETE
+    let drPurgedCnt = 0
+    for (let i = 0; i < drIds.length; i += CHUNK) {
+      const chunk = drIds.slice(i, i + CHUNK)
+      const ph = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`DELETE FROM daily_rewards WHERE id IN (${ph})`).bind(...chunk).run()
+      drPurgedCnt += (r as any)?.meta?.changes || 0
+    }
+
+    // (e) DR INSERT
+    const drCreatedAt = `${TARGET_PAID_DATE} 06:15:00`  // KST 15:15
+    const rrCreatedAt = `${TARGET_PAID_DATE} 06:15:01`
+
+    for (let i = 0; i < expectedDRs.length; i += CHUNK) {
+      const chunk = expectedDRs.slice(i, i + CHUNK)
+      const stmts = chunk.map(dr =>
+        db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(dr.user_id, dr.staking_id, dr.amount, TARGET_REWARD_DATE, TARGET_PAID_DATE, drCreatedAt)
+      )
+      if (stmts.length > 0) await db.batch(stmts)
+    }
+
+    // DR id 매핑
+    const drRowsAfter = await db.prepare(`
+      SELECT id, user_id, staking_id FROM daily_rewards
+      WHERE reward_date = ? AND paid_date = ?
+    `).bind(TARGET_REWARD_DATE, TARGET_PAID_DATE).all()
+    const drIdMap = new Map<string, number>()
+    for (const r of (drRowsAfter.results || []) as any[]) {
+      drIdMap.set(`${r.user_id}|${r.staking_id}`, Number(r.id))
+    }
+
+    // (f) DR tx INSERT
+    const drTxStmts = expectedDRs.map(dr => {
+      const drId = drIdMap.get(`${dr.user_id}|${dr.staking_id}`) ?? null
+      return db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+        VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
+      `).bind(dr.user_id, dr.amount, '일일 배당 (QKEY)', drId, drCreatedAt)
+    })
+    for (let i = 0; i < drTxStmts.length; i += CHUNK) {
+      const c2 = drTxStmts.slice(i, i + CHUNK)
+      if (c2.length > 0) await db.batch(c2)
+    }
+
+    // (g) RR INSERT
+    for (let i = 0; i < expectedRRs.length; i += CHUNK) {
+      const chunk = expectedRRs.slice(i, i + CHUNK)
+      const stmts = chunk.map(rr =>
+        db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(rr.referrer_id, rr.referee_id, rr.level, rr.original_amount, rr.reward_amount, TARGET_REWARD_DATE, TARGET_PAID_DATE, rr.staking_id, drCreatedAt)
+      )
+      if (stmts.length > 0) await db.batch(stmts)
+    }
+
+    // RR id 매핑
+    const rrRowsAfter = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id FROM referral_rewards
+      WHERE reward_date = ? AND paid_date = ?
+    `).bind(TARGET_REWARD_DATE, TARGET_PAID_DATE).all()
+    const rrIdMap = new Map<string, number>()
+    for (const r of (rrRowsAfter.results || []) as any[]) {
+      rrIdMap.set(`${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`, Number(r.id))
+    }
+
+    // (h) RR tx INSERT
+    const rrTxStmts = expectedRRs.map(rr => {
+      const rrId = rrIdMap.get(`${rr.referrer_id}|${rr.referee_id}|${rr.level}|${rr.staking_id}`) ?? null
+      const desc = rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+      return db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+        VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+      `).bind(rr.referrer_id, rr.reward_amount, desc, rrId, rrCreatedAt)
+    })
+    for (let i = 0; i < rrTxStmts.length; i += CHUNK) {
+      const c2 = rrTxStmts.slice(i, i + CHUNK)
+      if (c2.length > 0) await db.batch(c2)
+    }
+
+    // (i) balance 증가
+    {
+      const addDelta = new Map<number, number>()
+      for (const dr of expectedDRs) addDelta.set(dr.user_id, (addDelta.get(dr.user_id) || 0) + dr.amount)
+      for (const rr of expectedRRs) addDelta.set(rr.referrer_id, (addDelta.get(rr.referrer_id) || 0) + rr.reward_amount)
+      const balEntries = Array.from(addDelta.entries())
+      for (let i = 0; i < balEntries.length; i += CHUNK) {
+        const chunk = balEntries.slice(i, i + CHUNK)
+        const stmts = chunk.map(([uid, delta]) =>
+          db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
+        )
+        if (stmts.length > 0) await db.batch(stmts)
+        balanceUpdated += chunk.length
+      }
+    }
+
+    // POST-CHECK
+    const drNew = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total FROM daily_rewards WHERE reward_date = ?`).bind(TARGET_REWARD_DATE).first() as any
+    const rrNew = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total FROM referral_rewards WHERE reward_date = ?`).bind(TARGET_REWARD_DATE).first() as any
+
+    // legacy paid_date=5/8 잡것 잔여 확인
+    const drLegacyRemain = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE paid_date = ? AND reward_date != ?`).bind(TARGET_PAID_DATE, TARGET_REWARD_DATE).first() as any
+    const rrLegacyRemain = await db.prepare(`SELECT COUNT(*) AS cnt FROM referral_rewards WHERE paid_date = ? AND reward_date != ?`).bind(TARGET_PAID_DATE, TARGET_REWARD_DATE).first() as any
+
+    // PROTECT AFTER
+    const protectAfter: any[] = []
+    for (const pd of PROTECTED_REWARD_DATES) {
+      const drB = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total FROM daily_rewards WHERE reward_date = ?`).bind(pd).first() as any
+      const rrB = await db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total FROM referral_rewards WHERE reward_date = ?`).bind(pd).first() as any
+      protectAfter.push({
+        reward_date: pd,
+        dr_count: Number(drB?.cnt || 0), dr_total: Number(drB?.total || 0),
+        rr_count: Number(rrB?.cnt || 0), rr_total: Number(rrB?.total || 0),
+      })
+    }
+    const protectIntact = JSON.stringify(protectBaseline) === JSON.stringify(protectAfter)
+
+    const drMatch = Number(drNew?.cnt || 0) === expectedDRs.length
+    const rrMatch = Number(rrNew?.cnt || 0) === expectedRRs.length
+    const legacyClean = Number(drLegacyRemain?.cnt || 0) === 0 && Number(rrLegacyRemain?.cnt || 0) === 0
+    const allOk = protectIntact && drMatch && rrMatch && legacyClean
+
+    return c.json({
+      ok: allOk,
+      mode: 'EXEC',
+      action: 'recalc-may-seven',
+      summary,
+      exec_result: {
+        purge: { dr_deleted: drPurgedCnt, rr_deleted: rrPurgedCnt, tx_deleted: txPurgedCnt },
+        insert: { dr_inserted: expectedDRs.length, rr_inserted: expectedRRs.length, tx_inserted: expectedDRs.length + expectedRRs.length },
+        balance_updates: balanceUpdated,
+        net_balance_delta_total: netBalanceDelta,
+      },
+      post_check: {
+        new_5_7_count: {
+          dr: Number(drNew?.cnt || 0), dr_total: Number(drNew?.total || 0),
+          rr: Number(rrNew?.cnt || 0), rr_total: Number(rrNew?.total || 0),
+          dr_match: drMatch, rr_match: rrMatch,
+        },
+        legacy_5_8_remain: {
+          dr: Number(drLegacyRemain?.cnt || 0), rr: Number(rrLegacyRemain?.cnt || 0), clean: legacyClean,
+        },
+        protect: { baseline: protectBaseline, after: protectAfter, intact: protectIntact },
+        verdict: allOk ? '✅ 영구룰 적합 완료' : '🚨 검증 실패 — 즉시 STOP & 보고',
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+}
+
+app.get('/api/diag/recalc-may-seven', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagRecalcMaySeven(c, 'DRY_RUN')
+})
+
+app.post('/api/diag/recalc-may-seven', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 변경 게이트)' }, 400)
+  return diagRecalcMaySeven(c, 'EXEC')
+})
+
 app.get('/api/diag/user-reward-audit', async (c) => {
   const t0 = Date.now()
   try {
