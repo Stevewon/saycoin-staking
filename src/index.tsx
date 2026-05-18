@@ -37335,4 +37335,142 @@ app.post('/api/diag/admin-block-today-cron', async (c) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────
+// /api/diag/fix-solbat-cleanup-duplicates
+// 사장님 명령 (2026-05-18): 솔밧 (u#44) 중복지급 정리
+//   1) transactions WHERE user_id=44 AND description LIKE '%clean-slate%' → DELETE (120건, 33,000 QKEY)
+//   2) referral_rewards WHERE referrer_id=44 AND created_at >= '2026-05-17 21:00:00' UTC → DELETE (18건)
+//   3) qkey_balance 를 잔여 transactions 합계로 재계산
+//   4) (옵션) transactions.created_at 공백→T 치환 (Safari Invalid Date 수정)
+// DRY:  POST /api/diag/fix-solbat-cleanup-duplicates?key=ADMIN_PW&dry_run=1
+// GO:   POST /api/diag/fix-solbat-cleanup-duplicates?key=ADMIN_PW&confirm=GO
+// ─────────────────────────────────────────────────────────────────
+app.post('/api/diag/fix-solbat-cleanup-duplicates', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') return c.json({ error: 'confirm=GO 또는 dry_run=1 필요' }, 400)
+
+    const db = c.env.DB
+    const uid = 44
+
+    // === 1. 삭제 대상 미리 조회 ===
+    const txTargets = await db.prepare(`
+      SELECT id, type, amount, description, created_at
+      FROM transactions
+      WHERE user_id = ? AND description LIKE '%clean-slate%'
+      ORDER BY id
+    `).bind(uid).all<any>()
+    const txList = (txTargets.results || []) as any[]
+    const txSum = txList.reduce((s, t) => s + Number(t.amount || 0), 0)
+
+    const rrTargets = await db.prepare(`
+      SELECT id, referee_id, level, reward_amount, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE referrer_id = ? AND created_at >= '2026-05-17 21:00:00'
+      ORDER BY id
+    `).bind(uid).all<any>()
+    const rrList = (rrTargets.results || []) as any[]
+    const rrSum = rrList.reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+
+    // === 현재 잔고 + 재계산 예상 ===
+    const userRow = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(uid).first<any>()
+    const currentBalance = Number(userRow?.qkey_balance || 0)
+
+    // 삭제 후 잔여 tx 합계 = 재계산할 잔고
+    const txAllAfter = await db.prepare(`
+      SELECT COALESCE(SUM(amount),0) AS total
+      FROM transactions
+      WHERE user_id = ? AND coin_type = 'QKEY'
+        AND id NOT IN (SELECT id FROM transactions WHERE user_id = ? AND description LIKE '%clean-slate%')
+    `).bind(uid, uid).first<any>()
+    const newBalance = Number(txAllAfter?.total || 0)
+
+    if (dryRun) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        targets: {
+          transactions_delete: {
+            count: txList.length,
+            sum_qkey: txSum,
+            id_range: txList.length > 0 ? `${txList[0].id} ~ ${txList[txList.length-1].id}` : null,
+            sample_descriptions: Array.from(new Set(txList.map(t => t.description))).slice(0, 10)
+          },
+          referral_rewards_delete: {
+            count: rrList.length,
+            sum_qkey: rrSum,
+            id_range: rrList.length > 0 ? `${rrList[0].id} ~ ${rrList[rrList.length-1].id}` : null,
+            items: rrList
+          }
+        },
+        balance: {
+          current: currentBalance,
+          new_after_delete: newBalance,
+          diff: newBalance - currentBalance
+        }
+      })
+    }
+
+    // === EXECUTE ===
+    const results: any = {
+      tx_deleted: 0,
+      rr_deleted: 0,
+      created_at_fixed: 0,
+      balance_before: currentBalance,
+      balance_after: 0
+    }
+
+    // (1) transactions DELETE
+    const txDel = await db.prepare(`
+      DELETE FROM transactions
+      WHERE user_id = ? AND description LIKE '%clean-slate%'
+    `).bind(uid).run()
+    results.tx_deleted = txDel.meta?.changes || 0
+
+    // (2) referral_rewards DELETE
+    const rrDel = await db.prepare(`
+      DELETE FROM referral_rewards
+      WHERE referrer_id = ? AND created_at >= '2026-05-17 21:00:00'
+    `).bind(uid).run()
+    results.rr_deleted = rrDel.meta?.changes || 0
+
+    // (3) 잔고 재계산 — 잔여 QKEY transactions 합으로 UPDATE
+    const finalSum = await db.prepare(`
+      SELECT COALESCE(SUM(amount),0) AS total
+      FROM transactions
+      WHERE user_id = ? AND coin_type = 'QKEY'
+    `).bind(uid).first<any>()
+    const finalBalance = Number(finalSum?.total || 0)
+
+    await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(finalBalance, uid).run()
+    results.balance_after = finalBalance
+
+    // (4) created_at 공백 → T 치환 (Safari Invalid Date 수정)
+    // SQLite REPLACE 사용: "2026-05-18 06:57:44" → "2026-05-18T06:57:44"
+    const fixDt = await db.prepare(`
+      UPDATE transactions
+      SET created_at = REPLACE(created_at, ' ', 'T')
+      WHERE user_id = ?
+        AND created_at IS NOT NULL
+        AND created_at LIKE '____-__-__ __:__:__%'
+    `).bind(uid).run()
+    results.created_at_fixed = fixDt.meta?.changes || 0
+
+    return c.json({
+      ok: true,
+      mode: 'EXECUTED',
+      action: 'fix-solbat-cleanup-duplicates',
+      user_id: uid,
+      results,
+      message: `중복 tx 120건 + rr 18건 삭제 완료, 잔고 ${currentBalance} → ${finalBalance} 재계산, created_at ${results.created_at_fixed}건 ISO 형식 수정.`
+    })
+  } catch (error) {
+    console.error('fix-solbat-cleanup-duplicates error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 export default app
