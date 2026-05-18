@@ -47370,9 +47370,8 @@ app.get('/api/diag/daily-reward-dup-check', async (c) => {
     const dup3Detail: any[] = []
     for (const g of dup3Rows.slice(0, 30)) {
       const txDetail = await db.prepare(`
-        SELECT id, user_id, amount, description, created_at,
-               datetime(created_at, '+9 hours') AS kst_at,
-               reference_id
+        SELECT id, user_id, amount, type, description, created_at,
+               datetime(created_at, '+9 hours') AS kst_at
         FROM transactions
         WHERE user_id = ?
           AND coin_type = 'QKEY'
@@ -47390,9 +47389,9 @@ app.get('/api/diag/daily-reward-dup-check', async (c) => {
         rows: (txDetail.results || []).map((x: any) => ({
           id: Number(x.id),
           amount: Number(x.amount),
+          type: String(x.type || ''),
           description: String(x.description || ''),
           kst_at: String(x.kst_at || ''),
-          reference_id: x.reference_id == null ? null : Number(x.reference_id),
         })),
       })
     }
