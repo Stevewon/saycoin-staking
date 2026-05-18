@@ -42008,18 +42008,306 @@ async function diagReverseBackfillDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
   }
 }
 
+// ★★★★★ 영구 차단 — 2026-05-18 사장님 명령 ★★★★★
+//   사고: reverse-backfill 이 staking_id=NULL legacy actual row 를 expected set 비교에서
+//        제외 → "누락" 으로 잘못 분류 → 재 INSERT → 이중지급 117건 / 52,725 QKEY 사고 발생
+//   조치: GET/POST 모두 410 GONE 반환. 절대 호출 불가.
+//   미사용 함수 diagReverseBackfillDividend 는 코드에 남겨두되 호출 차단.
 app.get('/api/diag/reverse-backfill-dividend', async (c) => {
-  const key = c.req.query('key') || ''
-  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
-  return diagReverseBackfillDividend(c, 'DRY_RUN')
+  return c.json({
+    error: 'GONE',
+    blocked_at: '2026-05-18',
+    reason: '사장님 명령 (2026-05-18) — staking_id=NULL legacy row 미인식으로 이중지급 117건 사고 발생, 영구 차단',
+    incident: { affected_rows: 117, affected_qkey: 52725 },
+  }, 410)
+})
+app.post('/api/diag/reverse-backfill-dividend', async (c) => {
+  return c.json({
+    error: 'GONE',
+    blocked_at: '2026-05-18',
+    reason: '사장님 명령 (2026-05-18) — staking_id=NULL legacy row 미인식으로 이중지급 117건 사고 발생, 영구 차단',
+    incident: { affected_rows: 117, affected_qkey: 52725 },
+  }, 410)
 })
 
-app.post('/api/diag/reverse-backfill-dividend', async (c) => {
+// ============================================================================
+// rollback-reverse-backfill-marker: [REVERSE_BACKFILL] 마커 박힌 row 전부 들어냄
+//
+//   사장님 명령 (2026-05-18 사고 후):
+//   "리벌스라고 영어로 박힌거 그거 전부 들어내면 딱맞아"
+//
+//   대상 식별:
+//     transactions.description LIKE '%[REVERSE_BACKFILL%'
+//     (description 마커는 reverse-backfill EXEC 안에서만 박힘 — 정확 식별)
+//
+//   처리 (이 순서로 db.batch 청크):
+//     1. transactions ref_id 로 referral_rewards 조인 → 해당 rr id 수집
+//     2. 각 사용자의 qkey_balance -= 해당 tx.amount (음수면 +=)
+//     3. transactions DELETE (마커 row 들)
+//     4. referral_rewards DELETE (1 에서 수집한 rr id 들)
+//
+//   안전장치:
+//     - DRY-RUN 우선 (사장님 확인 후 EXEC)
+//     - description 마커 절대 다른 곳에서 안 박힘 (코드 grep 확인)
+//     - 마커 row 만 정확히 식별, 다른 정상 row 0건 영향
+//     - 사후 검증: 마커 row 0건 / referral_rewards id 0건 / balance 정합
+//
+//   GET  /api/diag/rollback-reverse-backfill-marker?key=ADMIN_PW              → DRY_RUN
+//   POST /api/diag/rollback-reverse-backfill-marker?key=ADMIN_PW&confirm=GO   → EXEC
+// ============================================================================
+async function diagRollbackReverseBackfillMarker(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  try {
+    console.log(`[ROLLBACK_RB] start mode=${mode}`)
+    const db = c.env.DB
+
+    // ─── PHASE 1: 마커 tx 수집 ───
+    //   description LIKE '%[REVERSE_BACKFILL%' 모든 tx
+    const txMarkerRaw = await db.prepare(`
+      SELECT id, user_id, type, amount, description, ref_id,
+             datetime(created_at, '+9 hours') AS created_kst
+      FROM transactions
+      WHERE description LIKE '%[REVERSE_BACKFILL%'
+      ORDER BY id ASC
+    `).all()
+    const txMarkerList = (txMarkerRaw.results || []) as any[]
+
+    if (txMarkerList.length === 0) {
+      return c.json({
+        ok: true,
+        mode,
+        action: 'rollback-reverse-backfill-marker',
+        message: '[REVERSE_BACKFILL] 마커 tx 0건 — 롤백할 것 없음',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─── PHASE 2: tx 유형별 분류 + rr id 수집 ───
+    //   type='referral_reward' → ref_id 로 referral_rewards 조인 → DELETE 대상
+    //   type='daily_qkey'      → ref_id 로 daily_rewards 조인 → DELETE 대상
+    //   type='*_rollback'      → 음수 보정 tx (있다면) — 정상 복구를 위해 같이 제거
+    const rrIdsToDelete: number[] = []
+    const drIdsToDelete: number[] = []
+    let totalAmount = 0
+    const balanceDelta = new Map<number, number>() // user_id → 차감해야 할 양수 / 가산해야 할 음수
+    const txByType: Record<string, { count: number, total: number }> = {}
+
+    for (const tx of txMarkerList) {
+      const uid = Number(tx.user_id)
+      const amt = Number(tx.amount)
+      const refId = String(tx.ref_id || '')
+      totalAmount += amt
+      const t = String(tx.type)
+      if (!txByType[t]) txByType[t] = { count: 0, total: 0 }
+      txByType[t].count++
+      txByType[t].total += amt
+
+      // 사용자 잔액 보정: tx 가 +면 잔액에서 차감, tx 가 -(rollback) 이면 잔액에 가산
+      balanceDelta.set(uid, (balanceDelta.get(uid) || 0) - amt)
+
+      // 신규 INSERT 였으면 ref_id 가 rr_id 또는 dr_id 의 문자열
+      if (t === 'referral_reward' && refId && /^\d+$/.test(refId)) {
+        rrIdsToDelete.push(Number(refId))
+      } else if (t === 'daily_qkey' && refId && /^\d+$/.test(refId)) {
+        drIdsToDelete.push(Number(refId))
+      }
+      // type='referral_reward_rollback' / 'daily_reward_rollback' 은
+      //   ref_id 가 'rr_extra_X' / 'dr_extra_X' 형태 (오늘 작업에선 잉여 0건이라 안 발생)
+      //   이건 별도 DELETE 안 함 — tx 만 제거하면 balance 복구됨
+    }
+
+    // ─── PHASE 3: rr / dr 실제 존재 여부 확인 (현재 DB 상태) ───
+    let rrExistList: any[] = []
+    let drExistList: any[] = []
+    if (rrIdsToDelete.length > 0) {
+      // chunk 단위로 IN 절 처리
+      const CHUNK = 100
+      for (let i = 0; i < rrIdsToDelete.length; i += CHUNK) {
+        const chunk = rrIdsToDelete.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT id, referrer_id, referee_id, level, reward_amount, reward_date, paid_date, staking_id
+          FROM referral_rewards
+          WHERE id IN (${placeholders})
+        `).bind(...chunk).all()
+        rrExistList.push(...((rows.results || []) as any[]))
+      }
+    }
+    if (drIdsToDelete.length > 0) {
+      const CHUNK = 100
+      for (let i = 0; i < drIdsToDelete.length; i += CHUNK) {
+        const chunk = drIdsToDelete.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+          FROM daily_rewards
+          WHERE id IN (${placeholders})
+        `).bind(...chunk).all()
+        drExistList.push(...((rows.results || []) as any[]))
+      }
+    }
+
+    // ─── 영향받을 사용자 / 합계 ───
+    const affectedUsers = Array.from(balanceDelta.keys()).sort((a, b) => a - b)
+    const balanceDeltaList = Array.from(balanceDelta.entries()).map(([uid, delta]) => ({ user_id: uid, balance_delta: delta }))
+
+    const summary = {
+      tx_marker_count: txMarkerList.length,
+      tx_total_amount: totalAmount,
+      tx_by_type: txByType,
+      rr_ids_to_delete: rrIdsToDelete.length,
+      rr_actually_exists: rrExistList.length,
+      dr_ids_to_delete: drIdsToDelete.length,
+      dr_actually_exists: drExistList.length,
+      affected_users_count: affectedUsers.length,
+    }
+
+    // ═══════════════ DRY-RUN ═══════════════
+    if (mode === 'DRY_RUN') {
+      // 사용자별 balance 변동 + 사고 후 → 복구 후 시뮬레이션
+      const userIdList = affectedUsers
+      let userBalanceSim: any[] = []
+      if (userIdList.length > 0) {
+        const CHUNK = 100
+        for (let i = 0; i < userIdList.length; i += CHUNK) {
+          const chunk = userIdList.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() => '?').join(',')
+          const rows = await db.prepare(`
+            SELECT id, name, email, qkey_balance
+            FROM users WHERE id IN (${placeholders})
+          `).bind(...chunk).all()
+          for (const u of (rows.results || []) as any[]) {
+            const delta = balanceDelta.get(Number(u.id)) || 0
+            userBalanceSim.push({
+              user_id: Number(u.id), name: u.name, email: u.email,
+              current_balance: Number(u.qkey_balance),
+              delta: delta,  // 음수이면 차감
+              post_balance: Number(u.qkey_balance) + delta,
+              will_go_negative: (Number(u.qkey_balance) + delta) < 0,
+            })
+          }
+        }
+      }
+
+      const negativeAfter = userBalanceSim.filter(u => u.will_go_negative)
+
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'rollback-reverse-backfill-marker',
+        marker_pattern: 'description LIKE %[REVERSE_BACKFILL%',
+        summary,
+        affected_users_balance_top20: userBalanceSim.slice(0, 20),
+        negative_balance_warning: {
+          count: negativeAfter.length,
+          samples: negativeAfter.slice(0, 10),
+        },
+        tx_marker_sample_top10: txMarkerList.slice(0, 10).map((tx: any) => ({
+          id: tx.id, user_id: tx.user_id, type: tx.type,
+          amount: tx.amount, description: tx.description,
+          ref_id: tx.ref_id, created_kst: tx.created_kst,
+        })),
+        rr_sample_top10: rrExistList.slice(0, 10),
+        dr_sample_top10: drExistList.slice(0, 10),
+        next_action: 'POST + confirm=GO 보내시면 EXEC. set-based batch DELETE + balance 차감.',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ═══════════════ EXEC ═══════════════
+    const CHUNK_SIZE = 80
+
+    // ── (1) users.qkey_balance 보정 ──
+    let balanceAdjusted = 0
+    const balEntries = Array.from(balanceDelta.entries())
+    for (let i = 0; i < balEntries.length; i += CHUNK_SIZE) {
+      const chunk = balEntries.slice(i, i + CHUNK_SIZE)
+      const stmts = chunk.map(([uid, delta]) =>
+        db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
+      )
+      await db.batch(stmts)
+      balanceAdjusted += chunk.length
+    }
+
+    // ── (2) referral_rewards DELETE ──
+    let rrDeleted = 0
+    if (rrIdsToDelete.length > 0) {
+      for (let i = 0; i < rrIdsToDelete.length; i += CHUNK_SIZE) {
+        const chunk = rrIdsToDelete.slice(i, i + CHUNK_SIZE)
+        const placeholders = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`DELETE FROM referral_rewards WHERE id IN (${placeholders})`).bind(...chunk).run()
+        rrDeleted += (r as any)?.meta?.changes || 0
+      }
+    }
+
+    // ── (3) daily_rewards DELETE ──
+    let drDeleted = 0
+    if (drIdsToDelete.length > 0) {
+      for (let i = 0; i < drIdsToDelete.length; i += CHUNK_SIZE) {
+        const chunk = drIdsToDelete.slice(i, i + CHUNK_SIZE)
+        const placeholders = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`DELETE FROM daily_rewards WHERE id IN (${placeholders})`).bind(...chunk).run()
+        drDeleted += (r as any)?.meta?.changes || 0
+      }
+    }
+
+    // ── (4) transactions DELETE (마커 row 들) ──
+    const txDelRes = await db.prepare(`DELETE FROM transactions WHERE description LIKE '%[REVERSE_BACKFILL%'`).run()
+    const txDeleted = (txDelRes as any)?.meta?.changes || 0
+
+    // ─── POST-CHECK ───
+    const postTxRaw = await db.prepare(`SELECT COUNT(*) AS cnt FROM transactions WHERE description LIKE '%[REVERSE_BACKFILL%'`).first() as any
+    const postTxCount = Number(postTxRaw?.cnt || 0)
+
+    let postRrExistCount = 0
+    if (rrIdsToDelete.length > 0) {
+      const CHUNK = 100
+      for (let i = 0; i < rrIdsToDelete.length; i += CHUNK) {
+        const chunk = rrIdsToDelete.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`SELECT COUNT(*) AS cnt FROM referral_rewards WHERE id IN (${placeholders})`).bind(...chunk).first() as any
+        postRrExistCount += Number(rows?.cnt || 0)
+      }
+    }
+
+    return c.json({
+      ok: postTxCount === 0 && postRrExistCount === 0,
+      mode: 'EXEC',
+      action: 'rollback-reverse-backfill-marker',
+      pre_summary: summary,
+      exec_result: {
+        balance_adjusted_users: balanceAdjusted,
+        rr_deleted: rrDeleted,
+        dr_deleted: drDeleted,
+        tx_deleted: txDeleted,
+      },
+      post_check: {
+        tx_marker_remaining: postTxCount,
+        rr_id_remaining: postRrExistCount,
+        verified: postTxCount === 0 && postRrExistCount === 0,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[ROLLBACK_RB] ERROR mode=${mode} duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+}
+
+app.get('/api/diag/rollback-reverse-backfill-marker', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagRollbackReverseBackfillMarker(c, 'DRY_RUN')
+})
+
+app.post('/api/diag/rollback-reverse-backfill-marker', async (c) => {
   const key = c.req.query('key') || ''
   if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
   const confirm = c.req.query('confirm') || ''
-  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 INSERT/DELETE 게이트)' }, 400)
-  return diagReverseBackfillDividend(c, 'EXEC')
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 DELETE 게이트)' }, 400)
+  return diagRollbackReverseBackfillMarker(c, 'EXEC')
 })
+
 
 export default app
