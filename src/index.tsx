@@ -46458,10 +46458,10 @@ async function diagRecalcMaySix(c: any, mode: 'DRY_RUN' | 'EXEC') {
     }
 
     // ═══════════════════════════════════════════════
-    // PHASE 2: RECALC EXPECTED 계산 (reward_date = 5/7 만)
+    // PHASE 2: RECALC EXPECTED 계산 (reward_date = 5/6 만)
     // ═══════════════════════════════════════════════
 
-    // staking 조회: 5/7 발생 대상
+    // staking 조회: 5/6 발생 대상 (영구룰 #익일리워드: 5/5 이전 진입자만)
     const stakingRows = await db.prepare(`
       SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.period_days,
              date(s.start_date,'+9 hours') AS start_kst,
@@ -46471,7 +46471,7 @@ async function diagRecalcMaySix(c: any, mode: 'DRY_RUN' | 'EXEC') {
       FROM staking s
       JOIN users u ON u.id = s.user_id
       WHERE s.status IN ('active','capped','completed')
-        AND date(s.start_date,'+9 hours') <= ?
+        AND date(s.start_date,'+9 hours') < ?
         AND date(s.end_date,'+9 hours') >= ?
       ORDER BY s.id ASC
     `).bind(TARGET_REWARD_DATE, TARGET_REWARD_DATE).all()
