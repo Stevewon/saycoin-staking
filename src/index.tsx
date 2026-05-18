@@ -39995,4 +39995,132 @@ app.post('/api/diag/fix-may15-to-may14-label', async (c) => {
   return diagFixMay15ToMay14(c, 'EXEC')
 })
 
+// ============================================================
+// /api/diag/scan-may14-vs-may15
+// ----------------------------------------------------------------
+// ★ 사장님 STEP 1 DRY-RUN 충돌 발견 후 추가 진단:
+//   14일과 15일 양쪽에 DR 가 56건씩 있음 — 정확한 현황 파악
+//
+// READ-ONLY. 두 날짜의 DR 을 staking_id 별 1:1 매칭 비교.
+// ============================================================
+app.get('/api/diag/scan-may14-vs-may15', async (c) => {
+  const t0 = Date.now()
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+
+  try {
+    // 14일 vs 15일 staking_id 별 비교
+    const compare = await db.prepare(`
+      WITH d14 AS (
+        SELECT user_id, staking_id, id AS dr_id, usdt_amount, paid_date,
+               strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours') AS created_kst
+        FROM daily_rewards WHERE reward_date = '2026-05-14'
+      ),
+      d15 AS (
+        SELECT user_id, staking_id, id AS dr_id, usdt_amount, paid_date,
+               strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours') AS created_kst
+        FROM daily_rewards WHERE reward_date = '2026-05-15'
+      )
+      SELECT
+        COALESCE(d14.user_id, d15.user_id) AS user_id,
+        COALESCE(d14.staking_id, d15.staking_id) AS staking_id,
+        d14.dr_id AS d14_id, d14.usdt_amount AS d14_amount, d14.paid_date AS d14_paid, d14.created_kst AS d14_created,
+        d15.dr_id AS d15_id, d15.usdt_amount AS d15_amount, d15.paid_date AS d15_paid, d15.created_kst AS d15_created,
+        CASE
+          WHEN d14.dr_id IS NULL THEN 'ONLY_15'
+          WHEN d15.dr_id IS NULL THEN 'ONLY_14'
+          WHEN d14.usdt_amount = d15.usdt_amount THEN 'BOTH_SAME_AMOUNT'
+          ELSE 'BOTH_DIFFERENT'
+        END AS pattern
+      FROM d14
+      FULL OUTER JOIN d15 ON d14.user_id = d15.user_id AND d14.staking_id = d15.staking_id
+      ORDER BY user_id, staking_id
+    `).all<any>().catch(async () => {
+      // SQLite full outer join 미지원 → UNION 으로 폴리필
+      return await db.prepare(`
+        WITH d14 AS (
+          SELECT user_id, staking_id, id AS dr_id, usdt_amount, paid_date,
+                 strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours') AS created_kst
+          FROM daily_rewards WHERE reward_date = '2026-05-14'
+        ),
+        d15 AS (
+          SELECT user_id, staking_id, id AS dr_id, usdt_amount, paid_date,
+                 strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours') AS created_kst
+          FROM daily_rewards WHERE reward_date = '2026-05-15'
+        )
+        SELECT
+          d14.user_id, d14.staking_id,
+          d14.dr_id AS d14_id, d14.usdt_amount AS d14_amount, d14.paid_date AS d14_paid, d14.created_kst AS d14_created,
+          d15.dr_id AS d15_id, d15.usdt_amount AS d15_amount, d15.paid_date AS d15_paid, d15.created_kst AS d15_created,
+          CASE
+            WHEN d15.dr_id IS NULL THEN 'ONLY_14'
+            WHEN d14.usdt_amount = d15.usdt_amount THEN 'BOTH_SAME_AMOUNT'
+            ELSE 'BOTH_DIFFERENT'
+          END AS pattern
+        FROM d14
+        LEFT JOIN d15 ON d14.user_id = d15.user_id AND d14.staking_id = d15.staking_id
+
+        UNION ALL
+
+        SELECT
+          d15.user_id, d15.staking_id,
+          NULL AS d14_id, NULL AS d14_amount, NULL AS d14_paid, NULL AS d14_created,
+          d15.dr_id AS d15_id, d15.usdt_amount AS d15_amount, d15.paid_date AS d15_paid, d15.created_kst AS d15_created,
+          'ONLY_15' AS pattern
+        FROM d15
+        LEFT JOIN d14 ON d14.user_id = d15.user_id AND d14.staking_id = d15.staking_id
+        WHERE d14.dr_id IS NULL
+
+        ORDER BY user_id, staking_id
+      `).all<any>()
+    })
+
+    const rows = compare?.results || []
+
+    const patternCount: any = { BOTH_SAME_AMOUNT: 0, BOTH_DIFFERENT: 0, ONLY_14: 0, ONLY_15: 0 }
+    for (const r of rows) patternCount[r.pattern] = (patternCount[r.pattern] || 0) + 1
+
+    // 14일과 15일 양쪽 created_at 시간대 분석
+    const d14CreatedRange = await db.prepare(`
+      SELECT MIN(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours')) AS min_created,
+             MAX(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours')) AS max_created,
+             MIN(paid_date) AS min_paid, MAX(paid_date) AS max_paid,
+             COUNT(*) AS cnt, COALESCE(SUM(usdt_amount), 0) AS total_amt
+      FROM daily_rewards WHERE reward_date = '2026-05-14'
+    `).first<any>()
+
+    const d15CreatedRange = await db.prepare(`
+      SELECT MIN(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours')) AS min_created,
+             MAX(strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours')) AS max_created,
+             MIN(paid_date) AS min_paid, MAX(paid_date) AS max_paid,
+             COUNT(*) AS cnt, COALESCE(SUM(usdt_amount), 0) AS total_amt
+      FROM daily_rewards WHERE reward_date = '2026-05-15'
+    `).first<any>()
+
+    return c.json({
+      ok: true,
+      action: 'scan-may14-vs-may15',
+      pattern_count: patternCount,
+      total_rows: rows.length,
+      d14_overview: {
+        rows: Number(d14CreatedRange?.cnt || 0),
+        total_amount: Number(d14CreatedRange?.total_amt || 0),
+        created_range_kst: { min: d14CreatedRange?.min_created, max: d14CreatedRange?.max_created },
+        paid_date_range: { min: d14CreatedRange?.min_paid, max: d14CreatedRange?.max_paid }
+      },
+      d15_overview: {
+        rows: Number(d15CreatedRange?.cnt || 0),
+        total_amount: Number(d15CreatedRange?.total_amt || 0),
+        created_range_kst: { min: d15CreatedRange?.min_created, max: d15CreatedRange?.max_created },
+        paid_date_range: { min: d15CreatedRange?.min_paid, max: d15CreatedRange?.max_paid }
+      },
+      samples_first_30: rows.slice(0, 30),
+      duration_ms: Date.now() - t0
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 export default app
