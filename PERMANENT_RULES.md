@@ -49,6 +49,39 @@
 
 ---
 
+## 🕒 영구룰 #정규시각 (MOST CRITICAL — 사용자 거래내역 UX)
+
+> **DR/RR/tx INSERT 시 created_at 은 반드시 paid_date 의 KST 15:15 (= UTC 06:15) 정규 cron 시각으로 명시한다.**
+
+### 절대 금지
+1. ❌ `INSERT INTO transactions (...) VALUES (...)` 에서 created_at 컬럼 생략
+   - → DB default `CURRENT_TIMESTAMP` 적용 → **EXEC 실행 시각** 박힘
+   - → 사용자 거래내역 화면에 **오늘 EXEC 한 시각이 추천보너스 시각으로 표시** → 사장님 격노 사고
+2. ❌ `created_at = CURRENT_TIMESTAMP` 명시
+3. ❌ 어드민 백필/recalc 시 created_at 을 "지금 시각" 으로 두는 것
+
+### 필수 형식
+```typescript
+const dividendCreatedAtUtc = `${payoutDate} 06:15:00`  // KST 15:15:00 = UTC 06:15:00 (DR/RR/daily_qkey tx)
+const rrTxCreatedAtUtc = `${payoutDate} 06:15:01`      // RR tx 는 정규 cron 순서 모사로 1초 늦게
+INSERT INTO transactions (..., created_at) VALUES (..., ?)
+INSERT INTO daily_rewards (..., created_at) VALUES (..., ?)
+INSERT INTO referral_rewards (..., created_at) VALUES (..., ?)
+```
+
+### 적용 범위
+- **모든 어드민 정산 endpoint** (recalc-day-dividend, fix-missing-tx 등)
+- 정규 cron 은 이미 KST 15:15 에 INSERT 하므로 자연스럽게 충족됨
+- 어드민/recalc EXEC 만 위험
+
+### 사고 이력 (2026-05-18)
+- recalc-day-dividend EXEC 4번 (5/11~5/14 reward) 의 tx.created_at 이 5/18 KST 19:04/19:12/19:14/19:17 로 박힘 → 사용자 거래내역에 "추천보너스 다량 5/18 저녁" 으로 표시 → 사장님 격노 → 4건 모두 reverse (657건/936,375 QKEY)
+
+**⚠️ 사장님 직접 인용 (2026-05-18, 사고 직후 직접 명령)**:
+> "너의 사고인 recalc-day-dividend EXEC 가 tx.created_at 을 paid_date 의 적절한 KST 시각이 아니라 EXEC 실행 시각으로 INSERT 한 것이 근본 원인이니 다음 EXEC 부터는 created_at 도 영구룰 정확 적용 하도록 코드 수정 필요"
+
+---
+
 ## ⭐ 영구룰 #스테이킹별독립 (MOST CRITICAL — 다른 영구룰의 전제)
 
 > **동일인이라도 스테이킹 금액이 같든 다르든, 같은 날짜든 다른 날짜든, 각 스테이킹은 완전히 별개로 취급한다.**
@@ -277,6 +310,7 @@ strftime('%Y-%m-%dT%H:%M:%S', created_at, '+9 hours')  -- KST ISO 8601 (Safari �
 | 2026-05-18 | scan-duplicate-dr-rr v1/v2 오진단 (484건 → 위반 분류 오류) | (user_id, reward_date) 기준으로 그룹화하여 staking 별 정상 row 를 위반으로 오분류 | #스테이킹별독립 |
 | 2026-05-18 | recalc-day-dividend 2번 EXEC timeout → 5/18 KST 17:53/17:54 에 referral_reward tx 105건 / 50,700 QKEY 중복 INSERT | N+1 SELECT + 30s Worker timeout 후에도 사용자별 loop 가 계속 실행됨. 첫 EXEC timeout 후 두번째 EXEC 보냄. | #중복지급금지 #스테이킹별독립 |
 | 2026-05-18 | 빌드 deploy 실패 인지 못하고 endpoint 404 후 재시도 루프 | `git push` 자동 감지 의존. GitHub Actions 빌드 status 명시 확인 안 함. Cloudflare API 가 commit message 거부 (Invalid UTF-8) 인 줄도 모름. | #GitHub빌드강제 |
+| 2026-05-18 | recalc-day-dividend EXEC 의 tx.created_at 이 EXEC 실행 시각 (5/18 19:04/19:12/19:14/19:17 KST) 으로 INSERT 됨 → 사용자 거래내역 UX 가 5/18 추천보너스 다량으로 표시 → 사장님 격노 ("또 중복지급한 상태니!") → reverse 657건/936,375 QKEY EXEC | INSERT INTO transactions 에 created_at 명시 안 함 → DB default CURRENT_TIMESTAMP 적용 → EXEC 시각이 박힘. 사용자 화면은 tx.created_at +9h 보정으로 KST 표시. | #정규시각 #중복지급금지 |
 | 이전 다수 | 클라이언트 inline JS SyntaxError | 백틱 안 이스케이프 시퀀스 깨짐 | (CRITICAL_RULES.md 참조) |
 
 ---

@@ -43703,15 +43703,18 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
     //   ★ timeout 방지: 직렬 await N번 대신 db.batch() 로 한번에
     let drInserted = 0
     let drTxInserted = 0
+    //   ★ 영구룰 #정규시각: created_at = paid_date 의 KST 15:15 (= UTC 06:15)
+    //     EXEC 시각 INSERT 사고 (5/18 19:04 사건) 방지
+    const dividendCreatedAtUtc = `${payoutDate} 06:15:00`
     if (expectedDRs.length > 0) {
       // ── (E4-1) DR batch INSERT ──
       for (let i = 0; i < expectedDRs.length; i += CHUNK_SIZE) {
         const chunk = expectedDRs.slice(i, i + CHUNK_SIZE)
         const stmts = chunk.map(dr =>
           db.prepare(`
-            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(dr.user_id, dr.staking_id, dr.amount, dividendDate, payoutDate)
+            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).bind(dr.user_id, dr.staking_id, dr.amount, dividendDate, payoutDate, dividendCreatedAtUtc)
         )
         await db.batch(stmts)
         drInserted += chunk.length
@@ -43728,12 +43731,16 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
         drIdMap.set(`${r.user_id}|${r.staking_id}`, Number(r.id))
       }
       // ── (E4-3) tx batch INSERT (ref_id = dr.id) ──
+      //   ★ created_at: paid_date 의 KST 15:15 정규시각 (= UTC 06:15) — 영구룰 #정규시각
+      //     EXEC 실행 시각으로 INSERT 되면 사용자 거래내역 UX 가 EXEC 시각으로 표시되는 사고 (5/18 19:04 사건)
+      //     DB 저장값은 UTC, 화면 표시는 +9h 보정으로 KST 15:15 표시
+      const txCreatedAtUtc = `${payoutDate} 06:15:00`  // = KST 15:15 정규 cron 시각
       const drTxStmts = expectedDRs.map(dr => {
         const drId = drIdMap.get(`${dr.user_id}|${dr.staking_id}`) ?? null
         return db.prepare(`
-          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
-          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
-        `).bind(dr.user_id, dr.amount, '일일 배당 (QKEY)', drId)
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
+        `).bind(dr.user_id, dr.amount, '일일 배당 (QKEY)', drId, txCreatedAtUtc)
       })
       for (let i = 0; i < drTxStmts.length; i += CHUNK_SIZE) {
         const chunk = drTxStmts.slice(i, i + CHUNK_SIZE)
@@ -43750,9 +43757,9 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
         const chunk = expectedRRs.slice(i, i + CHUNK_SIZE)
         const stmts = chunk.map(rr =>
           db.prepare(`
-            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          `).bind(rr.referrer_id, rr.referee_id, rr.level, rr.original_amount, rr.reward_amount, dividendDate, payoutDate, rr.staking_id)
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(rr.referrer_id, rr.referee_id, rr.level, rr.original_amount, rr.reward_amount, dividendDate, payoutDate, rr.staking_id, dividendCreatedAtUtc)
         )
         await db.batch(stmts)
         rrInserted += chunk.length
@@ -43768,13 +43775,15 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
         rrIdMap.set(`${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`, Number(r.id))
       }
       // ── (E5-3) tx batch INSERT (ref_id = rr.id) ──
+      //   ★ created_at: paid_date 의 KST 15:15 정규시각 (= UTC 06:15) — 영구룰 #정규시각
+      const rrTxCreatedAtUtc = `${payoutDate} 06:15:01`  // RR 은 DR 보다 1초 늦게 (정규 cron 순서 모사)
       const rrTxStmts = expectedRRs.map(rr => {
         const rrId = rrIdMap.get(`${rr.referrer_id}|${rr.referee_id}|${rr.level}|${rr.staking_id}`) ?? null
         const desc = rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
         return db.prepare(`
-          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
-          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
-        `).bind(rr.referrer_id, rr.reward_amount, desc, rrId)
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+        `).bind(rr.referrer_id, rr.reward_amount, desc, rrId, rrTxCreatedAtUtc)
       })
       for (let i = 0; i < rrTxStmts.length; i += CHUNK_SIZE) {
         const chunk = rrTxStmts.slice(i, i + CHUNK_SIZE)
