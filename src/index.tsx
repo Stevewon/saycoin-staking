@@ -47302,6 +47302,164 @@ app.get('/api/diag/user-rr-dup-check', async (c) => {
   }
 })
 
+// daily-reward-dup-check: 전수 사용자 일일배당 중복 검사 (READ-ONLY)
+// 영구룰 #중복지급금지 + #1일1정산 + #스테이킹별독립 검증
+// 검사 1: daily_rewards 테이블 (user_id, staking_id, reward_date) → 엄격 중복
+// 검사 2: daily_rewards 테이블 (user_id, reward_date) → staking 무관 중복 (여러 staking 활성이면 정상이나 보고)
+// 검사 3: transactions 테이블 QKEY 일일배당 (user_id, kst_date) → 실제 지급 중복
+// GET /api/diag/daily-reward-dup-check?key=ADMIN_PW
+app.get('/api/diag/daily-reward-dup-check', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // 검사 1: daily_rewards (user_id, staking_id, reward_date) 중복
+    const dup1 = await db.prepare(`
+      SELECT dr.user_id, u.name AS user_name, dr.staking_id, dr.reward_date,
+             COUNT(*) AS cnt, SUM(dr.qkey_amount) AS total_qkey
+      FROM daily_rewards dr
+      LEFT JOIN users u ON u.id = dr.user_id
+      GROUP BY dr.user_id, dr.staking_id, dr.reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, dr.user_id ASC, dr.reward_date ASC
+    `).all()
+    const dup1Rows = (dup1.results || []) as any[]
+
+    // 검사 2: daily_rewards (user_id, reward_date) — staking 무관
+    const dup2 = await db.prepare(`
+      SELECT dr.user_id, u.name AS user_name, dr.reward_date,
+             COUNT(*) AS cnt,
+             COUNT(DISTINCT dr.staking_id) AS distinct_stakings,
+             SUM(dr.qkey_amount) AS total_qkey,
+             GROUP_CONCAT(dr.staking_id) AS staking_ids,
+             GROUP_CONCAT(dr.id) AS dr_ids
+      FROM daily_rewards dr
+      LEFT JOIN users u ON u.id = dr.user_id
+      GROUP BY dr.user_id, dr.reward_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, dr.user_id ASC, dr.reward_date ASC
+    `).all()
+    const dup2Rows = (dup2.results || []) as any[]
+    // 영구룰 #스테이킹별독립: 여러 staking 이면 정상. 같은 staking 중복만 위반.
+    const dup2Suspect = dup2Rows.filter((r: any) => Number(r.cnt) > Number(r.distinct_stakings))
+
+    // 검사 3: transactions QKEY 일일배당 (user_id, kst_date) 중복
+    const dup3 = await db.prepare(`
+      SELECT t.user_id, u.name AS user_name,
+             date(t.created_at, '+9 hours') AS kst_date,
+             COUNT(*) AS cnt,
+             SUM(t.amount) AS total_amount,
+             GROUP_CONCAT(t.id) AS tx_ids,
+             GROUP_CONCAT(t.amount) AS amounts
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE t.coin_type = 'QKEY'
+        AND t.amount > 0
+        AND (t.description LIKE '%일일 배당%' OR t.description LIKE '%Daily reward%' OR t.description LIKE '%daily reward%')
+      GROUP BY t.user_id, kst_date
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC, t.user_id ASC, kst_date ASC
+    `).all()
+    const dup3Rows = (dup3.results || []) as any[]
+
+    // 검사 3b: tx 의 같은 (user_id, kst_date) 별로 staking 별 distinct 인지 분석
+    // 각 tx 중복 그룹 상세 (최대 30 그룹만 상세)
+    const dup3Detail: any[] = []
+    for (const g of dup3Rows.slice(0, 30)) {
+      const txDetail = await db.prepare(`
+        SELECT id, user_id, amount, description, created_at,
+               datetime(created_at, '+9 hours') AS kst_at,
+               reference_id
+        FROM transactions
+        WHERE user_id = ?
+          AND coin_type = 'QKEY'
+          AND amount > 0
+          AND date(created_at, '+9 hours') = ?
+          AND (description LIKE '%일일 배당%' OR description LIKE '%Daily reward%' OR description LIKE '%daily reward%')
+        ORDER BY created_at ASC, id ASC
+      `).bind(Number(g.user_id), String(g.kst_date)).all()
+      dup3Detail.push({
+        user_id: Number(g.user_id),
+        user_name: String(g.user_name || ''),
+        kst_date: String(g.kst_date),
+        cnt: Number(g.cnt),
+        total_amount: Number(g.total_amount),
+        rows: (txDetail.results || []).map((x: any) => ({
+          id: Number(x.id),
+          amount: Number(x.amount),
+          description: String(x.description || ''),
+          kst_at: String(x.kst_at || ''),
+          reference_id: x.reference_id == null ? null : Number(x.reference_id),
+        })),
+      })
+    }
+
+    return c.json({
+      ok: true,
+      check1_dr_strict: {
+        title: 'daily_rewards (user_id, staking_id, reward_date) 엄격 중복',
+        rule: '영구룰 #스테이킹별독립 + #1일1정산 → 0건이어야 정상',
+        count: dup1Rows.length,
+        verdict: dup1Rows.length === 0 ? '✅ OK' : '🚨 위반',
+        rows: dup1Rows.map((r: any) => ({
+          user_id: Number(r.user_id),
+          user_name: String(r.user_name || ''),
+          staking_id: Number(r.staking_id),
+          reward_date: String(r.reward_date),
+          cnt: Number(r.cnt),
+          total_qkey: Number(r.total_qkey),
+        })),
+      },
+      check2_dr_by_date: {
+        title: 'daily_rewards (user_id, reward_date) — 같은 날 2건 이상',
+        rule: '영구룰 #스테이킹별독립: 여러 staking 활성이면 정상. cnt > distinct_stakings 인 경우만 의심',
+        total_groups: dup2Rows.length,
+        suspect_count: dup2Suspect.length,
+        suspect_verdict: dup2Suspect.length === 0 ? '✅ 의심 0건' : '🚨 의심 발견',
+        suspect_rows: dup2Suspect.map((r: any) => ({
+          user_id: Number(r.user_id),
+          user_name: String(r.user_name || ''),
+          reward_date: String(r.reward_date),
+          cnt: Number(r.cnt),
+          distinct_stakings: Number(r.distinct_stakings),
+          total_qkey: Number(r.total_qkey),
+          staking_ids: String(r.staking_ids || ''),
+          dr_ids: String(r.dr_ids || ''),
+        })),
+        all_groups_sample: dup2Rows.slice(0, 20).map((r: any) => ({
+          user_id: Number(r.user_id),
+          user_name: String(r.user_name || ''),
+          reward_date: String(r.reward_date),
+          cnt: Number(r.cnt),
+          distinct_stakings: Number(r.distinct_stakings),
+          total_qkey: Number(r.total_qkey),
+        })),
+      },
+      check3_tx_daily_reward: {
+        title: 'transactions QKEY 일일배당 (user_id, kst_date) 중복',
+        rule: '실제 지급 tx 가 같은 KST 날짜에 2건 이상 → 영구룰 #중복지급금지 위반',
+        count: dup3Rows.length,
+        verdict: dup3Rows.length === 0 ? '✅ 중복 0건' : '🚨 중복 발견',
+        summary_rows: dup3Rows.map((r: any) => ({
+          user_id: Number(r.user_id),
+          user_name: String(r.user_name || ''),
+          kst_date: String(r.kst_date),
+          cnt: Number(r.cnt),
+          total_amount: Number(r.total_amount),
+          tx_ids: String(r.tx_ids || ''),
+          amounts: String(r.amounts || ''),
+        })),
+        details_top30: dup3Detail,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 // fix-irregular-time-tx: 영구룰 #정규시각(15:15 KST = 06:15 UTC) 위반 일일배당 tx 만 created_at 정정
 // 보호: 다른 날짜/다른 종류 tx 절대 보호. 영구룰 준수 tx 도 보호.
 // 대상 KST 날짜: 2026-05-07, 2026-05-11 (사장님 명령으로 고정)
