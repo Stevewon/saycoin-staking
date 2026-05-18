@@ -43399,6 +43399,56 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
     const expectedRRs: ExpectedRR[] = []
     const cappedSummary = { dr_capped_users: new Set<number>(), l1_capped_users: new Set<number>(), l2_capped_users: new Set<number>() }
 
+    // ★ 사전 일괄 조회 (N+1 SELECT 박멸 — timeout 방지) ★
+    //   (1) 모든 관련 사용자의 referrer_id 한번에 조회 → Map
+    //   (2) 그 reward_date 시점 active staking 보유 사용자 set 한번에 조회 → Set
+    const allRelatedUids = new Set<number>()
+    for (const s of stakingList) allRelatedUids.add(Number(s.user_id))
+    // referrer 조회는 stakingList user 만 1차로 묶음 (그 결과로 L1 uid 알아내고, L1 referrer 조회는 2차)
+    const refMap = new Map<number, number>()  // uid -> referrer_id (0 if none)
+    {
+      const uidsArr = Array.from(allRelatedUids)
+      if (uidsArr.length > 0) {
+        const CHUNK = 100
+        for (let i = 0; i < uidsArr.length; i += CHUNK) {
+          const chunk = uidsArr.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() => '?').join(',')
+          const rows = await db.prepare(`SELECT id, referrer_id FROM users WHERE id IN (${placeholders})`).bind(...chunk).all()
+          for (const u of (rows.results || []) as any[]) {
+            refMap.set(Number(u.id), u.referrer_id ? Number(u.referrer_id) : 0)
+          }
+        }
+      }
+      // L1 referrer 들의 referrer (L2 uid) 도 한번에 추가 조회
+      const l1Uids = new Set<number>()
+      for (const v of refMap.values()) if (v > 0) l1Uids.add(v)
+      // l1Uids 중 refMap 에 없는 것들만 조회
+      const l1Missing = Array.from(l1Uids).filter(u => !refMap.has(u))
+      if (l1Missing.length > 0) {
+        const CHUNK = 100
+        for (let i = 0; i < l1Missing.length; i += CHUNK) {
+          const chunk = l1Missing.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() => '?').join(',')
+          const rows = await db.prepare(`SELECT id, referrer_id FROM users WHERE id IN (${placeholders})`).bind(...chunk).all()
+          for (const u of (rows.results || []) as any[]) {
+            refMap.set(Number(u.id), u.referrer_id ? Number(u.referrer_id) : 0)
+          }
+        }
+      }
+    }
+
+    // dividendDate 시점 active 보유 사용자 set (L1/L2 자격 판정용)
+    const activeUserSet = new Set<number>()
+    {
+      const rows = await db.prepare(`
+        SELECT DISTINCT user_id FROM staking
+        WHERE status IN ('active','capped','completed')
+          AND date(start_date,'+9 hours') <= ?
+          AND date(end_date,'+9 hours') >= ?
+      `).bind(dividendDate, dividendDate).all()
+      for (const r of (rows.results || []) as any[]) activeUserSet.add(Number(r.user_id))
+    }
+
     for (const s of stakingList) {
       const stakingId = Number(s.staking_id)
       const uid = Number(s.user_id)
@@ -43416,65 +43466,42 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
         cappedSummary.dr_capped_users.add(uid)
       }
 
-      // L1 (referrer 20%) — own_DR (cap 적용 전 원금 ownReqQkey 기준!)
-      //   영구룰: 매칭은 referee 의 self-daily (cap 무관 원금) 기준 20% / 10%
-      //   ★ 단, referrer 가 active staking 보유해야만 매칭 자격 (스테이킹별독립 룰)
-      const refRow1 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(uid).first() as any
-      const l1Uid = refRow1?.referrer_id ? Number(refRow1.referrer_id) : 0
-      if (l1Uid > 0) {
-        // L1 가 dividendDate 시점 active 인지 확인
-        const l1Active = await db.prepare(`
-          SELECT id FROM staking
-          WHERE user_id = ? AND status IN ('active','capped','completed')
-            AND date(start_date,'+9 hours') <= ?
-            AND date(end_date,'+9 hours') >= ?
-          LIMIT 1
-        `).bind(l1Uid, dividendDate, dividendDate).first()
-        if (l1Active) {
-          const l1Req = Math.round(ownReqQkey * 0.20)
-          if (l1Req > 0) {
-            const l1Grant = tryGiveReward(l1Uid, l1Req)
-            if (l1Grant.granted > 0) {
-              expectedRRs.push({
-                referrer_id: l1Uid, referee_id: uid, level: 1,
-                staking_id: stakingId,
-                original_amount: ownReqQkey,
-                reward_amount: l1Grant.granted,
-              })
-            }
-            if (l1Grant.capped && l1Grant.granted < l1Req) {
-              cappedSummary.l1_capped_users.add(l1Uid)
-            }
+      // L1 (referrer 20%) — referrer 가 active 일 때만
+      const l1Uid = refMap.get(uid) || 0
+      if (l1Uid > 0 && activeUserSet.has(l1Uid)) {
+        const l1Req = Math.round(ownReqQkey * 0.20)
+        if (l1Req > 0) {
+          const l1Grant = tryGiveReward(l1Uid, l1Req)
+          if (l1Grant.granted > 0) {
+            expectedRRs.push({
+              referrer_id: l1Uid, referee_id: uid, level: 1,
+              staking_id: stakingId,
+              original_amount: ownReqQkey,
+              reward_amount: l1Grant.granted,
+            })
+          }
+          if (l1Grant.capped && l1Grant.granted < l1Req) {
+            cappedSummary.l1_capped_users.add(l1Uid)
           }
         }
+      }
 
-        // L2 (referrer.referrer 10%)
-        const refRow2 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(l1Uid).first() as any
-        const l2Uid = refRow2?.referrer_id ? Number(refRow2.referrer_id) : 0
-        if (l2Uid > 0) {
-          const l2Active = await db.prepare(`
-            SELECT id FROM staking
-            WHERE user_id = ? AND status IN ('active','capped','completed')
-              AND date(start_date,'+9 hours') <= ?
-              AND date(end_date,'+9 hours') >= ?
-            LIMIT 1
-          `).bind(l2Uid, dividendDate, dividendDate).first()
-          if (l2Active) {
-            const l2Req = Math.round(ownReqQkey * 0.10)
-            if (l2Req > 0) {
-              const l2Grant = tryGiveReward(l2Uid, l2Req)
-              if (l2Grant.granted > 0) {
-                expectedRRs.push({
-                  referrer_id: l2Uid, referee_id: uid, level: 2,
-                  staking_id: stakingId,
-                  original_amount: ownReqQkey,
-                  reward_amount: l2Grant.granted,
-                })
-              }
-              if (l2Grant.capped && l2Grant.granted < l2Req) {
-                cappedSummary.l2_capped_users.add(l2Uid)
-              }
-            }
+      // L2 (L1 의 referrer 10%) — L2 가 active 일 때만
+      const l2Uid = l1Uid > 0 ? (refMap.get(l1Uid) || 0) : 0
+      if (l2Uid > 0 && activeUserSet.has(l2Uid)) {
+        const l2Req = Math.round(ownReqQkey * 0.10)
+        if (l2Req > 0) {
+          const l2Grant = tryGiveReward(l2Uid, l2Req)
+          if (l2Grant.granted > 0) {
+            expectedRRs.push({
+              referrer_id: l2Uid, referee_id: uid, level: 2,
+              staking_id: stakingId,
+              original_amount: ownReqQkey,
+              reward_amount: l2Grant.granted,
+            })
+          }
+          if (l2Grant.capped && l2Grant.granted < l2Req) {
+            cappedSummary.l2_capped_users.add(l2Uid)
           }
         }
       }
@@ -43672,46 +43699,87 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
       }
     }
 
-    // (E4) 새 DR INSERT + tx INSERT (description 마커 없이)
+    // (E4) 새 DR batch INSERT → SELECT 로 id 매핑 → 매칭 tx batch INSERT
+    //   ★ timeout 방지: 직렬 await N번 대신 db.batch() 로 한번에
     let drInserted = 0
     let drTxInserted = 0
-    for (let i = 0; i < expectedDRs.length; i += CHUNK_SIZE) {
-      const chunk = expectedDRs.slice(i, i + CHUNK_SIZE)
-      // DR INSERT 하나씩 (last_row_id 캡처 필요)
-      for (const dr of chunk) {
-        const drIns = await db.prepare(`
-          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
-          VALUES (?, ?, ?, ?, ?)
-        `).bind(dr.user_id, dr.staking_id, dr.amount, dividendDate, payoutDate).run()
-        const drId = (drIns as any)?.meta?.last_row_id ?? null
-        drInserted++
-        // 매칭 tx INSERT — description 마커 없이, 정상 cron 과 동일
-        await db.prepare(`
+    if (expectedDRs.length > 0) {
+      // ── (E4-1) DR batch INSERT ──
+      for (let i = 0; i < expectedDRs.length; i += CHUNK_SIZE) {
+        const chunk = expectedDRs.slice(i, i + CHUNK_SIZE)
+        const stmts = chunk.map(dr =>
+          db.prepare(`
+            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+            VALUES (?, ?, ?, ?, ?)
+          `).bind(dr.user_id, dr.staking_id, dr.amount, dividendDate, payoutDate)
+        )
+        await db.batch(stmts)
+        drInserted += chunk.length
+      }
+      // ── (E4-2) 방금 INSERT 한 DR row 들의 id 조회 → (user_id, staking_id) -> id 매핑 ──
+      //   reward_date+paid_date 가 (user, staking) 별로 unique 하다고 가정
+      //   (DELETE 가 먼저 그 reward_date 의 모든 row 를 비웠으므로 안전)
+      const drRowsAfter = await db.prepare(`
+        SELECT id, user_id, staking_id FROM daily_rewards
+        WHERE reward_date = ? AND paid_date = ?
+      `).bind(dividendDate, payoutDate).all()
+      const drIdMap = new Map<string, number>()  // "uid|stakingId" -> dr.id
+      for (const r of (drRowsAfter.results || []) as any[]) {
+        drIdMap.set(`${r.user_id}|${r.staking_id}`, Number(r.id))
+      }
+      // ── (E4-3) tx batch INSERT (ref_id = dr.id) ──
+      const drTxStmts = expectedDRs.map(dr => {
+        const drId = drIdMap.get(`${dr.user_id}|${dr.staking_id}`) ?? null
+        return db.prepare(`
           INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
           VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
-        `).bind(dr.user_id, dr.amount, '일일 배당 (QKEY)', drId).run()
-        drTxInserted++
+        `).bind(dr.user_id, dr.amount, '일일 배당 (QKEY)', drId)
+      })
+      for (let i = 0; i < drTxStmts.length; i += CHUNK_SIZE) {
+        const chunk = drTxStmts.slice(i, i + CHUNK_SIZE)
+        await db.batch(chunk)
+        drTxInserted += chunk.length
       }
     }
 
-    // (E5) 새 RR INSERT + tx INSERT (description 마커 없이)
+    // (E5) 새 RR batch INSERT → SELECT 로 id 매핑 → tx batch INSERT
     let rrInserted = 0
     let rrTxInserted = 0
-    for (let i = 0; i < expectedRRs.length; i += CHUNK_SIZE) {
-      const chunk = expectedRRs.slice(i, i + CHUNK_SIZE)
-      for (const rr of chunk) {
-        const rrIns = await db.prepare(`
-          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(rr.referrer_id, rr.referee_id, rr.level, rr.original_amount, rr.reward_amount, dividendDate, payoutDate, rr.staking_id).run()
-        const rrId = (rrIns as any)?.meta?.last_row_id ?? null
-        rrInserted++
+    if (expectedRRs.length > 0) {
+      for (let i = 0; i < expectedRRs.length; i += CHUNK_SIZE) {
+        const chunk = expectedRRs.slice(i, i + CHUNK_SIZE)
+        const stmts = chunk.map(rr =>
+          db.prepare(`
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(rr.referrer_id, rr.referee_id, rr.level, rr.original_amount, rr.reward_amount, dividendDate, payoutDate, rr.staking_id)
+        )
+        await db.batch(stmts)
+        rrInserted += chunk.length
+      }
+      // ── (E5-2) RR id 매핑: (referrer_id, referee_id, level, staking_id) -> id ──
+      //   reward_date 기준 unique
+      const rrRowsAfter = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, staking_id FROM referral_rewards
+        WHERE reward_date = ? AND paid_date = ?
+      `).bind(dividendDate, payoutDate).all()
+      const rrIdMap = new Map<string, number>()
+      for (const r of (rrRowsAfter.results || []) as any[]) {
+        rrIdMap.set(`${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`, Number(r.id))
+      }
+      // ── (E5-3) tx batch INSERT (ref_id = rr.id) ──
+      const rrTxStmts = expectedRRs.map(rr => {
+        const rrId = rrIdMap.get(`${rr.referrer_id}|${rr.referee_id}|${rr.level}|${rr.staking_id}`) ?? null
         const desc = rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
-        await db.prepare(`
+        return db.prepare(`
           INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
           VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
-        `).bind(rr.referrer_id, rr.reward_amount, desc, rrId).run()
-        rrTxInserted++
+        `).bind(rr.referrer_id, rr.reward_amount, desc, rrId)
+      })
+      for (let i = 0; i < rrTxStmts.length; i += CHUNK_SIZE) {
+        const chunk = rrTxStmts.slice(i, i + CHUNK_SIZE)
+        await db.batch(chunk)
+        rrTxInserted += chunk.length
       }
     }
 
