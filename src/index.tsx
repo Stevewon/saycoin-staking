@@ -39527,4 +39527,234 @@ app.get('/api/diag/scan-may15-status', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/scan-may18-residue
+// ----------------------------------------------------------------
+// ★ 사장님 명령 (2026-05-18, 추가):
+//   "15일에 찍힌건 14일치 확정배당이다. 오늘 수동실행 잔재가 있다면 18일로 찍혀있는 것들을 제거하라.
+//    15일자는 그대로 두고, 16/17일 잔재도 청소. 그 후 18일자로 15일배당 바텀업 재실행."
+//
+// 진단 (READ-ONLY):
+//   - 2026-05-16, 2026-05-17, 2026-05-18 의 reward_date 잔재
+//   - 2026-05-16, 2026-05-17, 2026-05-18 의 paid_date 잔재 (reward_date 가 그 외인 경우)
+//   - 영향 사용자, 잔고 영향액
+//   - 대응 transactions 추출
+// ============================================================
+app.get('/api/diag/scan-may18-residue', async (c) => {
+  const t0 = Date.now()
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+
+  const TARGET_DATES = ['2026-05-16', '2026-05-17', '2026-05-18']
+
+  try {
+    console.log(`[DIVIDEND_BACKPAY] start scan-may18-residue target_dates=${TARGET_DATES.join(',')}`)
+
+    // 1. DR 잔재 (reward_date 기준)
+    const drByRewardDate = await db.prepare(`
+      SELECT
+        reward_date,
+        COUNT(*) AS cnt,
+        COUNT(DISTINCT user_id) AS distinct_users,
+        COUNT(DISTINCT staking_id) AS distinct_stakings,
+        COALESCE(SUM(usdt_amount), 0) AS total_amount,
+        MIN(id) AS min_id, MAX(id) AS max_id,
+        MIN(paid_date) AS min_paid, MAX(paid_date) AS max_paid
+      FROM daily_rewards
+      WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).all<any>()
+
+    // 2. DR 잔재 (paid_date 기준이지만 reward_date 가 16~18 아닌 경우 — 즉 정상 reward_date 인데 잘못된 paid_date 만 가진 case)
+    const drWrongPaidDate = await db.prepare(`
+      SELECT
+        paid_date,
+        COUNT(*) AS cnt,
+        COUNT(DISTINCT user_id) AS distinct_users,
+        COALESCE(SUM(usdt_amount), 0) AS total_amount,
+        GROUP_CONCAT(DISTINCT reward_date) AS reward_dates
+      FROM daily_rewards
+      WHERE paid_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+        AND reward_date NOT IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      GROUP BY paid_date
+      ORDER BY paid_date
+    `).all<any>()
+
+    // 3. RR 잔재 (reward_date 기준)
+    const rrByRewardDate = await db.prepare(`
+      SELECT
+        reward_date,
+        level,
+        COUNT(*) AS cnt,
+        COUNT(DISTINCT referrer_id) AS distinct_referrers,
+        COALESCE(SUM(reward_amount), 0) AS total_amount,
+        MIN(id) AS min_id, MAX(id) AS max_id,
+        MIN(paid_date) AS min_paid, MAX(paid_date) AS max_paid
+      FROM referral_rewards
+      WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      GROUP BY reward_date, level
+      ORDER BY reward_date, level
+    `).all<any>()
+
+    // 4. RR 잘못된 paid_date
+    const rrWrongPaidDate = await db.prepare(`
+      SELECT
+        paid_date,
+        level,
+        COUNT(*) AS cnt,
+        COALESCE(SUM(reward_amount), 0) AS total_amount,
+        GROUP_CONCAT(DISTINCT reward_date) AS reward_dates
+      FROM referral_rewards
+      WHERE paid_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+        AND reward_date NOT IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      GROUP BY paid_date, level
+      ORDER BY paid_date, level
+    `).all<any>()
+
+    // 5. 청소 대상 DR 샘플 (reward_date 16/17/18)
+    const drSamples = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date,
+             strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours') AS created_kst
+      FROM daily_rewards
+      WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      ORDER BY id DESC
+      LIMIT 50
+    `).all<any>()
+
+    // 6. 청소 대상 RR 샘플
+    const rrSamples = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             reward_date, paid_date, staking_id,
+             strftime('%Y-%m-%d %H:%M:%S', created_at, '+9 hours') AS created_kst
+      FROM referral_rewards
+      WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+      ORDER BY id DESC
+      LIMIT 50
+    `).all<any>()
+
+    // 7. 대응 transactions (ref_id 매칭)
+    const txDrMatch = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(t.amount), 0) AS total_amount,
+             COUNT(DISTINCT t.user_id) AS distinct_users
+      FROM transactions t
+      INNER JOIN daily_rewards dr ON t.ref_id = CAST(dr.id AS TEXT)
+      WHERE t.type = 'daily_qkey'
+        AND dr.reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+    `).first<any>()
+
+    const txRrMatch = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(t.amount), 0) AS total_amount,
+             COUNT(DISTINCT t.user_id) AS distinct_users
+      FROM transactions t
+      INNER JOIN referral_rewards rr ON t.ref_id = CAST(rr.id AS TEXT)
+      WHERE t.type = 'referral_reward'
+        AND rr.reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+    `).first<any>()
+
+    // 8. 사용자별 잔고 영향 (예상 차감액)
+    const userImpact = await db.prepare(`
+      WITH dr_impact AS (
+        SELECT user_id, COALESCE(SUM(usdt_amount), 0) AS total
+        FROM daily_rewards
+        WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+        GROUP BY user_id
+      ),
+      rr_impact AS (
+        SELECT referrer_id AS user_id, COALESCE(SUM(reward_amount), 0) AS total
+        FROM referral_rewards
+        WHERE reward_date IN ('2026-05-16', '2026-05-17', '2026-05-18')
+        GROUP BY referrer_id
+      ),
+      combined AS (
+        SELECT user_id, total FROM dr_impact
+        UNION ALL
+        SELECT user_id, total FROM rr_impact
+      )
+      SELECT
+        c.user_id,
+        u.name AS nickname,
+        u.qkey_balance AS current_balance,
+        SUM(c.total) AS total_to_revert,
+        u.qkey_balance - SUM(c.total) AS post_revert_balance
+      FROM combined c
+      LEFT JOIN users u ON u.id = c.user_id
+      GROUP BY c.user_id
+      ORDER BY total_to_revert DESC
+    `).all<any>()
+
+    const durMs = Date.now() - t0
+    console.log(`[DIVIDEND_BACKPAY] scan-may18-residue done duration_ms=${durMs}`)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      action: 'scan-may18-residue',
+      target_dates: TARGET_DATES,
+      summary: {
+        dr_residue: (drByRewardDate?.results || []).map((r: any) => ({
+          reward_date: r.reward_date,
+          rows: Number(r.cnt),
+          distinct_users: Number(r.distinct_users),
+          distinct_stakings: Number(r.distinct_stakings),
+          total_amount: Number(r.total_amount),
+          id_range: { min: Number(r.min_id), max: Number(r.max_id) },
+          paid_date_range: { min: r.min_paid, max: r.max_paid }
+        })),
+        dr_wrong_paid_date: (drWrongPaidDate?.results || []).map((r: any) => ({
+          paid_date: r.paid_date,
+          rows: Number(r.cnt),
+          distinct_users: Number(r.distinct_users),
+          total_amount: Number(r.total_amount),
+          reward_dates: r.reward_dates
+        })),
+        rr_residue: (rrByRewardDate?.results || []).map((r: any) => ({
+          reward_date: r.reward_date,
+          level: Number(r.level),
+          rows: Number(r.cnt),
+          distinct_referrers: Number(r.distinct_referrers),
+          total_amount: Number(r.total_amount),
+          id_range: { min: Number(r.min_id), max: Number(r.max_id) },
+          paid_date_range: { min: r.min_paid, max: r.max_paid }
+        })),
+        rr_wrong_paid_date: (rrWrongPaidDate?.results || []).map((r: any) => ({
+          paid_date: r.paid_date,
+          level: Number(r.level),
+          rows: Number(r.cnt),
+          total_amount: Number(r.total_amount),
+          reward_dates: r.reward_dates
+        })),
+        tx_dr_matched: {
+          rows: Number(txDrMatch?.cnt || 0),
+          total_amount: Number(txDrMatch?.total_amount || 0),
+          distinct_users: Number(txDrMatch?.distinct_users || 0)
+        },
+        tx_rr_matched: {
+          rows: Number(txRrMatch?.cnt || 0),
+          total_amount: Number(txRrMatch?.total_amount || 0),
+          distinct_users: Number(txRrMatch?.distinct_users || 0)
+        }
+      },
+      user_balance_impact: (userImpact?.results || []).map((r: any) => ({
+        user_id: Number(r.user_id),
+        nickname: r.nickname,
+        current_balance: Number(r.current_balance),
+        total_to_revert: Number(r.total_to_revert),
+        post_revert_balance: Number(r.post_revert_balance),
+        will_go_negative: Number(r.post_revert_balance) < 0
+      })),
+      samples: {
+        dr_residue_samples: (drSamples?.results || []),
+        rr_residue_samples: (rrSamples?.results || [])
+      },
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[DIVIDEND_BACKPAY] ERROR scan-may18-residue duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+})
+
 export default app
