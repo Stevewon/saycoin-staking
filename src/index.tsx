@@ -39757,4 +39757,242 @@ app.get('/api/diag/scan-may18-residue', async (c) => {
   }
 })
 
+// ============================================================
+// /api/diag/fix-may15-to-may14-label
+// ----------------------------------------------------------------
+// ★ 사장님 명령 (2026-05-18, 옵션 A):
+//   "기존 reward_date=2026-05-15 인 dr 56건 + rr 12건은 사실 14일치 확정 배당이다.
+//    reward_date 를 2026-05-14 로 UPDATE 하라 (paid_date 는 그대로)."
+//
+// 영구룰 #중복지급금지:
+//   - 금액 변동 없음 (잔고 손대지 않음)
+//   - INSERT/DELETE 없음 — 오직 UPDATE
+//   - set-based (개별 row 루프 없음)
+//   - DRY_RUN 먼저, confirm=GO 로 EXEC
+//   - 사전: 2026-05-14 에 이미 동일 키 row 가 있는지 확인 (충돌 방지)
+//   - 사후: 검증 + DR 56 + RR 12 = 68건 일치 확인
+//
+// 사용:
+//   GET  /api/diag/fix-may15-to-may14-label?key=ADMIN_PW                  → DRY_RUN
+//   POST /api/diag/fix-may15-to-may14-label?key=ADMIN_PW&confirm=GO       → EXEC
+// ============================================================
+const OLD_DATE = '2026-05-15'
+const NEW_DATE = '2026-05-14'
+
+async function diagFixMay15ToMay14(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  const db = c.env.DB
+
+  try {
+    console.log(`[DIVIDEND_BACKPAY] start fix-may15-to-may14-label mode=${mode} OLD=${OLD_DATE} NEW=${NEW_DATE}`)
+
+    // ─── PRE-CHECK 1: 대상 row 수 확정 ───
+    const drCount = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total_amt,
+             COUNT(DISTINCT user_id) AS distinct_users,
+             COUNT(DISTINCT staking_id) AS distinct_stakings
+      FROM daily_rewards WHERE reward_date = ?
+    `).bind(OLD_DATE).first<any>()
+
+    const rrCount = await db.prepare(`
+      SELECT level, COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total_amt,
+             COUNT(DISTINCT referrer_id) AS distinct_refs
+      FROM referral_rewards WHERE reward_date = ?
+      GROUP BY level ORDER BY level
+    `).bind(OLD_DATE).all<any>()
+
+    // ─── PRE-CHECK 2: 2026-05-14 에 이미 동일 (user_id, staking_id) DR 있는지 (충돌) ───
+    const drConflict = await db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM daily_rewards dr_old
+      INNER JOIN daily_rewards dr_new
+        ON dr_old.user_id = dr_new.user_id
+       AND dr_old.staking_id = dr_new.staking_id
+       AND dr_new.reward_date = ?
+      WHERE dr_old.reward_date = ?
+    `).bind(NEW_DATE, OLD_DATE).first<any>()
+
+    // ─── PRE-CHECK 3: 2026-05-14 에 이미 동일 RR 키 있는지 (충돌) ───
+    //   영구룰 #스테이킹별독립: (referrer_id, referee_id, COALESCE(staking_id,-1), reward_date, level)
+    const rrConflict = await db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM referral_rewards rr_old
+      INNER JOIN referral_rewards rr_new
+        ON rr_old.referrer_id = rr_new.referrer_id
+       AND rr_old.referee_id = rr_new.referee_id
+       AND COALESCE(rr_old.staking_id, -1) = COALESCE(rr_new.staking_id, -1)
+       AND rr_old.level = rr_new.level
+       AND rr_new.reward_date = ?
+      WHERE rr_old.reward_date = ?
+    `).bind(NEW_DATE, OLD_DATE).first<any>()
+
+    // ─── PRE-CHECK 4: 14일자 기존 row 현황 (참고) ───
+    const drExistingOn14 = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = ?
+    `).bind(NEW_DATE).first<any>()
+    const rrExistingOn14 = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM referral_rewards WHERE reward_date = ?
+    `).bind(NEW_DATE).first<any>()
+
+    const drCountN = Number(drCount?.cnt || 0)
+    const rrL1 = (rrCount?.results || []).find((r: any) => Number(r.level) === 1)
+    const rrL2 = (rrCount?.results || []).find((r: any) => Number(r.level) === 2)
+    const rrL0 = (rrCount?.results || []).find((r: any) => Number(r.level) === 0)
+    const drConflictN = Number(drConflict?.cnt || 0)
+    const rrConflictN = Number(rrConflict?.cnt || 0)
+
+    const preCheckPassed = drConflictN === 0 && rrConflictN === 0
+
+    // 사장님 예상치 검증
+    const expected_dr = 56
+    const expected_rr_l1 = 6
+    const expected_rr_l2 = 6
+    const dr_matches_expected = drCountN === expected_dr
+    const rr_l1_matches = Number(rrL1?.cnt || 0) === expected_rr_l1
+    const rr_l2_matches = Number(rrL2?.cnt || 0) === expected_rr_l2
+
+    const baseReport = {
+      mode,
+      action: 'fix-may15-to-may14-label',
+      OLD_DATE,
+      NEW_DATE,
+      target: {
+        dr: {
+          rows: drCountN,
+          total_amount: Number(drCount?.total_amt || 0),
+          distinct_users: Number(drCount?.distinct_users || 0),
+          distinct_stakings: Number(drCount?.distinct_stakings || 0),
+          matches_expected_56: dr_matches_expected
+        },
+        rr: (rrCount?.results || []).map((r: any) => ({
+          level: Number(r.level),
+          rows: Number(r.cnt),
+          total_amount: Number(r.total_amt),
+          distinct_referrers: Number(r.distinct_refs)
+        })),
+        rr_l0_rows: Number(rrL0?.cnt || 0),
+        rr_l1_rows: Number(rrL1?.cnt || 0),
+        rr_l1_matches_expected_6: rr_l1_matches,
+        rr_l2_rows: Number(rrL2?.cnt || 0),
+        rr_l2_matches_expected_6: rr_l2_matches,
+        total_rows_to_update: drCountN + Number(rrL1?.cnt || 0) + Number(rrL2?.cnt || 0) + Number(rrL0?.cnt || 0)
+      },
+      pre_check: {
+        passed: preCheckPassed,
+        dr_conflict_on_2026_05_14: drConflictN,
+        rr_conflict_on_2026_05_14: rrConflictN,
+        existing_dr_on_2026_05_14: Number(drExistingOn14?.cnt || 0),
+        existing_rr_on_2026_05_14: Number(rrExistingOn14?.cnt || 0),
+        note: drConflictN > 0 || rrConflictN > 0
+          ? '🚫 충돌 있음 — UPDATE 시 영구룰 #스테이킹별독립 위반 (같은 키 2개)'
+          : '✅ 충돌 없음 — UPDATE 안전'
+      }
+    }
+
+    if (mode === 'DRY_RUN') {
+      const durMs = Date.now() - t0
+      console.log(`[DIVIDEND_BACKPAY] DRY_RUN done duration_ms=${durMs}`)
+      return c.json({
+        ok: true,
+        ...baseReport,
+        will_execute: 'UPDATE 2 statements (DR + RR), set-based, paid_date 미변경, 잔고 미변경',
+        next_action: preCheckPassed
+          ? 'GO 보내시면 EXEC (POST ?confirm=GO)'
+          : '🚫 충돌 있음 → 사장님 결정 필요',
+        duration_ms: durMs
+      })
+    }
+
+    // ─── EXEC 분기 ───
+    if (!preCheckPassed) {
+      const durMs = Date.now() - t0
+      console.error(`[DIVIDEND_BACKPAY] STOP — pre_check failed (conflict)`)
+      return c.json({
+        ok: false,
+        stopped: true,
+        reason: '영구룰 #스테이킹별독립 충돌 — 사전 검증 실패',
+        ...baseReport,
+        duration_ms: durMs
+      }, 400)
+    }
+
+    // 안전 가드: 사장님 예상치와 너무 다르면 STOP
+    if (drCountN > 100 || drCountN < 30) {
+      const durMs = Date.now() - t0
+      console.error(`[DIVIDEND_BACKPAY] STOP — DR row count out of expected range (got ${drCountN}, expected ~56)`)
+      return c.json({
+        ok: false,
+        stopped: true,
+        reason: `영구룰 #중복지급금지 — DR row 수 이상치 (${drCountN}, 예상 ~56)`,
+        ...baseReport,
+        duration_ms: durMs
+      }, 400)
+    }
+
+    // ─── set-based UPDATE (2 statements, db.batch) ───
+    console.log(`[DIVIDEND_BACKPAY] EXEC starting set-based UPDATE`)
+
+    const updateDr = db.prepare(`
+      UPDATE daily_rewards SET reward_date = ? WHERE reward_date = ?
+    `).bind(NEW_DATE, OLD_DATE)
+
+    const updateRr = db.prepare(`
+      UPDATE referral_rewards SET reward_date = ? WHERE reward_date = ?
+    `).bind(NEW_DATE, OLD_DATE)
+
+    const batchResults = await db.batch([updateDr, updateRr])
+    const drUpdated = Number((batchResults[0] as any)?.meta?.changes || 0)
+    const rrUpdated = Number((batchResults[1] as any)?.meta?.changes || 0)
+
+    console.log(`[DIVIDEND_BACKPAY] EXEC done — dr_updated=${drUpdated} rr_updated=${rrUpdated}`)
+
+    // ─── POST-CHECK: 결과 검증 ───
+    const drAfter15 = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = ?`).bind(OLD_DATE).first<any>()
+    const drAfter14 = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date = ?`).bind(NEW_DATE).first<any>()
+    const rrAfter15 = await db.prepare(`SELECT level, COUNT(*) AS cnt FROM referral_rewards WHERE reward_date = ? GROUP BY level`).bind(OLD_DATE).all<any>()
+    const rrAfter14 = await db.prepare(`SELECT level, COUNT(*) AS cnt FROM referral_rewards WHERE reward_date = ? GROUP BY level`).bind(NEW_DATE).all<any>()
+
+    const durMs = Date.now() - t0
+    console.log(`[DIVIDEND_BACKPAY] EXEC fully done duration_ms=${durMs}`)
+
+    return c.json({
+      ok: true,
+      ...baseReport,
+      exec_result: {
+        dr_updated: drUpdated,
+        rr_updated: rrUpdated,
+        total_updated: drUpdated + rrUpdated,
+        dr_updated_matches_target: drUpdated === drCountN,
+        rr_updated_matches_target: rrUpdated === (Number(rrL0?.cnt || 0) + Number(rrL1?.cnt || 0) + Number(rrL2?.cnt || 0))
+      },
+      post_check: {
+        dr_remaining_on_2026_05_15: Number(drAfter15?.cnt || 0),
+        dr_now_on_2026_05_14: Number(drAfter14?.cnt || 0),
+        rr_remaining_on_2026_05_15: (rrAfter15?.results || []).map((r: any) => ({ level: Number(r.level), rows: Number(r.cnt) })),
+        rr_now_on_2026_05_14: (rrAfter14?.results || []).map((r: any) => ({ level: Number(r.level), rows: Number(r.cnt) })),
+        verified: Number(drAfter15?.cnt || 0) === 0
+      },
+      duration_ms: durMs
+    })
+  } catch (error) {
+    const durMs = Date.now() - t0
+    console.error(`[DIVIDEND_BACKPAY] ERROR fix-may15-to-may14-label duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
+  }
+}
+
+app.get('/api/diag/fix-may15-to-may14-label', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagFixMay15ToMay14(c, 'DRY_RUN')
+})
+
+app.post('/api/diag/fix-may15-to-may14-label', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 UPDATE 게이트)' }, 400)
+  return diagFixMay15ToMay14(c, 'EXEC')
+})
+
 export default app
