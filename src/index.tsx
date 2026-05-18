@@ -47316,9 +47316,10 @@ app.get('/api/diag/daily-reward-dup-check', async (c) => {
     const db = c.env.DB
 
     // 검사 1: daily_rewards (user_id, staking_id, reward_date) 중복
+    // NOTE: daily_rewards.usdt_amount 컬럼이 실제 KEY 가치 저장 (영구룰 dr.qkey_amount = amount × daily_rate × 150)
     const dup1 = await db.prepare(`
       SELECT dr.user_id, u.name AS user_name, dr.staking_id, dr.reward_date,
-             COUNT(*) AS cnt, SUM(dr.qkey_amount) AS total_qkey
+             COUNT(*) AS cnt, SUM(dr.usdt_amount) AS total_qkey
       FROM daily_rewards dr
       LEFT JOIN users u ON u.id = dr.user_id
       GROUP BY dr.user_id, dr.staking_id, dr.reward_date
@@ -47332,7 +47333,7 @@ app.get('/api/diag/daily-reward-dup-check', async (c) => {
       SELECT dr.user_id, u.name AS user_name, dr.reward_date,
              COUNT(*) AS cnt,
              COUNT(DISTINCT dr.staking_id) AS distinct_stakings,
-             SUM(dr.qkey_amount) AS total_qkey,
+             SUM(dr.usdt_amount) AS total_qkey,
              GROUP_CONCAT(dr.staking_id) AS staking_ids,
              GROUP_CONCAT(dr.id) AS dr_ids
       FROM daily_rewards dr
