@@ -42447,5 +42447,336 @@ app.get('/api/diag/scan-may18-full', async (c) => {
   })
 })
 
+// ============================================================================
+// recompute-bottom-up-dividend: 영구룰 바텀업 로직으로 한 dividendDate 의
+//   전체 사용자 expected vs actual 재정산 (READ-ONLY, 가감만 보고)
+//
+//   영구룰:
+//     - 본인 DR: amount × daily_rate × 150
+//     - L1: 추천한 사람의 DR × 20%
+//     - L2: 추천인의 추천인의 DR × 10%
+//     - #스테이킹별독립: 동일인이라도 staking_id 별개로 계산
+//     - dividendDate 기준 active staking 만 (start ≤ dividendDate ≤ end)
+//
+//   actual_set = referral_rewards/daily_rewards WHERE reward_date=dividendDate
+//   expected_set = 영구룰로 재계산
+//   가감 = expected - actual
+//
+//   READ-ONLY, DB 변경 절대 없음
+//
+//   GET /api/diag/recompute-bottom-up-dividend?key=ADMIN_PW&dividendDate=2026-05-12&payoutDate=2026-05-13
+// ============================================================================
+app.get('/api/diag/recompute-bottom-up-dividend', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = (c.env as any).DB as D1Database
+
+    const dividendDate = c.req.query('dividendDate') || '2026-05-12'
+    const payoutDate = c.req.query('payoutDate') || '2026-05-13'
+    const USD_TO_QKEY = 150
+
+    // ─── 1. dividendDate 에 active 였던 모든 staking 조회 ───
+    const activeStakings = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate,
+             u.name, u.email, u.referrer_id
+      FROM staking s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.status = 'active'
+        AND date(s.start_date,'+9 hours') <= date(?)
+        AND date(s.end_date,'+9 hours') >= date(?)
+      ORDER BY s.user_id, s.id
+    `).bind(dividendDate, dividendDate).all()
+    const stakings = (activeStakings.results || []) as any[]
+
+    // ─── 2. expected DR (본인 배당) — staking_id 단위 ───
+    const expectedDR: any[] = []
+    // expected RR — referrer_id 단위로 집계 (L1: amount×rate×150×0.20, L2: ...×0.10)
+    const expectedL1: Record<number, { total: number, details: any[] }> = {}
+    const expectedL2: Record<number, { total: number, details: any[] }> = {}
+
+    // user_id → referrer_id 캐시
+    const userMap = new Map<number, { name: string, email: string, referrer_id: number | null }>()
+    for (const s of stakings) {
+      if (!userMap.has(s.user_id)) {
+        userMap.set(s.user_id, { name: s.name, email: s.email, referrer_id: s.referrer_id ?? null })
+      }
+    }
+    // referrer_id 가 user_map 에 없는 경우 추가 조회
+    const missingRefIds = new Set<number>()
+    for (const v of userMap.values()) {
+      if (v.referrer_id != null && !userMap.has(v.referrer_id)) missingRefIds.add(v.referrer_id)
+    }
+    if (missingRefIds.size > 0) {
+      const idsList = [...missingRefIds]
+      const placeholders = idsList.map(() => '?').join(',')
+      const usersExtra = await db.prepare(`
+        SELECT id, name, email, referrer_id FROM users WHERE id IN (${placeholders})
+      `).bind(...idsList).all()
+      for (const u of (usersExtra.results || []) as any[]) {
+        userMap.set(u.id, { name: u.name, email: u.email, referrer_id: u.referrer_id ?? null })
+      }
+      // 2-hop 도 캐시
+      const hop2: number[] = []
+      for (const u of (usersExtra.results || []) as any[]) {
+        if (u.referrer_id != null && !userMap.has(u.referrer_id)) hop2.push(u.referrer_id)
+      }
+      if (hop2.length > 0) {
+        const p2 = hop2.map(() => '?').join(',')
+        const u2 = await db.prepare(`
+          SELECT id, name, email, referrer_id FROM users WHERE id IN (${p2})
+        `).bind(...hop2).all()
+        for (const u of (u2.results || []) as any[]) {
+          userMap.set(u.id, { name: u.name, email: u.email, referrer_id: u.referrer_id ?? null })
+        }
+      }
+    }
+
+    // staking 별 계산
+    for (const s of stakings) {
+      const amt = Number(s.amount) || 0
+      const rate = Number(s.daily_rate) || 0
+      const dailyQkey = Math.round(amt * rate * USD_TO_QKEY)
+      expectedDR.push({
+        user_id: s.user_id, staking_id: s.staking_id,
+        amount: amt, daily_rate: rate,
+        qkey_amount: dailyQkey,
+        formula: `${amt}×${rate}×${USD_TO_QKEY}=${dailyQkey}`,
+      })
+
+      // L1: refereeOwner 의 referrer → +20%
+      const ownerInfo = userMap.get(s.user_id)
+      const l1Id = ownerInfo?.referrer_id
+      if (l1Id) {
+        const l1Reward = Math.round(dailyQkey * 0.20)
+        if (!expectedL1[l1Id]) expectedL1[l1Id] = { total: 0, details: [] }
+        expectedL1[l1Id].total += l1Reward
+        expectedL1[l1Id].details.push({
+          referee_id: s.user_id, referee_staking_id: s.staking_id,
+          referee_own_qkey: dailyQkey, l1_reward: l1Reward,
+        })
+        // L2: L1 의 referrer
+        const l1Info = userMap.get(l1Id)
+        const l2Id = l1Info?.referrer_id
+        if (l2Id) {
+          const l2Reward = Math.round(dailyQkey * 0.10)
+          if (!expectedL2[l2Id]) expectedL2[l2Id] = { total: 0, details: [] }
+          expectedL2[l2Id].total += l2Reward
+          expectedL2[l2Id].details.push({
+            l1_id: l1Id, referee_id: s.user_id, referee_staking_id: s.staking_id,
+            referee_own_qkey: dailyQkey, l2_reward: l2Reward,
+          })
+        }
+      }
+    }
+
+    // ─── 3. actual DR/RR (현재 DB) — reward_date=dividendDate ───
+    const actualDR = await db.prepare(`
+      SELECT id, user_id, staking_id, reward_date, paid_date, amount,
+             datetime(created_at,'+9 hours') AS created_kst
+      FROM daily_rewards
+      WHERE reward_date = ?
+      ORDER BY user_id, staking_id, id
+    `).bind(dividendDate).all()
+    const actualRR = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             reward_date, paid_date, staking_id,
+             datetime(created_at,'+9 hours') AS created_kst
+      FROM referral_rewards
+      WHERE reward_date = ?
+      ORDER BY referrer_id, referee_id, level, id
+    `).bind(dividendDate).all()
+    const actDR = (actualDR.results || []) as any[]
+    const actRR = (actualRR.results || []) as any[]
+
+    // actual DR: user_id+staking_id 별 amount 합
+    const actualDRMap = new Map<string, { rows: number, total: number, ids: number[] }>()
+    for (const r of actDR) {
+      const k = `${r.user_id}|${r.staking_id ?? 'NULL'}`
+      if (!actualDRMap.has(k)) actualDRMap.set(k, { rows: 0, total: 0, ids: [] })
+      const e = actualDRMap.get(k)!
+      e.rows++
+      e.total += Number(r.amount || 0)
+      e.ids.push(r.id)
+    }
+    // actual RR: referrer_id+level 별 합 (사장님 4-tuple idempotency)
+    const actualL1Map = new Map<number, { rows: number, total: number, ids: number[], staking_null: number }>()
+    const actualL2Map = new Map<number, { rows: number, total: number, ids: number[], staking_null: number }>()
+    for (const r of actRR) {
+      const m = r.level === 1 ? actualL1Map : (r.level === 2 ? actualL2Map : null)
+      if (!m) continue
+      if (!m.has(r.referrer_id)) m.set(r.referrer_id, { rows: 0, total: 0, ids: [], staking_null: 0 })
+      const e = m.get(r.referrer_id)!
+      e.rows++
+      e.total += Number(r.reward_amount || 0)
+      e.ids.push(r.id)
+      if (r.staking_id == null) e.staking_null++
+    }
+
+    // ─── 4. expected DR ↔ actual DR 비교 (staking_id 단위) ───
+    const drDiff: any[] = []
+    let drExpectedTotal = 0, drActualTotal = 0
+    for (const e of expectedDR) {
+      drExpectedTotal += e.qkey_amount
+      const k = `${e.user_id}|${e.staking_id}`
+      const a = actualDRMap.get(k)
+      const actualAmt = a?.total || 0
+      const delta = e.qkey_amount - actualAmt
+      if (delta !== 0 || !a) {
+        drDiff.push({
+          user_id: e.user_id, staking_id: e.staking_id,
+          expected: e.qkey_amount, actual: actualAmt, delta,
+          actual_row_ids: a?.ids || [],
+          status: !a ? 'MISSING' : (delta > 0 ? 'UNDERPAID' : 'OVERPAID'),
+        })
+      }
+    }
+    for (const a of actDR) drActualTotal += Number(a.amount || 0)
+
+    // 잉여 DR (expected 에 없는데 actual 에만 있는 것)
+    const expectedDRKeys = new Set(expectedDR.map(e => `${e.user_id}|${e.staking_id}`))
+    const drOrphan: any[] = []
+    for (const [k, v] of actualDRMap.entries()) {
+      if (!expectedDRKeys.has(k)) {
+        const [uid, sid] = k.split('|')
+        drOrphan.push({ user_id: Number(uid), staking_id: sid, rows: v.rows, actual: v.total, ids: v.ids })
+      }
+    }
+
+    // ─── 5. expected L1 ↔ actual L1 비교 (referrer_id 단위) ───
+    const l1Diff: any[] = []
+    let l1ExpectedTotal = 0
+    for (const [refId, v] of Object.entries(expectedL1)) {
+      l1ExpectedTotal += v.total
+      const refIdN = Number(refId)
+      const a = actualL1Map.get(refIdN)
+      const actualAmt = a?.total || 0
+      const delta = v.total - actualAmt
+      if (delta !== 0 || !a) {
+        const info = userMap.get(refIdN)
+        l1Diff.push({
+          referrer_id: refIdN, name: info?.name, email: info?.email,
+          expected: v.total, actual: actualAmt, delta,
+          actual_row_ids: a?.ids || [],
+          actual_staking_null: a?.staking_null || 0,
+          status: !a ? 'MISSING' : (delta > 0 ? 'UNDERPAID' : 'OVERPAID'),
+        })
+      }
+    }
+    let l1ActualTotal = 0
+    for (const v of actualL1Map.values()) l1ActualTotal += v.total
+
+    // 잉여 L1 (expected 에 없는데 actual 에 있는 referrer)
+    const l1Orphan: any[] = []
+    for (const [refId, v] of actualL1Map.entries()) {
+      if (!expectedL1[refId]) {
+        const info = userMap.get(refId)
+        l1Orphan.push({
+          referrer_id: refId, name: info?.name, email: info?.email,
+          rows: v.rows, actual: v.total, staking_null: v.staking_null, ids: v.ids,
+        })
+      }
+    }
+
+    // ─── 6. expected L2 ↔ actual L2 비교 ───
+    const l2Diff: any[] = []
+    let l2ExpectedTotal = 0
+    for (const [refId, v] of Object.entries(expectedL2)) {
+      l2ExpectedTotal += v.total
+      const refIdN = Number(refId)
+      const a = actualL2Map.get(refIdN)
+      const actualAmt = a?.total || 0
+      const delta = v.total - actualAmt
+      if (delta !== 0 || !a) {
+        const info = userMap.get(refIdN)
+        l2Diff.push({
+          referrer_id: refIdN, name: info?.name, email: info?.email,
+          expected: v.total, actual: actualAmt, delta,
+          actual_row_ids: a?.ids || [],
+          actual_staking_null: a?.staking_null || 0,
+          status: !a ? 'MISSING' : (delta > 0 ? 'UNDERPAID' : 'OVERPAID'),
+        })
+      }
+    }
+    let l2ActualTotal = 0
+    for (const v of actualL2Map.values()) l2ActualTotal += v.total
+    const l2Orphan: any[] = []
+    for (const [refId, v] of actualL2Map.entries()) {
+      if (!expectedL2[refId]) {
+        const info = userMap.get(refId)
+        l2Orphan.push({
+          referrer_id: refId, name: info?.name, email: info?.email,
+          rows: v.rows, actual: v.total, staking_null: v.staking_null, ids: v.ids,
+        })
+      }
+    }
+
+    // ─── 사용자별 종합 가감 ───
+    const userDelta = new Map<number, { dr: number, l1: number, l2: number, total: number, name?: string, email?: string }>()
+    function addDelta(uid: number, kind: 'dr'|'l1'|'l2', delta: number) {
+      if (!userDelta.has(uid)) {
+        const info = userMap.get(uid)
+        userDelta.set(uid, { dr: 0, l1: 0, l2: 0, total: 0, name: info?.name, email: info?.email })
+      }
+      const e = userDelta.get(uid)!
+      e[kind] += delta
+      e.total += delta
+    }
+    for (const d of drDiff) addDelta(d.user_id, 'dr', d.delta)
+    for (const d of drOrphan) addDelta(d.user_id, 'dr', -d.actual)
+    for (const d of l1Diff) addDelta(d.referrer_id, 'l1', d.delta)
+    for (const d of l1Orphan) addDelta(d.referrer_id, 'l1', -d.actual)
+    for (const d of l2Diff) addDelta(d.referrer_id, 'l2', d.delta)
+    for (const d of l2Orphan) addDelta(d.referrer_id, 'l2', -d.actual)
+
+    const userDeltaArr = [...userDelta.entries()]
+      .map(([uid, v]) => ({ user_id: uid, ...v }))
+      .filter(r => r.total !== 0)
+      .sort((a, b) => Math.abs(b.total) - Math.abs(a.total))
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_RECOMPUTE',
+      action: 'recompute-bottom-up-dividend',
+      input: { dividendDate, payoutDate, USD_TO_QKEY },
+      summary: {
+        active_stakings: stakings.length,
+        expected_dr_count: expectedDR.length,
+        expected_l1_referrers: Object.keys(expectedL1).length,
+        expected_l2_referrers: Object.keys(expectedL2).length,
+        actual_dr_rows: actDR.length,
+        actual_rr_rows: actRR.length,
+      },
+      totals: {
+        dr: { expected: drExpectedTotal, actual: drActualTotal, delta: drExpectedTotal - drActualTotal },
+        l1: { expected: l1ExpectedTotal, actual: l1ActualTotal, delta: l1ExpectedTotal - l1ActualTotal },
+        l2: { expected: l2ExpectedTotal, actual: l2ActualTotal, delta: l2ExpectedTotal - l2ActualTotal },
+        grand: {
+          expected: drExpectedTotal + l1ExpectedTotal + l2ExpectedTotal,
+          actual: drActualTotal + l1ActualTotal + l2ActualTotal,
+          delta: (drExpectedTotal + l1ExpectedTotal + l2ExpectedTotal) - (drActualTotal + l1ActualTotal + l2ActualTotal),
+        },
+      },
+      diff_counts: {
+        dr_diff: drDiff.length, dr_orphan: drOrphan.length,
+        l1_diff: l1Diff.length, l1_orphan: l1Orphan.length,
+        l2_diff: l2Diff.length, l2_orphan: l2Orphan.length,
+      },
+      user_delta_top20: userDeltaArr.slice(0, 20),
+      user_delta_count: userDeltaArr.length,
+      dr_diff_sample: drDiff.slice(0, 10),
+      dr_orphan_sample: drOrphan.slice(0, 10),
+      l1_diff_sample: l1Diff.slice(0, 10),
+      l1_orphan_sample: l1Orphan.slice(0, 10),
+      l2_diff_sample: l2Diff.slice(0, 10),
+      l2_orphan_sample: l2Orphan.slice(0, 10),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (e: any) {
+    return c.json({ ok: false, error: String(e?.message || e), stack: e?.stack }, 500)
+  }
+})
+
 
 export default app
