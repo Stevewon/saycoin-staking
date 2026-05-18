@@ -42323,18 +42323,17 @@ app.get('/api/diag/scan-may18-full', async (c) => {
   if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
   const db = (c.env as any).DB as D1Database
 
-  // 5/18 KST = 5/17 15:00 UTC ~ 5/18 14:59:59 UTC
-  const kstStart = '2026-05-17T15:00:00.000Z'
-  const kstEnd = '2026-05-18T14:59:59.999Z'
+  // 5/18 KST date(created_at, '+9 hours') = '2026-05-18'
+  const KST_DATE = '2026-05-18'
 
   // 1. 5/18 KST 생성된 transactions 전체
   const txAll = await db.prepare(`
     SELECT id, user_id, type, amount, description, ref_id, created_at,
            datetime(created_at, '+9 hours') as created_kst
     FROM transactions
-    WHERE created_at >= ? AND created_at <= ?
+    WHERE date(created_at, '+9 hours') = ?
     ORDER BY id ASC
-  `).bind(kstStart, kstEnd).all()
+  `).bind(KST_DATE).all()
 
   // 2. DR rows with paid_date=2026-05-18 or reward_date=2026-05-18
   const drRows = await db.prepare(`
