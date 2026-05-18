@@ -43845,5 +43845,423 @@ app.post('/api/diag/recalc-day-dividend', async (c) => {
   return diagRecalcDayDividend(c, 'EXEC')
 })
 
+// ============================================================================
+// purge-tx-by-time: 사장님 명령 (2026-05-18)
+//   "5/18 KST 17:53/17:54 의 referral_reward tx 105건 즉시 제거 + balance 차감"
+//
+//   목적: 어시스턴트 사고 (recalc-day-dividend EXEC 2번 timeout 후 중복 INSERT)
+//        로 인해 5/18 KST 17:53~17:54 에 referral_reward tx 105건 중복 들어간 것
+//        정확히 그 시간대 + type 만 제거
+//
+//   알고리즘:
+//     ① type='referral_reward' AND coin_type='QKEY'
+//        AND datetime(created_at,'+9 hours') BETWEEN '<from>' AND '<to>'
+//        조건의 tx 모두 수집
+//     ② 사용자별 amount 합계 → balance 차감 (-amount)
+//     ③ 매칭되는 referral_rewards row (ref_id) 도 함께 제거 (정합 유지)
+//     ④ tx 105건 DELETE
+//     ⑤ POST-CHECK: 그 시간대 type tx 0건 확인
+//
+//   사장님 직접 명령:
+//     "다른날꺼는 절대로 넣지말것"
+//     "중복이 들어갈듯하면 바로 모든걸 멈추고 보고할것"
+//
+//   엔드포인트:
+//     GET  /api/diag/purge-tx-by-time?key=ADMIN_PW
+//          &from=2026-05-18 17:53:00 &to=2026-05-18 17:54:59
+//          &type=referral_reward                                    → DRY_RUN
+//     POST 같은 URL + &confirm=GO                                   → EXEC
+// ============================================================================
+async function diagPurgeTxByTime(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  try {
+    const db = c.env.DB
+    const fromKst = c.req.query('from') || ''
+    const toKst = c.req.query('to') || ''
+    const txType = c.req.query('type') || ''
+    if (!fromKst || !toKst || !txType) {
+      return c.json({ error: 'from, to, type query 필수 (예: from=2026-05-18 17:53:00 &to=2026-05-18 17:54:59 &type=referral_reward)' }, 400)
+    }
+    // 안전 가드: KST 시간대 범위가 60분 이내인지 확인 (사고 방지)
+    const fromMs = Date.parse(fromKst.replace(' ', 'T') + 'Z')
+    const toMs = Date.parse(toKst.replace(' ', 'T') + 'Z')
+    if (isNaN(fromMs) || isNaN(toMs) || toMs < fromMs) {
+      return c.json({ error: 'from/to 시간 파싱 실패 또는 to < from' }, 400)
+    }
+    const rangeMins = (toMs - fromMs) / 60000
+    if (rangeMins > 60) {
+      return c.json({ error: `시간 범위가 ${rangeMins}분 — 60분 초과 금지 (안전 가드)` }, 400)
+    }
+
+    // ─── 대상 tx 수집 ───
+    const txList = (await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id,
+             datetime(created_at,'+9 hours') AS created_kst
+      FROM transactions
+      WHERE type = ? AND coin_type = 'QKEY'
+        AND datetime(created_at,'+9 hours') >= ?
+        AND datetime(created_at,'+9 hours') <= ?
+      ORDER BY id ASC
+    `).bind(txType, fromKst, toKst).all()).results as any[] || []
+
+    if (txList.length === 0) {
+      return c.json({
+        ok: true, mode, action: 'purge-tx-by-time',
+        from_kst: fromKst, to_kst: toKst, type: txType,
+        message: '해당 시간대 type tx 0건 — 제거할 것 없음',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─── 사용자별 amount 합계 (balance 차감 양) ───
+    const balanceDelta = new Map<number, number>()
+    const refIds: number[] = []
+    let totalAmount = 0
+    for (const tx of txList) {
+      const uid = Number(tx.user_id)
+      const amt = Number(tx.amount)
+      totalAmount += amt
+      balanceDelta.set(uid, (balanceDelta.get(uid) || 0) - amt)
+      if (tx.ref_id && /^\d+$/.test(String(tx.ref_id))) refIds.push(Number(tx.ref_id))
+    }
+
+    // ─── 매칭 referral_rewards row 수집 (정합용) ───
+    let rrExistList: any[] = []
+    if (refIds.length > 0 && txType === 'referral_reward') {
+      const CHUNK = 100
+      for (let i = 0; i < refIds.length; i += CHUNK) {
+        const chunk = refIds.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT id, referrer_id, referee_id, level, staking_id, reward_amount, reward_date, paid_date
+          FROM referral_rewards WHERE id IN (${placeholders})
+        `).bind(...chunk).all()
+        rrExistList.push(...((rows.results || []) as any[]))
+      }
+    }
+
+    // tx id 중복 검수 (안전 — 같은 ref_id 의 tx 가 여러개 있으면 중복 의심)
+    const refIdCount = new Map<number, number>()
+    for (const tx of txList) {
+      const rid = Number(tx.ref_id || 0)
+      if (rid > 0) refIdCount.set(rid, (refIdCount.get(rid) || 0) + 1)
+    }
+    const duplicatedRefIds = Array.from(refIdCount.entries()).filter(([_, c]) => c > 1).map(([rid, c]) => ({ ref_id: rid, count: c }))
+
+    const summary = {
+      tx_count: txList.length,
+      tx_total_amount: totalAmount,
+      affected_users_count: balanceDelta.size,
+      rr_match_count: rrExistList.length,
+      ref_ids_total: refIds.length,
+      ref_ids_unique: new Set(refIds).size,
+      duplicated_ref_ids_within_selection: duplicatedRefIds.length,
+      sample_duplicates_top10: duplicatedRefIds.slice(0, 10),
+    }
+
+    // ═══════════════ DRY-RUN ═══════════════
+    if (mode === 'DRY_RUN') {
+      const userIds = Array.from(balanceDelta.keys())
+      let userSim: any[] = []
+      if (userIds.length > 0) {
+        const CHUNK = 100
+        for (let i = 0; i < userIds.length; i += CHUNK) {
+          const chunk = userIds.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() => '?').join(',')
+          const rows = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id IN (${placeholders})`).bind(...chunk).all()
+          for (const u of (rows.results || []) as any[]) {
+            const delta = balanceDelta.get(Number(u.id)) || 0
+            userSim.push({
+              user_id: Number(u.id), name: u.name, email: u.email,
+              current_balance: Number(u.qkey_balance),
+              delta,
+              post_balance: Number(u.qkey_balance) + delta,
+              will_go_negative: (Number(u.qkey_balance) + delta) < 0,
+            })
+          }
+        }
+      }
+      const negAfter = userSim.filter(u => u.will_go_negative)
+
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'purge-tx-by-time',
+        from_kst: fromKst, to_kst: toKst, type: txType,
+        summary,
+        balance_sim_top20: userSim.slice(0, 20),
+        negative_after: { count: negAfter.length, samples: negAfter.slice(0, 10) },
+        tx_sample_first10: txList.slice(0, 10).map(t => ({
+          id: t.id, user_id: t.user_id, amount: t.amount,
+          description: t.description, ref_id: t.ref_id, created_kst: t.created_kst,
+        })),
+        tx_sample_last10: txList.slice(-10).map(t => ({
+          id: t.id, user_id: t.user_id, amount: t.amount,
+          description: t.description, ref_id: t.ref_id, created_kst: t.created_kst,
+        })),
+        rr_match_sample_top10: rrExistList.slice(0, 10),
+        next_action: 'POST + confirm=GO 보내시면 EXEC. tx DELETE + balance 차감 + 매칭 RR DELETE.',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ═══════════════ EXEC ═══════════════
+    const CHUNK_SIZE = 80
+
+    // ── (1) balance 차감 ──
+    let balanceAdjusted = 0
+    const balEntries = Array.from(balanceDelta.entries())
+    for (let i = 0; i < balEntries.length; i += CHUNK_SIZE) {
+      const chunk = balEntries.slice(i, i + CHUNK_SIZE)
+      const stmts = chunk.map(([uid, delta]) =>
+        db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid)
+      )
+      await db.batch(stmts)
+      balanceAdjusted += chunk.length
+    }
+
+    // ── (2) referral_rewards DELETE (매칭 ref_id) ──
+    let rrDeleted = 0
+    if (refIds.length > 0 && txType === 'referral_reward') {
+      const uniqueRefIds = Array.from(new Set(refIds))
+      for (let i = 0; i < uniqueRefIds.length; i += CHUNK_SIZE) {
+        const chunk = uniqueRefIds.slice(i, i + CHUNK_SIZE)
+        const placeholders = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`DELETE FROM referral_rewards WHERE id IN (${placeholders})`).bind(...chunk).run()
+        rrDeleted += (r as any)?.meta?.changes || 0
+      }
+    }
+
+    // ── (3) transactions DELETE (id 기반 — 정확) ──
+    const txIds = txList.map(t => Number(t.id))
+    let txDeleted = 0
+    for (let i = 0; i < txIds.length; i += CHUNK_SIZE) {
+      const chunk = txIds.slice(i, i + CHUNK_SIZE)
+      const placeholders = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...chunk).run()
+      txDeleted += (r as any)?.meta?.changes || 0
+    }
+
+    // ─── POST-CHECK: 그 시간대 type tx 0건 확인 ───
+    const postCheck = await db.prepare(`
+      SELECT COUNT(*) AS cnt FROM transactions
+      WHERE type = ? AND coin_type = 'QKEY'
+        AND datetime(created_at,'+9 hours') >= ?
+        AND datetime(created_at,'+9 hours') <= ?
+    `).bind(txType, fromKst, toKst).first() as any
+
+    return c.json({
+      ok: Number(postCheck?.cnt || 0) === 0,
+      mode: 'EXEC',
+      action: 'purge-tx-by-time',
+      from_kst: fromKst, to_kst: toKst, type: txType,
+      pre_summary: summary,
+      exec_result: {
+        balance_adjusted_users: balanceAdjusted,
+        rr_deleted: rrDeleted,
+        tx_deleted: txDeleted,
+      },
+      post_check: {
+        tx_remaining_in_range: Number(postCheck?.cnt || 0),
+        verified: Number(postCheck?.cnt || 0) === 0,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+}
+
+app.get('/api/diag/purge-tx-by-time', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagPurgeTxByTime(c, 'DRY_RUN')
+})
+
+app.post('/api/diag/purge-tx-by-time', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 변경 게이트)' }, 400)
+  return diagPurgeTxByTime(c, 'EXEC')
+})
+
+// ============================================================================
+// verify-paid-date: 사장님 영구룰 검수 endpoint
+//   특정 paid_date 의 DR/RR/tx 정합 + 중복 확인 (READ-ONLY)
+//
+//   사장님 절대 명령:
+//     "반드시 중복없는지 검수해서 보고할것! 중복이 들어갈듯하면 바로 모든걸 멈추고 보고할것"
+//
+//   검수 항목:
+//     ① daily_rewards: 같은 (user_id, staking_id, paid_date) 중복 row 있는가?
+//     ② referral_rewards: 같은 (referrer_id, referee_id, level, staking_id, paid_date) 중복?
+//     ③ transactions: 같은 ref_id 의 referral_reward 또는 daily_qkey 중복?
+//     ④ daily_qkey tx 합계 = daily_rewards.usdt_amount 합계?
+//     ⑤ referral_reward tx 합계 = referral_rewards.reward_amount 합계?
+//     ⑥ user 별 paid_total = stake_total × 2 × 150 초과한 사람 있는지 (Cap 위반)
+//
+//   엔드포인트:
+//     GET /api/diag/verify-paid-date?key=ADMIN_PW&paidDate=2026-05-18
+// ============================================================================
+app.get('/api/diag/verify-paid-date', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const paidDate = c.req.query('paidDate') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(paidDate)) {
+      return c.json({ error: 'paidDate=YYYY-MM-DD 필수' }, 400)
+    }
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+
+    // ─── ① daily_rewards 중복 체크 ───
+    const drDupRaw = await db.prepare(`
+      SELECT user_id, staking_id, paid_date, COUNT(*) AS cnt, SUM(usdt_amount) AS total_amt
+      FROM daily_rewards
+      WHERE paid_date = ?
+      GROUP BY user_id, staking_id, paid_date
+      HAVING cnt > 1
+    `).bind(paidDate).all()
+    const drDuplicates = (drDupRaw.results || []) as any[]
+
+    // ─── ② referral_rewards 중복 체크 ───
+    const rrDupRaw = await db.prepare(`
+      SELECT referrer_id, referee_id, level, staking_id, paid_date, COUNT(*) AS cnt, SUM(reward_amount) AS total_amt
+      FROM referral_rewards
+      WHERE paid_date = ?
+      GROUP BY referrer_id, referee_id, level, staking_id, paid_date
+      HAVING cnt > 1
+    `).bind(paidDate).all()
+    const rrDuplicates = (rrDupRaw.results || []) as any[]
+
+    // ─── ③ transactions ref_id 중복 체크 ───
+    //   ref_id 가 같은 daily_qkey 또는 referral_reward tx 가 2건 이상이면 중복
+    const txDupRaw = await db.prepare(`
+      SELECT type, ref_id, COUNT(*) AS cnt, SUM(amount) AS total_amt
+      FROM transactions
+      WHERE type IN ('daily_qkey','referral_reward') AND coin_type='QKEY'
+        AND ref_id IS NOT NULL
+        AND (
+          ref_id IN (SELECT id FROM daily_rewards WHERE paid_date = ?)
+          OR ref_id IN (SELECT id FROM referral_rewards WHERE paid_date = ?)
+        )
+      GROUP BY type, ref_id
+      HAVING cnt > 1
+    `).bind(paidDate, paidDate).all()
+    const txDuplicates = (txDupRaw.results || []) as any[]
+
+    // ─── ④/⑤ tx 합계 vs DR/RR 합계 정합 ───
+    const drTotalRow = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total FROM daily_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+    const rrTotalRow = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total FROM referral_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+    const txDqRow = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total
+      FROM transactions
+      WHERE type='daily_qkey' AND coin_type='QKEY'
+        AND ref_id IN (SELECT id FROM daily_rewards WHERE paid_date = ?)
+    `).bind(paidDate).first() as any
+    const txRrRow = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total
+      FROM transactions
+      WHERE type='referral_reward' AND coin_type='QKEY'
+        AND ref_id IN (SELECT id FROM referral_rewards WHERE paid_date = ?)
+    `).bind(paidDate).first() as any
+
+    // ─── ⑥ KST 그날 created_at 인 tx 통계 (referral_reward / daily_qkey 분 단위 분포) ───
+    //   사고 흔적 (특정 분에 비정상적으로 많이 들어간 경우) 찾기
+    const txMinRaw = await db.prepare(`
+      SELECT strftime('%Y-%m-%d %H:%M', datetime(created_at,'+9 hours')) AS kst_minute,
+             type, COUNT(*) AS cnt, SUM(amount) AS total
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')
+        AND date(created_at,'+9 hours') = ?
+      GROUP BY kst_minute, type
+      ORDER BY cnt DESC
+      LIMIT 30
+    `).bind(paidDate).all()
+    const txMinList = (txMinRaw.results || []) as any[]
+
+    // ─── ⑦ 200% Cap 위반 사용자 (paid_total >= target) ───
+    const capRaw = await db.prepare(`
+      SELECT u.id, u.name, u.email,
+             COALESCE((SELECT SUM(amount) FROM staking WHERE user_id=u.id AND status IN ('active','completed','capped')), 0) AS stake_total,
+             COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=u.id AND coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')), 0) AS paid_total
+      FROM users u
+      WHERE u.id IN (SELECT DISTINCT user_id FROM staking WHERE status IN ('active','completed','capped'))
+    `).all()
+    const capList = (capRaw.results || []) as any[]
+    const capViolations = capList.filter((r: any) => {
+      const target = Number(r.stake_total) * 2 * USD_TO_QKEY
+      return target > 0 && Number(r.paid_total) > target
+    }).map((r: any) => {
+      const target = Number(r.stake_total) * 2 * USD_TO_QKEY
+      return {
+        user_id: Number(r.id), name: r.name, email: r.email,
+        stake_total: Number(r.stake_total),
+        paid_total: Number(r.paid_total),
+        target,
+        excess: Number(r.paid_total) - target,
+      }
+    })
+
+    // 정합 결과
+    const totalDuplicates = drDuplicates.length + rrDuplicates.length + txDuplicates.length
+    const drCount = Number(drTotalRow?.cnt || 0)
+    const drTotal = Number(drTotalRow?.total || 0)
+    const rrCount = Number(rrTotalRow?.cnt || 0)
+    const rrTotal = Number(rrTotalRow?.total || 0)
+    const txDqCount = Number(txDqRow?.cnt || 0)
+    const txDqTotal = Number(txDqRow?.total || 0)
+    const txRrCount = Number(txRrRow?.cnt || 0)
+    const txRrTotal = Number(txRrRow?.total || 0)
+    const drTxMatch = (drCount === txDqCount) && (drTotal === txDqTotal)
+    const rrTxMatch = (rrCount === txRrCount) && (rrTotal === txRrTotal)
+
+    return c.json({
+      ok: true,
+      action: 'verify-paid-date',
+      paid_date: paidDate,
+      duplicate_check: {
+        dr_duplicates: drDuplicates.length,
+        rr_duplicates: rrDuplicates.length,
+        tx_duplicates: txDuplicates.length,
+        total: totalDuplicates,
+        verdict: totalDuplicates === 0 ? '✅ 중복 0건 (영구룰 #중복지급금지 충족)' : '🚨 중복 발견 — 즉시 STOP & 보고',
+        samples: {
+          dr: drDuplicates.slice(0, 10),
+          rr: rrDuplicates.slice(0, 10),
+          tx: txDuplicates.slice(0, 10),
+        },
+      },
+      tx_match_check: {
+        dr_count_vs_tx: { dr: drCount, tx: txDqCount, diff: drCount - txDqCount },
+        dr_total_vs_tx: { dr: drTotal, tx: txDqTotal, diff: drTotal - txDqTotal },
+        rr_count_vs_tx: { rr: rrCount, tx: txRrCount, diff: rrCount - txRrCount },
+        rr_total_vs_tx: { rr: rrTotal, tx: txRrTotal, diff: rrTotal - txRrTotal },
+        dr_tx_match: drTxMatch,
+        rr_tx_match: rrTxMatch,
+        verdict: (drTxMatch && rrTxMatch) ? '✅ DR/RR ↔ tx 정합' : '🚨 정합 깨짐',
+      },
+      cap_check: {
+        violations: capViolations.length,
+        samples: capViolations.slice(0, 10),
+        verdict: capViolations.length === 0 ? '✅ 200% Cap 위반 0명' : '🚨 Cap 초과 사용자 발견',
+      },
+      kst_minute_distribution: {
+        note: `${paidDate} KST 의 daily_qkey/referral_reward tx 분 단위 분포 (사고 흔적 진단용)`,
+        top_minutes: txMinList,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 
 export default app
