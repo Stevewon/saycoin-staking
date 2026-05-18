@@ -1,8 +1,51 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-18 (★ 영구룰 #스테이킹별독립 추가)
+**최종 업데이트**: 2026-05-18 (★ 영구룰 #GitHub빌드강제 추가 — 사장님 직접 명령)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
+
+---
+
+## 🛠️ 영구룰 #GitHub빌드강제 (MOST CRITICAL — 빌드/배포 사전조건)
+
+> **빌드/배포는 반드시 GitHub Actions 를 통해 명시적으로 트리거하고, 워크플로 성공을 명시적으로 확인한 뒤에만 다음 단계로 진행한다.**
+
+### 절대 금지
+1. ❌ `git push` 후 "Cloudflare Pages 가 알아서 감지하겠지" 식으로 시간만 기다린 뒤 endpoint 호출
+2. ❌ `gh run list` / `gh run view` 로 **빌드 success 여부를 확인하지 않은 채** 다음 단계 진행
+3. ❌ HTTP 404 / 구버전 응답 받고도 "deploy 가 늦나" 하고 단순 재시도
+4. ❌ commit message 에 emoji / 비-ASCII 특수문자 / em-dash(—) / 제어문자 등 **Cloudflare API 가 거부할 수 있는 문자** 사용
+   - 사고 이력: `Invalid commit message, it must be a valid UTF-8 string. [code: 8000111]` → 빌드는 성공해도 Cloudflare 가 deploy 거부
+
+### 필수 절차 (모든 endpoint 추가/수정 시)
+1. ✅ **commit message 는 ASCII + 한글만, 특수문자 최소화** (em-dash `—` 금지, 대시는 ASCII `-` 사용)
+2. ✅ `git push origin saycoin-staking-platform`
+3. ✅ **즉시** `gh run list --workflow=deploy.yml --limit 1` 로 트리거 확인
+4. ✅ **빌드 완료 대기**: `gh run watch <run-id>` 또는 폴링 (`completed success` 까지)
+5. ✅ failure 면 `gh run view <run-id> --log-failed` 로 원인 확인 → 수정 후 재push
+6. ✅ success 확인 후에만 endpoint 호출
+
+### workflow_dispatch (명시적 재트리거)
+- push 가 어떤 이유로 자동 트리거 안 됐거나, **이미 deploy 된 commit 을 재배포**하려면:
+  ```bash
+  gh workflow run deploy.yml --ref saycoin-staking-platform
+  ```
+
+### 백업 수단 (Actions 자체가 막혔을 때만)
+- Cloudflare API 토큰이 secrets 에 있고, 로컬에서 직접 배포 필요할 때:
+  ```bash
+  cd /home/user/webapp && npm run build
+  # CLOUDFLARE_API_TOKEN 환경변수 설정 후
+  npx wrangler pages deploy dist --project-name=saycoin-staking --branch=saycoin-staking-platform --commit-dirty=true --commit-message="ascii only"
+  ```
+- 단, 사장님 환경에서는 GitHub Actions 가 정식 경로. 로컬 wrangler 는 fallback.
+
+**⚠️ 사장님 직접 인용 (2026-05-18, 사고 직후 직접 명령)**:
+> "깃허브로 빌드하라고 대체 몇번을 말하냐?!!!!!1 영구명령에 넣어!.md"
+
+**위반 시 결과**: endpoint 404 → "왜 안 되지?" 재시도 루프 → 사장님 격노 + 시간 낭비
+
+**이 룰은 모든 작업의 **사전 조건** 이다. 빌드/배포 확인 없이 endpoint 호출하면 그 순간이 사고다.**
 
 ---
 
@@ -232,6 +275,8 @@ strftime('%Y-%m-%dT%H:%M:%S', created_at, '+9 hours')  -- KST ISO 8601 (Safari �
 |---|---|---|---|
 | 2026-05-18 | fix-missing-tx 중복 INSERT 560건 / 1,759,845 QKEY | EXISTS-loop + ref_id 가드 완화 | #중복지급금지 |
 | 2026-05-18 | scan-duplicate-dr-rr v1/v2 오진단 (484건 → 위반 분류 오류) | (user_id, reward_date) 기준으로 그룹화하여 staking 별 정상 row 를 위반으로 오분류 | #스테이킹별독립 |
+| 2026-05-18 | recalc-day-dividend 2번 EXEC timeout → 5/18 KST 17:53/17:54 에 referral_reward tx 105건 / 50,700 QKEY 중복 INSERT | N+1 SELECT + 30s Worker timeout 후에도 사용자별 loop 가 계속 실행됨. 첫 EXEC timeout 후 두번째 EXEC 보냄. | #중복지급금지 #스테이킹별독립 |
+| 2026-05-18 | 빌드 deploy 실패 인지 못하고 endpoint 404 후 재시도 루프 | `git push` 자동 감지 의존. GitHub Actions 빌드 status 명시 확인 안 함. Cloudflare API 가 commit message 거부 (Invalid UTF-8) 인 줄도 모름. | #GitHub빌드강제 |
 | 이전 다수 | 클라이언트 inline JS SyntaxError | 백틱 안 이스케이프 시퀀스 깨짐 | (CRITICAL_RULES.md 참조) |
 
 ---
