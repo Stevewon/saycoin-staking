@@ -42572,8 +42572,9 @@ app.get('/api/diag/recompute-bottom-up-dividend', async (c) => {
     }
 
     // ─── 3. actual DR/RR (현재 DB) — reward_date=dividendDate ───
+    //   ★ daily_rewards 컬럼은 usdt_amount (실제 QKEY 값 저장)
     const actualDR = await db.prepare(`
-      SELECT id, user_id, staking_id, reward_date, paid_date, amount,
+      SELECT id, user_id, staking_id, reward_date, paid_date, usdt_amount AS amount,
              datetime(created_at,'+9 hours') AS created_kst
       FROM daily_rewards
       WHERE reward_date = ?
