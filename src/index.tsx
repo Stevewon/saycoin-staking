@@ -46574,6 +46574,181 @@ app.get('/api/diag/user-tx-list', async (c) => {
   }
 })
 
+// fix-irregular-time-tx: 영구룰 #정규시각(15:15 KST = 06:15 UTC) 위반 일일배당 tx 만 created_at 정정
+// 보호: 다른 날짜/다른 종류 tx 절대 보호. 영구룰 준수 tx 도 보호.
+// 대상 KST 날짜: 2026-05-07, 2026-05-11 (사장님 명령으로 고정)
+// DRY-RUN: GET /api/diag/fix-irregular-time-tx?key=ADMIN_PW
+// EXEC:    GET /api/diag/fix-irregular-time-tx?key=ADMIN_PW&exec=true
+app.get('/api/diag/fix-irregular-time-tx', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const exec = (c.req.query('exec') || '').toLowerCase() === 'true'
+
+    // ★ 하드코딩 대상 KST 날짜 (사장님 명령)
+    const TARGET_KST_DATES = ['2026-05-07', '2026-05-11']
+    // ★ 정규 시각: 15:15:00 KST = 06:15:00 UTC
+    const REGULAR_UTC_TIME = '06:15:00'
+
+    const db = c.env.DB
+    const allTargets: any[] = []
+
+    for (const kstDate of TARGET_KST_DATES) {
+      // SELECT: 해당 KST 날짜 + QKEY + 일일배당 + 정규시각 아닌 것
+      const rows = await db.prepare(`
+        SELECT id, user_id, amount, description, ref_id, created_at,
+               datetime(created_at, '+9 hours') AS kst_at,
+               date(created_at, '+9 hours') AS kst_date,
+               time(created_at, '+9 hours') AS kst_time
+        FROM transactions
+        WHERE coin_type = 'QKEY'
+          AND amount > 0
+          AND (description LIKE '%일일 배당%' OR description LIKE '%Daily reward%')
+          AND date(created_at, '+9 hours') = ?
+          AND time(created_at, '+9 hours') != '15:15:00'
+        ORDER BY created_at ASC, id ASC
+      `).bind(kstDate).all()
+
+      const items = (rows.results || []) as any[]
+      for (const r of items) {
+        // 안전 검증: 정말 해당 KST 날짜인가?
+        if (String(r.kst_date) !== kstDate) continue
+        // 안전 검증: 정말 15:15 가 아닌가?
+        if (String(r.kst_time) === '15:15:00') continue
+        // 안전 검증: amount 양수인가?
+        if (Number(r.amount) <= 0) continue
+
+        const targetUtc = `${kstDate.replace(/-/g, '-')} ${REGULAR_UTC_TIME}`
+        // KST 날짜 2026-05-07 의 15:15 KST = UTC 2026-05-07 06:15
+        // (KST 가 UTC+9 이므로 같은 날짜 -9시간)
+
+        allTargets.push({
+          id: Number(r.id),
+          user_id: Number(r.user_id),
+          amount: Number(r.amount),
+          description: String(r.description || ''),
+          ref_id: r.ref_id != null ? Number(r.ref_id) : null,
+          before_kst: String(r.kst_at || ''),
+          before_utc: String(r.created_at || ''),
+          after_utc: targetUtc,
+          after_kst: `${kstDate} 15:15:00`,
+          kst_date: kstDate,
+        })
+      }
+    }
+
+    if (!exec) {
+      // 안전 사전 검증: 보호 대상 (5/7, 5/11 외 날짜) 이 섞이지 않았는지 재확인
+      const protectViolation = allTargets.filter(t => !TARGET_KST_DATES.includes(t.kst_date))
+      return c.json({
+        ok: true,
+        mode: 'DRY-RUN',
+        target_kst_dates: TARGET_KST_DATES,
+        regular_kst_time: '15:15:00',
+        regular_utc_time: REGULAR_UTC_TIME,
+        targets_count: allTargets.length,
+        protect_violation_count: protectViolation.length,
+        protect_violation: protectViolation,
+        targets: allTargets,
+        note: 'EXEC: &exec=true. 5/7, 5/11 KST 외 절대 미수정. 영구룰 #정규시각 준수 tx 도 미수정.',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC 안전 게이트
+    const protectViolation = allTargets.filter(t => !TARGET_KST_DATES.includes(t.kst_date))
+    if (protectViolation.length > 0) {
+      return c.json({
+        ok: false,
+        error: 'PROTECT VIOLATION: targets contain non-allowed kst_date',
+        protect_violation: protectViolation,
+        duration_ms: Date.now() - t0,
+      }, 500)
+    }
+
+    // EXEC: created_at UPDATE (batch)
+    const stmts: any[] = []
+    for (const t of allTargets) {
+      // ID + before_utc 둘 다 매칭 (이중 안전)
+      stmts.push(
+        db.prepare(`
+          UPDATE transactions
+          SET created_at = ?
+          WHERE id = ?
+            AND created_at = ?
+            AND coin_type = 'QKEY'
+            AND amount > 0
+            AND (description LIKE '%일일 배당%' OR description LIKE '%Daily reward%')
+            AND date(created_at, '+9 hours') = ?
+        `).bind(t.after_utc, t.id, t.before_utc, t.kst_date)
+      )
+    }
+
+    let updated_rows = 0
+    if (stmts.length > 0) {
+      const results = await db.batch(stmts)
+      for (const r of results) {
+        const meta: any = (r as any).meta || {}
+        updated_rows += Number(meta.changes || 0)
+      }
+    }
+
+    // Verify: 같은 SELECT 다시 → 0건 이어야 함
+    const verifyAll: any[] = []
+    for (const kstDate of TARGET_KST_DATES) {
+      const rows = await db.prepare(`
+        SELECT id, datetime(created_at, '+9 hours') AS kst_at, time(created_at, '+9 hours') AS kst_time
+        FROM transactions
+        WHERE coin_type = 'QKEY'
+          AND amount > 0
+          AND (description LIKE '%일일 배당%' OR description LIKE '%Daily reward%')
+          AND date(created_at, '+9 hours') = ?
+          AND time(created_at, '+9 hours') != '15:15:00'
+      `).bind(kstDate).all()
+      for (const r of (rows.results || []) as any[]) {
+        verifyAll.push({ id: Number(r.id), kst_at: String(r.kst_at), kst_time: String(r.kst_time), kst_date: kstDate })
+      }
+    }
+
+    // Verify: 보호 대상 (5/7, 5/11 외) tx 가 변경되지 않았는지 (sanity)
+    // → 우리는 5/7, 5/11 만 UPDATE 했으므로 무관 검증 불필요. 그러나 영구룰 준수 tx 카운트 안정성 확인.
+    const otherDatesIntact = await db.prepare(`
+      SELECT date(created_at, '+9 hours') AS kst_date, COUNT(*) AS cnt
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND amount > 0
+        AND (description LIKE '%일일 배당%' OR description LIKE '%Daily reward%')
+        AND date(created_at, '+9 hours') NOT IN ('2026-05-07', '2026-05-11')
+        AND time(created_at, '+9 hours') = '15:15:00'
+      GROUP BY date(created_at, '+9 hours')
+      ORDER BY kst_date ASC
+    `).all()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      target_kst_dates: TARGET_KST_DATES,
+      regular_kst_time: '15:15:00',
+      regular_utc_time: REGULAR_UTC_TIME,
+      updated_attempt: allTargets.length,
+      updated_rows,
+      targets: allTargets,
+      verify: {
+        still_irregular_count: verifyAll.length,
+        still_irregular_list: verifyAll,
+        other_dates_regular_counts: (otherDatesIntact.results || []) as any[],
+      },
+      verdict: verifyAll.length === 0
+        ? '✅ 5/7, 5/11 비정규 tx 완전 정정. 다른 날짜 영구룰 준수 tx 보호됨'
+        : '🚨 잔여 비정규 tx 발견',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 app.get('/api/diag/user-reward-audit', async (c) => {
   const t0 = Date.now()
   try {
