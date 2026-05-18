@@ -47460,13 +47460,13 @@ app.get('/api/diag/daily-reward-dup-check', async (c) => {
   }
 })
 
-// fix-duplicate-daily-reward-tx: 영구룰 #중복지급금지 위반 일일배당 tx 제거
-// 알고리즘:
+// fix-duplicate-daily-reward-tx: 영구룰 #중복지급금지 위반 일일배당 tx 제거 (단순 로직)
+// 알고리즘 (사장님 직접 명령):
 //   1) transactions QKEY 일일배당 (user_id, kst_date) 별로 2건 이상 그룹 찾기
-//   2) 같은 그룹의 dr 테이블 정상 합계 (= SUM(dr.usdt_amount) WHERE user_id, reward_date=kst_date) 계산
-//   3) tx 그룹 합계 - dr 정상 합계 = 초과 지급 금액
-//   4) 초과 금액과 일치하는 tx 를 찾아 삭제 + users.qkey_balance 차감
-//   5) 정확히 일치하는 단일 tx 없으면 SKIP + 보고 (절대 수동 판단 안 함)
+//   2) 각 그룹에서 가장 큰 id (= 나중에 INSERT 된 tx) 1건만 남기고 나머지 모두 삭제
+//      → 즉, MIN(id) 1건만 보존, 나머지 (cnt-1) 건 삭제
+//      ※ "먼저 들어온 tx 가 진짜, 나중 들어온 tx 가 중복" 으로 간주
+//   3) 삭제한 tx 의 amount 합계 만큼 users.qkey_balance 차감
 // 보호: dr 테이블 절대 건드리지 않음. 다른 type/coin/날짜 tx 절대 건드리지 않음.
 // DRY-RUN: GET /api/diag/fix-duplicate-daily-reward-tx?key=ADMIN_PW
 // EXEC:    GET /api/diag/fix-duplicate-daily-reward-tx?key=ADMIN_PW&exec=true
@@ -47478,15 +47478,18 @@ app.get('/api/diag/fix-duplicate-daily-reward-tx', async (c) => {
     const exec = (c.req.query('exec') || '').toLowerCase() === 'true'
     const db = c.env.DB
 
-    // 1) 중복 그룹 식별
+    // 1) 중복 그룹 식별 + 그룹 안에서 MIN(id) 보존
     const dupGroups = await db.prepare(`
       SELECT t.user_id,
+             u.name AS user_name,
              date(t.created_at, '+9 hours') AS kst_date,
              COUNT(*) AS cnt,
              SUM(t.amount) AS tx_sum,
+             MIN(t.id) AS keep_tx_id,
              GROUP_CONCAT(t.id) AS tx_ids,
              GROUP_CONCAT(t.amount) AS amounts
       FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
       WHERE t.coin_type = 'QKEY'
         AND t.amount > 0
         AND (t.description LIKE '%일일 배당%' OR t.description LIKE '%Daily reward%' OR t.description LIKE '%daily reward%')
@@ -47496,108 +47499,60 @@ app.get('/api/diag/fix-duplicate-daily-reward-tx', async (c) => {
     `).all()
     const groups = (dupGroups.results || []) as any[]
 
-    const plan: any[] = []
-    const skipped: any[] = []
-    let totalDeleteAmount = 0
+    // 2) 삭제 대상 tx id 와 amount 수집 (각 그룹의 MIN(id) 제외한 모든 것)
+    const deletePlan: Array<{ user_id: number; user_name: string; kst_date: string; keep_id: number; delete_id: number; delete_amount: number }> = []
     const txIdsToDelete: number[] = []
     const balanceDeductions: Record<number, number> = {}
+    let totalDeleteAmount = 0
 
     for (const g of groups) {
       const userId = Number(g.user_id)
+      const userName = String(g.user_name || '')
       const kstDate = String(g.kst_date)
-      const txSum = Number(g.tx_sum)
+      const keepId = Number(g.keep_tx_id)
       const txIds = String(g.tx_ids).split(',').map((x) => Number(x))
       const amounts = String(g.amounts).split(',').map((x) => Number(x))
 
-      // 2) 해당 (user_id, reward_date) 의 dr 정상 합계 조회
-      const drRow = await db.prepare(`
-        SELECT COALESCE(SUM(usdt_amount), 0) AS dr_sum, COUNT(*) AS dr_cnt
-        FROM daily_rewards
-        WHERE user_id = ? AND reward_date = ?
-      `).bind(userId, kstDate).first() as any
-      const drSum = Number(drRow?.dr_sum || 0)
-      const drCnt = Number(drRow?.dr_cnt || 0)
-
-      // 3) 초과 금액 계산
-      const excess = txSum - drSum
-
-      // 4) 초과 금액과 일치하는 tx 찾기 — 가장 큰 id (나중 INSERT) 부터 시도
-      const txDetails = await db.prepare(`
-        SELECT id, amount FROM transactions
-        WHERE id IN (${txIds.map(() => '?').join(',')})
-        ORDER BY id DESC
-      `).bind(...txIds).all()
-      const txList = (txDetails.results || []) as any[]
-
-      // 케이스 A: excess == 0 → dr 정상이고 tx 도 정상 합계지만 2개로 쪼개진 케이스 → SKIP (분할 가능성, 수동 판단 필요)
-      if (excess === 0) {
-        skipped.push({
-          reason: 'excess=0 (tx_sum == dr_sum but split into multiple tx)',
-          user_id: userId, kst_date: kstDate,
-          tx_sum: txSum, dr_sum: drSum, dr_cnt: drCnt,
-          tx_ids: txIds, amounts,
+      for (let i = 0; i < txIds.length; i++) {
+        if (txIds[i] === keepId) continue
+        deletePlan.push({
+          user_id: userId,
+          user_name: userName,
+          kst_date: kstDate,
+          keep_id: keepId,
+          delete_id: txIds[i],
+          delete_amount: amounts[i],
         })
-        continue
+        txIdsToDelete.push(txIds[i])
+        balanceDeductions[userId] = (balanceDeductions[userId] || 0) + amounts[i]
+        totalDeleteAmount += amounts[i]
       }
-
-      // 케이스 B: 단일 tx 의 amount == excess 인 것 찾기 (가장 큰 id 우선)
-      let targetTxId: number | null = null
-      let targetAmount = 0
-      for (const tx of txList) {
-        if (Number(tx.amount) === excess) {
-          targetTxId = Number(tx.id)
-          targetAmount = Number(tx.amount)
-          break
-        }
-      }
-
-      // 케이스 C: 단일 tx 가 정확히 일치 안하면 → SKIP (수동 판단 안 함)
-      if (targetTxId === null) {
-        skipped.push({
-          reason: 'no single tx amount matches excess',
-          user_id: userId, kst_date: kstDate,
-          tx_sum: txSum, dr_sum: drSum, excess,
-          tx_ids: txIds, amounts,
-        })
-        continue
-      }
-
-      // 4) 삭제 계획 수립
-      plan.push({
-        user_id: userId, kst_date: kstDate,
-        tx_sum: txSum, dr_sum: drSum, excess,
-        delete_tx_id: targetTxId, delete_amount: targetAmount,
-        remaining_tx_ids: txIds.filter((id) => id !== targetTxId),
-        original_tx_ids: txIds, original_amounts: amounts,
-      })
-      txIdsToDelete.push(targetTxId)
-      totalDeleteAmount += targetAmount
-      balanceDeductions[userId] = (balanceDeductions[userId] || 0) + targetAmount
     }
 
-    // 5) DRY-RUN 출력
+    // 3) DRY-RUN 출력
     if (!exec) {
       return c.json({
         ok: true,
         mode: 'DRY-RUN',
         total_dup_groups: groups.length,
-        plan_count: plan.length,
-        skip_count: skipped.length,
         total_delete_tx: txIdsToDelete.length,
         total_delete_amount_qkey: totalDeleteAmount,
         affected_users: Object.keys(balanceDeductions).length,
         balance_deductions_preview: balanceDeductions,
-        plan: plan.slice(0, 50),
-        skipped: skipped.slice(0, 50),
+        delete_plan: deletePlan.slice(0, 100),
         next_step: 'add &exec=true to execute',
         duration_ms: Date.now() - t0,
       })
     }
 
-    // 6) EXEC — batch DELETE + balance UPDATE
+    // 4) EXEC — batch DELETE + balance UPDATE
     const stmts: any[] = []
-    for (const txId of txIdsToDelete) {
-      stmts.push(db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txId))
+    // tx 삭제는 chunk 로 (D1 SQL_MAX_LENGTH 안전)
+    const CHUNK = 50
+    for (let i = 0; i < txIdsToDelete.length; i += CHUNK) {
+      const chunk = txIdsToDelete.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      stmts.push(db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...chunk))
     }
     for (const [uidStr, deduction] of Object.entries(balanceDeductions)) {
       const uid = Number(uidStr)
@@ -47605,7 +47560,7 @@ app.get('/api/diag/fix-duplicate-daily-reward-tx', async (c) => {
     }
     await db.batch(stmts)
 
-    // 7) 검증 — 다시 dup 검사
+    // 5) 검증 — 다시 dup 검사
     const verifyAfter = await db.prepare(`
       SELECT COUNT(*) AS dup_left
       FROM (
@@ -47622,15 +47577,12 @@ app.get('/api/diag/fix-duplicate-daily-reward-tx', async (c) => {
       ok: true,
       mode: 'EXEC',
       total_dup_groups: groups.length,
-      plan_count: plan.length,
-      skip_count: skipped.length,
       total_delete_tx: txIdsToDelete.length,
       total_delete_amount_qkey: totalDeleteAmount,
       affected_users: Object.keys(balanceDeductions).length,
       balance_deductions: balanceDeductions,
       dup_left_after: Number(verifyAfter?.dup_left || 0),
       verdict_after: Number(verifyAfter?.dup_left || 0) === 0 ? '✅ 모든 중복 제거됨' : `🚨 ${verifyAfter?.dup_left}건 남음`,
-      skipped: skipped.slice(0, 50),
       duration_ms: Date.now() - t0,
     })
   } catch (error) {
