@@ -45636,6 +45636,242 @@ app.post('/api/diag/recalc-single-reward-date', async (c) => {
 })
 
 // ============================================================================
+// user-reward-audit: 특정 사용자 의 특정 paid_date 전체 reward 흔적 (READ-ONLY)
+//
+//   사장님 명령: "이현우 김주성 12일 중복 점검"
+//
+//   대상자 찾기:
+//     - name LIKE 또는 user_id 직접
+//   검사 항목:
+//     ① 그 user_id 가 해당 paid_date 에 받은 모든 daily_qkey tx
+//     ② 그 user_id 가 해당 paid_date 에 받은 모든 referral_reward / direct_referral tx
+//     ③ 매칭된 daily_rewards row 전부 (reward_date 별)
+//     ④ 매칭된 referral_rewards row 전부 (reward_date 별)
+//     ⑤ 사용자 staking 목록 (active/completed/capped)
+//     ⑥ 누적 paid_total vs 200% target
+//
+//   엔드포인트:
+//     GET /api/diag/user-reward-audit?key=ADMIN_PW&paidDate=2026-05-12&names=이현우,김주성
+//     GET /api/diag/user-reward-audit?key=ADMIN_PW&paidDate=2026-05-12&userIds=1,2,3
+// ============================================================================
+app.get('/api/diag/user-reward-audit', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const paidDate = c.req.query('paidDate') || ''
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(paidDate)) {
+      return c.json({ error: 'paidDate=YYYY-MM-DD required' }, 400)
+    }
+    const namesQ = c.req.query('names') || ''
+    const userIdsQ = c.req.query('userIds') || ''
+    const db = c.env.DB
+
+    // 대상 user_id 수집
+    const userIds: number[] = []
+    const userMap = new Map<number, any>()
+
+    if (userIdsQ) {
+      const ids = userIdsQ.split(',').map(s => Number(s.trim())).filter(n => !isNaN(n))
+      for (const id of ids) userIds.push(id)
+    }
+    if (namesQ) {
+      const names = namesQ.split(',').map(s => s.trim()).filter(Boolean)
+      for (const nm of names) {
+        const rows = await db.prepare(`
+          SELECT id, name, email, qkey_balance, referrer_id
+          FROM users
+          WHERE name LIKE ? OR name LIKE ? OR name LIKE ?
+        `).bind(`%${nm}%`, `${nm}%`, `%${nm}`).all()
+        for (const u of (rows.results || []) as any[]) {
+          if (!userIds.includes(Number(u.id))) userIds.push(Number(u.id))
+          userMap.set(Number(u.id), u)
+        }
+      }
+    }
+
+    if (userIds.length === 0) {
+      return c.json({ error: 'no user found. provide names= or userIds=' }, 400)
+    }
+
+    // user info 보완
+    const missing = userIds.filter(id => !userMap.has(id))
+    if (missing.length > 0) {
+      const ph = missing.map(() => '?').join(',')
+      const rows = await db.prepare(`SELECT id, name, email, qkey_balance, referrer_id FROM users WHERE id IN (${ph})`).bind(...missing).all()
+      for (const u of (rows.results || []) as any[]) userMap.set(Number(u.id), u)
+    }
+
+    const USD_TO_QKEY = 150
+    const result: any[] = []
+
+    for (const uid of userIds) {
+      const u = userMap.get(uid) || { id: uid, name: '(unknown)', email: '', qkey_balance: 0 }
+
+      // ① paid_date 의 daily_qkey tx
+      const dqTxRows = await db.prepare(`
+        SELECT id, amount, description, ref_id,
+               created_at,
+               datetime(created_at,'+9 hours') AS kst_at
+        FROM transactions
+        WHERE user_id = ? AND coin_type='QKEY' AND type='daily_qkey'
+          AND ref_id IN (SELECT id FROM daily_rewards WHERE paid_date = ?)
+        ORDER BY created_at ASC, id ASC
+      `).bind(uid, paidDate).all()
+      const dqTxs = (dqTxRows.results || []) as any[]
+
+      // ② paid_date 의 referral/direct tx
+      const rrTxRows = await db.prepare(`
+        SELECT id, amount, description, ref_id, type,
+               created_at,
+               datetime(created_at,'+9 hours') AS kst_at
+        FROM transactions
+        WHERE user_id = ? AND coin_type='QKEY' AND type IN ('referral_reward','direct_referral')
+          AND ref_id IN (SELECT id FROM referral_rewards WHERE paid_date = ?)
+        ORDER BY created_at ASC, id ASC
+      `).bind(uid, paidDate).all()
+      const rrTxs = (rrTxRows.results || []) as any[]
+
+      // ③ 매칭 daily_rewards row
+      const dqRefIds = dqTxs.map((t: any) => Number(t.ref_id)).filter((n: number) => !isNaN(n))
+      let drRows: any[] = []
+      if (dqRefIds.length > 0) {
+        const ph = dqRefIds.map(() => '?').join(',')
+        const r = await db.prepare(`
+          SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date,
+                 datetime(created_at,'+9 hours') AS kst_at
+          FROM daily_rewards WHERE id IN (${ph})
+        `).bind(...dqRefIds).all()
+        drRows = (r.results || []) as any[]
+      }
+
+      // 추가: paid_date 기준 모든 DR (혹시 ref_id 매칭 안 된 것 있으면 발견)
+      const drAllRows = await db.prepare(`
+        SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date,
+               datetime(created_at,'+9 hours') AS kst_at
+        FROM daily_rewards WHERE user_id = ? AND paid_date = ?
+        ORDER BY created_at ASC, id ASC
+      `).bind(uid, paidDate).all()
+      const drAll = (drAllRows.results || []) as any[]
+
+      // ④ 매칭 referral_rewards row (이 user 가 referrer)
+      const rrRefIds = rrTxs.map((t: any) => Number(t.ref_id)).filter((n: number) => !isNaN(n))
+      let rrRows: any[] = []
+      if (rrRefIds.length > 0) {
+        const ph = rrRefIds.map(() => '?').join(',')
+        const r = await db.prepare(`
+          SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+                 staking_id, reward_date, paid_date,
+                 datetime(created_at,'+9 hours') AS kst_at
+          FROM referral_rewards WHERE id IN (${ph})
+        `).bind(...rrRefIds).all()
+        rrRows = (r.results || []) as any[]
+      }
+
+      const rrAllRows = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+               staking_id, reward_date, paid_date,
+               datetime(created_at,'+9 hours') AS kst_at
+        FROM referral_rewards WHERE referrer_id = ? AND paid_date = ?
+        ORDER BY created_at ASC, id ASC
+      `).bind(uid, paidDate).all()
+      const rrAll = (rrAllRows.results || []) as any[]
+
+      // ⑤ staking 목록
+      const stRows = await db.prepare(`
+        SELECT id, amount, daily_rate, status,
+               date(start_date,'+9 hours') AS start_kst,
+               date(end_date,'+9 hours') AS end_kst
+        FROM staking
+        WHERE user_id = ? AND status IN ('active','completed','capped')
+        ORDER BY id ASC
+      `).bind(uid).all()
+      const stakings = (stRows.results || []) as any[]
+      const stakeTotal = stakings.reduce((s, r) => s + Number(r.amount || 0), 0)
+      const target200 = stakeTotal * 2 * USD_TO_QKEY
+
+      // ⑥ 누적 paid_total
+      const paidTotalRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM transactions
+        WHERE user_id = ? AND coin_type='QKEY'
+          AND type IN ('daily_qkey','referral_reward','direct_referral')
+      `).bind(uid).first() as any
+      const paidTotal = Number(paidTotalRow?.total || 0)
+
+      // 중복 의심 분석:
+      //   (a) daily_qkey tx 갯수 vs staking 갯수 (가입자 1개 staking → 1 DR → 1 tx 가 정상)
+      //   (b) 동일 (user_id, staking_id, reward_date) 의 DR 갯수 > 1 인 것 있는지
+      const drGroupKey = new Map<string, number>()
+      for (const dr of drAll) {
+        const k = `${dr.staking_id}|${dr.reward_date}`
+        drGroupKey.set(k, (drGroupKey.get(k) || 0) + 1)
+      }
+      const drDupSamples = Array.from(drGroupKey.entries())
+        .filter(([_, c]) => c > 1)
+        .map(([k, c]) => ({ key: k, count: c }))
+
+      // reward_date 별 daily_qkey tx 갯수
+      const dqByRewardDate: Record<string, { cnt: number, total: number }> = {}
+      for (const dr of drAll) {
+        const k = String(dr.reward_date)
+        if (!dqByRewardDate[k]) dqByRewardDate[k] = { cnt: 0, total: 0 }
+        dqByRewardDate[k].cnt += 1
+        dqByRewardDate[k].total += Number(dr.usdt_amount) * USD_TO_QKEY
+      }
+      // tx 기준 reward_date 별 (DR row 와 일치하는지 비교)
+      const dqTxByMin: Record<string, { cnt: number, total: number }> = {}
+      for (const tx of dqTxs) {
+        const k = String(tx.kst_at || '').slice(0, 16)
+        if (!dqTxByMin[k]) dqTxByMin[k] = { cnt: 0, total: 0 }
+        dqTxByMin[k].cnt += 1
+        dqTxByMin[k].total += Number(tx.amount)
+      }
+
+      const dqSum = dqTxs.reduce((s, t) => s + Number(t.amount), 0)
+      const rrSum = rrTxs.reduce((s, t) => s + Number(t.amount), 0)
+
+      result.push({
+        user: { id: uid, name: u.name, email: u.email, qkey_balance: Number(u.qkey_balance || 0), referrer_id: u.referrer_id },
+        staking: { count: stakings.length, total_amount: stakeTotal, target_200pct: target200, rows: stakings },
+        paid_total_all_time: paidTotal,
+        cap_check: { paid: paidTotal, target: target200, over: paidTotal > target200, remaining: Math.max(0, target200 - paidTotal) },
+        daily_qkey_on_date: {
+          tx_count: dqTxs.length,
+          tx_total: dqSum,
+          dr_rows_via_ref_id: drRows.length,
+          dr_rows_by_paid_date: drAll.length,
+          dr_duplicates: drDupSamples,
+          tx_by_kst_minute: dqTxByMin,
+          dr_by_reward_date: dqByRewardDate,
+          tx_samples: dqTxs.slice(0, 20),
+          dr_samples: drAll.slice(0, 20),
+        },
+        referral_on_date: {
+          tx_count: rrTxs.length,
+          tx_total: rrSum,
+          rr_rows_via_ref_id: rrRows.length,
+          rr_rows_by_paid_date: rrAll.length,
+          tx_samples: rrTxs.slice(0, 20),
+          rr_samples: rrAll.slice(0, 20),
+        },
+      })
+    }
+
+    return c.json({
+      ok: true,
+      action: 'user-reward-audit',
+      paid_date: paidDate,
+      users_audited: result.length,
+      result,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
 // verify-paid-date: 사장님 영구룰 검수 endpoint
 //   특정 paid_date 의 DR/RR/tx 정합 + 중복 확인 (READ-ONLY)
 //
