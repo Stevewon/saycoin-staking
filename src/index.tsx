@@ -47534,6 +47534,206 @@ app.get('/api/diag/daily-reward-dup-check', async (c) => {
   }
 })
 
+// fix-duplicate-qkey-tx-v3: 전수 QKEY 모든 type 중복 tx 제거 (balance 차감 없음)
+// - 영구룰: balance 는 마지막에 := tx_sum 으로 통째로 동기화 되므로, 여기서는 tx DELETE 만 함
+// - 음수 amount (admin_adjustment 환수) 도 중복이면 같이 제거
+// - 같은 (user_id, kst_date, type, amount, description) 그룹화. MIN(id) 1건 보존, 나머지 삭제.
+// - 보호: 다른 coin tx 절대 건드리지 않음.
+// DRY-RUN: GET /api/diag/fix-duplicate-qkey-tx-v3?key=ADMIN_PW
+// EXEC:    GET /api/diag/fix-duplicate-qkey-tx-v3?key=ADMIN_PW&exec=true
+app.get('/api/diag/fix-duplicate-qkey-tx-v3', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const exec = (c.req.query('exec') || '').toLowerCase() === 'true'
+    const db = c.env.DB
+
+    // 1) 중복 그룹 식별 — 모든 type (단 _purge_internal, balance_sync 보정용 제외)
+    const dupGroups = await db.prepare(`
+      SELECT t.user_id,
+             u.name AS user_name,
+             date(t.created_at, '+9 hours') AS kst_date,
+             t.type,
+             t.amount,
+             t.description,
+             COUNT(*) AS cnt,
+             MIN(t.id) AS keep_tx_id,
+             GROUP_CONCAT(t.id) AS tx_ids
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE LOWER(t.coin_type) = 'qkey'
+        AND t.type NOT IN ('_purge_internal', 'balance_sync')
+      GROUP BY t.user_id, kst_date, t.type, t.amount, t.description
+      HAVING COUNT(*) > 1
+      ORDER BY t.user_id ASC, kst_date ASC, t.type ASC
+    `).all()
+    const groups = (dupGroups.results || []) as any[]
+
+    const deletePlan: any[] = []
+    const txIdsToDelete: number[] = []
+    const sumPerUser: Record<number, number> = {}
+    let totalDeleteSum = 0
+
+    for (const g of groups) {
+      const userId = Number(g.user_id)
+      const userName = String(g.user_name || '')
+      const kstDate = String(g.kst_date)
+      const txType = String(g.type)
+      const amount = Number(g.amount)
+      const description = String(g.description || '')
+      const cnt = Number(g.cnt)
+      const keepId = Number(g.keep_tx_id)
+      const txIds = String(g.tx_ids).split(',').map((x) => Number(x))
+
+      const deleteIds = txIds.filter((id) => id !== keepId)
+      const deletedSum = deleteIds.length * amount
+
+      deletePlan.push({
+        user_id: userId, user_name: userName, kst_date: kstDate,
+        type: txType, amount, description, cnt,
+        keep_id: keepId, delete_ids: deleteIds, deleted_sum: deletedSum,
+      })
+      for (const did of deleteIds) txIdsToDelete.push(did)
+      sumPerUser[userId] = (sumPerUser[userId] || 0) + deletedSum
+      totalDeleteSum += deletedSum
+    }
+
+    if (!exec) {
+      return c.json({
+        ok: true, mode: 'DRY-RUN',
+        total_dup_groups: groups.length,
+        total_delete_tx: txIdsToDelete.length,
+        total_delete_amount_sum: totalDeleteSum,
+        affected_users: Object.keys(sumPerUser).length,
+        sum_change_per_user: sumPerUser,
+        delete_plan: deletePlan.slice(0, 200),
+        next_step: 'add &exec=true to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC: DELETE 만, balance 는 손대지 않음
+    const stmts: any[] = []
+    const CHUNK = 50
+    for (let i = 0; i < txIdsToDelete.length; i += CHUNK) {
+      const chunk = txIdsToDelete.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      stmts.push(db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...chunk))
+    }
+    if (stmts.length > 0) await db.batch(stmts)
+
+    // 검증
+    const verifyAfter = await db.prepare(`
+      SELECT COUNT(*) AS dup_left FROM (
+        SELECT user_id, date(created_at, '+9 hours') AS kst_date, type, amount, description, COUNT(*) AS cnt
+        FROM transactions
+        WHERE LOWER(coin_type) = 'qkey' AND type NOT IN ('_purge_internal', 'balance_sync')
+        GROUP BY user_id, kst_date, type, amount, description
+        HAVING COUNT(*) > 1
+      )
+    `).first() as any
+
+    return c.json({
+      ok: true, mode: 'EXEC',
+      total_dup_groups: groups.length,
+      total_delete_tx: txIdsToDelete.length,
+      total_delete_amount_sum: totalDeleteSum,
+      affected_users: Object.keys(sumPerUser).length,
+      sum_change_per_user: sumPerUser,
+      dup_left_after: Number(verifyAfter?.dup_left || 0),
+      verdict_after: Number(verifyAfter?.dup_left || 0) === 0 ? '✅ 모든 중복 제거됨' : `🚨 ${verifyAfter?.dup_left}건 남음`,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// balance-force-sync-all: 모든 사용자 qkey_balance := SUM(all qkey tx) 강제 동기화 (영구룰 #balance↔tx정합)
+// - mismatched 사용자만 또는 전체 사용자 (force) 지원
+// - tx INSERT 없음. UPDATE 만.
+// DRY-RUN: GET /api/diag/balance-force-sync-all?key=ADMIN_PW
+// EXEC:    GET /api/diag/balance-force-sync-all?key=ADMIN_PW&exec=true
+app.get('/api/diag/balance-force-sync-all', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const exec = (c.req.query('exec') || '').toLowerCase() === 'true'
+    const db = c.env.DB
+
+    // 모든 사용자 + tx 합계 (대소문자 무시)
+    const rows = await db.prepare(`
+      SELECT u.id, u.name, u.email, u.qkey_balance AS balance,
+             COALESCE((SELECT SUM(amount) FROM transactions
+                       WHERE user_id=u.id AND LOWER(coin_type)='qkey'), 0) AS tx_sum
+      FROM users u
+      ORDER BY u.id ASC
+    `).all()
+    const userList = (rows.results || []) as any[]
+
+    const updates: any[] = []
+    let totalDelta = 0
+    for (const u of userList) {
+      const bal = Number(u.balance || 0)
+      const tx = Number(u.tx_sum || 0)
+      if (bal !== tx) {
+        updates.push({
+          user_id: Number(u.id),
+          name: String(u.name || ''),
+          email: String(u.email || ''),
+          old_balance: bal,
+          new_balance: tx,
+          delta: tx - bal,
+        })
+        totalDelta += (tx - bal)
+      }
+    }
+
+    if (!exec) {
+      return c.json({
+        ok: true, mode: 'DRY-RUN',
+        total_users: userList.length,
+        update_count: updates.length,
+        total_delta: totalDelta,
+        updates,
+        next_step: 'add &exec=true to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC
+    const stmts: any[] = []
+    for (const u of updates) {
+      stmts.push(db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(u.new_balance, u.user_id))
+    }
+    if (stmts.length > 0) await db.batch(stmts)
+
+    // 검증
+    const verifyAfter = await db.prepare(`
+      SELECT COUNT(*) AS mismatched_left FROM users u
+      WHERE u.qkey_balance != COALESCE((SELECT SUM(amount) FROM transactions
+                                        WHERE user_id=u.id AND LOWER(coin_type)='qkey'), 0)
+    `).first() as any
+
+    return c.json({
+      ok: true, mode: 'EXEC',
+      total_users: userList.length,
+      update_count: updates.length,
+      total_delta: totalDelta,
+      mismatched_left: Number(verifyAfter?.mismatched_left || 0),
+      verdict: Number(verifyAfter?.mismatched_left || 0) === 0
+        ? '✅ 모든 사용자 balance ↔ tx 정합 완료'
+        : `🚨 ${verifyAfter?.mismatched_left} 사용자 잔여 mismatch`,
+      updates,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 // fix-duplicate-qkey-tx-v2: 전수 QKEY 보상 중복 제거 (대소문자 무시, 일일배당 + 추천보상)
 // 영구룰 #중복지급금지 위반 tx 제거
 // 알고리즘:
