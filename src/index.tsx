@@ -47460,6 +47460,143 @@ app.get('/api/diag/daily-reward-dup-check', async (c) => {
   }
 })
 
+// fix-duplicate-qkey-tx-v2: 전수 QKEY 보상 중복 제거 (대소문자 무시, 일일배당 + 추천보상)
+// 영구룰 #중복지급금지 위반 tx 제거
+// 알고리즘:
+//   1) LOWER(coin_type)='qkey' AND amount>0 AND type IN (daily_qkey, referral_reward) 모든 tx 조회
+//   2) 같은 (user_id, kst_date, type, amount, description) 그룹화
+//   3) cnt > 1 이면 MIN(id) 1건 보존, 나머지 모두 삭제
+//   4) 삭제한 amount 합계만큼 users.qkey_balance 차감
+// 보호: dr/rr 테이블 절대 건드리지 않음. 다른 coin/type tx 절대 건드리지 않음.
+// DRY-RUN: GET /api/diag/fix-duplicate-qkey-tx-v2?key=ADMIN_PW
+// EXEC:    GET /api/diag/fix-duplicate-qkey-tx-v2?key=ADMIN_PW&exec=true
+app.get('/api/diag/fix-duplicate-qkey-tx-v2', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const exec = (c.req.query('exec') || '').toLowerCase() === 'true'
+    const db = c.env.DB
+
+    // 1) 중복 그룹 식별 (대소문자 무시 + type/amount/description 일치 기준)
+    const dupGroups = await db.prepare(`
+      SELECT t.user_id,
+             u.name AS user_name,
+             date(t.created_at, '+9 hours') AS kst_date,
+             t.type,
+             t.amount,
+             t.description,
+             COUNT(*) AS cnt,
+             MIN(t.id) AS keep_tx_id,
+             GROUP_CONCAT(t.id) AS tx_ids,
+             SUM(t.amount) AS group_sum
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE LOWER(t.coin_type) = 'qkey'
+        AND t.amount > 0
+        AND t.type IN ('daily_qkey', 'referral_reward')
+      GROUP BY t.user_id, kst_date, t.type, t.amount, t.description
+      HAVING COUNT(*) > 1
+      ORDER BY t.user_id ASC, kst_date ASC, t.type ASC
+    `).all()
+    const groups = (dupGroups.results || []) as any[]
+
+    // 2) 삭제 대상 tx id 수집
+    const deletePlan: any[] = []
+    const txIdsToDelete: number[] = []
+    const balanceDeductions: Record<number, number> = {}
+    let totalDeleteAmount = 0
+
+    for (const g of groups) {
+      const userId = Number(g.user_id)
+      const userName = String(g.user_name || '')
+      const kstDate = String(g.kst_date)
+      const txType = String(g.type)
+      const amount = Number(g.amount)
+      const description = String(g.description || '')
+      const cnt = Number(g.cnt)
+      const keepId = Number(g.keep_tx_id)
+      const txIds = String(g.tx_ids).split(',').map((x) => Number(x))
+
+      const deleteIds = txIds.filter((id) => id !== keepId)
+      const deletedAmount = deleteIds.length * amount
+
+      deletePlan.push({
+        user_id: userId,
+        user_name: userName,
+        kst_date: kstDate,
+        type: txType,
+        amount,
+        description,
+        cnt,
+        keep_id: keepId,
+        delete_ids: deleteIds,
+        deleted_amount_sum: deletedAmount,
+      })
+
+      for (const did of deleteIds) txIdsToDelete.push(did)
+      balanceDeductions[userId] = (balanceDeductions[userId] || 0) + deletedAmount
+      totalDeleteAmount += deletedAmount
+    }
+
+    // 3) DRY-RUN 출력
+    if (!exec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY-RUN',
+        total_dup_groups: groups.length,
+        total_delete_tx: txIdsToDelete.length,
+        total_delete_amount_qkey: totalDeleteAmount,
+        affected_users: Object.keys(balanceDeductions).length,
+        balance_deductions_preview: balanceDeductions,
+        delete_plan_sample: deletePlan.slice(0, 100),
+        next_step: 'add &exec=true to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // 4) EXEC — batch DELETE + balance UPDATE
+    const stmts: any[] = []
+    const CHUNK = 50
+    for (let i = 0; i < txIdsToDelete.length; i += CHUNK) {
+      const chunk = txIdsToDelete.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(',')
+      stmts.push(db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...chunk))
+    }
+    for (const [uidStr, deduction] of Object.entries(balanceDeductions)) {
+      const uid = Number(uidStr)
+      stmts.push(db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(deduction, uid))
+    }
+    await db.batch(stmts)
+
+    // 5) 검증 — 다시 dup 검사
+    const verifyAfter = await db.prepare(`
+      SELECT COUNT(*) AS dup_left FROM (
+        SELECT user_id, date(created_at, '+9 hours') AS kst_date, type, amount, description, COUNT(*) AS cnt
+        FROM transactions
+        WHERE LOWER(coin_type) = 'qkey' AND amount > 0 AND type IN ('daily_qkey', 'referral_reward')
+        GROUP BY user_id, kst_date, type, amount, description
+        HAVING COUNT(*) > 1
+      )
+    `).first() as any
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      total_dup_groups: groups.length,
+      total_delete_tx: txIdsToDelete.length,
+      total_delete_amount_qkey: totalDeleteAmount,
+      affected_users: Object.keys(balanceDeductions).length,
+      balance_deductions: balanceDeductions,
+      dup_left_after: Number(verifyAfter?.dup_left || 0),
+      verdict_after: Number(verifyAfter?.dup_left || 0) === 0 ? '✅ 모든 중복 제거됨' : `🚨 ${verifyAfter?.dup_left}건 남음`,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 // fix-duplicate-daily-reward-tx: 영구룰 #중복지급금지 위반 일일배당 tx 제거 (단순 로직)
 // 알고리즘 (사장님 직접 명령):
 //   1) transactions QKEY 일일배당 (user_id, kst_date) 별로 2건 이상 그룹 찾기
