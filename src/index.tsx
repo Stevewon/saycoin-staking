@@ -42779,5 +42779,360 @@ app.get('/api/diag/recompute-bottom-up-dividend', async (c) => {
   }
 })
 
+// ============================================================================
+// reconcile-bottom-up-dividend: 영구룰 expected vs actual 가감을 실제 DB 에 반영
+//
+//   계산 방식 (recompute-bottom-up-dividend 와 정확히 동일):
+//     - expected DR: staking 별 amount × daily_rate × 150
+//     - expected L1: 본인이 추천한 사람의 DR × 0.20
+//     - expected L2: 추천인의 추천인의 DR × 0.10
+//     - #스테이킹별독립 (staking_id 단위)
+//
+//   조치 (DRY-RUN/EXEC 분리):
+//     [A] 잉여 RR row 삭제 + 매칭 transactions 삭제 + balance 차감
+//         - actual_referrer L1/L2 에서 영구룰 expected 초과분만큼
+//         - staking_id=NULL 우선 삭제 (legacy 사고 흔적)
+//     [B] 누락 RR row INSERT + transactions INSERT + balance 가산
+//         - expected referrer 의 staking_null + missing 분만큼
+//
+//   marker: description 에 `[RECONCILE 2026-05-12→2026-05-13]` 박음 (추후 식별/롤백용)
+//
+//   GET  /api/diag/reconcile-bottom-up-dividend?key=...&dividendDate=2026-05-12&payoutDate=2026-05-13 → DRY_RUN
+//   POST /api/diag/reconcile-bottom-up-dividend?key=...&dividendDate=...&payoutDate=...&confirm=GO → EXEC
+// ============================================================================
+async function diagReconcileBottomUpDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
+  const t0 = Date.now()
+  try {
+    const db = c.env.DB as D1Database
+    const dividendDate = c.req.query('dividendDate') || '2026-05-12'
+    const payoutDate = c.req.query('payoutDate') || '2026-05-13'
+    const USD_TO_QKEY = 150
+    const MARKER = `[RECONCILE ${dividendDate}→${payoutDate}]`
+
+    // ── 1. expected 재계산 (recompute 와 동일) ──
+    const stRows = await db.prepare(`
+      SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate,
+             u.referrer_id
+      FROM staking s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.status = 'active'
+        AND date(s.start_date,'+9 hours') <= date(?)
+        AND date(s.end_date,'+9 hours') >= date(?)
+      ORDER BY s.user_id, s.id
+    `).bind(dividendDate, dividendDate).all()
+    const stakings = (stRows.results || []) as any[]
+
+    // userMap: 2-hop 까지 referrer 캐시
+    const userMap = new Map<number, { referrer_id: number | null }>()
+    for (const s of stakings) {
+      if (!userMap.has(s.user_id)) userMap.set(s.user_id, { referrer_id: s.referrer_id ?? null })
+    }
+    const hop1: number[] = []
+    for (const v of userMap.values()) if (v.referrer_id != null && !userMap.has(v.referrer_id)) hop1.push(v.referrer_id)
+    if (hop1.length > 0) {
+      const ph = hop1.map(() => '?').join(',')
+      const r1 = await db.prepare(`SELECT id, referrer_id FROM users WHERE id IN (${ph})`).bind(...hop1).all()
+      const hop2: number[] = []
+      for (const u of (r1.results || []) as any[]) {
+        userMap.set(u.id, { referrer_id: u.referrer_id ?? null })
+        if (u.referrer_id != null && !userMap.has(u.referrer_id)) hop2.push(u.referrer_id)
+      }
+      if (hop2.length > 0) {
+        const ph2 = hop2.map(() => '?').join(',')
+        const r2 = await db.prepare(`SELECT id, referrer_id FROM users WHERE id IN (${ph2})`).bind(...hop2).all()
+        for (const u of (r2.results || []) as any[]) {
+          userMap.set(u.id, { referrer_id: u.referrer_id ?? null })
+        }
+      }
+    }
+
+    // expected L1/L2: referrer_id → { total, details: [{ referee_id, referee_staking_id, qkeyAmount, reward }] }
+    const expectedL1 = new Map<number, { total: number, details: any[] }>()
+    const expectedL2 = new Map<number, { total: number, details: any[] }>()
+    for (const s of stakings) {
+      const qkey = Math.round(Number(s.amount) * Number(s.daily_rate) * USD_TO_QKEY)
+      const l1Id = userMap.get(s.user_id)?.referrer_id
+      if (l1Id) {
+        const r = Math.round(qkey * 0.20)
+        if (!expectedL1.has(l1Id)) expectedL1.set(l1Id, { total: 0, details: [] })
+        const e = expectedL1.get(l1Id)!
+        e.total += r
+        e.details.push({ referee_id: s.user_id, referee_staking_id: s.staking_id, qkey, reward: r })
+        const l2Id = userMap.get(l1Id)?.referrer_id
+        if (l2Id) {
+          const r2 = Math.round(qkey * 0.10)
+          if (!expectedL2.has(l2Id)) expectedL2.set(l2Id, { total: 0, details: [] })
+          const e2 = expectedL2.get(l2Id)!
+          e2.total += r2
+          e2.details.push({ l1_id: l1Id, referee_id: s.user_id, referee_staking_id: s.staking_id, qkey, reward: r2 })
+        }
+      }
+    }
+
+    // ── 2. actual RR (reward_date=dividendDate) — staking_null 우선 정렬 ──
+    const actualRR = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             reward_date, paid_date, staking_id
+      FROM referral_rewards
+      WHERE reward_date = ?
+      ORDER BY referrer_id, level,
+        CASE WHEN staking_id IS NULL THEN 0 ELSE 1 END,
+        paid_date DESC, id DESC
+    `).bind(dividendDate).all()
+    const actRR = (actualRR.results || []) as any[]
+
+    // actual map: referrer_id+level 별
+    const actMap = new Map<string, any[]>()
+    for (const r of actRR) {
+      const k = `${r.referrer_id}|${r.level}`
+      if (!actMap.has(k)) actMap.set(k, [])
+      actMap.get(k)!.push(r)
+    }
+
+    // ── 3. 잉여 (OVERPAID) RR row 식별 — staking_null 우선 삭제 ──
+    const overpaidDeletes: any[] = []  // { rr_id, referrer_id, level, reward_amount, staking_id }
+    // 모든 (referrer, level) 쌍 처리
+    const allKeys = new Set<string>()
+    for (const k of actMap.keys()) allKeys.add(k)
+    for (const refId of expectedL1.keys()) allKeys.add(`${refId}|1`)
+    for (const refId of expectedL2.keys()) allKeys.add(`${refId}|2`)
+
+    for (const k of allKeys) {
+      const [refIdStr, lvStr] = k.split('|')
+      const refId = Number(refIdStr)
+      const lv = Number(lvStr)
+      const expected = lv === 1 ? (expectedL1.get(refId)?.total || 0) : (expectedL2.get(refId)?.total || 0)
+      const actualRows = actMap.get(k) || []
+      const actualTotal = actualRows.reduce((s, r) => s + Number(r.reward_amount || 0), 0)
+      let overage = actualTotal - expected
+      if (overage <= 0) continue
+      // staking_null 부터 (이미 ORDER BY 로 정렬됨)
+      for (const r of actualRows) {
+        if (overage <= 0) break
+        const amt = Number(r.reward_amount || 0)
+        if (amt <= overage) {
+          overpaidDeletes.push({
+            rr_id: r.id, referrer_id: refId, level: lv,
+            reward_amount: amt, staking_id: r.staking_id, paid_date: r.paid_date,
+          })
+          overage -= amt
+        }
+        // 부분 차감(같은 amount 가 정확히 안 떨어지면) 안전을 위해 skip — 차후 누락 INSERT 단계서 해결
+      }
+    }
+    const overpaidRrIds = new Set(overpaidDeletes.map(x => x.rr_id))
+
+    // 삭제 후 남는 actual map 재계산
+    const remainAct = new Map<string, number>()
+    for (const r of actRR) {
+      if (overpaidRrIds.has(r.id)) continue
+      const k = `${r.referrer_id}|${r.level}`
+      remainAct.set(k, (remainAct.get(k) || 0) + Number(r.reward_amount || 0))
+    }
+
+    // ── 4. 누락 (MISSING/UNDERPAID) — 새 RR INSERT 후보 ──
+    //   잔여 actual < expected 인 (referrer, level) 에 대해
+    //   expected 의 details 중 아직 actual_set 에 staking_id 매칭 안 된 것 INSERT
+    const newInserts: any[] = [] // { referrer_id, referee_id, level, original_amount, reward_amount, staking_id }
+    // 현재 staking_id 별 actual 보유 set
+    const actByStakingKey = new Set<string>()
+    for (const r of actRR) {
+      if (overpaidRrIds.has(r.id)) continue
+      if (r.staking_id != null) {
+        actByStakingKey.add(`${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`)
+      }
+    }
+
+    function deficit(refId: number, lv: number): number {
+      const exp = lv === 1 ? (expectedL1.get(refId)?.total || 0) : (expectedL2.get(refId)?.total || 0)
+      return Math.max(0, exp - (remainAct.get(`${refId}|${lv}`) || 0))
+    }
+
+    for (const [refId, e] of expectedL1.entries()) {
+      let need = deficit(refId, 1)
+      if (need <= 0) continue
+      for (const d of e.details) {
+        const key = `${refId}|${d.referee_id}|1|${d.referee_staking_id}`
+        if (actByStakingKey.has(key)) continue
+        // 이 staking_id 에 대응하는 actual L1 없음 → INSERT 후보
+        newInserts.push({
+          referrer_id: refId, referee_id: d.referee_id, level: 1,
+          original_amount: d.qkey, reward_amount: d.reward, staking_id: d.referee_staking_id,
+        })
+        need -= d.reward
+        actByStakingKey.add(key)
+        if (need <= 0) break
+      }
+    }
+    for (const [refId, e] of expectedL2.entries()) {
+      let need = deficit(refId, 2)
+      if (need <= 0) continue
+      for (const d of e.details) {
+        const key = `${refId}|${d.referee_id}|2|${d.referee_staking_id}`
+        if (actByStakingKey.has(key)) continue
+        newInserts.push({
+          referrer_id: refId, referee_id: d.referee_id, level: 2,
+          original_amount: d.qkey, reward_amount: d.reward, staking_id: d.referee_staking_id,
+        })
+        need -= d.reward
+        actByStakingKey.add(key)
+        if (need <= 0) break
+      }
+    }
+
+    // ── 5. balance delta 사용자별 집계 (-삭제분 +INSERT분) ──
+    const balanceDelta = new Map<number, number>()
+    for (const x of overpaidDeletes) {
+      balanceDelta.set(x.referrer_id, (balanceDelta.get(x.referrer_id) || 0) - x.reward_amount)
+    }
+    for (const x of newInserts) {
+      balanceDelta.set(x.referrer_id, (balanceDelta.get(x.referrer_id) || 0) + x.reward_amount)
+    }
+
+    // 음수 잔고 체크
+    const uids = [...balanceDelta.keys()]
+    const balRows = uids.length > 0
+      ? await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id IN (${uids.map(() => '?').join(',')})`).bind(...uids).all()
+      : { results: [] }
+    const balMap = new Map<number, any>()
+    for (const u of (balRows.results || []) as any[]) balMap.set(u.id, u)
+    const balanceImpact = uids.map(uid => {
+      const u = balMap.get(uid)
+      const delta = balanceDelta.get(uid)!
+      const cur = Number(u?.qkey_balance || 0)
+      const post = cur + delta
+      return {
+        user_id: uid, name: u?.name, email: u?.email,
+        current_balance: cur, delta, post_balance: post,
+        will_go_negative: post < 0 && cur >= 0,
+      }
+    }).sort((a, b) => a.delta - b.delta)
+
+    // 정합 검증
+    const totalDeleteAmt = overpaidDeletes.reduce((s, x) => s + x.reward_amount, 0)
+    const totalInsertAmt = newInserts.reduce((s, x) => s + x.reward_amount, 0)
+    const netChange = totalInsertAmt - totalDeleteAmt
+
+    // ── DRY_RUN 보고 ──
+    if (mode === 'DRY_RUN') {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'reconcile-bottom-up-dividend',
+        input: { dividendDate, payoutDate, USD_TO_QKEY, marker: MARKER },
+        plan: {
+          delete_rr_count: overpaidDeletes.length,
+          delete_amount: totalDeleteAmt,
+          insert_rr_count: newInserts.length,
+          insert_amount: totalInsertAmt,
+          net_change: netChange,
+          affected_users: uids.length,
+        },
+        balance_impact: balanceImpact,
+        delete_sample: overpaidDeletes.slice(0, 20),
+        insert_sample: newInserts.slice(0, 20),
+        delete_staking_null_count: overpaidDeletes.filter(x => x.staking_id == null).length,
+        next_action: 'POST + confirm=GO 보내시면 EXEC. set-based batch.',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ── EXEC ──
+    // 음수 잔고 발생 시 자동 중단 (current >= 0 이었던 사용자만 체크)
+    const goNeg = balanceImpact.filter(b => b.will_go_negative)
+    if (goNeg.length > 0) {
+      return c.json({
+        ok: false,
+        error: '음수 잔고 발생 위험 — EXEC 중단',
+        will_go_negative_users: goNeg,
+        plan: {
+          delete_rr_count: overpaidDeletes.length,
+          insert_rr_count: newInserts.length,
+        },
+      }, 400)
+    }
+
+    // 5-1. RR DELETE (chunked batch) + matching tx DELETE
+    const CHUNK = 50
+    let rrDeleted = 0, txDeleted = 0, rrInserted = 0, txInserted = 0
+    for (let i = 0; i < overpaidDeletes.length; i += CHUNK) {
+      const slice = overpaidDeletes.slice(i, i + CHUNK)
+      const rrIds = slice.map(x => x.rr_id)
+      const ph = rrIds.map(() => '?').join(',')
+      const stmts: any[] = []
+      // tx 매칭은 type=referral_reward AND ref_id IN (...)
+      stmts.push(db.prepare(`DELETE FROM transactions WHERE type = 'referral_reward' AND ref_id IN (${ph})`).bind(...rrIds))
+      stmts.push(db.prepare(`DELETE FROM referral_rewards WHERE id IN (${ph})`).bind(...rrIds))
+      const res = await db.batch(stmts)
+      txDeleted += Number((res[0] as any)?.meta?.changes || 0)
+      rrDeleted += Number((res[1] as any)?.meta?.changes || 0)
+    }
+
+    // 5-2. RR INSERT + tx INSERT (개별 — last_row_id 캡처 필요)
+    for (const x of newInserts) {
+      const desc = `추천 보너스 (Level ${x.level}) ${MARKER}`
+      const rrIns = await db.prepare(`
+        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(x.referrer_id, x.referee_id, x.level, x.original_amount, x.reward_amount, dividendDate, payoutDate, x.staking_id).run()
+      const rrId = (rrIns as any)?.meta?.last_row_id
+      if (rrId) {
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(x.referrer_id, x.reward_amount, desc, rrId).run()
+        rrInserted++
+        txInserted++
+      }
+    }
+
+    // 5-3. balance 조정 (chunked UPDATE)
+    for (const b of balanceImpact) {
+      if (b.delta === 0) continue
+      await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(b.delta, b.user_id).run()
+    }
+
+    // ── POST-CHECK ──
+    const postRR = await db.prepare(`
+      SELECT level, COUNT(*) AS rows, COALESCE(SUM(reward_amount),0) AS total
+      FROM referral_rewards WHERE reward_date = ?
+      GROUP BY level
+    `).bind(dividendDate).all()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      action: 'reconcile-bottom-up-dividend',
+      input: { dividendDate, payoutDate, marker: MARKER },
+      exec_result: {
+        rr_deleted: rrDeleted,
+        tx_deleted: txDeleted,
+        rr_inserted: rrInserted,
+        tx_inserted: txInserted,
+        balance_adjusted_users: balanceImpact.filter(b => b.delta !== 0).length,
+        net_qkey_change: netChange,
+      },
+      post_check: {
+        rr_by_level: postRR.results || [],
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (e: any) {
+    return c.json({ ok: false, error: String(e?.message || e), stack: e?.stack }, 500)
+  }
+}
+app.get('/api/diag/reconcile-bottom-up-dividend', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  return diagReconcileBottomUpDividend(c, 'DRY_RUN')
+})
+app.post('/api/diag/reconcile-bottom-up-dividend', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  if (confirm !== 'GO') return c.json({ error: 'confirm=GO 필요 (실 변경 게이트)' }, 400)
+  return diagReconcileBottomUpDividend(c, 'EXEC')
+})
+
 
 export default app
