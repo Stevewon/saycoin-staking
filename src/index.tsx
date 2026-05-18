@@ -47833,6 +47833,175 @@ app.get('/api/diag/dup-prevention-precheck', async (c) => {
   }
 })
 
+// ============================================================================
+// normalize-coin-type-qkey: 소문자 'qkey' → 'QKEY' 대문자 정규화
+// 영구룰 #중복지급금지 보강 — coin_type 대소문자 불일치로 인한 중복 검출 실패 방지
+// DRY-RUN: GET /api/diag/normalize-coin-type-qkey?key=ADMIN_PW
+// EXEC:    GET /api/diag/normalize-coin-type-qkey?key=ADMIN_PW&exec=true
+// ============================================================================
+app.get('/api/diag/normalize-coin-type-qkey', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const exec = c.req.query('exec') === 'true'
+  const db = c.env.DB
+  const t0 = Date.now()
+  try {
+    // BEFORE 분포
+    const before = await db.prepare(`
+      SELECT coin_type, COUNT(*) AS cnt
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey' AND coin_type != 'QKEY'
+      GROUP BY coin_type
+    `).all()
+
+    // 대상 tx 샘플
+    const sample = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description,
+             datetime(created_at,'+9 hours') AS kst_at
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey' AND coin_type != 'QKEY'
+      ORDER BY id ASC
+      LIMIT 30
+    `).all()
+
+    const beforeRows = (before.results || []) as any[]
+    const sampleRows = (sample.results || []) as any[]
+    const targetCnt = beforeRows.reduce((s, r) => s + Number(r.cnt || 0), 0)
+
+    if (!exec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        target_count: targetCnt,
+        before_distribution: beforeRows,
+        sample_first_30: sampleRows,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC
+    const upd = await db.prepare(`
+      UPDATE transactions
+      SET coin_type = 'QKEY'
+      WHERE LOWER(coin_type) = 'qkey' AND coin_type != 'QKEY'
+    `).run()
+
+    // AFTER 확인
+    const after = await db.prepare(`
+      SELECT coin_type, COUNT(*) AS cnt
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey'
+      GROUP BY coin_type
+    `).all()
+    const afterRows = (after.results || []) as any[]
+    const stillLower = afterRows.some((r: any) => r.coin_type !== 'QKEY')
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      updated_count: (upd as any)?.meta?.changes || 0,
+      before_distribution: beforeRows,
+      after_distribution: afterRows,
+      verdict: stillLower ? '🚨 소문자 잔여' : '✅ 모두 QKEY 대문자',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
+// apply-tx-unique-index: dr/rr UNIQUE INDEX 영구 가드 적용
+// 영구룰 #중복지급금지 — DB-level 강제 가드
+// 적용 INDEX:
+//   - uq_tx_daily_qkey_ref:  (user_id, ref_id) WHERE type='daily_qkey' AND ref_id IS NOT NULL
+//   - uq_tx_referral_ref:    (user_id, ref_id) WHERE type='referral_reward' AND ref_id IS NOT NULL
+// NULL ref_id 는 검사 제외 (SQLite partial unique 표준 동작)
+// DRY-RUN: GET /api/diag/apply-tx-unique-index?key=ADMIN_PW
+// EXEC:    GET /api/diag/apply-tx-unique-index?key=ADMIN_PW&exec=true
+// ============================================================================
+app.get('/api/diag/apply-tx-unique-index', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const exec = c.req.query('exec') === 'true'
+  const db = c.env.DB
+  const t0 = Date.now()
+  try {
+    // 사전: 중복 재확인 (NULL 제외)
+    const dupCheck = await db.prepare(`
+      SELECT user_id, type, ref_id, COUNT(*) AS dup_cnt
+      FROM transactions
+      WHERE type IN ('daily_qkey','referral_reward')
+        AND ref_id IS NOT NULL
+      GROUP BY user_id, type, ref_id
+      HAVING COUNT(*) > 1
+      LIMIT 50
+    `).all()
+    const dupRows = (dupCheck.results || []) as any[]
+    if (dupRows.length > 0) {
+      return c.json({
+        ok: false,
+        blocked: true,
+        reason: '중복 행이 존재하여 UNIQUE INDEX 적용 불가',
+        duplicates: dupRows,
+        duration_ms: Date.now() - t0,
+      }, 400)
+    }
+
+    const ddl = [
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_tx_daily_qkey_ref
+         ON transactions (user_id, ref_id)
+         WHERE type = 'daily_qkey' AND ref_id IS NOT NULL`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_tx_referral_ref
+         ON transactions (user_id, ref_id)
+         WHERE type = 'referral_reward' AND ref_id IS NOT NULL`,
+    ]
+
+    if (!exec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        duplicates_blocking: dupRows.length,
+        planned_ddl: ddl,
+        note: 'NULL ref_id 인 행은 인덱스 검사 대상 아님 (SQLite partial unique 표준)',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC: DDL 적용
+    const applied: any[] = []
+    for (const sql of ddl) {
+      try {
+        await db.prepare(sql).run()
+        applied.push({ sql: sql.replace(/\s+/g, ' ').trim(), ok: true })
+      } catch (e) {
+        applied.push({ sql: sql.replace(/\s+/g, ' ').trim(), ok: false, error: String(e) })
+      }
+    }
+
+    // 검증: sqlite_master 에서 인덱스 존재 확인
+    const indexes = await db.prepare(`
+      SELECT name, tbl_name, sql
+      FROM sqlite_master
+      WHERE type='index' AND tbl_name='transactions'
+        AND name IN ('uq_tx_daily_qkey_ref','uq_tx_referral_ref')
+    `).all()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      applied,
+      indexes_in_db: indexes.results || [],
+      verdict: (indexes.results || []).length === 2
+        ? '✅ UNIQUE INDEX 2개 적용 완료'
+        : '🚨 일부 INDEX 누락',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
 // fix-duplicate-qkey-tx-v2: 전수 QKEY 보상 중복 제거 (대소문자 무시, 일일배당 + 추천보상)
 // 영구룰 #중복지급금지 위반 tx 제거
 // 알고리즘:
