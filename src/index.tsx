@@ -46541,7 +46541,7 @@ app.get('/api/diag/user-tx-list', async (c) => {
     if (!u) return c.json({ error: 'user not found' }, 404)
 
     const rows = await db.prepare(`
-      SELECT id, amount, description, ref_id, ref_table, created_at,
+      SELECT id, amount, description, ref_id, created_at,
              datetime(created_at, '+9 hours') AS kst_at
       FROM transactions
       WHERE user_id=? AND coin_type=?
@@ -46564,7 +46564,6 @@ app.get('/api/diag/user-tx-list', async (c) => {
         amount: Number(t.amount),
         description: String(t.description || ''),
         ref_id: t.ref_id != null ? Number(t.ref_id) : null,
-        ref_table: t.ref_table != null ? String(t.ref_table) : null,
         kst_at: String(t.kst_at || ''),
         created_at_utc: String(t.created_at || ''),
       })),
