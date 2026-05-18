@@ -37473,4 +37473,186 @@ app.post('/api/diag/fix-solbat-cleanup-duplicates', async (c) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────
+// /api/diag/fix-all-cleanup-duplicates
+// 사장님 명령 (2026-05-18): 솔밧과 같은 케이스의 모든 계정 일괄 정리
+//   1) DRY-RUN: 영향받은 user_id 전수 조사
+//   2) EXECUTE:
+//      A. transactions WHERE description LIKE '%clean-slate%' → DELETE (전 계정)
+//      B. referral_rewards WHERE created_at >= '2026-05-17 21:00:00' → DELETE (전 계정)
+//      C. 영향받은 모든 사용자의 qkey_balance 를 잔여 QKEY tx 합계로 재계산
+//      D. 영향받은 모든 사용자의 transactions.created_at 공백→T 치환
+// DRY:  POST /api/diag/fix-all-cleanup-duplicates?key=ADMIN_PW&dry_run=1
+// GO:   POST /api/diag/fix-all-cleanup-duplicates?key=ADMIN_PW&confirm=GO
+// ─────────────────────────────────────────────────────────────────
+app.post('/api/diag/fix-all-cleanup-duplicates', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'GO') return c.json({ error: 'confirm=GO 또는 dry_run=1 필요' }, 400)
+
+    const db = c.env.DB
+
+    // === A. clean-slate tx 영향 user 조사 ===
+    const txAffected = await db.prepare(`
+      SELECT user_id,
+             COUNT(*) AS cnt,
+             COALESCE(SUM(amount),0) AS sum_amt,
+             MIN(id) AS min_id,
+             MAX(id) AS max_id
+      FROM transactions
+      WHERE description LIKE '%clean-slate%'
+      GROUP BY user_id
+      ORDER BY user_id
+    `).all<any>()
+    const txGroups = (txAffected.results || []) as any[]
+
+    // === B. 5/18 작업 rr 영향 user 조사 (referrer_id 와 referee_id 둘 다) ===
+    const rrAffectedReferrer = await db.prepare(`
+      SELECT referrer_id AS user_id, COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS sum_amt
+      FROM referral_rewards
+      WHERE created_at >= '2026-05-17 21:00:00'
+      GROUP BY referrer_id
+      ORDER BY referrer_id
+    `).all<any>()
+    const rrGroups = (rrAffectedReferrer.results || []) as any[]
+
+    // 합쳐서 영향받은 user_id 집합
+    const affectedUserSet = new Set<number>()
+    for (const g of txGroups) affectedUserSet.add(Number(g.user_id))
+    for (const g of rrGroups) affectedUserSet.add(Number(g.user_id))
+    const affectedUsers = Array.from(affectedUserSet).sort((a,b) => a-b)
+
+    // user 정보
+    const userDetails: any[] = []
+    if (affectedUsers.length > 0) {
+      const placeholders = affectedUsers.map(() => '?').join(',')
+      const rows = await db.prepare(`
+        SELECT id, email, name, qkey_balance
+        FROM users
+        WHERE id IN (${placeholders})
+        ORDER BY id
+      `).bind(...affectedUsers).all<any>()
+      userDetails.push(...((rows.results || []) as any[]))
+    }
+
+    // user별 매트릭스 통합
+    const txMap = new Map<number, any>()
+    for (const g of txGroups) txMap.set(Number(g.user_id), g)
+    const rrMap = new Map<number, any>()
+    for (const g of rrGroups) rrMap.set(Number(g.user_id), g)
+
+    const matrix = userDetails.map(u => {
+      const tx = txMap.get(Number(u.id))
+      const rr = rrMap.get(Number(u.id))
+      return {
+        user_id: u.id,
+        email: u.email,
+        name: u.name,
+        current_balance: u.qkey_balance,
+        tx_clean_slate_count: tx ? Number(tx.cnt) : 0,
+        tx_clean_slate_sum: tx ? Number(tx.sum_amt) : 0,
+        rr_late_count: rr ? Number(rr.cnt) : 0,
+        rr_late_sum: rr ? Number(rr.sum_amt) : 0,
+        expected_balance_after: Number(u.qkey_balance) - (tx ? Number(tx.sum_amt) : 0)
+      }
+    })
+
+    const totalTxCount = txGroups.reduce((s, g) => s + Number(g.cnt), 0)
+    const totalTxSum = txGroups.reduce((s, g) => s + Number(g.sum_amt), 0)
+    const totalRrCount = rrGroups.reduce((s, g) => s + Number(g.cnt), 0)
+    const totalRrSum = rrGroups.reduce((s, g) => s + Number(g.sum_amt), 0)
+
+    if (dryRun) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        summary: {
+          affected_user_count: affectedUsers.length,
+          tx_clean_slate_total_count: totalTxCount,
+          tx_clean_slate_total_qkey: totalTxSum,
+          rr_late_total_count: totalRrCount,
+          rr_late_total_qkey: totalRrSum
+        },
+        matrix
+      })
+    }
+
+    // === EXECUTE ===
+    const results: any = {
+      affected_users: affectedUsers.length,
+      tx_deleted: 0,
+      rr_deleted: 0,
+      balance_updated: 0,
+      created_at_fixed: 0,
+      user_changes: [] as any[]
+    }
+
+    // (A) transactions DELETE (전체)
+    const txDel = await db.prepare(`
+      DELETE FROM transactions
+      WHERE description LIKE '%clean-slate%'
+    `).run()
+    results.tx_deleted = txDel.meta?.changes || 0
+
+    // (B) referral_rewards DELETE (전체)
+    const rrDel = await db.prepare(`
+      DELETE FROM referral_rewards
+      WHERE created_at >= '2026-05-17 21:00:00'
+    `).run()
+    results.rr_deleted = rrDel.meta?.changes || 0
+
+    // (C) 영향받은 모든 사용자의 잔고 재계산 + (D) created_at 형식 수정
+    for (const uid of affectedUsers) {
+      // 잔고 재계산
+      const finalSum = await db.prepare(`
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM transactions
+        WHERE user_id = ? AND coin_type = 'QKEY'
+      `).bind(uid).first<any>()
+      const finalBalance = Number(finalSum?.total || 0)
+
+      const before = userDetails.find(u => Number(u.id) === uid)
+      const beforeBal = Number(before?.qkey_balance || 0)
+
+      await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(finalBalance, uid).run()
+      results.balance_updated++
+
+      // created_at 공백→T 치환
+      const fixDt = await db.prepare(`
+        UPDATE transactions
+        SET created_at = REPLACE(created_at, ' ', 'T')
+        WHERE user_id = ?
+          AND created_at IS NOT NULL
+          AND created_at LIKE '____-__-__ __:__:__%'
+      `).bind(uid).run()
+      const dtFixed = fixDt.meta?.changes || 0
+      results.created_at_fixed += dtFixed
+
+      results.user_changes.push({
+        user_id: uid,
+        email: before?.email,
+        name: before?.name,
+        balance_before: beforeBal,
+        balance_after: finalBalance,
+        balance_diff: finalBalance - beforeBal,
+        created_at_fixed: dtFixed
+      })
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXECUTED',
+      action: 'fix-all-cleanup-duplicates',
+      results,
+      message: `${affectedUsers.length}명 정리 완료: tx ${results.tx_deleted}건, rr ${results.rr_deleted}건, balance ${results.balance_updated}건, created_at ${results.created_at_fixed}건.`
+    })
+  } catch (error) {
+    console.error('fix-all-cleanup-duplicates error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 export default app
