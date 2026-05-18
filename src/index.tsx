@@ -37655,4 +37655,306 @@ app.post('/api/diag/fix-all-cleanup-duplicates', async (c) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────
+// /api/diag/scan-missing-tx-from-dr-rr
+// 사장님 명령 (2026-05-18): 김용선 같은 케이스 — dr/rr 테이블엔 있는데 tx 가 누락된 사용자 전수조사
+// READ-ONLY 진단 (수정 안 함)
+// GET /api/diag/scan-missing-tx-from-dr-rr?key=ADMIN_PW
+// ─────────────────────────────────────────────────────────────────
+app.get('/api/diag/scan-missing-tx-from-dr-rr', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // 전 사용자별 dr/rr/tx 합 집계
+    const rows = await db.prepare(`
+      SELECT
+        u.id AS user_id,
+        u.email,
+        u.name,
+        u.qkey_balance,
+        COALESCE(dr.dr_sum, 0)  AS dr_sum,
+        COALESCE(dr.dr_cnt, 0)  AS dr_cnt,
+        COALESCE(rr.rr_sum, 0)  AS rr_sum,
+        COALESCE(rr.rr_cnt, 0)  AS rr_cnt,
+        COALESCE(tx.tx_daily_sum, 0)    AS tx_daily_sum,
+        COALESCE(tx.tx_daily_cnt, 0)    AS tx_daily_cnt,
+        COALESCE(tx.tx_referral_sum, 0) AS tx_referral_sum,
+        COALESCE(tx.tx_referral_cnt, 0) AS tx_referral_cnt,
+        COALESCE(tx.tx_total_qkey, 0)   AS tx_total_qkey
+      FROM users u
+      LEFT JOIN (
+        SELECT user_id, SUM(usdt_amount) AS dr_sum, COUNT(*) AS dr_cnt
+        FROM daily_rewards GROUP BY user_id
+      ) dr ON dr.user_id = u.id
+      LEFT JOIN (
+        SELECT referrer_id AS user_id, SUM(reward_amount) AS rr_sum, COUNT(*) AS rr_cnt
+        FROM referral_rewards GROUP BY referrer_id
+      ) rr ON rr.user_id = u.id
+      LEFT JOIN (
+        SELECT user_id,
+          SUM(CASE WHEN type='daily_qkey'      AND coin_type='QKEY' THEN amount ELSE 0 END) AS tx_daily_sum,
+          SUM(CASE WHEN type='daily_qkey'      AND coin_type='QKEY' THEN 1     ELSE 0 END) AS tx_daily_cnt,
+          SUM(CASE WHEN type='referral_reward' AND coin_type='QKEY' THEN amount ELSE 0 END) AS tx_referral_sum,
+          SUM(CASE WHEN type='referral_reward' AND coin_type='QKEY' THEN 1     ELSE 0 END) AS tx_referral_cnt,
+          SUM(CASE WHEN coin_type='QKEY' THEN amount ELSE 0 END) AS tx_total_qkey
+        FROM transactions GROUP BY user_id
+      ) tx ON tx.user_id = u.id
+      WHERE COALESCE(dr.dr_sum,0) > 0 OR COALESCE(rr.rr_sum,0) > 0
+      ORDER BY u.id
+    `).all<any>()
+
+    const items = (rows.results || []) as any[]
+
+    // 누락 진단:
+    //   dr_missing: dr_sum > tx_daily_sum
+    //   rr_missing: rr_sum > tx_referral_sum
+    //   총 미지급 = (dr_sum - tx_daily_sum) + (rr_sum - tx_referral_sum)
+    const affected: any[] = []
+    for (const r of items) {
+      const drDiff = Number(r.dr_sum || 0) - Number(r.tx_daily_sum || 0)
+      const rrDiff = Number(r.rr_sum || 0) - Number(r.tx_referral_sum || 0)
+      if (drDiff > 0 || rrDiff > 0) {
+        affected.push({
+          user_id: r.user_id,
+          email: r.email,
+          name: r.name,
+          current_balance: Number(r.qkey_balance),
+          dr_sum: Number(r.dr_sum),
+          dr_cnt: Number(r.dr_cnt),
+          tx_daily_sum: Number(r.tx_daily_sum),
+          tx_daily_cnt: Number(r.tx_daily_cnt),
+          rr_sum: Number(r.rr_sum),
+          rr_cnt: Number(r.rr_cnt),
+          tx_referral_sum: Number(r.tx_referral_sum),
+          tx_referral_cnt: Number(r.tx_referral_cnt),
+          dr_missing_qkey: drDiff,
+          rr_missing_qkey: rrDiff,
+          total_missing_qkey: drDiff + rrDiff
+        })
+      }
+    }
+
+    const totalMissing = affected.reduce((s, a) => s + a.total_missing_qkey, 0)
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      summary: {
+        total_users_with_dr_or_rr: items.length,
+        affected_users_count: affected.length,
+        total_missing_qkey: totalMissing
+      },
+      affected
+    })
+  } catch (error) {
+    console.error('scan-missing-tx-from-dr-rr error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────
+// /api/diag/fix-missing-tx-from-dr-rr
+// 사장님 명령 (2026-05-18): 김용선 케이스 일괄 보충 — dr/rr 기준으로 누락된 tx INSERT + 잔고 복원
+//   - daily_rewards 각 row 에 대응하는 daily_qkey tx 가 없으면 INSERT
+//   - referral_rewards 각 row 에 대응하는 referral_reward tx 가 없으면 INSERT
+//   - 6중 EXISTS 가드 (영구룰 #중복지급금지):
+//       (user_id, type, coin_type, amount, ref_id) 또는
+//       (user_id, type, coin_type, amount, description) 조합으로 사전 검사
+//   - tx.created_at = dr.created_at (또는 rr.created_at) 그대로 사용 → 화면에 KST 정상 표시
+//   - 잔고 = 잔여 tx 합으로 재계산 UPDATE
+//   - 대상: user_id 파라미터 또는 all=1 (전수)
+// DRY: POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&dry_run=1&user_id=38
+//   or POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&dry_run=1&all=1
+// GO:  POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&confirm=GO&user_id=38
+//   or POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&confirm=GO&all=1
+// ─────────────────────────────────────────────────────────────────
+app.post('/api/diag/fix-missing-tx-from-dr-rr', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const dryRun = c.req.query('dry_run') === '1'
+    const confirm = c.req.query('confirm') || ''
+    const all = c.req.query('all') === '1'
+    const userIdQ = c.req.query('user_id') || ''
+    if (!dryRun && confirm !== 'GO') return c.json({ error: 'confirm=GO 또는 dry_run=1 필요' }, 400)
+    if (!all && !userIdQ) return c.json({ error: 'user_id 또는 all=1 필요' }, 400)
+
+    const db = c.env.DB
+
+    // 대상 사용자 결정
+    let targetUserIds: number[] = []
+    if (all) {
+      // scan 동일 로직으로 affected 사용자 추출
+      const rows = await db.prepare(`
+        SELECT u.id,
+          COALESCE((SELECT SUM(usdt_amount) FROM daily_rewards WHERE user_id=u.id),0) AS dr_sum,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=u.id AND type='daily_qkey' AND coin_type='QKEY'),0) AS tx_d,
+          COALESCE((SELECT SUM(reward_amount) FROM referral_rewards WHERE referrer_id=u.id),0) AS rr_sum,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=u.id AND type='referral_reward' AND coin_type='QKEY'),0) AS tx_r
+        FROM users u
+      `).all<any>()
+      for (const r of (rows.results || []) as any[]) {
+        const drDiff = Number(r.dr_sum||0) - Number(r.tx_d||0)
+        const rrDiff = Number(r.rr_sum||0) - Number(r.tx_r||0)
+        if (drDiff > 0 || rrDiff > 0) targetUserIds.push(Number(r.id))
+      }
+    } else {
+      targetUserIds = [Number(userIdQ)]
+    }
+
+    const userChanges: any[] = []
+    let totalDrTxInserted = 0
+    let totalRrTxInserted = 0
+    let totalBalanceUpdated = 0
+
+    for (const uid of targetUserIds) {
+      const userBefore = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(uid).first<any>()
+      if (!userBefore) continue
+      const balBefore = Number(userBefore.qkey_balance || 0)
+
+      // === daily_rewards 누락 tx 보충 ===
+      const drRows = await db.prepare(`
+        SELECT id AS dr_id, usdt_amount, reward_date, paid_date, created_at
+        FROM daily_rewards
+        WHERE user_id = ?
+        ORDER BY reward_date, id
+      `).bind(uid).all<any>()
+      const drList = (drRows.results || []) as any[]
+
+      let drInsertedHere = 0
+      const drInsertedDetails: any[] = []
+      for (const dr of drList) {
+        const amount = Number(dr.usdt_amount || 0)
+        const rd = dr.reward_date as string
+        const pd = (dr.paid_date as string) || rd
+        const refId = `dr_${dr.dr_id}`
+        const desc = `일일 배당 (QKEY) — ${rd}`
+        const createdAt = dr.created_at  // 원래 시각 그대로 유지
+
+        // 영구룰 #중복지급금지: 6중 EXISTS 가드
+        //   (user_id, type='daily_qkey', coin_type='QKEY', amount, ref_id=dr_{dr.id})
+        //   또는 (user_id, type='daily_qkey', date(created_at)=reward_date)
+        const exists = await db.prepare(`
+          SELECT id FROM transactions
+          WHERE user_id = ?
+            AND type = 'daily_qkey'
+            AND coin_type = 'QKEY'
+            AND (
+              ref_id = ?
+              OR date(created_at, '+9 hours') = ?
+              OR (amount = ? AND description = ?)
+            )
+          LIMIT 1
+        `).bind(uid, refId, rd, amount, desc).first<any>()
+
+        if (exists) continue
+
+        if (!dryRun) {
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
+          `).bind(uid, amount, desc, refId, createdAt).run()
+        }
+        drInsertedHere++
+        drInsertedDetails.push({ dr_id: dr.dr_id, rd, pd, amount, ref_id: refId })
+      }
+      totalDrTxInserted += drInsertedHere
+
+      // === referral_rewards 누락 tx 보충 ===
+      const rrRows = await db.prepare(`
+        SELECT id AS rr_id, referee_id, level, reward_amount, reward_date, paid_date, created_at
+        FROM referral_rewards
+        WHERE referrer_id = ?
+        ORDER BY reward_date, id
+      `).bind(uid).all<any>()
+      const rrList = (rrRows.results || []) as any[]
+
+      let rrInsertedHere = 0
+      const rrInsertedDetails: any[] = []
+      for (const rr of rrList) {
+        const amount = Number(rr.reward_amount || 0)
+        const rd = rr.reward_date as string
+        const pd = (rr.paid_date as string) || rd
+        const lvl = Number(rr.level || 0)
+        const refId = `rr_${rr.rr_id}`
+        const desc = lvl === 0
+          ? `직판 보너스 — ${rd}`
+          : `추천 보너스 (Level ${lvl}) — ${rd}`
+        const createdAt = rr.created_at
+
+        const exists = await db.prepare(`
+          SELECT id FROM transactions
+          WHERE user_id = ?
+            AND type = 'referral_reward'
+            AND coin_type = 'QKEY'
+            AND (
+              ref_id = ?
+              OR (amount = ? AND description = ?)
+              OR (amount = ? AND date(created_at, '+9 hours') = ? AND description LIKE ?)
+            )
+          LIMIT 1
+        `).bind(uid, refId, amount, desc, amount, rd, `%Level ${lvl}%`).first<any>()
+
+        if (exists) continue
+
+        if (!dryRun) {
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+            VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+          `).bind(uid, amount, desc, refId, createdAt).run()
+        }
+        rrInsertedHere++
+        rrInsertedDetails.push({ rr_id: rr.rr_id, rd, pd, level: lvl, amount, ref_id: refId })
+      }
+      totalRrTxInserted += rrInsertedHere
+
+      // === 잔고 재계산 ===
+      let balAfter = balBefore
+      if (!dryRun) {
+        const sumRes = await db.prepare(`
+          SELECT COALESCE(SUM(amount),0) AS total
+          FROM transactions
+          WHERE user_id = ? AND coin_type = 'QKEY'
+        `).bind(uid).first<any>()
+        balAfter = Number(sumRes?.total || 0)
+        await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(balAfter, uid).run()
+        totalBalanceUpdated++
+      } else {
+        // DRY: 예상 잔고 = balBefore + (insert 될 dr 합 + rr 합)
+        const drAddSum = drInsertedDetails.reduce((s, x) => s + Number(x.amount||0), 0)
+        const rrAddSum = rrInsertedDetails.reduce((s, x) => s + Number(x.amount||0), 0)
+        balAfter = balBefore + drAddSum + rrAddSum
+      }
+
+      userChanges.push({
+        user_id: uid,
+        email: userBefore.email,
+        name: userBefore.name,
+        balance_before: balBefore,
+        balance_after: balAfter,
+        balance_diff: balAfter - balBefore,
+        dr_tx_inserted: drInsertedHere,
+        rr_tx_inserted: rrInsertedHere
+      })
+    }
+
+    return c.json({
+      ok: true,
+      mode: dryRun ? 'DRY_RUN' : 'EXECUTED',
+      action: 'fix-missing-tx-from-dr-rr',
+      summary: {
+        target_users: targetUserIds.length,
+        dr_tx_inserted: totalDrTxInserted,
+        rr_tx_inserted: totalRrTxInserted,
+        balance_updated: totalBalanceUpdated
+      },
+      user_changes: userChanges
+    })
+  } catch (error) {
+    console.error('fix-missing-tx-from-dr-rr error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 export default app
