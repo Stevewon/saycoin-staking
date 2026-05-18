@@ -42328,7 +42328,7 @@ app.get('/api/diag/scan-may18-full', async (c) => {
 
   // 1. 5/18 KST 생성된 transactions 전체
   const txAll = await db.prepare(`
-    SELECT id, user_id, type, amount, description, ref_id, created_at,
+    SELECT *,
            datetime(created_at, '+9 hours') as created_kst
     FROM transactions
     WHERE date(created_at, '+9 hours') = ?
@@ -42337,7 +42337,7 @@ app.get('/api/diag/scan-may18-full', async (c) => {
 
   // 2. DR rows with paid_date=2026-05-18 or reward_date=2026-05-18
   const drRows = await db.prepare(`
-    SELECT id, user_id, staking_id, reward_date, paid_date, amount, daily_rate,
+    SELECT *,
            datetime(created_at, '+9 hours') as created_kst
     FROM daily_rewards
     WHERE paid_date = '2026-05-18' OR reward_date = '2026-05-18'
@@ -42346,8 +42346,7 @@ app.get('/api/diag/scan-may18-full', async (c) => {
 
   // 3. RR rows with paid_date=2026-05-18 or reward_date=2026-05-18
   const rrRows = await db.prepare(`
-    SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
-           reward_date, paid_date, staking_id,
+    SELECT *,
            datetime(created_at, '+9 hours') as created_kst
     FROM referral_rewards
     WHERE paid_date = '2026-05-18' OR reward_date = '2026-05-18'
