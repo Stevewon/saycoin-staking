@@ -37754,197 +37754,300 @@ app.get('/api/diag/scan-missing-tx-from-dr-rr', async (c) => {
 })
 
 // ─────────────────────────────────────────────────────────────────
-// /api/diag/fix-missing-tx-from-dr-rr
-// 사장님 명령 (2026-05-18): 김용선 케이스 일괄 보충 — dr/rr 기준으로 누락된 tx INSERT + 잔고 복원
-//   - daily_rewards 각 row 에 대응하는 daily_qkey tx 가 없으면 INSERT
-//   - referral_rewards 각 row 에 대응하는 referral_reward tx 가 없으면 INSERT
-//   - 6중 EXISTS 가드 (영구룰 #중복지급금지):
-//       (user_id, type, coin_type, amount, ref_id) 또는
-//       (user_id, type, coin_type, amount, description) 조합으로 사전 검사
-//   - tx.created_at = dr.created_at (또는 rr.created_at) 그대로 사용 → 화면에 KST 정상 표시
-//   - 잔고 = 잔여 tx 합으로 재계산 UPDATE
-//   - 대상: user_id 파라미터 또는 all=1 (전수)
-// DRY: POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&dry_run=1&user_id=38
-//   or POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&dry_run=1&all=1
-// GO:  POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&confirm=GO&user_id=38
-//   or POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&confirm=GO&all=1
+// /api/diag/fix-missing-tx-from-dr-rr  ── SET-BASED REWRITE (2026-05-18)
+// 사장님 명령 직접 반영:
+//   ✅ row 마다 EXISTS SELECT 절대 금지 (구버전 EXISTS-loop 완전 폐기)
+//   ✅ UNIQUE INDEX 기반 중복 방지 (idx_tx_unique_ref, partial WHERE ref_id IS NOT NULL)
+//   ✅ INSERT OR IGNORE INTO ... SELECT ... LEFT JOIN ... WHERE t.id IS NULL (anti-join)
+//   ✅ db.batch([create_index, dr_insert, rr_insert, balance_update]) — 4개 statement 묶음
+//   ✅ 사용자별 for-loop 없음. 전체가 SQL 한 묶음.
+//   ✅ 같은 작업 재실행 시 0건 INSERT (멱등성 — UNIQUE INDEX + anti-join 이중 보호)
+//
+// 로직:
+//   1. CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique_ref ON transactions(user_id, type, coin_type, ref_id) WHERE ref_id IS NOT NULL
+//   2. daily_rewards → daily_qkey tx 누락분 INSERT OR IGNORE (LEFT JOIN anti-join)
+//   3. referral_rewards → referral_reward tx 누락분 INSERT OR IGNORE (LEFT JOIN anti-join)
+//   4. users.qkey_balance = SUM(transactions WHERE coin_type='QKEY')  — 영향사용자만
+//
+// 사용:
+//   DRY: POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&dry_run=1            (전수)
+//        POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&dry_run=1&user_id=38 (단일)
+//   GO:  POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&confirm=GO            (전수)
+//        POST /api/diag/fix-missing-tx-from-dr-rr?key=ADMIN_PW&confirm=GO&user_id=38 (단일)
+//
+// 로그: [REWARD_BATCH] start / dr_inserted / rr_inserted / duration_ms / no_per_row_exists=true
 // ─────────────────────────────────────────────────────────────────
 app.post('/api/diag/fix-missing-tx-from-dr-rr', async (c) => {
+  const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
     const dryRun = c.req.query('dry_run') === '1'
     const confirm = c.req.query('confirm') || ''
-    const all = c.req.query('all') === '1'
     const userIdQ = c.req.query('user_id') || ''
-    if (!dryRun && confirm !== 'GO') return c.json({ error: 'confirm=GO 또는 dry_run=1 필요' }, 400)
-    if (!all && !userIdQ) return c.json({ error: 'user_id 또는 all=1 필요' }, 400)
-
-    const db = c.env.DB
-
-    // 대상 사용자 결정
-    let targetUserIds: number[] = []
-    if (all) {
-      // scan 동일 로직으로 affected 사용자 추출
-      const rows = await db.prepare(`
-        SELECT u.id,
-          COALESCE((SELECT SUM(usdt_amount) FROM daily_rewards WHERE user_id=u.id),0) AS dr_sum,
-          COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=u.id AND type='daily_qkey' AND coin_type='QKEY'),0) AS tx_d,
-          COALESCE((SELECT SUM(reward_amount) FROM referral_rewards WHERE referrer_id=u.id),0) AS rr_sum,
-          COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=u.id AND type='referral_reward' AND coin_type='QKEY'),0) AS tx_r
-        FROM users u
-      `).all<any>()
-      for (const r of (rows.results || []) as any[]) {
-        const drDiff = Number(r.dr_sum||0) - Number(r.tx_d||0)
-        const rrDiff = Number(r.rr_sum||0) - Number(r.tx_r||0)
-        if (drDiff > 0 || rrDiff > 0) targetUserIds.push(Number(r.id))
-      }
-    } else {
-      targetUserIds = [Number(userIdQ)]
+    // 호환: all=1 도 받지만, user_id 없으면 자동으로 전수 처리
+    // (구버전 호출자가 all=1 을 명시해도 그대로 작동)
+    if (!dryRun && confirm !== 'GO') {
+      return c.json({ error: 'confirm=GO 또는 dry_run=1 필요' }, 400)
     }
 
-    const userChanges: any[] = []
-    let totalDrTxInserted = 0
-    let totalRrTxInserted = 0
-    let totalBalanceUpdated = 0
+    const db = c.env.DB
+    const singleUserMode = !!userIdQ
+    const uidFilter: number | null = singleUserMode ? Number(userIdQ) : null
 
-    for (const uid of targetUserIds) {
-      const userBefore = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(uid).first<any>()
-      if (!userBefore) continue
-      const balBefore = Number(userBefore.qkey_balance || 0)
+    console.log(`[REWARD_BATCH] start action=fix-missing-tx-from-dr-rr mode=${dryRun ? 'DRY_RUN' : 'EXECUTED'} target=${singleUserMode ? 'user_id=' + uidFilter : 'ALL'} method=SET_BASED_INSERT_OR_IGNORE no_per_row_exists=true`)
 
-      // === daily_rewards 누락 tx 보충 ===
-      const drRows = await db.prepare(`
-        SELECT id AS dr_id, usdt_amount, reward_date, paid_date, created_at
-        FROM daily_rewards
-        WHERE user_id = ?
-        ORDER BY reward_date, id
-      `).bind(uid).all<any>()
-      const drList = (drRows.results || []) as any[]
+    // ════════════════════════════════════════════════════════════════
+    // STEP 0. 사전 진단 (READ-ONLY, set-based)
+    //   - 누락 row 수와 합계를 single SQL anti-join 으로 산출
+    //   - 사용자별 for-loop 없음
+    //   - DRY_RUN 의 응답 + EXECUTED 의 검증 양쪽에 사용
+    // ════════════════════════════════════════════════════════════════
+    const drWhereSql = singleUserMode ? 'WHERE dr.user_id = ? AND t.id IS NULL' : 'WHERE t.id IS NULL'
+    const rrWhereSql = singleUserMode ? 'WHERE rr.referrer_id = ? AND t.id IS NULL' : 'WHERE t.id IS NULL'
+    const drBindings: any[] = singleUserMode ? [uidFilter] : []
+    const rrBindings: any[] = singleUserMode ? [uidFilter] : []
 
-      let drInsertedHere = 0
-      const drInsertedDetails: any[] = []
-      for (const dr of drList) {
-        const amount = Number(dr.usdt_amount || 0)
-        const rd = dr.reward_date as string
-        const pd = (dr.paid_date as string) || rd
-        const refId = `dr_${dr.dr_id}`
-        const desc = `일일 배당 (QKEY) — ${rd}`
-        const createdAt = dr.created_at  // 원래 시각 그대로 유지
+    const drMissingStat = await db.prepare(`
+      SELECT
+        COALESCE(COUNT(*), 0)            AS missing_count,
+        COALESCE(SUM(dr.usdt_amount), 0) AS missing_amount,
+        COALESCE(COUNT(DISTINCT dr.user_id), 0) AS missing_users
+      FROM daily_rewards dr
+      LEFT JOIN transactions t
+        ON t.user_id = dr.user_id
+       AND t.type = 'daily_qkey'
+       AND t.coin_type = 'QKEY'
+       AND t.ref_id = 'dr_' || dr.id
+      ${drWhereSql}
+    `).bind(...drBindings).first<any>()
 
-        // ref_id 정확 매칭만 (dr_id 기반 — 가장 정확한 멱등성)
-        const exists = await db.prepare(`
-          SELECT id FROM transactions
-          WHERE user_id = ?
-            AND type = 'daily_qkey'
-            AND coin_type = 'QKEY'
-            AND ref_id = ?
-          LIMIT 1
-        `).bind(uid, refId).first<any>()
+    const rrMissingStat = await db.prepare(`
+      SELECT
+        COALESCE(COUNT(*), 0)              AS missing_count,
+        COALESCE(SUM(rr.reward_amount), 0) AS missing_amount,
+        COALESCE(COUNT(DISTINCT rr.referrer_id), 0) AS missing_users
+      FROM referral_rewards rr
+      LEFT JOIN transactions t
+        ON t.user_id = rr.referrer_id
+       AND t.type = 'referral_reward'
+       AND t.coin_type = 'QKEY'
+       AND t.ref_id = 'rr_' || rr.id
+      ${rrWhereSql}
+    `).bind(...rrBindings).first<any>()
 
-        if (exists) continue
+    const drMissingCount = Number(drMissingStat?.missing_count || 0)
+    const drMissingAmount = Number(drMissingStat?.missing_amount || 0)
+    const rrMissingCount = Number(rrMissingStat?.missing_count || 0)
+    const rrMissingAmount = Number(rrMissingStat?.missing_amount || 0)
 
-        if (!dryRun) {
-          await db.prepare(`
-            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
-            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
-          `).bind(uid, amount, desc, refId, createdAt).run()
-        }
-        drInsertedHere++
-        drInsertedDetails.push({ dr_id: dr.dr_id, rd, pd, amount, ref_id: refId })
-      }
-      totalDrTxInserted += drInsertedHere
+    // 영향 사용자 목록 (DR 또는 RR 한쪽이라도 누락 있는 사용자)
+    const affectedUsersRes = await db.prepare(`
+      SELECT u.id, u.email, u.name, u.qkey_balance AS balance_before
+      FROM users u
+      WHERE u.id IN (
+        SELECT DISTINCT dr.user_id
+        FROM daily_rewards dr
+        LEFT JOIN transactions t
+          ON t.user_id = dr.user_id
+         AND t.type = 'daily_qkey'
+         AND t.coin_type = 'QKEY'
+         AND t.ref_id = 'dr_' || dr.id
+        ${drWhereSql}
+        UNION
+        SELECT DISTINCT rr.referrer_id
+        FROM referral_rewards rr
+        LEFT JOIN transactions t
+          ON t.user_id = rr.referrer_id
+         AND t.type = 'referral_reward'
+         AND t.coin_type = 'QKEY'
+         AND t.ref_id = 'rr_' || rr.id
+        ${rrWhereSql}
+      )
+      ORDER BY u.id
+    `).bind(...drBindings, ...rrBindings).all<any>()
+    const affectedUsers = (affectedUsersRes.results || []) as any[]
+    const affectedUserIds = affectedUsers.map((u: any) => Number(u.id))
 
-      // === referral_rewards 누락 tx 보충 ===
-      const rrRows = await db.prepare(`
-        SELECT id AS rr_id, referee_id, level, reward_amount, reward_date, paid_date, created_at
-        FROM referral_rewards
-        WHERE referrer_id = ?
-        ORDER BY reward_date, id
-      `).bind(uid).all<any>()
-      const rrList = (rrRows.results || []) as any[]
-
-      let rrInsertedHere = 0
-      const rrInsertedDetails: any[] = []
-      for (const rr of rrList) {
-        const amount = Number(rr.reward_amount || 0)
-        const rd = rr.reward_date as string
-        const pd = (rr.paid_date as string) || rd
-        const lvl = Number(rr.level || 0)
-        const refId = `rr_${rr.rr_id}`
-        const desc = lvl === 0
-          ? `직판 보너스 — ${rd}`
-          : `추천 보너스 (Level ${lvl}) — ${rd}`
-        const createdAt = rr.created_at
-
-        // ref_id 정확 매칭만 (rr_id 기반 — 가장 정확한 멱등성)
-        const exists = await db.prepare(`
-          SELECT id FROM transactions
-          WHERE user_id = ?
-            AND type = 'referral_reward'
-            AND coin_type = 'QKEY'
-            AND ref_id = ?
-          LIMIT 1
-        `).bind(uid, refId).first<any>()
-
-        if (exists) continue
-
-        if (!dryRun) {
-          await db.prepare(`
-            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
-            VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
-          `).bind(uid, amount, desc, refId, createdAt).run()
-        }
-        rrInsertedHere++
-        rrInsertedDetails.push({ rr_id: rr.rr_id, rd, pd, level: lvl, amount, ref_id: refId })
-      }
-      totalRrTxInserted += rrInsertedHere
-
-      // === 잔고 재계산 ===
-      let balAfter = balBefore
-      if (!dryRun) {
-        const sumRes = await db.prepare(`
-          SELECT COALESCE(SUM(amount),0) AS total
-          FROM transactions
-          WHERE user_id = ? AND coin_type = 'QKEY'
-        `).bind(uid).first<any>()
-        balAfter = Number(sumRes?.total || 0)
-        await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(balAfter, uid).run()
-        totalBalanceUpdated++
-      } else {
-        // DRY: 예상 잔고 = balBefore + (insert 될 dr 합 + rr 합)
-        const drAddSum = drInsertedDetails.reduce((s, x) => s + Number(x.amount||0), 0)
-        const rrAddSum = rrInsertedDetails.reduce((s, x) => s + Number(x.amount||0), 0)
-        balAfter = balBefore + drAddSum + rrAddSum
-      }
-
-      userChanges.push({
-        user_id: uid,
-        email: userBefore.email,
-        name: userBefore.name,
-        balance_before: balBefore,
-        balance_after: balAfter,
-        balance_diff: balAfter - balBefore,
-        dr_tx_inserted: drInsertedHere,
-        rr_tx_inserted: rrInsertedHere
+    // ════════════════════════════════════════════════════════════════
+    // DRY_RUN 종료 — INSERT/UPDATE 절대 없음
+    // ════════════════════════════════════════════════════════════════
+    if (dryRun) {
+      const durMs = Date.now() - t0
+      console.log(`[REWARD_BATCH] DRY_RUN done dr_would_insert=${drMissingCount} rr_would_insert=${rrMissingCount} affected_users=${affectedUsers.length} duration_ms=${durMs}`)
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        action: 'fix-missing-tx-from-dr-rr',
+        method: 'SET_BASED_INSERT_OR_IGNORE',
+        no_per_row_exists: true,
+        target: singleUserMode ? { user_id: uidFilter } : 'ALL',
+        summary: {
+          dr_would_insert: drMissingCount,
+          dr_would_amount: drMissingAmount,
+          rr_would_insert: rrMissingCount,
+          rr_would_amount: rrMissingAmount,
+          total_qkey_would_insert: drMissingAmount + rrMissingAmount,
+          affected_users: affectedUsers.length
+        },
+        affected_users: affectedUsers,
+        duration_ms: durMs
       })
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // EXECUTE — db.batch([...]) 묶음 (사용자별 루프 절대 없음)
+    //   Statement 1: CREATE UNIQUE INDEX IF NOT EXISTS (partial, ref_id IS NOT NULL)
+    //   Statement 2: DR INSERT OR IGNORE ... SELECT ... LEFT JOIN ... WHERE t.id IS NULL
+    //   Statement 3: RR INSERT OR IGNORE ... SELECT ... LEFT JOIN ... WHERE t.id IS NULL
+    //   Statement 4: UPDATE users.qkey_balance — 영향 사용자만 (set-based)
+    //
+    //   - row 마다 EXISTS SELECT 절대 없음
+    //   - UNIQUE INDEX + INSERT OR IGNORE = 이중 중복 차단
+    //   - 같은 작업 재실행 시 INSERT OR IGNORE 가 모두 0 changes (멱등)
+    // ════════════════════════════════════════════════════════════════
+
+    // Statement 1: UNIQUE INDEX (partial)
+    const stmtCreateIndex = db.prepare(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique_ref
+      ON transactions(user_id, type, coin_type, ref_id)
+      WHERE ref_id IS NOT NULL
+    `)
+
+    // Statement 2: DR INSERT OR IGNORE
+    const drInsertSql = `
+      INSERT OR IGNORE INTO transactions
+        (user_id, type, coin_type, amount, description, ref_id, created_at)
+      SELECT
+        dr.user_id,
+        'daily_qkey',
+        'QKEY',
+        dr.usdt_amount,
+        '일일 배당 (QKEY) - ' || dr.reward_date,
+        'dr_' || dr.id,
+        dr.created_at
+      FROM daily_rewards dr
+      LEFT JOIN transactions t
+        ON t.user_id = dr.user_id
+       AND t.type = 'daily_qkey'
+       AND t.coin_type = 'QKEY'
+       AND t.ref_id = 'dr_' || dr.id
+      ${drWhereSql}
+    `
+    const stmtDrInsert = singleUserMode
+      ? db.prepare(drInsertSql).bind(uidFilter)
+      : db.prepare(drInsertSql)
+
+    // Statement 3: RR INSERT OR IGNORE
+    const rrInsertSql = `
+      INSERT OR IGNORE INTO transactions
+        (user_id, type, coin_type, amount, description, ref_id, created_at)
+      SELECT
+        rr.referrer_id,
+        'referral_reward',
+        'QKEY',
+        rr.reward_amount,
+        CASE
+          WHEN rr.level = 0 THEN '직판 보너스 - ' || rr.reward_date
+          ELSE '추천 보너스 (Level ' || rr.level || ') - ' || rr.reward_date
+        END,
+        'rr_' || rr.id,
+        rr.created_at
+      FROM referral_rewards rr
+      LEFT JOIN transactions t
+        ON t.user_id = rr.referrer_id
+       AND t.type = 'referral_reward'
+       AND t.coin_type = 'QKEY'
+       AND t.ref_id = 'rr_' || rr.id
+      ${rrWhereSql}
+    `
+    const stmtRrInsert = singleUserMode
+      ? db.prepare(rrInsertSql).bind(uidFilter)
+      : db.prepare(rrInsertSql)
+
+    // Statement 4: 영향 사용자 잔고 재계산
+    let stmtBalanceUpdate: any = null
+    if (affectedUserIds.length > 0) {
+      const placeholders = affectedUserIds.map(() => '?').join(',')
+      stmtBalanceUpdate = db.prepare(`
+        UPDATE users
+        SET qkey_balance = COALESCE((
+          SELECT SUM(amount) FROM transactions
+          WHERE user_id = users.id AND coin_type = 'QKEY'
+        ), 0)
+        WHERE id IN (${placeholders})
+      `).bind(...affectedUserIds)
+    }
+
+    // db.batch 실행 — 2~4개 statement 묶음
+    const batchStmts: any[] = [stmtCreateIndex, stmtDrInsert, stmtRrInsert]
+    if (stmtBalanceUpdate) batchStmts.push(stmtBalanceUpdate)
+    const batchResults: any[] = await db.batch(batchStmts)
+
+    const drInsertRes = batchResults[1]
+    const rrInsertRes = batchResults[2]
+    const balUpdateRes = stmtBalanceUpdate ? batchResults[3] : null
+
+    const drInserted = Number(drInsertRes?.meta?.changes ?? drInsertRes?.changes ?? 0)
+    const rrInserted = Number(rrInsertRes?.meta?.changes ?? rrInsertRes?.changes ?? 0)
+    const balUpdated = Number(balUpdateRes?.meta?.changes ?? balUpdateRes?.changes ?? 0)
+
+    // 영향 사용자별 after balance 조회 (보고용, 1 쿼리)
+    const userAfterMap: Record<number, number> = {}
+    if (affectedUserIds.length > 0) {
+      const placeholders = affectedUserIds.map(() => '?').join(',')
+      const afterRes = await db.prepare(`
+        SELECT id, qkey_balance AS balance_after FROM users WHERE id IN (${placeholders})
+      `).bind(...affectedUserIds).all<any>()
+      for (const r of (afterRes.results || []) as any[]) {
+        userAfterMap[Number(r.id)] = Number(r.balance_after || 0)
+      }
+    }
+    const userChanges = affectedUsers.map((u: any) => {
+      const uid = Number(u.id)
+      const before = Number(u.balance_before || 0)
+      const after = userAfterMap[uid] ?? before
+      return {
+        user_id: uid,
+        email: u.email,
+        name: u.name,
+        balance_before: before,
+        balance_after: after,
+        balance_diff: after - before
+      }
+    })
+
+    const durMs = Date.now() - t0
+    console.log(`[REWARD_BATCH] EXECUTED done dr_inserted=${drInserted} rr_inserted=${rrInserted} balance_updated_rows=${balUpdated} affected_users=${affectedUsers.length} duration_ms=${durMs} no_per_row_exists=true`)
+
     return c.json({
       ok: true,
-      mode: dryRun ? 'DRY_RUN' : 'EXECUTED',
+      mode: 'EXECUTED',
       action: 'fix-missing-tx-from-dr-rr',
+      method: 'SET_BASED_INSERT_OR_IGNORE',
+      no_per_row_exists: true,
+      target: singleUserMode ? { user_id: uidFilter } : 'ALL',
       summary: {
-        target_users: targetUserIds.length,
-        dr_tx_inserted: totalDrTxInserted,
-        rr_tx_inserted: totalRrTxInserted,
-        balance_updated: totalBalanceUpdated
+        dr_tx_inserted: drInserted,
+        rr_tx_inserted: rrInserted,
+        balance_updated_rows: balUpdated,
+        affected_users: affectedUsers.length,
+        unique_index: 'idx_tx_unique_ref (partial WHERE ref_id IS NOT NULL)'
       },
-      user_changes: userChanges
+      pre_scan: {
+        dr_missing_count: drMissingCount,
+        dr_missing_amount: drMissingAmount,
+        rr_missing_count: rrMissingCount,
+        rr_missing_amount: rrMissingAmount,
+        total_missing_qkey: drMissingAmount + rrMissingAmount
+      },
+      user_changes: userChanges,
+      duration_ms: durMs
     })
   } catch (error) {
-    console.error('fix-missing-tx-from-dr-rr error:', error)
-    return c.json({ error: String(error) }, 500)
+    const durMs = Date.now() - t0
+    console.error(`[REWARD_BATCH] ERROR action=fix-missing-tx-from-dr-rr duration_ms=${durMs}`, error)
+    return c.json({ error: String(error), duration_ms: durMs }, 500)
   }
 })
 
