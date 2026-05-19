@@ -54284,9 +54284,10 @@ app.get('/api/diag/inspect-511-existing-rr', async (c) => {
     if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
-    // 5/11 paid 의 모든 RR 상세
+    // 5/11 paid 의 모든 RR 상세 (정확한 컬럼: referrer_id, referee_id, reward_amount, original_amount, staking_id)
     const rrAll = await db.prepare(`
-      SELECT id, user_id as referrer, from_user_id as referee, level, amount,
+      SELECT id, referrer_id as referrer, referee_id as referee, level,
+             reward_amount as amount, original_amount, staking_id,
              reward_date, paid_date, created_at
       FROM referral_rewards
       WHERE paid_date = '2026-05-11'
@@ -54324,12 +54325,12 @@ app.get('/api/diag/inspect-511-existing-rr', async (c) => {
       if (tx) txByRrId[r.id] = tx
     }
 
-    // 중복 검사: 같은 (referrer, referee, level, reward_date, paid_date) 가 2개 이상?
+    // 중복 검사: 같은 (referrer_id, referee_id, level, reward_date, paid_date, staking_id) 가 2개 이상?
     const dupCheck = await db.prepare(`
-      SELECT user_id as referrer, from_user_id as referee, level, reward_date, paid_date, COUNT(*) as cnt
+      SELECT referrer_id as referrer, referee_id as referee, level, reward_date, paid_date, staking_id, COUNT(*) as cnt
       FROM referral_rewards
       WHERE paid_date = '2026-05-11'
-      GROUP BY user_id, from_user_id, level, reward_date, paid_date
+      GROUP BY referrer_id, referee_id, level, reward_date, paid_date, staking_id
       HAVING COUNT(*) > 1
     `).all<any>()
 
