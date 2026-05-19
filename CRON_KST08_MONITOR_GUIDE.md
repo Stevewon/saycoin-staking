@@ -36,6 +36,20 @@ curl -s "https://pqcpay.co.kr/api/diag/cron-h-plan-monitor?password=Qta@2026!Sec
 
 ---
 
+## ⚠️ 중요 — 사용 시점
+
+**`paid_date` 미지정 시 오늘 KST 자동**. 즉:
+- KST 5/20 08:05 에 호출 → 오늘=2026-05-20 의 신규 cron 데이터 검증
+- **이게 5/20 cron 가동 직후 정확한 사용법**
+
+### 5/19 이전 데이터로 endpoint 테스트하면 FAIL 정상
+
+5/19 이전 historical 데이터는 normalize-tx-time-kst-08 에 의해 다른 기준 (`paid_date 23:00:00 UTC` = `paid_date+1day 08:00 KST`) 으로 정규화되었습니다. 새 영구룰 정의 (`paid_date 의 KST 08:00 = paid_date-1day 23:00:00 UTC`) 와 off-by-one 차이가 있어 검증 endpoint 는 FAIL 을 반환합니다.
+
+**5/20 신규 cron 부터는 새 룰 기준으로 created_at 박힘** → `cron-kst08-verify?paid_date=2026-05-20` 가 PASS 입니다.
+
+---
+
 ## 🟢 정상 결과 (사장님이 봐야 할 것)
 
 `cron-kst08-verify` 응답:
