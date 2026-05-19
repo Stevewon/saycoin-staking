@@ -56475,6 +56475,299 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-513-paid — 5/13 paid (5/12 reward 확정분) 전수조사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "13일꺼 즉 12일 확정분의 13일 지급건에 대해 전수 조사해서 보고"
+//
+// 조사 항목:
+//   1) DR 전체 (paid_date=5/13)
+//   2) RR level=0/1/2 분포
+//   3) reward_date 분포 (정상치: 5/12 단일)
+//   4) TX 매핑 (ref_id 기반 + 시각윈도우)
+//   5) TX description 정합성 (Level 1 / Level 2 표기)
+//   6) ratio 정합성 (L1=20%, L2=10%)
+//   7) 중복 row 검사 (영구룰 #스테이킹별독립)
+//   8) created_at 정규시각 (UTC 5/12 23:00:00)
+//   9) balance 영향 분석
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-513-paid', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    const PAID = '2026-05-13'
+    const RD_EXPECTED = '2026-05-12'
+    const CREATED_DR_EXPECTED = '2026-05-12 23:00:00'
+
+    // 1) DR
+    const dr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE paid_date=? ORDER BY id
+    `).bind(PAID).all<any>()
+    const drRows = (dr.results || []) as any[]
+
+    // 2) RR (전체 level)
+    const rr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE paid_date=? ORDER BY level, id
+    `).bind(PAID).all<any>()
+    const rrRows = (rr.results || []) as any[]
+    const rrL0 = rrRows.filter(r => r.level === 0)
+    const rrL1 = rrRows.filter(r => r.level === 1)
+    const rrL2 = rrRows.filter(r => r.level === 2)
+
+    // 3) reward_date 분포
+    const drByRd: Record<string, { count: number, qkey: number }> = {}
+    for (const d of drRows) {
+      const k = d.reward_date
+      if (!drByRd[k]) drByRd[k] = { count: 0, qkey: 0 }
+      drByRd[k].count++
+      drByRd[k].qkey += Number(d.qkey || 0)
+    }
+    const rrByLevelRd: Record<string, { count: number, qkey: number }> = {}
+    for (const r of rrRows) {
+      const k = `L${r.level}-${r.reward_date}`
+      if (!rrByLevelRd[k]) rrByLevelRd[k] = { count: 0, qkey: 0 }
+      rrByLevelRd[k].count++
+      rrByLevelRd[k].qkey += Number(r.reward_amount || 0)
+    }
+
+    // 4) TX 매핑 (chunked)
+    const CHUNK = 50
+    const drIds = drRows.map(d => d.id)
+    const rrIds = rrRows.map(r => r.id)
+    let txByDrRef: any[] = []
+    let txByRrRef: any[] = []
+    if (drIds.length > 0) {
+      for (let i = 0; i < drIds.length; i += CHUNK) {
+        const chunk = drIds.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, user_id, type, amount, ref_id, description, created_at
+          FROM transactions
+          WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all<any>()
+        txByDrRef = txByDrRef.concat((r.results || []) as any[])
+      }
+    }
+    if (rrIds.length > 0) {
+      for (let i = 0; i < rrIds.length; i += CHUNK) {
+        const chunk = rrIds.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, user_id, type, amount, ref_id, description, created_at
+          FROM transactions
+          WHERE type IN ('referral_reward','direct_referral') AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all<any>()
+        txByRrRef = txByRrRef.concat((r.results || []) as any[])
+      }
+    }
+
+    // 5) 시각윈도우 TX (UTC 5/12 23:00 ~ 5/13 23:00)
+    const txByTime = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward','direct_referral')
+        AND created_at >= '2026-05-12 23:00:00'
+        AND created_at < '2026-05-13 23:00:00'
+      ORDER BY created_at, id
+    `).all<any>()
+    const txTimeRows = (txByTime.results || []) as any[]
+
+    // 6) description 정합 검사 (Level 1 / Level 2 포함 여부)
+    const txL1: any[] = txByRrRef.filter((t:any) => {
+      const rr0 = rrRows.find((r:any) => r.id === t.ref_id)
+      return rr0 && rr0.level === 1
+    })
+    const txL2: any[] = txByRrRef.filter((t:any) => {
+      const rr0 = rrRows.find((r:any) => r.id === t.ref_id)
+      return rr0 && rr0.level === 2
+    })
+    const txL0: any[] = txByRrRef.filter((t:any) => {
+      const rr0 = rrRows.find((r:any) => r.id === t.ref_id)
+      return rr0 && rr0.level === 0
+    })
+    const descL1Distinct: Record<string, number> = {}
+    const descL2Distinct: Record<string, number> = {}
+    const descL0Distinct: Record<string, number> = {}
+    const descDrDistinct: Record<string, number> = {}
+    let l1HasLevel1 = 0, l1NoLevel1 = 0
+    let l2HasLevel1 = 0, l2NoLevel1 = 0
+    for (const t of txL1) {
+      descL1Distinct[t.description] = (descL1Distinct[t.description] || 0) + 1
+      if (String(t.description || '').indexOf('Level 1') >= 0) l1HasLevel1++; else l1NoLevel1++
+    }
+    for (const t of txL2) {
+      descL2Distinct[t.description] = (descL2Distinct[t.description] || 0) + 1
+      if (String(t.description || '').indexOf('Level 1') >= 0) l2HasLevel1++; else l2NoLevel1++
+    }
+    for (const t of txL0) {
+      descL0Distinct[t.description] = (descL0Distinct[t.description] || 0) + 1
+    }
+    for (const t of txByDrRef) {
+      descDrDistinct[t.description] = (descDrDistinct[t.description] || 0) + 1
+    }
+
+    // 7) ratio 정합성 (L1=20%, L2=10%)
+    let ratioOk = 0, ratioFail = 0
+    const ratioMismatches: any[] = []
+    for (const r of [...rrL1, ...rrL2]) {
+      const ratio = r.level === 1 ? 0.20 : 0.10
+      const expected = Math.floor(Number(r.original_amount) * ratio)
+      if (Number(r.reward_amount) === expected) ratioOk++
+      else {
+        ratioFail++
+        if (ratioMismatches.length < 10) {
+          ratioMismatches.push({
+            id: r.id, level: r.level,
+            original_amount: r.original_amount, reward_amount: r.reward_amount, expected,
+          })
+        }
+      }
+    }
+
+    // 8) 중복 검사 (영구룰 #스테이킹별독립)
+    const dupDr = await db.prepare(`
+      SELECT user_id, staking_id, reward_date, paid_date, COUNT(*) as cnt
+      FROM daily_rewards WHERE paid_date=?
+      GROUP BY user_id, staking_id, reward_date, paid_date HAVING cnt > 1
+    `).bind(PAID).all<any>()
+    const dupRr = await db.prepare(`
+      SELECT referrer_id, referee_id, level, reward_date, paid_date, staking_id, COUNT(*) as cnt
+      FROM referral_rewards WHERE paid_date=?
+      GROUP BY referrer_id, referee_id, level, reward_date, paid_date, staking_id HAVING cnt > 1
+    `).bind(PAID).all<any>()
+
+    // 9) created_at 정규시각 분포
+    const createdDrDistinct: Record<string, number> = {}
+    const createdRrDistinct: Record<string, number> = {}
+    for (const d of drRows) createdDrDistinct[d.created_at] = (createdDrDistinct[d.created_at]||0)+1
+    for (const r of rrRows) createdRrDistinct[r.created_at] = (createdRrDistinct[r.created_at]||0)+1
+
+    // 10) balance 영향 분석 (현재 분포만 - DELETE 가정 시 차감액)
+    const balanceImpact: Record<number, { from_dr: number, from_rr_l12: number, from_rr_l0: number, total: number, name?: string }> = {}
+    for (const d of drRows) {
+      const uid = d.user_id
+      if (!balanceImpact[uid]) balanceImpact[uid] = { from_dr: 0, from_rr_l12: 0, from_rr_l0: 0, total: 0 }
+      balanceImpact[uid].from_dr += Number(d.qkey || 0)
+    }
+    for (const r of [...rrL1, ...rrL2]) {
+      const uid = r.referrer_id
+      if (!balanceImpact[uid]) balanceImpact[uid] = { from_dr: 0, from_rr_l12: 0, from_rr_l0: 0, total: 0 }
+      balanceImpact[uid].from_rr_l12 += Number(r.reward_amount || 0)
+    }
+    for (const r of rrL0) {
+      const uid = r.referrer_id
+      if (!balanceImpact[uid]) balanceImpact[uid] = { from_dr: 0, from_rr_l12: 0, from_rr_l0: 0, total: 0 }
+      balanceImpact[uid].from_rr_l0 += Number(r.reward_amount || 0)
+    }
+    for (const uid of Object.keys(balanceImpact)) {
+      const b = balanceImpact[Number(uid)]
+      b.total = b.from_dr + b.from_rr_l12 + b.from_rr_l0
+    }
+    const affectedIds = Object.keys(balanceImpact).map(Number)
+
+    // 11) 다른 paid_date snapshot
+    const otherPaid = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date BETWEEN '2026-05-09' AND '2026-05-20'
+      GROUP BY paid_date ORDER BY paid_date
+    `).all<any>()
+
+    // 12) TX 시각윈도우 중 ref_id 매핑 외 orphan (5/13 paid 외)
+    const drIdSet = new Set(drIds)
+    const rrIdSet = new Set(rrIds)
+    const orphanTx = txTimeRows.filter((t:any) => {
+      if (t.type === 'daily_qkey') return !drIdSet.has(t.ref_id)
+      return !rrIdSet.has(t.ref_id)
+    })
+
+    // 13) Verdict
+    const issues: string[] = []
+    if (drRows.length === 0) issues.push('DR_EMPTY')
+    if (Object.keys(drByRd).some(k => k !== RD_EXPECTED)) issues.push(`DR_REWARD_DATE_MISMATCH: ${Object.keys(drByRd).join(',')}`)
+    if (ratioFail > 0) issues.push(`RR_RATIO_FAIL: ${ratioFail}`)
+    if ((dupDr.results || []).length > 0) issues.push(`DR_DUPLICATE: ${(dupDr.results || []).length}`)
+    if ((dupRr.results || []).length > 0) issues.push(`RR_DUPLICATE: ${(dupRr.results || []).length}`)
+    if (l1NoLevel1 > 0) issues.push(`L1_TX_DESC_MISSING_Level1: ${l1NoLevel1}`)
+    if (l2HasLevel1 > 0) issues.push(`L2_TX_DESC_HAS_Level1_WRONG: ${l2HasLevel1}`)
+    if (txByDrRef.length !== drRows.length) issues.push(`TX_DR_MAPPING_MISMATCH: tx=${txByDrRef.length} vs dr=${drRows.length}`)
+    const expectedRrTx = rrL1.length + rrL2.length + rrL0.length
+    if (txByRrRef.length !== expectedRrTx) issues.push(`TX_RR_MAPPING_MISMATCH: tx=${txByRrRef.length} vs rr=${expectedRrTx}`)
+    if (orphanTx.length > 0) issues.push(`ORPHAN_TX_IN_5_13_WINDOW: ${orphanTx.length}`)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      paid_date: PAID,
+      reward_date_expected: RD_EXPECTED,
+      created_at_expected_dr: CREATED_DR_EXPECTED,
+      verdict: issues.length === 0 ? 'SCAN_513_OK' : 'SCAN_513_ISSUES_FOUND',
+      issues,
+      counts: {
+        dr: drRows.length,
+        dr_qkey: drRows.reduce((a,b)=>a+Number(b.qkey||0),0),
+        rr_l0: rrL0.length,
+        rr_l0_qkey: rrL0.reduce((a:number,b:any)=>a+Number(b.reward_amount||0),0),
+        rr_l1: rrL1.length,
+        rr_l1_qkey: rrL1.reduce((a:number,b:any)=>a+Number(b.reward_amount||0),0),
+        rr_l2: rrL2.length,
+        rr_l2_qkey: rrL2.reduce((a:number,b:any)=>a+Number(b.reward_amount||0),0),
+        grand_total_qkey:
+          drRows.reduce((a,b)=>a+Number(b.qkey||0),0)
+          + rrRows.reduce((a:number,b:any)=>a+Number(b.reward_amount||0),0),
+        tx_by_dr_ref: txByDrRef.length,
+        tx_by_rr_ref: txByRrRef.length,
+        tx_by_time_window: txTimeRows.length,
+        orphan_tx_in_window: orphanTx.length,
+        ratio_ok: ratioOk, ratio_fail: ratioFail,
+        balance_users_affected: affectedIds.length,
+        balance_total_credit: Object.values(balanceImpact).reduce((a,b)=>a+b.total,0),
+      },
+      dr_by_reward_date: drByRd,
+      rr_by_level_reward_date: rrByLevelRd,
+      created_at_distinct: {
+        dr: createdDrDistinct,
+        rr: createdRrDistinct,
+      },
+      tx_description: {
+        dr_distinct: descDrDistinct,
+        l0_distinct: descL0Distinct,
+        l1_distinct: descL1Distinct,
+        l2_distinct: descL2Distinct,
+        l1_has_level1: l1HasLevel1,
+        l1_no_level1: l1NoLevel1,
+        l2_has_level1_wrong: l2HasLevel1,
+        l2_no_level1_ok: l2NoLevel1,
+      },
+      ratio_mismatches: ratioMismatches,
+      duplicates: {
+        dr: dupDr.results || [],
+        rr: dupRr.results || [],
+      },
+      rr_l0_detail: rrL0.map((r:any) => ({
+        id: r.id, referrer_id: r.referrer_id, referee_id: r.referee_id,
+        original_amount: r.original_amount, reward_amount: r.reward_amount,
+        reward_date: r.reward_date, created_at: r.created_at, staking_id: r.staking_id,
+      })),
+      sample_dr: drRows.slice(0, 5),
+      sample_rr_l1: rrL1.slice(0, 5),
+      sample_rr_l2: rrL2.slice(0, 5),
+      orphan_tx_sample: orphanTx.slice(0, 10),
+      other_paid_dr_snapshot: otherPaid.results || [],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // fix-519-tx-description — 5/19 referral_reward TX description 정정 (DRY-RUN + EXEC)
 // ════════════════════════════════════════════════════════════════════════
 // 문제: UI 의 dash 화면 로직 (src/index.tsx:24488)
