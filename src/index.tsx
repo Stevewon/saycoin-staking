@@ -56606,6 +56606,158 @@ app.get('/api/diag/scan-tx-double-payments', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-holiday-tx-double — 휴일진입자 5명 TX 중복 정밀조사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "다른 진입자들은 정상인듯 하니 휴일진입자만 집중해서 볼것!!!!"
+//
+// 휴일진입자 5명:
+//   user 33 (방승훈), 38 (김용선), 40 (이정옥), 91 (김주성), 93 (이현우)
+//   stakings 94, 95, 96, 97, 98
+//
+// 조사 범위:
+//   - 5/11 ~ 5/19 KST 의 TX 전체 (type IN ('daily_qkey', 'referral_reward'))
+//   - 5명 user_id 만 필터링
+//
+// 분석:
+//   1) 각 user 의 (type, amount, KST date) 별 중복 group dump
+//   2) 각 group 의 모든 TX row (id, created_at_kst, ref_id, description)
+//   3) ref_id 매핑된 DR/RR row 존재 여부 (정상 vs 잔재 판별)
+//   4) 1회만 남기고 차감해야 할 후보 TX 자동 식별
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-holiday-tx-double', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const HOLIDAY_USERS = [33, 38, 40, 91, 93]
+    const userList = HOLIDAY_USERS.join(',')
+
+    // ── 1) 5명의 TX 전체 (5/11 ~ 5/19 KST) 가져오기 ──────────────────────
+    const txAll = await c.env.DB.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description, created_at,
+             date(created_at, '+9 hours') as kst_date,
+             time(created_at, '+9 hours') as kst_time
+      FROM transactions
+      WHERE user_id IN (${userList})
+        AND type IN ('daily_qkey', 'referral_reward')
+        AND date(created_at, '+9 hours') BETWEEN '2026-05-11' AND '2026-05-19'
+      ORDER BY user_id, kst_date, type, amount, created_at
+    `).all()
+
+    const txRows = (txAll.results || []) as any[]
+
+    // ── 2) (user_id, type, amount, kst_date) 별 grouping ─────────────────
+    const groupMap = new Map<string, any[]>()
+    for (const r of txRows) {
+      const key = `${r.user_id}|${r.type}|${r.amount}|${r.kst_date}`
+      if (!groupMap.has(key)) groupMap.set(key, [])
+      groupMap.get(key)!.push(r)
+    }
+
+    // ── 3) 중복 group 만 추출 (cnt >= 2) ──────────────────────────────────
+    const dupGroups: any[] = []
+    let totalExtraRows = 0
+    for (const [key, rows] of groupMap.entries()) {
+      if (rows.length < 2) continue
+      const [user_id, type, amount, kst_date] = key.split('|')
+      const extra = rows.length - 1
+      totalExtraRows += extra
+
+      // 각 row 의 ref_id 매핑 확인 (DR or RR 존재 여부)
+      const enriched = [] as any[]
+      for (const row of rows) {
+        let refExists = false
+        let refTable: string | null = null
+        let refDetail: any = null
+        if (row.ref_id) {
+          if (row.type === 'daily_qkey') {
+            const dr = await c.env.DB.prepare(
+              `SELECT id, user_id, staking_id, paid_date, qkey_amount FROM daily_rewards WHERE id = ?`
+            ).bind(row.ref_id).first()
+            if (dr) { refExists = true; refTable = 'daily_rewards'; refDetail = dr }
+          } else if (row.type === 'referral_reward') {
+            const rr = await c.env.DB.prepare(
+              `SELECT id, referrer_id, referee_id, level, reward_amount, paid_date FROM referral_rewards WHERE id = ?`
+            ).bind(row.ref_id).first()
+            if (rr) { refExists = true; refTable = 'referral_rewards'; refDetail = rr }
+          }
+        }
+        enriched.push({
+          id: row.id,
+          created_at: row.created_at,
+          kst_time: row.kst_time,
+          ref_id: row.ref_id,
+          ref_exists: refExists,
+          ref_table: refTable,
+          ref_detail: refDetail,
+          description: row.description,
+        })
+      }
+
+      // "정상" 후보: ref_exists=true AND kst_time 가 08:00:00 또는 08:00:01 부근
+      // "잔재" 후보: ref_exists=false (orphan) OR 비정규시각
+      const normal = enriched.filter(r => r.ref_exists && (r.kst_time === '08:00:00' || r.kst_time === '08:00:01'))
+      const orphan = enriched.filter(r => !r.ref_exists)
+      const offTime = enriched.filter(r => r.ref_exists && r.kst_time !== '08:00:00' && r.kst_time !== '08:00:01')
+
+      dupGroups.push({
+        user_id: parseInt(user_id),
+        type,
+        amount: parseFloat(amount),
+        kst_date,
+        total_count: rows.length,
+        extra_count: extra,
+        normal_rows: normal,         // 보존 후보
+        orphan_rows: orphan,         // 잔재 (ref_id NULL or 매핑 없음)
+        off_time_rows: offTime,      // ref_id 존재하나 비정규시각
+        keep_candidate_id: normal.length > 0 ? normal[0].id : (enriched[0]?.id ?? null),
+        delete_candidate_ids: [
+          ...orphan.map(r => r.id),
+          ...offTime.map(r => r.id),
+          ...(normal.length > 1 ? normal.slice(1).map(r => r.id) : []),
+        ],
+      })
+    }
+
+    // ── 4) user 별 요약 ────────────────────────────────────────────────────
+    const perUser: Record<string, any> = {}
+    for (const uid of HOLIDAY_USERS) {
+      const groups = dupGroups.filter(g => g.user_id === uid)
+      const userTxAll = txRows.filter(r => r.user_id === uid)
+      perUser[String(uid)] = {
+        tx_total_rows: userTxAll.length,
+        dup_groups: groups.length,
+        extra_rows: groups.reduce((s, g) => s + g.extra_count, 0),
+        amount_to_deduct: groups.reduce((s, g) => s + g.extra_count * g.amount, 0),
+      }
+    }
+
+    // ── 5) 전체 차감해야 할 금액 ───────────────────────────────────────────
+    const totalAmountToDeduct = dupGroups.reduce(
+      (s, g) => s + g.extra_count * g.amount, 0
+    )
+
+    return c.json({
+      verdict: dupGroups.length > 0 ? 'HOLIDAY_TX_DOUBLE_FOUND' : 'HOLIDAY_TX_OK',
+      holiday_users: HOLIDAY_USERS,
+      scan_range: '2026-05-11 ~ 2026-05-19 KST',
+      summary: {
+        total_tx_rows: txRows.length,
+        total_dup_groups: dupGroups.length,
+        total_extra_rows: totalExtraRows,
+        total_amount_to_deduct: totalAmountToDeduct,
+      },
+      per_user: perUser,
+      dup_groups: dupGroups,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // scan-holiday-joiners-double — 휴일진입자 이중지급 전수조사 (READ-ONLY)
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "휴일진입자 2중 지급이 된거 같으니 11일부터 18일 확정분을
