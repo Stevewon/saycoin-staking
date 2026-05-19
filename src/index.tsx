@@ -56758,6 +56758,75 @@ app.get('/api/diag/scan-holiday-tx-double', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// admin-page-mirror — 관리자 회원상세 화면이 호출하는 query 를 그대로 재현
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 이미지 (2026-05-19): 이현우(93) 5/13 11:58 + 08:00 일일배당 750 두 건 표시
+// scan-user-full 은 TX 7건 정상이라고 결과 → 실제 admin 화면이 보는 데이터와 다를 가능성
+// 이 endpoint 는 /api/admin/user/:userId 와 동일 query 를 auth 없이 실행
+app.get('/api/diag/admin-page-mirror', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const userId = parseInt(c.req.query('user_id') || '93')
+    const db = c.env.DB
+
+    const user = await db.prepare(`
+      SELECT id, name, qkey_balance FROM users WHERE id = ?
+    `).bind(userId).first()
+
+    // rewards (admin 화면의 "보상 정보" 영역)
+    const rewards = await db.prepare(`
+      SELECT d.id, d.user_id, d.staking_id, d.usdt_amount, d.reward_date, d.paid_date,
+             d.created_at as created_at_utc,
+             datetime(d.created_at, '+9 hours') AS created_at_kst,
+             s.amount as staking_amount
+      FROM daily_rewards d
+      LEFT JOIN staking s ON d.staking_id = s.id
+      WHERE d.user_id = ?
+      ORDER BY datetime(d.created_at, '+9 hours') DESC, d.id DESC
+    `).bind(userId).all()
+
+    // transactions (admin 화면의 "거래 내역" 영역) - admin endpoint 와 100% 동일
+    const transactions = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id,
+             created_at as created_at_utc,
+             datetime(created_at, '+9 hours') AS created_at_kst
+      FROM transactions WHERE user_id = ?
+      ORDER BY datetime(created_at, '+9 hours') DESC, id DESC
+    `).bind(userId).all()
+
+    // referral_rewards (admin 화면의 "직판수당" 영역)
+    const referralRewards = await db.prepare(`
+      SELECT r.id, r.referrer_id, r.referee_id, r.level, r.reward_amount,
+             r.reward_date, r.paid_date,
+             r.created_at as created_at_utc,
+             datetime(r.created_at, '+9 hours') AS created_at_kst,
+             u.name as referee_name
+      FROM referral_rewards r
+      LEFT JOIN users u ON r.referee_id = u.id
+      WHERE r.referrer_id = ?
+      ORDER BY r.created_at DESC
+      LIMIT 200
+    `).bind(userId).all()
+
+    return c.json({
+      user,
+      rewards_count: (rewards.results || []).length,
+      rewards: rewards.results,
+      transactions_count: (transactions.results || []).length,
+      transactions: transactions.results,
+      referral_rewards_count: (referralRewards.results || []).length,
+      referral_rewards: referralRewards.results,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // scan-user-full — 특정 user 의 전체 기간 모든 지급 항목 중복지급 전수조사
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "이제 박원태에 대해서 중복지급인지 아닌지 전수조사해서 보고할것"
