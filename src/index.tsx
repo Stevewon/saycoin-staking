@@ -50614,4 +50614,143 @@ app.get('/api/diag/emerg-batch-purge', async (c) => {
 })
 
 
+// ============================================================================
+// 🚨 EMERGENCY 2026-05-19: 전체 paid_date 별 batch 무결성 감사
+// ============================================================================
+// 각 paid_date 에 대해:
+//   - daily_rewards 행 수 (정상은 활성 사용자 수와 같아야 함, 한 사용자당 1행)
+//   - 같은 (user_id, staking_id, reward_date) 중복 행 수
+//   - daily_qkey tx 수 vs daily_rewards 수 (같아야 함, 다르면 중복 INSERT)
+//   - daily_qkey tx 의 distinct created_at 개수 (1 이어야 함, 2 이상이면 두 batch INSERT)
+//   - referral_reward 도 마찬가지
+//   - 결과: 각 paid_date 의 "이상 여부"
+app.get('/api/diag/all-batches-audit', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    const days = Number(c.req.query('days') || 14)
+
+    // 모든 paid_date 추출 (daily_rewards 기준)
+    const dates = await db.prepare(`
+      SELECT DISTINCT paid_date FROM daily_rewards
+      ORDER BY paid_date DESC
+      LIMIT ?
+    `).bind(days).all<any>()
+
+    const out: any[] = []
+    for (const row of (dates.results || [])) {
+      const pd = row.paid_date
+
+      // daily_rewards 행 수 + 중복 검사
+      const drAgg = await db.prepare(`
+        SELECT COUNT(*) AS cnt, COUNT(DISTINCT user_id) AS user_cnt,
+               COUNT(DISTINCT created_at) AS distinct_created_at,
+               MIN(created_at) AS first_created, MAX(created_at) AS last_created
+        FROM daily_rewards WHERE paid_date = ?
+      `).bind(pd).first<any>()
+
+      // dr 중복 (user_id, staking_id, reward_date)
+      const drDup = await db.prepare(`
+        SELECT COUNT(*) AS dup_groups FROM (
+          SELECT user_id, staking_id, reward_date, COUNT(*) AS c
+          FROM daily_rewards WHERE paid_date = ?
+          GROUP BY user_id, staking_id, reward_date HAVING c > 1
+        )
+      `).bind(pd).first<any>()
+
+      // daily_qkey tx (dr.id 매칭)
+      const dqtxAgg = await db.prepare(`
+        SELECT COUNT(*) AS tx_cnt, COUNT(DISTINCT t.ref_id) AS distinct_ref,
+               COUNT(DISTINCT t.created_at) AS distinct_tx_created_at,
+               MIN(t.created_at) AS tx_first_at, MAX(t.created_at) AS tx_last_at,
+               SUM(t.amount) AS tx_sum
+        FROM transactions t
+        INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+        WHERE t.type = 'daily_qkey' AND dr.paid_date = ?
+      `).bind(pd).first<any>()
+
+      // referral_rewards 행 수 + tx 매칭
+      const rrAgg = await db.prepare(`
+        SELECT COUNT(*) AS cnt, COUNT(DISTINCT created_at) AS distinct_created_at
+        FROM referral_rewards WHERE paid_date = ?
+      `).bind(pd).first<any>()
+
+      const rrtxAgg = await db.prepare(`
+        SELECT COUNT(*) AS tx_cnt, COUNT(DISTINCT t.created_at) AS distinct_tx_created_at,
+               SUM(t.amount) AS tx_sum
+        FROM transactions t
+        INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+        WHERE t.type = 'referral_reward' AND rr.paid_date = ?
+      `).bind(pd).first<any>()
+
+      // 같은 paid_date 에 대해 created_at 의 KST 표시 (5/19 batch 의 두 시각이 어떤지 보기 위해)
+      const drCreatedSamples = await db.prepare(`
+        SELECT created_at, datetime(created_at, '+9 hours') AS kst_at, COUNT(*) AS c
+        FROM daily_rewards WHERE paid_date = ?
+        GROUP BY created_at ORDER BY created_at
+      `).bind(pd).all<any>()
+
+      const dqtxCreatedSamples = await db.prepare(`
+        SELECT t.created_at, datetime(t.created_at, '+9 hours') AS kst_at, COUNT(*) AS c
+        FROM transactions t INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+        WHERE t.type = 'daily_qkey' AND dr.paid_date = ?
+        GROUP BY t.created_at ORDER BY t.created_at
+      `).bind(pd).all<any>()
+
+      const rrtxCreatedSamples = await db.prepare(`
+        SELECT t.created_at, datetime(t.created_at, '+9 hours') AS kst_at, COUNT(*) AS c
+        FROM transactions t INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+        WHERE t.type = 'referral_reward' AND rr.paid_date = ?
+        GROUP BY t.created_at ORDER BY t.created_at
+      `).bind(pd).all<any>()
+
+      const drCnt = Number(drAgg?.cnt || 0)
+      const dqtxCnt = Number(dqtxAgg?.tx_cnt || 0)
+      const rrCnt = Number(rrAgg?.cnt || 0)
+      const rrtxCnt = Number(rrtxAgg?.tx_cnt || 0)
+      const dupGroups = Number(drDup?.dup_groups || 0)
+      const dqTxDistinctTimes = Number(dqtxAgg?.distinct_tx_created_at || 0)
+      const rrTxDistinctTimes = Number(rrtxAgg?.distinct_tx_created_at || 0)
+
+      const issues: string[] = []
+      if (dupGroups > 0) issues.push(`dr 중복그룹=${dupGroups}`)
+      if (drCnt !== dqtxCnt) issues.push(`dr=${drCnt} != daily_qkey tx=${dqtxCnt}`)
+      if (rrCnt !== rrtxCnt) issues.push(`rr=${rrCnt} != referral_reward tx=${rrtxCnt}`)
+      if (dqTxDistinctTimes > 1) issues.push(`daily_qkey tx created_at 종류=${dqTxDistinctTimes} (1 이어야 함)`)
+      if (rrTxDistinctTimes > 1) issues.push(`referral tx created_at 종류=${rrTxDistinctTimes} (1 이어야 함)`)
+
+      out.push({
+        paid_date: pd,
+        dr: { cnt: drCnt, user_cnt: Number(drAgg?.user_cnt || 0), distinct_created_at: Number(drAgg?.distinct_created_at || 0) },
+        dr_duplicate_groups: dupGroups,
+        daily_qkey_tx: { cnt: dqtxCnt, distinct_ref: Number(dqtxAgg?.distinct_ref || 0), distinct_created_at: dqTxDistinctTimes, sum: Number(dqtxAgg?.tx_sum || 0) },
+        rr: { cnt: rrCnt, distinct_created_at: Number(rrAgg?.distinct_created_at || 0) },
+        referral_tx: { cnt: rrtxCnt, distinct_created_at: rrTxDistinctTimes, sum: Number(rrtxAgg?.tx_sum || 0) },
+        dr_created_times: (drCreatedSamples.results || []),
+        daily_tx_created_times: (dqtxCreatedSamples.results || []),
+        referral_tx_created_times: (rrtxCreatedSamples.results || []),
+        verdict: issues.length === 0 ? '✅ OK' : `⚠️ ${issues.join(' | ')}`,
+        issues,
+      })
+    }
+
+    const anomalies = out.filter(x => x.issues.length > 0)
+
+    return c.json({
+      ok: true,
+      checked_days: out.length,
+      anomalies_count: anomalies.length,
+      anomalies_summary: anomalies.map(a => ({ paid_date: a.paid_date, verdict: a.verdict })),
+      audit: out,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
