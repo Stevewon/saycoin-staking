@@ -56921,12 +56921,12 @@ app.get('/api/diag/scan-all-tx-double', async (c) => {
       const chunk = affectedUserIds.slice(i, i + 50)
       const placeholders = chunk.map(() => '?').join(',')
       const res = await c.env.DB.prepare(
-        `SELECT id, name, balance FROM users WHERE id IN (${placeholders})`
+        `SELECT id, name, qkey_balance FROM users WHERE id IN (${placeholders})`
       ).bind(...chunk).all()
       for (const r of (res.results || []) as any[]) {
         if (perUser[String(r.id)]) {
           perUser[String(r.id)].name = r.name
-          perUser[String(r.id)].current_balance = r.balance
+          perUser[String(r.id)].current_qkey_balance = r.qkey_balance
         }
       }
     }
