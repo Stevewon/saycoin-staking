@@ -61413,4 +61413,149 @@ app.get('/api/diag/fix-solbat-tree-missing-v2', async (c) => {
 })
 
 
+// ============================================================================
+// rollback-solbat-tree-v2 — v2 EXEC 으로 잘못 INSERT 된 모든 데이터 제거
+// 이유: 5/5 어린이날 + 5/9, 5/16 휴일(토요일) - 휴일에는 배당 없음 (영구룰)
+// 표식: description 에 'solbat-tree-v2' 포함
+// EXEC: 마커 TX 식별 → qkey_balance 정확히 차감(SUM 으로) → DELETE tx/dr/rr
+// DRY-RUN: GET /api/diag/rollback-solbat-tree-v2?pw=ADMIN_PW
+// EXEC:    GET /api/diag/rollback-solbat-tree-v2?pw=ADMIN_PW&confirm=ROLLBACK_SOLBAT_V2_HOLIDAY
+// ============================================================================
+app.get('/api/diag/rollback-solbat-tree-v2', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const isExec = c.req.query('confirm') === 'ROLLBACK_SOLBAT_V2_HOLIDAY'
+
+  try {
+    // 1) 마커가 있는 transactions 식별
+    const markedTxRows = await c.env.DB.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description FROM transactions
+      WHERE description LIKE '%solbat-tree-v2%'
+    `).all()
+    const markedTxs = (markedTxRows.results || []) as any[]
+
+    // 회원별 차감 amount 합산
+    const perUserDelta: Record<number, number> = {}
+    const drIds = new Set<number>()
+    const rrIds = new Set<number>()
+    for (const t of markedTxs) {
+      perUserDelta[t.user_id] = (perUserDelta[t.user_id] || 0) + t.amount
+      if (t.type === 'daily_qkey' && t.ref_id) drIds.add(t.ref_id)
+      else if (t.type === 'referral_reward' && t.ref_id) rrIds.add(t.ref_id)
+    }
+
+    // 현재 잔액 조회
+    const userIds = Object.keys(perUserDelta).map(Number)
+    const phU = userIds.map(() => '?').join(',')
+    const curRows = userIds.length > 0
+      ? (await c.env.DB.prepare(`SELECT id, name, qkey_balance FROM users WHERE id IN (${phU})`).bind(...userIds).all()).results as any[]
+      : []
+    const curMap: Record<number, any> = {}
+    for (const u of curRows) curMap[u.id] = u
+
+    const previewRows = userIds.map(uid => ({
+      user_id: uid, name: curMap[uid]?.name || '?',
+      current: curMap[uid]?.qkey_balance || 0,
+      delta: -perUserDelta[uid],
+      after: (curMap[uid]?.qkey_balance || 0) - perUserDelta[uid]
+    })).sort((a,b)=>a.user_id-b.user_id)
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        tx_count: markedTxs.length,
+        tx_id_range: markedTxs.length ? [Math.min(...markedTxs.map(t=>t.id)), Math.max(...markedTxs.map(t=>t.id))] : null,
+        daily_rewards_count: drIds.size,
+        referral_rewards_count: rrIds.size,
+        total_rollback_qkey: Object.values(perUserDelta).reduce((a,b)=>a+b, 0),
+        per_user_rollback: previewRows,
+        hint: 'Add &confirm=ROLLBACK_SOLBAT_V2_HOLIDAY to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ========== EXEC ==========
+    // Order: UPDATE balance → DELETE tx → DELETE dr → DELETE rr
+    let balUpdated = 0
+    const balErrors: any[] = []
+    for (const [uid, delta] of Object.entries(perUserDelta)) {
+      try {
+        const r = await c.env.DB.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`).bind(delta, Number(uid)).run()
+        if ((r.meta?.changes || 0) > 0) balUpdated++
+      } catch (e:any) {
+        balErrors.push({ user_id: Number(uid), delta, error: String(e?.message || e) })
+      }
+    }
+
+    // DELETE transactions
+    const delTx = await c.env.DB.prepare(`DELETE FROM transactions WHERE description LIKE '%solbat-tree-v2%'`).run()
+
+    // DELETE daily_rewards (chunk 50)
+    let delDr = 0
+    if (drIds.size > 0) {
+      const drArr = Array.from(drIds)
+      for (let i = 0; i < drArr.length; i += 50) {
+        const chunk = drArr.slice(i, i+50)
+        const ph = chunk.map(() => '?').join(',')
+        const r = await c.env.DB.prepare(`DELETE FROM daily_rewards WHERE id IN (${ph})`).bind(...chunk).run()
+        delDr += (r.meta?.changes || 0)
+      }
+    }
+
+    // DELETE referral_rewards (chunk 50)
+    let delRr = 0
+    if (rrIds.size > 0) {
+      const rrArr = Array.from(rrIds)
+      for (let i = 0; i < rrArr.length; i += 50) {
+        const chunk = rrArr.slice(i, i+50)
+        const ph = chunk.map(() => '?').join(',')
+        const r = await c.env.DB.prepare(`DELETE FROM referral_rewards WHERE id IN (${ph})`).bind(...chunk).run()
+        delRr += (r.meta?.changes || 0)
+      }
+    }
+
+    // 사후 검증
+    const gb = await c.env.DB.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS s FROM users`).first() as any
+    const gt = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE coin_type = 'QKEY'`).first() as any
+
+    // 회원별 사후 검증
+    const afterRows = userIds.length > 0
+      ? (await c.env.DB.prepare(`SELECT id, name, qkey_balance FROM users WHERE id IN (${phU})`).bind(...userIds).all()).results as any[]
+      : []
+    const afterCheck: any[] = []
+    for (const u of afterRows) {
+      const ts = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'QKEY'`).bind(u.id).first() as any
+      afterCheck.push({
+        user_id: u.id, name: u.name,
+        qkey_balance: u.qkey_balance, tx_sum: ts?.s,
+        match: u.qkey_balance === ts?.s ? 'OK' : 'MISMATCH'
+      })
+    }
+
+    return c.json({
+      mode: 'EXEC_DONE',
+      balance_updated_users: balUpdated,
+      balance_errors: balErrors,
+      deleted: {
+        transactions: delTx.meta?.changes || 0,
+        daily_rewards: delDr,
+        referral_rewards: delRr,
+      },
+      after_check: afterCheck.sort((a,b)=>a.user_id-b.user_id),
+      global: {
+        total_qkey_balance: gb?.s,
+        total_qkey_tx_sum: gt?.s,
+        integrity: gb?.s === gt?.s ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+        diff: (gb?.s ?? 0) - (gt?.s ?? 0),
+      },
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
