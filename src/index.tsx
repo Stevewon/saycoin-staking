@@ -57040,6 +57040,196 @@ app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// sim-option-d — Option-D (깨끗한 청산) DRY-RUN 시뮬레이션
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 질문 (2026-05-19):
+//   "옵션 d 가 정확히 어떤 내역이 들어가서 나오는 정산된 합계인가?"
+//
+// Option-D 정의 (절대 변경되지 않음, 코드에 박힘):
+//   Step 1) B-EXEC 잘못 차감 복원 (RESTORE):
+//           - user 91 (김주성): qkey_balance += 7350
+//           - user 93 (이현우): qkey_balance += 750
+//   Step 2) 위반 type TX 122건 DELETE (PURGE):
+//           - WHERE coin_type='QKEY' AND type IN
+//             ('daily_reward','staking_reward','shop_purchase','shop_refund','three_set_supplement')
+//   Step 3) 모든 user qkey_balance = SUM(legal QKEY TX) 강제 UPDATE (RECOMPUTE):
+//           - legal = ('daily_qkey','referral_reward','direct_referral',
+//                     'admin_adjustment','swap_in','swap_out')
+//
+// 본 endpoint: READ-ONLY 시뮬레이션. DB 변경 0건.
+//   - 각 user 별: 현재잔액, Step1 후, Step2 영향 (제거될 TX 합), Step3 결과(legal sum)
+//   - 최종 잔액 / 변동 / 음수 user 식별
+//   - 위반 TX 122건 상세 (각 row 의 user/type/amount/desc)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/sim-option-d', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+
+    // 정의
+    const LEGAL_TYPES = ['daily_qkey','referral_reward','direct_referral','admin_adjustment','swap_in','swap_out']
+    const VIOLATION_TYPES = ['daily_reward','staking_reward','shop_purchase','shop_refund','three_set_supplement']
+    const B_EXEC_RESTORE = [
+      { user_id: 91, name: '김주성', restore_amount: 7350, reason: 'B-EXEC purge-holiday-513-legacy tx_id=3303 잘못된 잔액 차감 복원' },
+      { user_id: 93, name: '이현우', restore_amount:  750, reason: 'B-EXEC purge-holiday-513-legacy tx_id=3305 잘못된 잔액 차감 복원' },
+    ]
+
+    // 1) 전체 user
+    const usersRes = await db.prepare(`
+      SELECT id, name, qkey_balance FROM users ORDER BY id
+    `).all()
+    const users = (usersRes.results || []) as any[]
+
+    // 2) 위반 TX 122건 (실제 raw)
+    const violPlaceholders = VIOLATION_TYPES.map(() => '?').join(',')
+    const violTxRes = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id,
+             created_at as created_at_utc,
+             datetime(created_at, '+9 hours') AS created_at_kst
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN (${violPlaceholders})
+      ORDER BY user_id, datetime(created_at, '+9 hours')
+    `).bind(...VIOLATION_TYPES).all()
+    const violTxs = (violTxRes.results || []) as any[]
+
+    // 3) user 별 위반 TX 합 (Step 2 에서 제거될 금액)
+    const violSumByUser = new Map<number, { cnt: number; sum: number; by_type: Record<string, { cnt: number; sum: number }> }>()
+    for (const t of violTxs) {
+      if (!violSumByUser.has(t.user_id)) violSumByUser.set(t.user_id, { cnt: 0, sum: 0, by_type: {} })
+      const e = violSumByUser.get(t.user_id)!
+      e.cnt += 1
+      e.sum += t.amount
+      if (!e.by_type[t.type]) e.by_type[t.type] = { cnt: 0, sum: 0 }
+      e.by_type[t.type].cnt += 1
+      e.by_type[t.type].sum += t.amount
+    }
+
+    // 4) user 별 legal TX 합 (Step 3 결과)
+    const legalPlaceholders = LEGAL_TYPES.map(() => '?').join(',')
+    const legalAggRes = await db.prepare(`
+      SELECT user_id, type, COUNT(*) AS cnt, SUM(amount) AS sum
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN (${legalPlaceholders})
+      GROUP BY user_id, type
+    `).bind(...LEGAL_TYPES).all()
+    const legalByUser = new Map<number, { total: number; by_type: Record<string, { cnt: number; sum: number }> }>()
+    for (const r of (legalAggRes.results || []) as any[]) {
+      if (!legalByUser.has(r.user_id)) legalByUser.set(r.user_id, { total: 0, by_type: {} })
+      const e = legalByUser.get(r.user_id)!
+      e.total += (r.sum || 0)
+      e.by_type[r.type] = { cnt: r.cnt, sum: r.sum || 0 }
+    }
+
+    // 5) user 별 'other'(unknown) type 합 (정의에 없는 type)
+    const otherAggRes = await db.prepare(`
+      SELECT user_id, type, COUNT(*) AS cnt, SUM(amount) AS sum
+      FROM transactions
+      WHERE coin_type='QKEY'
+        AND type NOT IN (${legalPlaceholders})
+        AND type NOT IN (${violPlaceholders})
+      GROUP BY user_id, type
+    `).bind(...LEGAL_TYPES, ...VIOLATION_TYPES).all()
+    const otherByUser = new Map<number, { total: number; by_type: Record<string, { cnt: number; sum: number }> }>()
+    for (const r of (otherAggRes.results || []) as any[]) {
+      if (!otherByUser.has(r.user_id)) otherByUser.set(r.user_id, { total: 0, by_type: {} })
+      const e = otherByUser.get(r.user_id)!
+      e.total += (r.sum || 0)
+      e.by_type[r.type] = { cnt: r.cnt, sum: r.sum || 0 }
+    }
+
+    // 6) B-EXEC restore map
+    const restoreMap = new Map<number, number>()
+    for (const r of B_EXEC_RESTORE) restoreMap.set(r.user_id, r.restore_amount)
+
+    // 7) 각 user 별 시뮬레이션
+    const perUser: any[] = []
+    for (const u of users) {
+      const current = Number(u.qkey_balance || 0)
+      const restore = restoreMap.get(u.id) || 0
+      const legalInfo = legalByUser.get(u.id) || { total: 0, by_type: {} }
+      const violInfo = violSumByUser.get(u.id) || { cnt: 0, sum: 0, by_type: {} }
+      const otherInfo = otherByUser.get(u.id) || { total: 0, by_type: {} }
+      const finalBalance = legalInfo.total  // Step 3 결과
+
+      perUser.push({
+        user_id: u.id,
+        name: u.name,
+        step0_current_balance: current,
+        step1_restore_amount: restore,
+        step1_balance: current + restore,
+        step2_violation_tx_count: violInfo.cnt,
+        step2_violation_sum_purged: violInfo.sum,
+        step2_violation_by_type: violInfo.by_type,
+        step3_other_unknown_sum: otherInfo.total,
+        step3_other_by_type: otherInfo.by_type,
+        step3_legal_by_type: legalInfo.by_type,
+        step3_legal_total: legalInfo.total,
+        final_balance: finalBalance,
+        net_delta_from_current: finalBalance - current,
+        is_negative_final: finalBalance < 0,
+        has_violation_history: violInfo.cnt > 0,
+        has_b_exec_restore: restore > 0,
+      })
+    }
+
+    // 8) 분류
+    const changed = perUser.filter(u => u.net_delta_from_current !== 0)
+    const negativeFinal = perUser.filter(u => u.is_negative_final)
+    const violators = perUser.filter(u => u.has_violation_history)
+
+    // 9) 합계
+    const totalCurrentBal = perUser.reduce((s, u) => s + u.step0_current_balance, 0)
+    const totalRestore = perUser.reduce((s, u) => s + u.step1_restore_amount, 0)
+    const totalPurged = perUser.reduce((s, u) => s + u.step2_violation_sum_purged, 0)
+    const totalFinalBal = perUser.reduce((s, u) => s + u.final_balance, 0)
+    const totalNetDelta = perUser.reduce((s, u) => s + u.net_delta_from_current, 0)
+    const totalOther = perUser.reduce((s, u) => s + u.step3_other_unknown_sum, 0)
+
+    // 10) 정렬 (|delta| desc)
+    perUser.sort((a, b) => Math.abs(b.net_delta_from_current) - Math.abs(a.net_delta_from_current))
+
+    return c.json({
+      verdict: 'OPTION_D_SIMULATION_DRY_RUN',
+      definition: {
+        step1_restore: 'B-EXEC 잘못 차감 복원: 김주성(91) +7350, 이현우(93) +750',
+        step2_purge: 'DELETE FROM transactions WHERE coin_type=QKEY AND type IN (daily_reward,staking_reward,shop_purchase,shop_refund,three_set_supplement)',
+        step3_recompute: 'UPDATE users SET qkey_balance = SUM(legal QKEY TX) WHERE legal types = (daily_qkey,referral_reward,direct_referral,admin_adjustment,swap_in,swap_out)',
+      },
+      legal_types: LEGAL_TYPES,
+      violation_types: VIOLATION_TYPES,
+      b_exec_restore_targets: B_EXEC_RESTORE,
+      violation_tx_total_count: violTxs.length,
+      violation_tx_rows: violTxs,
+      summary: {
+        total_users: users.length,
+        users_changed_count: changed.length,
+        users_violation_count: violators.length,
+        users_negative_after_count: negativeFinal.length,
+        total_current_balance: totalCurrentBal,
+        total_restore_amount: totalRestore,
+        total_violation_purged: totalPurged,
+        total_other_unknown_sum: totalOther,
+        total_final_balance: totalFinalBal,
+        total_net_delta: totalNetDelta,
+        formula_check: `current(${totalCurrentBal}) + restore(${totalRestore}) - violation_in_balance(?) = final(${totalFinalBal})`,
+      },
+      negative_after_users: negativeFinal.map(u => ({
+        user_id: u.user_id, name: u.name,
+        current: u.step0_current_balance, final: u.final_balance,
+        violation_purged: u.step2_violation_sum_purged,
+      })),
+      per_user: perUser,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // purge-holiday-513-legacy — 휴일진입자 5/13 legacy daily_reward 잔재 제거
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "b를 발빠르게 처리하고"
