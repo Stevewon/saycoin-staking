@@ -56475,6 +56475,137 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-tx-double-payments — TX 기반 이중지급 전수조사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19, 이미지 증거):
+//   user 93 이현우: 2026-05-13 11:58 일일배당 750 + 2026-05-13 08:00 일일배당 750
+//   → 같은 paid_date 에 2번 지급된 진짜 이중지급
+//
+// 검사 방식 (TX 테이블 기반 + DR/RR row 기반 양쪽):
+//   1) transactions 테이블에서 (user_id, type, ref_id 무관, 같은 paid_date 시각윈도우) 다중 발견
+//   2) DR row 에서 (user_id, staking_id, paid_date) 중복 검사 — paid_date 단위 1건이 영구룰
+//   3) RR row 에서 (staking_id, level, paid_date, referrer_id, referee_id) 중복 검사
+//   4) 시각 분포로 어느 게 정상/잔재인지 식별 (created_at='UTC paid-1 23:00:00' = 정상, 그 외 = 잔재)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-tx-double-payments', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    // ─── 1) DR (user_id, staking_id, paid_date) 중복 ─────────────
+    // 영구룰 #스테이킹별독립: (user_id, staking_id, reward_date, paid_date) 1건
+    // 더 강한 가드: (user_id, staking_id, paid_date) 도 1건 (같은 날 두 번 받을 수 없음)
+    const drDupByPaid = await db.prepare(`
+      SELECT user_id, staking_id, paid_date, COUNT(*) as cnt,
+             GROUP_CONCAT(id) as ids,
+             GROUP_CONCAT(reward_date) as rds,
+             GROUP_CONCAT(usdt_amount) as qkeys,
+             GROUP_CONCAT(created_at) as cas
+      FROM daily_rewards
+      WHERE paid_date BETWEEN '2026-05-11' AND '2026-05-19'
+      GROUP BY user_id, staking_id, paid_date
+      HAVING cnt > 1
+      ORDER BY paid_date, user_id, staking_id
+    `).all<any>()
+
+    // ─── 2) RR (referrer_id, referee_id, staking_id, level, paid_date) 중복 ─────────────
+    const rrDupByPaid = await db.prepare(`
+      SELECT referrer_id, referee_id, staking_id, level, paid_date, COUNT(*) as cnt,
+             GROUP_CONCAT(id) as ids,
+             GROUP_CONCAT(reward_date) as rds,
+             GROUP_CONCAT(reward_amount) as qkeys,
+             GROUP_CONCAT(created_at) as cas
+      FROM referral_rewards
+      WHERE paid_date BETWEEN '2026-05-11' AND '2026-05-19'
+        AND level IN (1,2)
+      GROUP BY referrer_id, referee_id, staking_id, level, paid_date
+      HAVING cnt > 1
+      ORDER BY paid_date, level, staking_id
+    `).all<any>()
+
+    // ─── 3) TX 기반 (user_id, type, amount, 같은 KST 날짜) 중복 (UI 표시 직접 시그널) ─────
+    // 사장님이 본 화면: 같은 user, 같은 type='daily_qkey', 같은 amount, 같은 KST date 가 여러 건
+    // KST date = date(created_at, '+9 hours')
+    const txDupByDateAmt = await db.prepare(`
+      SELECT user_id, type, amount, date(created_at,'+9 hours') as kst_date,
+             COUNT(*) as cnt,
+             GROUP_CONCAT(id) as tx_ids,
+             GROUP_CONCAT(ref_id) as ref_ids,
+             GROUP_CONCAT(created_at) as cas,
+             GROUP_CONCAT(description) as descs
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')
+        AND date(created_at,'+9 hours') BETWEEN '2026-05-11' AND '2026-05-19'
+      GROUP BY user_id, type, amount, kst_date
+      HAVING cnt > 1
+      ORDER BY kst_date, user_id, type
+    `).all<any>()
+
+    // ─── 4) user 93 (이현우) 5/13 paid 직접 dump ─────────
+    const user93_513_dr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards
+      WHERE user_id=93 AND paid_date='2026-05-13'
+      ORDER BY id
+    `).all<any>()
+    const user93_513_tx = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE user_id=93 AND coin_type='QKEY' AND type='daily_qkey'
+        AND date(created_at,'+9 hours')='2026-05-13'
+      ORDER BY id
+    `).all<any>()
+    const user93_all_dr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE user_id=93
+      ORDER BY paid_date, id
+    `).all<any>()
+
+    // ─── 5) per-paid 카운트 (DR 잔재 row 존재 여부 빠른 검사) ─────────
+    const drCountPerPaid = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt, COUNT(DISTINCT user_id) as users
+      FROM daily_rewards
+      WHERE paid_date BETWEEN '2026-05-11' AND '2026-05-19'
+      GROUP BY paid_date ORDER BY paid_date
+    `).all<any>()
+
+    // ─── 6) 종합 ─────────
+    const drDup = (drDupByPaid.results || []) as any[]
+    const rrDup = (rrDupByPaid.results || []) as any[]
+    const txDup = (txDupByDateAmt.results || []) as any[]
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      verdict: (drDup.length + rrDup.length + txDup.length) === 0 ? 'NO_DOUBLE' : 'DOUBLE_PAYMENTS_FOUND',
+      counts: {
+        dr_dup_groups: drDup.length,
+        rr_dup_groups: rrDup.length,
+        tx_dup_groups: txDup.length,
+        dr_extra_rows: drDup.reduce((a,b)=>a+(Number(b.cnt)-1), 0),
+        rr_extra_rows: rrDup.reduce((a,b)=>a+(Number(b.cnt)-1), 0),
+        tx_extra_rows: txDup.reduce((a,b)=>a+(Number(b.cnt)-1), 0),
+      },
+      dr_duplicates: drDup,
+      rr_duplicates: rrDup,
+      tx_duplicates: txDup,
+      dr_count_per_paid: drCountPerPaid.results || [],
+      user93_diagnostic: {
+        dr_at_513: user93_513_dr.results || [],
+        tx_at_513: user93_513_tx.results || [],
+        all_dr: user93_all_dr.results || [],
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // scan-holiday-joiners-double — 휴일진입자 이중지급 전수조사 (READ-ONLY)
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "휴일진입자 2중 지급이 된거 같으니 11일부터 18일 확정분을
