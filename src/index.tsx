@@ -50753,4 +50753,99 @@ app.get('/api/diag/all-batches-audit', async (c) => {
 })
 
 
+// ============================================================================
+// 🚨 EMERGENCY 2026-05-19: paid_date='2026-05-19' 미래 batch 삭제 (사장님 A 명령)
+// ============================================================================
+// 배경: 오늘(5/19) cron 이 5/19 가 끝나기 전 paid_date='2026-05-19' batch 를 미리 박음.
+// 사장님 영구정책: paid_date 가 완전히 끝난 다음 평일 KST 08:00 에 박혀야 함.
+// → 오늘 batch (dr/rr) 삭제, cron_lock 도 삭제 (내일 5/20 cron 이 정상 처리하도록)
+// 잔액: 변경 없음 (어제 tx 회수 때 이미 -238,725 차감됨)
+//
+// DRY-RUN: GET /api/diag/purge-future-batch-2026-05-19?key=ADMIN_PW
+// EXEC:    GET /api/diag/purge-future-batch-2026-05-19?key=ADMIN_PW&confirm=PURGE_FUTURE_519
+app.get('/api/diag/purge-future-batch-2026-05-19', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'PURGE_FUTURE_519'
+    const db = c.env.DB
+    const paidDate = '2026-05-19'
+
+    // 사전 카운트
+    const drCnt = await db.prepare(`SELECT COUNT(*) AS c FROM daily_rewards WHERE paid_date = ?`).bind(paidDate).first<any>()
+    const rrCnt = await db.prepare(`SELECT COUNT(*) AS c FROM referral_rewards WHERE paid_date = ?`).bind(paidDate).first<any>()
+    const txViaRefDr = await db.prepare(`
+      SELECT COUNT(*) AS c FROM transactions t
+      INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+      WHERE t.type='daily_qkey' AND dr.paid_date = ?
+    `).bind(paidDate).first<any>()
+    const txViaRefRr = await db.prepare(`
+      SELECT COUNT(*) AS c FROM transactions t
+      INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+      WHERE t.type='referral_reward' AND rr.paid_date = ?
+    `).bind(paidDate).first<any>()
+    const lockRow = await db.prepare(`SELECT lock_date, source, locked_at, last_finished_at FROM daily_cron_lock WHERE lock_date = ?`).bind(paidDate).first<any>()
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        target_paid_date: paidDate,
+        plan: {
+          delete_daily_rewards: Number(drCnt?.c || 0),
+          delete_referral_rewards: Number(rrCnt?.c || 0),
+          delete_daily_cron_lock_row: lockRow ? 1 : 0,
+          referenced_daily_qkey_tx_remaining: Number(txViaRefDr?.c || 0),
+          referenced_referral_reward_tx_remaining: Number(txViaRefRr?.c || 0),
+          note: '잔액 변경 없음 (어제 tx 회수 때 이미 차감 완료)',
+        },
+        lock_row: lockRow,
+        confirm_token_required: 'PURGE_FUTURE_519',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC (D1 batch)
+    const stmts: any[] = []
+    // 1) referral_rewards 삭제 (paid_date = 5/19)
+    stmts.push(db.prepare(`DELETE FROM referral_rewards WHERE paid_date = ?`).bind(paidDate))
+    // 2) daily_rewards 삭제 (paid_date = 5/19)
+    stmts.push(db.prepare(`DELETE FROM daily_rewards WHERE paid_date = ?`).bind(paidDate))
+    // 3) daily_cron_lock 삭제 (lock_date = 5/19)
+    stmts.push(db.prepare(`DELETE FROM daily_cron_lock WHERE lock_date = ?`).bind(paidDate))
+    const res = await db.batch(stmts)
+
+    // 검증
+    const drAfter = await db.prepare(`SELECT COUNT(*) AS c FROM daily_rewards WHERE paid_date = ?`).bind(paidDate).first<any>()
+    const rrAfter = await db.prepare(`SELECT COUNT(*) AS c FROM referral_rewards WHERE paid_date = ?`).bind(paidDate).first<any>()
+    const lockAfter = await db.prepare(`SELECT lock_date FROM daily_cron_lock WHERE lock_date = ?`).bind(paidDate).first<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      target_paid_date: paidDate,
+      purged: {
+        daily_rewards_deleted: Number(drCnt?.c || 0),
+        referral_rewards_deleted: Number(rrCnt?.c || 0),
+        daily_cron_lock_deleted: lockRow ? 1 : 0,
+      },
+      after: {
+        daily_rewards_remaining: Number(drAfter?.c || 0),
+        referral_rewards_remaining: Number(rrAfter?.c || 0),
+        cron_lock_remaining: lockAfter ? 1 : 0,
+      },
+      verdict: (Number(drAfter?.c || 0) === 0 && Number(rrAfter?.c || 0) === 0 && !lockAfter)
+        ? '✅ paid_date=2026-05-19 미래 batch 완전 제거. 내일 5/20 cron 이 5/19 확정분으로 정상 처리 예정.'
+        : '⚠️ 일부 잔존 — 재확인 필요',
+      batch_result_count: res.length,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
