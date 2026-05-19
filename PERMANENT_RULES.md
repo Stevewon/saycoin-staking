@@ -1,6 +1,6 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-19 (★ 영구룰 #지상최고 신규 추가 + #정규시각 KST 15:15 → KST 08:00 변경 — 사장님 직접 명령)
+**최종 업데이트**: 2026-05-19 (★ 영구룰 #지상최고 + #정규시각 KST 08:00 + #관리자보정정당 + #위반type가감 + #이중구조절대금지 — 사장님 직접 명령)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
 
@@ -58,6 +58,94 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_tx_referral_ref
 **위반 시 결과**: 그 즉시 시스템 신뢰 파괴. 사용자 자산 손실. 사장님 격노. 회복 불가능 가능.
 
 **이 룰은 다른 모든 룰의 위에 있다. 다른 룰이 EXEC 를 권하더라도, 이 룰이 의심을 표하면 STOP 한다.**
+
+---
+
+## 👑 영구룰 #관리자보정정당 (2026-05-19 사장님 명령 1)
+
+> **어드민(관리자)이 직접 처리한 모든 보정은, 그 어떤 영구룰이 있어도 사용자 내역 및 어드민 화면에 그대로 반영하고 적용한다.**
+
+### 정의
+- `transactions.type = 'admin_adjustment'` 으로 박힌 tx 는 **사장님 직접 의도** 로 간주
+- 영구룰 #정규지급type 위반 type 으로 분류되지 않음 (정당한 운영 행위)
+- **공식 영구 잔액 공식에서 admin_adjustment 는 합법 type 으로 포함**
+
+### 확장 공식 (이전 공식 보강)
+```
+expected_qkey_balance =
+    Σ(tx WHERE type IN ('daily_qkey', 'referral_reward', 'swap_in', 'swap_out', 'admin_adjustment') AND coin_type='QKEY')
+  - Σ(withdrawals.amount WHERE coin_type='QKEY' AND status IN ('approved','completed','processing','pending'))
+```
+
+### 절대 원칙
+1. ❌ `admin_adjustment` tx 는 어떤 정정/normalize 작업에서도 **절대 제거 / 변경 금지**
+2. ❌ `admin_adjustment` 만큼 balance 를 다시 되돌리는 작업 금지 (사장님 의도 위반)
+3. ✅ `admin_adjustment` 가 잔액에 영향을 미친 만큼 사용자 화면/어드민에 그대로 표시
+4. ✅ 신규 `admin_adjustment` INSERT 시 반드시 description 에 사유 명시 + balance 동시 UPDATE 원자적
+
+**사장님 직접 인용 (2026-05-19)**:
+> "의도된것이고 어드민 즉 관리자에서 조치한것은 그대로 영구룰이 있어도 사용자내역및 어드민에 반영하고 적용 시킬것!"
+
+**적용 사례**: u#9 진성의 2026-05-04 11:48 admin_adjustment -165,000 ("관리자 보정(직접판매 차감)") 은 정당한 사장님 의도. -334,500 음수는 사장님 직접 처리 결과이므로 보정 대상 아님.
+
+---
+
+## 👑 영구룰 #위반type가감 (2026-05-19 사장님 명령 2)
+
+> **어드민 관리 차감(admin_adjustment) 이 아닌데 영구룰 위반 type 으로 잔액에 영향을 준 경우, 그 amount 만큼 가감 조치한다.**
+
+### 위반 type 정의
+| type | 분류 | 처리 |
+|---|---|---|
+| `daily_qkey` | ✅ 합법 | 보존 |
+| `referral_reward` | ✅ 합법 | 보존 |
+| `swap_in` / `swap_out` | ✅ 합법 | 보존 |
+| `admin_adjustment` | ✅ 합법 (사장님 의도) | 보존 |
+| **`direct_referral`** | ❌ 위반 (폐기된 옛 보상 type) | **가감 대상** |
+| **`staking_reward`** | ❌ 위반 (폐기된 옛 보상 type) | **가감 대상** |
+| **`shop_purchase`** | ❌ 위반 (영구룰에 미정의) | **가감 대상** |
+| **`shop_refund`** | ❌ 위반 (영구룰에 미정의) | **가감 대상** |
+| **`_exec_*_marker`** 등 메타 | ❌ 비-금전 marker | **가감 대상** (amount=0 이면 무영향) |
+
+### 처리 절차
+1. ✅ DRY-RUN: 가감 대상 tx 전수 산출 → 사장님 결재
+2. ✅ EXEC: 위반 type tx 자체는 **보존** (감사 추적), 대신 `admin_adjustment` type 으로 **역상쇄 tx INSERT** + balance UPDATE 원자적
+3. ✅ 역상쇄 tx description 명시: `"위반 type 가감: tx#XX (type) {date} amount=XX 차감"`
+4. ❌ 위반 type tx 를 직접 DELETE / UPDATE 금지 (감사 추적 영구 보존)
+5. ❌ 동일 위반 tx 에 대해 가감 2번 절대 금지 (이중차감) → UNIQUE INDEX 가드 필요
+
+**사장님 직접 인용 (2026-05-19)**:
+> "어드민 관리 차감이 아닌데 불구하고 영구룰 위반이면 가감 조치할것!"
+
+---
+
+## 👑 영구룰 #이중구조절대금지 (2026-05-19 사장님 명령 3)
+
+> **출금신청이나 스왑 등으로 인한 QKEY 수량 감소 시, 사용자 내역 및 어드민에 정확히 반영한다. 이로 인한 이중 지급 또는 이중 차감은 절대 일어나서는 안 된다.**
+
+### 핵심
+- swap_out / withdrawal 처리는 다음 3가지가 **원자적 (atomic)** 으로 일어나야 함:
+  1. `users.qkey_balance` UPDATE (-amount)
+  2. `transactions` INSERT (type='swap_out' or withdrawal record)
+  3. 관련 reference 행 (swap pair, withdrawal record) INSERT/UPDATE
+
+### 절대 원칙
+1. ❌ **balance UPDATE 없이 tx 만 INSERT 금지** (사용자 화면 잔액과 실제 ledger 불일치)
+2. ❌ **tx INSERT 없이 balance UPDATE 금지** (감사 추적 불가)
+3. ❌ **동일 swap/withdrawal 행에 대해 balance UPDATE 2번 금지** (이중차감)
+4. ❌ **동일 swap/withdrawal 행에 대해 tx INSERT 2번 금지** (이중기록)
+5. ✅ swap_out 처리 시 **PRE-CHECK**: `qkey_balance >= required_qkey` 검증 후 진행
+6. ✅ withdrawal 처리 시 **PRE-CHECK**: `qkey_balance >= amount` 검증 후 진행
+7. ✅ atomic 트랜잭션 (db.batch 또는 BEGIN/COMMIT) 필수
+8. ✅ 실패 시 rollback (부분 적용 금지)
+
+### 위반 발생 시 영향
+- 사용자 화면 잔액 ≠ 실제 ledger → 신뢰 파괴
+- 이중차감 → 사용자 자산 손실 → 회복 불가
+- 이중지급 → 영구룰 #지상최고 위반
+
+**사장님 직접 인용 (2026-05-19)**:
+> "출금신청이나 스왑등으로 인해 쿠키의 수량감소시에도 사용자내역및 어드민에 정확히 반영할것. 이로인한 이중 지급 또는 이중차감은 절대 일어나서는 안됨"
 
 ---
 

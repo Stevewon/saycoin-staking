@@ -34747,6 +34747,135 @@ app.get('/api/diag/cron-h-plan-monitor', async (c) => {
 })
 
 // ============================================================================
+// illegal-type-audit (2026-05-19): 영구룰 위반 type 가감 대상 전수 산출
+// ============================================================================
+//   영구룰 #위반type가감 (2026-05-19 사장님 명령 2):
+//     "어드민 관리 차감(admin_adjustment) 이 아닌데 영구룰 위반 type 으로 잔액에
+//      영향을 준 경우, 그 amount 만큼 가감 조치한다."
+//
+//   합법 type: daily_qkey, referral_reward, swap_in, swap_out, admin_adjustment
+//   위반 type: direct_referral, staking_reward, shop_purchase, shop_refund, etc.
+//   read-only, DRY-RUN. DB 미수정.
+//
+//   사용: GET /api/diag/illegal-type-audit?key=<ADMIN_PW>&coin=QKEY
+app.get('/api/diag/illegal-type-audit', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || c.req.query('password') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const coin = (c.req.query('coin') || 'QKEY').toUpperCase()
+    const db = c.env.DB
+
+    // 합법 type 정의 (영구룰 #관리자보정정당 적용)
+    const LEGIT_TYPES = ['daily_qkey', 'referral_reward', 'swap_in', 'swap_out', 'admin_adjustment']
+    const legitInClause = LEGIT_TYPES.map(t => `'${t}'`).join(',')
+
+    // ── A. 위반 type tx 전체 SELECT ──
+    const illegalTx = await db.prepare(`
+      SELECT id, user_id, type, amount, description, ref_id, created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM transactions
+      WHERE coin_type = ?
+        AND type NOT IN (${legitInClause})
+      ORDER BY user_id ASC, created_at ASC, id ASC
+    `).bind(coin).all()
+
+    const rows = (illegalTx.results || []) as any[]
+
+    // ── B. user_id 별 그룹 + type 별 합계 ──
+    const byUser = new Map<number, { name?: string, email?: string, total_amount: number, total_count: number, types: Record<string, { cnt: number, sum: number, ids: number[] }> }>()
+    for (const r of rows) {
+      const uid = Number(r.user_id)
+      const type = String(r.type)
+      const amt = Number(r.amount)
+      if (!byUser.has(uid)) byUser.set(uid, { total_amount: 0, total_count: 0, types: {} })
+      const u = byUser.get(uid)!
+      u.total_amount += amt
+      u.total_count++
+      if (!u.types[type]) u.types[type] = { cnt: 0, sum: 0, ids: [] }
+      u.types[type].cnt++
+      u.types[type].sum += amt
+      u.types[type].ids.push(Number(r.id))
+    }
+
+    // ── C. 회원 정보 조인 ──
+    const userIds = Array.from(byUser.keys())
+    if (userIds.length > 0) {
+      const ph = userIds.map(() => '?').join(',')
+      const users = await db.prepare(`
+        SELECT id, email, name, qkey_balance
+        FROM users WHERE id IN (${ph})
+      `).bind(...userIds).all()
+      for (const u of (users.results || []) as any[]) {
+        const e = byUser.get(Number(u.id))
+        if (e) {
+          e.email = String(u.email || '')
+          e.name = String(u.name || '')
+          ;(e as any).current_qkey_balance = Number(u.qkey_balance || 0)
+        }
+      }
+    }
+
+    // ── D. type 전체 합계 ──
+    const typeTotals: Record<string, { cnt: number, sum: number, user_count: number }> = {}
+    for (const r of rows) {
+      const t = String(r.type)
+      if (!typeTotals[t]) typeTotals[t] = { cnt: 0, sum: 0, user_count: 0 }
+      typeTotals[t].cnt++
+      typeTotals[t].sum += Number(r.amount)
+    }
+    for (const t of Object.keys(typeTotals)) {
+      typeTotals[t].user_count = new Set(rows.filter(r => r.type === t).map(r => r.user_id)).size
+    }
+
+    // ── E. 사용자별 보고서 + 가감 후 예상 잔액 ──
+    const report: any[] = []
+    let grandTotalAdj = 0
+    for (const [uid, e] of byUser.entries()) {
+      const cur = (e as any).current_qkey_balance ?? null
+      const expectedAfterAdjustment = cur != null ? cur - e.total_amount : null
+      grandTotalAdj += e.total_amount
+      report.push({
+        user_id: uid,
+        email: e.email || null,
+        name: e.name || null,
+        current_qkey_balance: cur,
+        total_illegal_amount: e.total_amount,            // 가감해야 할 총량 (signed)
+        total_illegal_count: e.total_count,
+        expected_balance_after_adjustment: expectedAfterAdjustment,
+        will_become_negative: expectedAfterAdjustment != null && expectedAfterAdjustment < 0,
+        types: Object.entries(e.types).map(([type, info]) => ({
+          type,
+          count: info.cnt,
+          sum: info.sum,
+          tx_ids: info.ids,
+        })),
+      })
+    }
+    report.sort((a, b) => Math.abs(b.total_illegal_amount) - Math.abs(a.total_illegal_amount))
+
+    return c.json({
+      ok: true,
+      mode: 'DRY-RUN',
+      coin,
+      legit_types_definition: LEGIT_TYPES,
+      summary: {
+        total_illegal_tx_count: rows.length,
+        affected_users: byUser.size,
+        grand_total_signed_amount: grandTotalAdj,
+        users_will_become_negative_after_adjustment: report.filter(r => r.will_become_negative).length,
+      },
+      type_totals: typeTotals,
+      report,
+      note: '영구룰 #위반type가감 (2026-05-19 사장님 명령 2). DRY-RUN. EXEC 별도 endpoint 필요.',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: error?.message || String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
 // user-ledger-replay (2026-05-19): 단일 회원 transactions 전체 chronological replay
 // ============================================================================
 //   목적: 사장님 명령 - 음수/불일치 회원의 DRY-RUN ledger replay
