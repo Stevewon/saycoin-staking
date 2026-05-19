@@ -57040,6 +57040,327 @@ app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// snapshot-export — 전체 DB 스냅샷 (모든 테이블 dump)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19):
+//   "언제든 내일 또 다시 정산이 틀어지더라도 바로 지금 기준으로 되돌릴수 있는
+//    소스를 확보하고 다운로드를 할수있게 해줘라 내게"
+//
+// 형식:
+//   format=json  → 모든 테이블 JSON 으로 반환 (기본)
+//   format=sql   → SQL INSERT 문 묶음으로 반환 (복원용)
+//
+// 백업 대상 테이블:
+//   users, transactions, daily_rewards, referral_rewards,
+//   staking, withdrawals
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/snapshot-export', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+    const format = c.req.query('format') || 'json'
+
+    const TABLES = ['users', 'transactions', 'daily_rewards', 'referral_rewards', 'staking', 'withdrawals']
+    const dump: Record<string, any[]> = {}
+    const stats: Record<string, number> = {}
+
+    for (const t of TABLES) {
+      try {
+        const r = await db.prepare(`SELECT * FROM ${t}`).all()
+        const rows = (r.results || []) as any[]
+        dump[t] = rows
+        stats[t] = rows.length
+      } catch (e) {
+        dump[t] = []
+        stats[t] = -1
+      }
+    }
+
+    // KST 시각 라벨
+    const nowUtc = new Date()
+    const nowKstISO = new Date(nowUtc.getTime() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)
+    const snapshotLabel = `snapshot_${nowKstISO.replace(/[-: ]/g, '').slice(0, 14)}_KST`
+
+    // SQL 포맷
+    if (format === 'sql') {
+      const lines: string[] = []
+      lines.push(`-- ═══════════════════════════════════════════════════════════════════`)
+      lines.push(`-- Quantarium DB Snapshot — ${snapshotLabel}`)
+      lines.push(`-- Generated at (KST): ${nowKstISO}`)
+      lines.push(`-- Source: pqcpay.co.kr Cloudflare D1`)
+      lines.push(`-- Tables: ${TABLES.join(', ')}`)
+      lines.push(`-- Row counts: ${TABLES.map(t => `${t}=${stats[t]}`).join(', ')}`)
+      lines.push(`-- 복원 방법:`)
+      lines.push(`--   1) wrangler d1 execute <DB_NAME> --file=THIS_FILE.sql`)
+      lines.push(`--   2) 또는 /api/diag/snapshot-restore endpoint 호출`)
+      lines.push(`-- ═══════════════════════════════════════════════════════════════════`)
+      lines.push(``)
+      lines.push(`BEGIN TRANSACTION;`)
+      lines.push(``)
+
+      const escapeVal = (v: any): string => {
+        if (v === null || v === undefined) return 'NULL'
+        if (typeof v === 'number') return String(v)
+        if (typeof v === 'boolean') return v ? '1' : '0'
+        // string
+        const s = String(v).replace(/'/g, "''")
+        return `'${s}'`
+      }
+
+      for (const t of TABLES) {
+        const rows = dump[t]
+        lines.push(`-- ── ${t} (${rows.length} rows) ──────────────────────────────`)
+        lines.push(`DELETE FROM ${t};`)
+        if (rows.length === 0) {
+          lines.push(``)
+          continue
+        }
+        const cols = Object.keys(rows[0])
+        const colList = cols.map(c => `"${c}"`).join(', ')
+        // 청크로 분할 (D1 variable limit 회피 — 한 INSERT 당 50행)
+        const CHUNK = 50
+        for (let i = 0; i < rows.length; i += CHUNK) {
+          const chunk = rows.slice(i, i + CHUNK)
+          const valuesList = chunk.map(row =>
+            `(${cols.map(c => escapeVal(row[c])).join(', ')})`
+          ).join(',\n  ')
+          lines.push(`INSERT INTO ${t} (${colList}) VALUES\n  ${valuesList};`)
+        }
+        lines.push(``)
+      }
+
+      lines.push(`COMMIT;`)
+      lines.push(``)
+      lines.push(`-- ─── End of snapshot ───`)
+      const sqlText = lines.join('\n')
+
+      c.header('Content-Type', 'text/plain; charset=utf-8')
+      c.header('Content-Disposition', `attachment; filename="${snapshotLabel}.sql"`)
+      return c.body(sqlText)
+    }
+
+    // 기본: JSON 포맷
+    const payload = {
+      snapshot_label: snapshotLabel,
+      generated_at_kst: nowKstISO,
+      generated_at_utc: nowUtc.toISOString(),
+      source: 'pqcpay.co.kr Cloudflare D1',
+      tables: TABLES,
+      row_counts: stats,
+      restore_instructions: {
+        method_1: 'POST /api/diag/snapshot-restore with confirm=RESTORE_FROM_SNAPSHOT_2026_05_19',
+        method_2: 'wrangler d1 execute <DB_NAME> --file=<snapshot.sql>',
+        method_3: 'JSON 의 각 테이블 rows 를 직접 INSERT',
+      },
+      data: dump,
+      duration_ms: Date.now() - t0,
+    }
+
+    c.header('Content-Type', 'application/json; charset=utf-8')
+    if (c.req.query('download') === '1') {
+      c.header('Content-Disposition', `attachment; filename="${snapshotLabel}.json"`)
+    }
+    return c.body(JSON.stringify(payload, null, 2))
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
+// snapshot-meta — 스냅샷 메타 정보만 (빠른 무결성 확인용)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/snapshot-meta', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+    const TABLES = ['users', 'transactions', 'daily_rewards', 'referral_rewards', 'staking', 'withdrawals']
+    const stats: Record<string, any> = {}
+    for (const t of TABLES) {
+      try {
+        const cnt = await db.prepare(`SELECT COUNT(*) AS c FROM ${t}`).first() as any
+        const max = await db.prepare(`SELECT MAX(id) AS m FROM ${t}`).first() as any
+        stats[t] = { row_count: cnt?.c, max_id: max?.m }
+      } catch (e) {
+        stats[t] = { error: String(e) }
+      }
+    }
+    // 잔액 총합
+    const balSum = await db.prepare(`SELECT SUM(qkey_balance) AS s FROM users`).first() as any
+    const txSum = await db.prepare(`SELECT SUM(amount) AS s FROM transactions WHERE coin_type='QKEY'`).first() as any
+    return c.json({
+      now_utc: new Date().toISOString(),
+      tables: stats,
+      total_qkey_balance: balSum?.s,
+      total_qkey_tx_sum: txSum?.s,
+      integrity_check: (balSum?.s === txSum?.s) ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
+// snapshot-restore — 업로드 한 JSON 스냅샷으로 DB 복원
+// ════════════════════════════════════════════════════════════════════════
+// 사용법:
+//   POST /api/diag/snapshot-restore?pw=...&confirm=RESTORE_FROM_SNAPSHOT_2026_05_19
+//   Body: snapshot-export 가 출력 한 JSON 전체 (snapshot_label, data 키 포함)
+//
+// 동작:
+//   1) confirm 체크 — confirm 없으면 DRY-RUN (검증만)
+//   2) 각 테이블 마다 DELETE FROM <table>; → INSERT (50행 청크)
+//   3) 사후 카운트 검증
+//
+// 안전장치:
+//   - snapshot.data 가 없으면 거절
+//   - snapshot 의 tables 가 화이트리스트 외이면 거절
+//   - users / staking 0행이면 거절 (잘못된 파일 방어)
+// ════════════════════════════════════════════════════════════════════════
+app.post('/api/diag/snapshot-restore', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'RESTORE_FROM_SNAPSHOT_2026_05_19'
+
+    const body = await c.req.json() as any
+    if (!body || !body.data) {
+      return c.json({ error: 'INVALID_SNAPSHOT: data field missing' }, 400)
+    }
+
+    const WHITELIST = ['users', 'transactions', 'daily_rewards', 'referral_rewards', 'staking', 'withdrawals']
+    const data = body.data as Record<string, any[]>
+
+    // 사전 검증
+    const incoming: Record<string, number> = {}
+    for (const t of Object.keys(data)) {
+      if (!WHITELIST.includes(t)) {
+        return c.json({ error: `INVALID_TABLE: ${t} not in whitelist` }, 400)
+      }
+      incoming[t] = Array.isArray(data[t]) ? data[t].length : -1
+    }
+
+    // 안전장치: users 또는 staking 0행이면 거절
+    if (!incoming.users || incoming.users <= 0) {
+      return c.json({ error: 'REFUSE: snapshot.users is empty', incoming }, 400)
+    }
+    if (!incoming.staking || incoming.staking <= 0) {
+      return c.json({ error: 'REFUSE: snapshot.staking is empty', incoming }, 400)
+    }
+
+    // 현재 DB 카운트 (복원 전)
+    const before: Record<string, number> = {}
+    for (const t of WHITELIST) {
+      try {
+        const r = await db.prepare(`SELECT COUNT(*) AS c FROM ${t}`).first() as any
+        before[t] = r?.c ?? -1
+      } catch (e) {
+        before[t] = -1
+      }
+    }
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        snapshot_label: body.snapshot_label,
+        snapshot_generated_at_kst: body.generated_at_kst,
+        before_db_counts: before,
+        incoming_snapshot_counts: incoming,
+        warning: '실행 시 모든 테이블이 DELETE 되고 스냅샷 데이터로 교체됩니다',
+        exec_hint: 'add &confirm=RESTORE_FROM_SNAPSHOT_2026_05_19 to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC — 각 테이블 DELETE + INSERT (50행 청크)
+    const restoreLog: any[] = []
+    const escapeVal = (v: any): any => v
+    for (const t of WHITELIST) {
+      const rows = data[t] || []
+      let deleted = 0
+      let inserted = 0
+      try {
+        const delRes = await db.prepare(`DELETE FROM ${t}`).run()
+        deleted = (delRes.meta as any)?.changes ?? 0
+      } catch (e) {
+        restoreLog.push({ table: t, status: 'DELETE_FAIL', error: String(e) })
+        continue
+      }
+      if (rows.length === 0) {
+        restoreLog.push({ table: t, status: 'OK_EMPTY', deleted, inserted: 0 })
+        continue
+      }
+      const cols = Object.keys(rows[0])
+      const colList = cols.map(c => `"${c}"`).join(', ')
+      const CHUNK = 50
+      try {
+        for (let i = 0; i < rows.length; i += CHUNK) {
+          const chunk = rows.slice(i, i + CHUNK)
+          const placeholders = chunk.map(() =>
+            `(${cols.map(() => '?').join(', ')})`
+          ).join(', ')
+          const flatVals: any[] = []
+          for (const row of chunk) {
+            for (const col of cols) {
+              flatVals.push(row[col] ?? null)
+            }
+          }
+          const ins = await db.prepare(
+            `INSERT INTO ${t} (${colList}) VALUES ${placeholders}`
+          ).bind(...flatVals).run()
+          inserted += (ins.meta as any)?.changes ?? chunk.length
+        }
+        restoreLog.push({ table: t, status: 'OK', deleted, inserted })
+      } catch (e) {
+        restoreLog.push({ table: t, status: 'INSERT_FAIL', deleted, inserted, error: String(e) })
+      }
+    }
+
+    // 사후 카운트
+    const after: Record<string, number> = {}
+    for (const t of WHITELIST) {
+      try {
+        const r = await db.prepare(`SELECT COUNT(*) AS c FROM ${t}`).first() as any
+        after[t] = r?.c ?? -1
+      } catch (e) {
+        after[t] = -1
+      }
+    }
+
+    // 사후 무결성
+    const balSum = await db.prepare(`SELECT SUM(qkey_balance) AS s FROM users`).first() as any
+    const txSum = await db.prepare(`SELECT SUM(amount) AS s FROM transactions WHERE coin_type='QKEY'`).first() as any
+
+    return c.json({
+      mode: 'EXEC',
+      snapshot_label: body.snapshot_label,
+      before_db_counts: before,
+      after_db_counts: after,
+      incoming_snapshot_counts: incoming,
+      restore_log: restoreLog,
+      post_integrity: {
+        total_qkey_balance: balSum?.s,
+        total_qkey_tx_sum: txSum?.s,
+        match: (balSum?.s === txSum?.s) ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // fix-balance-to-history — Option-B EXEC: 모든 user 잔액 = 거래내역 QKEY 합
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "즉시 고!!!!!"
