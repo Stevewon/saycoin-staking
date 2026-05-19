@@ -56758,6 +56758,152 @@ app.get('/api/diag/scan-holiday-tx-double', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-balance-vs-tx — 전체 user TX 합산 vs users.qkey_balance 정합성 전수조사
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "각 계정들의 내역과 각 계정들의 합산잔액들이 일치하지 않는다!
+//   전부 전수조사해서 보고할것!"
+//
+// 검증:
+//   - 각 user 마다 SUM(transactions.amount) WHERE coin_type 무시 = 이론 잔액
+//   - users.qkey_balance = 실제 저장된 잔액
+//   - 일치 / 불일치 / 잔재 분류
+//
+// type 별 합산도 함께 (어떤 type 잔재가 영향 주는지 분석)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-balance-vs-tx', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+
+    // 합법 type 정의
+    const LEGAL_TYPES = ['daily_qkey', 'referral_reward', 'direct_referral', 'admin_adjustment', 'swap_in', 'swap_out']
+    // withdrawal/withdrawal_fee 등은 출금 실제 차감 운영 type (정상)
+    const OPERATIONAL_WITHDRAWAL_TYPES = ['withdrawal', 'withdrawal_fee', 'withdrawal_refund', 'withdrawal_fee_refund']
+    // 영구룰 위반 type
+    const VIOLATION_TYPES_KNOWN = ['daily_reward', 'staking_reward', 'shop_purchase', 'shop_refund', 'three_set_supplement']
+
+    // 전체 user (qkey_balance 존재)
+    const allUsers = await db.prepare(`
+      SELECT id, name, qkey_balance FROM users
+      ORDER BY id
+    `).all()
+    const users = (allUsers.results || []) as any[]
+
+    // 전체 TX SUM by user_id (coin_type 무관, QKEY 컬럼은 qkey_balance 라서 모든 amount 가 QKEY 라고 가정)
+    // 영구룰: transactions.amount 는 해당 type 의 코인 값. QKEY 관련 type 만 합산해야 정확
+    // QKEY 영향 type: daily_qkey, referral_reward, direct_referral, daily_reward(잔재), staking_reward(잔재),
+    //                shop_purchase(-), shop_refund(+), three_set_supplement(+),
+    //                withdrawal(-), withdrawal_fee(-), withdrawal_refund(+), withdrawal_fee_refund(+),
+    //                admin_adjustment, swap_in (QKEY 매입), swap_out (QKEY 매도)
+    //
+    // 가장 안전한 방식: coin_type='QKEY' 인 TX 만 합산 (혹은 NULL 도 포함 시 영향 type)
+    // 일단 coin_type 컬럼 존재 여부 확인하고 합산
+    // 여기서는 type 별 합산을 한 번에 가져와 분류
+
+    const txByUserType = await db.prepare(`
+      SELECT user_id, type, COUNT(*) as cnt, SUM(amount) as sum_amt
+      FROM transactions
+      WHERE (coin_type = 'QKEY' OR coin_type IS NULL OR coin_type = '')
+      GROUP BY user_id, type
+    `).all()
+    const txAgg = (txByUserType.results || []) as any[]
+
+    // user → {type → {cnt, sum}}
+    const aggByUser = new Map<number, Map<string, { cnt: number, sum: number }>>()
+    for (const r of txAgg) {
+      if (!aggByUser.has(r.user_id)) aggByUser.set(r.user_id, new Map())
+      aggByUser.get(r.user_id)!.set(r.type, { cnt: r.cnt, sum: Number(r.sum_amt) })
+    }
+
+    // 각 user 마다 검증
+    const results: any[] = []
+    let totalLegalSum = 0
+    let totalViolationSum = 0
+    let totalWithdrawalSum = 0
+    let totalUnknownSum = 0
+    let mismatchCount = 0
+    let matchCount = 0
+    let totalDiffAbs = 0
+
+    for (const u of users) {
+      const userAgg = aggByUser.get(u.id) || new Map()
+      let legalSum = 0
+      let violationSum = 0
+      let withdrawalSum = 0
+      let unknownSum = 0
+      const typeBreakdown: Record<string, { cnt: number, sum: number, classification: string }> = {}
+
+      for (const [type, info] of userAgg.entries()) {
+        let classification: string
+        if (LEGAL_TYPES.includes(type)) { classification = 'LEGAL'; legalSum += info.sum }
+        else if (VIOLATION_TYPES_KNOWN.includes(type)) { classification = 'VIOLATION'; violationSum += info.sum }
+        else if (OPERATIONAL_WITHDRAWAL_TYPES.includes(type)) { classification = 'OPERATIONAL'; withdrawalSum += info.sum }
+        else { classification = 'UNKNOWN'; unknownSum += info.sum }
+        typeBreakdown[type] = { cnt: info.cnt, sum: info.sum, classification }
+      }
+
+      const txTotal = legalSum + violationSum + withdrawalSum + unknownSum  // 모든 TX 합산
+      const expectedBalance = txTotal  // 이상적: 모든 TX 합산 = 현재 잔액
+      const actualBalance = Number(u.qkey_balance || 0)
+      const diff = actualBalance - expectedBalance
+
+      totalLegalSum += legalSum
+      totalViolationSum += violationSum
+      totalWithdrawalSum += withdrawalSum
+      totalUnknownSum += unknownSum
+
+      const isMatch = Math.abs(diff) < 0.001
+      if (isMatch) matchCount++
+      else { mismatchCount++; totalDiffAbs += Math.abs(diff) }
+
+      results.push({
+        user_id: u.id,
+        name: u.name,
+        actual_balance: actualBalance,
+        tx_total: txTotal,
+        diff_actual_minus_tx: diff,
+        legal_sum: legalSum,
+        violation_sum: violationSum,
+        operational_sum: withdrawalSum,
+        unknown_sum: unknownSum,
+        match: isMatch,
+        type_breakdown: typeBreakdown,
+      })
+    }
+
+    // 정렬: |diff| desc
+    results.sort((a, b) => Math.abs(b.diff_actual_minus_tx) - Math.abs(a.diff_actual_minus_tx))
+
+    // top 일치 안 함만 추출
+    const topMismatches = results.filter(r => !r.match)
+
+    return c.json({
+      verdict: mismatchCount > 0 ? 'BALANCE_MISMATCH_FOUND' : 'ALL_BALANCED',
+      summary: {
+        total_users: users.length,
+        match_count: matchCount,
+        mismatch_count: mismatchCount,
+        total_diff_abs: totalDiffAbs,
+        total_legal_sum: totalLegalSum,
+        total_violation_sum: totalViolationSum,
+        total_operational_sum: totalWithdrawalSum,
+        total_unknown_sum: totalUnknownSum,
+      },
+      legal_types: LEGAL_TYPES,
+      operational_types: OPERATIONAL_WITHDRAWAL_TYPES,
+      violation_types_known: VIOLATION_TYPES_KNOWN,
+      mismatches: topMismatches,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // purge-holiday-513-legacy — 휴일진입자 5/13 legacy daily_reward 잔재 제거
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "b를 발빠르게 처리하고"
