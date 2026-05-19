@@ -56475,6 +56475,242 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-holiday-joiners-double — 휴일진입자 이중지급 전수조사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "휴일진입자 2중 지급이 된거 같으니 11일부터 18일 확정분을
+//   전수 검사하고 휴일진입자만 골라서 1회는 차감하라"
+//
+// 정의:
+//   - 휴일진입자: date(staking.start_date,'+9 hours') IN ('2026-05-09','2026-05-10')
+//   - 정상 5/11 paid GROUP B: reward_date='2026-05-10', paid_date='2026-05-11' (딱 1건)
+//   - 의심: 같은 staking 에서 reward_date 중복 / 정상 paid 개수보다 1 많음
+//
+// 조사:
+//   1) 휴일진입자 staking 전체 + 가입일
+//   2) 각 staking 별 5/11 ~ 5/19 paid 의 DR rows (paid_date, reward_date, qkey, id)
+//   3) reward_date 중복 검사 (같은 reward_date 두 번 지급?)
+//   4) 정상 paid 개수: 5/11 paid(GROUP B)=1 + 그 후 평일 5/12,5/13,5/14,5/15,5/18 = 6
+//      (5/9,5/10,5/16,5/17 은 휴일/주말 — paid 없음)
+//   5) 만약 paid 개수가 > 6 또는 reward_date 중복 → 이중지급 후보
+//   6) RR L1/L2 도 동일 분석
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-holiday-joiners-double', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    // 1) 휴일진입자 staking 전체
+    const holidayStakings = await db.prepare(`
+      SELECT s.id as staking_id, s.user_id, s.amount, s.daily_rate, s.period_days, s.period_months,
+             s.start_date, s.end_date, s.status,
+             date(s.start_date,'+9 hours') as start_date_kst,
+             date(s.end_date,'+9 hours') as end_date_kst,
+             u.name as user_name
+      FROM staking s
+      LEFT JOIN users u ON u.id = s.user_id
+      WHERE date(s.start_date,'+9 hours') IN ('2026-05-09','2026-05-10')
+      ORDER BY s.id
+    `).all<any>()
+    const hStakings = (holidayStakings.results || []) as any[]
+    const hStakingIds = hStakings.map(s => s.staking_id)
+    const hUserIds = Array.from(new Set(hStakings.map(s => s.user_id)))
+
+    if (hStakings.length === 0) {
+      return c.json({ ok: true, mode: 'READ_ONLY', message: '휴일진입자 staking 0건', duration_ms: Date.now() - t0 })
+    }
+
+    const CHUNK = 50
+
+    // 2) 휴일진입자 staking 의 5/11~5/19 paid DR
+    let drRows: any[] = []
+    for (let i = 0; i < hStakingIds.length; i += CHUNK) {
+      const chunk = hStakingIds.slice(i, i + CHUNK)
+      const ph = chunk.map(()=>'?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+        FROM daily_rewards
+        WHERE staking_id IN (${ph})
+          AND paid_date BETWEEN '2026-05-11' AND '2026-05-19'
+        ORDER BY staking_id, paid_date, reward_date, id
+      `).bind(...chunk).all<any>()
+      drRows = drRows.concat((r.results || []) as any[])
+    }
+
+    // 3) staking 별 그룹화 + 이상치 탐지
+    const byStaking: Record<number, { staking_id: number, user_id: number, user_name: string, start_kst: string, amount: number, drs: any[], rds: string[], pds: string[], dup_rds: string[], double_suspected: boolean, double_rows: any[] }> = {}
+    for (const s of hStakings) {
+      byStaking[s.staking_id] = {
+        staking_id: s.staking_id, user_id: s.user_id, user_name: s.user_name,
+        start_kst: s.start_date_kst, amount: s.amount,
+        drs: [], rds: [], pds: [], dup_rds: [], double_suspected: false, double_rows: [],
+      }
+    }
+    for (const d of drRows) {
+      if (!byStaking[d.staking_id]) continue
+      byStaking[d.staking_id].drs.push(d)
+      byStaking[d.staking_id].rds.push(d.reward_date)
+      byStaking[d.staking_id].pds.push(d.paid_date)
+    }
+
+    // reward_date 중복 검사 (이중지급 핵심 시그널)
+    const rdDupRows: any[] = []
+    for (const k of Object.keys(byStaking)) {
+      const st = byStaking[Number(k)]
+      const rdCount: Record<string, any[]> = {}
+      for (const d of st.drs) {
+        if (!rdCount[d.reward_date]) rdCount[d.reward_date] = []
+        rdCount[d.reward_date].push(d)
+      }
+      for (const rd of Object.keys(rdCount)) {
+        if (rdCount[rd].length > 1) {
+          st.dup_rds.push(rd)
+          st.double_suspected = true
+          st.double_rows = st.double_rows.concat(rdCount[rd])
+          for (const r of rdCount[rd]) {
+            rdDupRows.push({ ...r, user_name: st.user_name, start_kst: st.start_kst })
+          }
+        }
+      }
+    }
+
+    // 정상 기대 paid count 계산
+    // 5/11(GROUP B reward=5/10) + 5/12 + 5/13 + 5/14 + 5/15 + 5/18 = 6 paid
+    // 단, 5/11 GROUP B 의 reward_date=5/10, 그 외 reward_date=paid-1
+    const EXPECTED_PAIDS = ['2026-05-11','2026-05-12','2026-05-13','2026-05-14','2026-05-15','2026-05-18','2026-05-19']
+    // 5/19 까지면 7회 (5/19 reward=5/18)
+    const summaryPerStaking: any[] = []
+    for (const k of Object.keys(byStaking)) {
+      const st = byStaking[Number(k)]
+      const paidSet = Array.from(new Set(st.pds)).sort()
+      const rdSet = Array.from(new Set(st.rds)).sort()
+      const expected_count = EXPECTED_PAIDS.length  // 7 (5/11 + 5/12 ~ 5/15 + 5/18 + 5/19)
+      const actual_count = st.drs.length
+      const extra = actual_count - expected_count
+      const total_qkey = st.drs.reduce((a:number,b:any)=>a+Number(b.qkey||0), 0)
+      summaryPerStaking.push({
+        staking_id: st.staking_id, user_id: st.user_id, user_name: st.user_name,
+        start_kst: st.start_kst, stake_amount: st.amount,
+        dr_total_count: actual_count, expected_count, extra_count: extra,
+        unique_reward_dates: rdSet, unique_paid_dates: paidSet,
+        dup_reward_dates: st.dup_rds,
+        double_suspected: st.double_suspected || extra > 0,
+        double_rows_count: st.double_rows.length,
+        total_qkey_received: total_qkey,
+      })
+    }
+
+    // 4) 의심 staking 만 추출 + 결정적 row 식별
+    // 이중지급 row 선정 룰: dup_rds 가 있는 staking → 각 dup_rd 에서 id 큰 row 가 PURGE 후 다시 들어온 의심 row
+    //   하지만 사장님 룰은 "1회 차감" → 가장 minimal 하게 row 1개씩만 후보로 표시
+    const doubleCandidates: any[] = []
+    for (const k of Object.keys(byStaking)) {
+      const st = byStaking[Number(k)]
+      // reward_date 별 중복 row: 작은 id 보존, 큰 id 가 의심 row (가장 최근 INSERT)
+      const rdGroup: Record<string, any[]> = {}
+      for (const d of st.drs) {
+        if (!rdGroup[d.reward_date]) rdGroup[d.reward_date] = []
+        rdGroup[d.reward_date].push(d)
+      }
+      for (const rd of Object.keys(rdGroup)) {
+        if (rdGroup[rd].length > 1) {
+          // 최신 id (가장 뒤에 들어간 row) 를 의심 후보
+          const sorted = [...rdGroup[rd]].sort((a,b)=>b.id - a.id)
+          const newest = sorted[0]
+          const preserved = sorted.slice(1)  // 보존 후보
+          doubleCandidates.push({
+            staking_id: st.staking_id, user_id: st.user_id, user_name: st.user_name,
+            reward_date: rd,
+            duplicate_count: rdGroup[rd].length,
+            newest_row: newest,
+            preserved_rows: preserved,
+            staking_start_kst: st.start_kst,
+          })
+        }
+      }
+    }
+
+    // 5) RR L1/L2 도 같은 staking 기준 조회 (이중지급 같이 발생했을 가능성)
+    let rrRows: any[] = []
+    for (let i = 0; i < hStakingIds.length; i += CHUNK) {
+      const chunk = hStakingIds.slice(i, i + CHUNK)
+      const ph = chunk.map(()=>'?').join(',')
+      const r = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+               staking_id, reward_date, paid_date, created_at
+        FROM referral_rewards
+        WHERE staking_id IN (${ph})
+          AND paid_date BETWEEN '2026-05-11' AND '2026-05-19'
+          AND level IN (1,2)
+        ORDER BY staking_id, level, paid_date, reward_date, id
+      `).bind(...chunk).all<any>()
+      rrRows = rrRows.concat((r.results || []) as any[])
+    }
+    // RR reward_date 중복 검사 (staking_id + referrer + referee + level + reward_date 기준)
+    const rrKey = (r:any) => `s${r.staking_id}_l${r.level}_rd${r.reward_date}_ref${r.referrer_id}_ree${r.referee_id}`
+    const rrGroup: Record<string, any[]> = {}
+    for (const r of rrRows) {
+      const k = rrKey(r)
+      if (!rrGroup[k]) rrGroup[k] = []
+      rrGroup[k].push(r)
+    }
+    const rrDoubleCandidates: any[] = []
+    for (const k of Object.keys(rrGroup)) {
+      if (rrGroup[k].length > 1) {
+        const sorted = [...rrGroup[k]].sort((a,b)=>b.id - a.id)
+        const newest = sorted[0]
+        const preserved = sorted.slice(1)
+        rrDoubleCandidates.push({
+          group_key: k,
+          duplicate_count: rrGroup[k].length,
+          newest_row: newest,
+          preserved_rows: preserved,
+        })
+      }
+    }
+
+    // 6) 종합 카운트
+    const totalDrDoubleQkey = doubleCandidates.reduce((a,b)=>a+Number(b.newest_row?.qkey||0), 0)
+    const totalRrDoubleQkey = rrDoubleCandidates.reduce((a,b)=>a+Number(b.newest_row?.reward_amount||0), 0)
+    const stakingsWithIssue = summaryPerStaking.filter(s => s.double_suspected || s.extra_count > 0).length
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      verdict: doubleCandidates.length === 0 && rrDoubleCandidates.length === 0 ? 'NO_DOUBLE_DETECTED' : 'DOUBLE_PAYMENT_DETECTED',
+      counts: {
+        holiday_stakings_total: hStakings.length,
+        holiday_users_total: hUserIds.length,
+        dr_rows_in_range: drRows.length,
+        rr_l12_rows_in_range: rrRows.length,
+        stakings_with_issue: stakingsWithIssue,
+        dr_double_candidates: doubleCandidates.length,
+        rr_double_candidates: rrDoubleCandidates.length,
+        total_dr_double_qkey_to_remove: totalDrDoubleQkey,
+        total_rr_double_qkey_to_remove: totalRrDoubleQkey,
+        grand_total_to_remove: totalDrDoubleQkey + totalRrDoubleQkey,
+      },
+      holiday_stakings: hStakings.map(s => ({
+        staking_id: s.staking_id, user_id: s.user_id, user_name: s.user_name,
+        start_kst: s.start_date_kst, end_kst: s.end_date_kst,
+        amount: s.amount, status: s.status,
+      })),
+      per_staking_summary: summaryPerStaking,
+      dr_double_candidates_sample: doubleCandidates.slice(0, 20),
+      rr_double_candidates_sample: rrDoubleCandidates.slice(0, 20),
+      dr_double_candidates_count: doubleCandidates.length,
+      rr_double_candidates_count: rrDoubleCandidates.length,
+      duplicate_dr_rows_sample: rdDupRows.slice(0, 20),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // purge-513-paid — 5/13 paid 전량 PURGE (DRY-RUN + EXEC)
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "12일 확정분 즉 13일 지급일건에 대해 영구룰 방식으로
