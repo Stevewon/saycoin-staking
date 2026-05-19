@@ -50848,4 +50848,149 @@ app.get('/api/diag/purge-future-batch-2026-05-19', async (c) => {
 })
 
 
+// ============================================================================
+// 🚨 EMERGENCY 2026-05-19: 표시일 휴일 위반 batch 의 paid_date/created_at 정정
+// ============================================================================
+// 사장님 영구정책: paid_date = 페이드 = KST 표시일 (= 확정일 다음 평일)
+// 위반:
+//   - paid_date=2026-05-15 (금) → KST 5/16(토) 표시 → 정정: paid_date=2026-05-18, created_at='2026-05-17 23:00:00' UTC
+//   - paid_date=2026-05-08 (금) → KST 5/09(토) 표시 → 정정: paid_date=2026-05-11, created_at='2026-05-10 23:00:00' UTC
+// 잔액 변경 없음 (paid_date/created_at 만 UPDATE)
+//
+// DRY-RUN: GET /api/diag/fix-paid-date-holidays?key=ADMIN_PW
+// EXEC:    GET /api/diag/fix-paid-date-holidays?key=ADMIN_PW&confirm=FIX_PAID_HOLIDAYS
+app.get('/api/diag/fix-paid-date-holidays', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_PAID_HOLIDAYS'
+    const db = c.env.DB
+
+    // 정정 매핑
+    const fixes = [
+      { old_paid: '2026-05-15', new_paid: '2026-05-18', new_created_at: '2026-05-17 23:00:00' },
+      { old_paid: '2026-05-08', new_paid: '2026-05-11', new_created_at: '2026-05-10 23:00:00' },
+    ]
+
+    const plan: any[] = []
+    for (const f of fixes) {
+      const drCnt = await db.prepare(`SELECT COUNT(*) AS c FROM daily_rewards WHERE paid_date = ?`).bind(f.old_paid).first<any>()
+      const rrCnt = await db.prepare(`SELECT COUNT(*) AS c FROM referral_rewards WHERE paid_date = ?`).bind(f.old_paid).first<any>()
+      const drTxCnt = await db.prepare(`
+        SELECT COUNT(*) AS c FROM transactions t
+        INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+        WHERE t.type='daily_qkey' AND dr.paid_date = ?
+      `).bind(f.old_paid).first<any>()
+      const rrTxCnt = await db.prepare(`
+        SELECT COUNT(*) AS c FROM transactions t
+        INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+        WHERE t.type='referral_reward' AND rr.paid_date = ?
+      `).bind(f.old_paid).first<any>()
+      const lockRow = await db.prepare(`SELECT lock_date, source FROM daily_cron_lock WHERE lock_date = ?`).bind(f.old_paid).first<any>()
+      const newLockExists = await db.prepare(`SELECT lock_date FROM daily_cron_lock WHERE lock_date = ?`).bind(f.new_paid).first<any>()
+      plan.push({
+        ...f,
+        daily_rewards_to_update: Number(drCnt?.c || 0),
+        referral_rewards_to_update: Number(rrCnt?.c || 0),
+        daily_qkey_tx_to_update: Number(drTxCnt?.c || 0),
+        referral_tx_to_update: Number(rrTxCnt?.c || 0),
+        lock_row_to_move: lockRow ? lockRow : null,
+        target_lock_already_exists: !!newLockExists,
+      })
+    }
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        plan,
+        balance_change: '없음 (paid_date/created_at 만 UPDATE)',
+        confirm_token_required: 'FIX_PAID_HOLIDAYS',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC
+    const results: any[] = []
+    for (const f of fixes) {
+      const stmts: any[] = []
+      // 1) daily_rewards: paid_date + created_at UPDATE (paid_date 가 변하면서 UNIQUE 충돌 가능성? daily_rewards 는 UNIQUE 없음 0004)
+      stmts.push(db.prepare(`
+        UPDATE daily_rewards
+        SET paid_date = ?, created_at = ?
+        WHERE paid_date = ?
+      `).bind(f.new_paid, f.new_created_at, f.old_paid))
+      // 2) referral_rewards
+      stmts.push(db.prepare(`
+        UPDATE referral_rewards
+        SET paid_date = ?, created_at = ?
+        WHERE paid_date = ?
+      `).bind(f.new_paid, f.new_created_at, f.old_paid))
+      // 3) daily_qkey tx (ref_id 로 매칭되는 transactions)
+      stmts.push(db.prepare(`
+        UPDATE transactions
+        SET created_at = ?
+        WHERE type='daily_qkey' AND ref_id IN (SELECT id FROM daily_rewards WHERE paid_date = ?)
+      `).bind(f.new_created_at, f.new_paid))
+      // 4) referral_reward tx
+      stmts.push(db.prepare(`
+        UPDATE transactions
+        SET created_at = ?
+        WHERE type='referral_reward' AND ref_id IN (SELECT id FROM referral_rewards WHERE paid_date = ?)
+      `).bind(f.new_created_at, f.new_paid))
+      // 5) daily_cron_lock 이관 (old → new, 단 new 가 이미 있으면 old 만 삭제)
+      const newLockExists = await db.prepare(`SELECT lock_date FROM daily_cron_lock WHERE lock_date = ?`).bind(f.new_paid).first<any>()
+      if (newLockExists) {
+        stmts.push(db.prepare(`DELETE FROM daily_cron_lock WHERE lock_date = ?`).bind(f.old_paid))
+      } else {
+        stmts.push(db.prepare(`UPDATE daily_cron_lock SET lock_date = ? WHERE lock_date = ?`).bind(f.new_paid, f.old_paid))
+      }
+
+      const res = await db.batch(stmts)
+
+      // 검증
+      const drNew = await db.prepare(`SELECT COUNT(*) AS c FROM daily_rewards WHERE paid_date = ?`).bind(f.new_paid).first<any>()
+      const drOld = await db.prepare(`SELECT COUNT(*) AS c FROM daily_rewards WHERE paid_date = ?`).bind(f.old_paid).first<any>()
+      const rrNew = await db.prepare(`SELECT COUNT(*) AS c FROM referral_rewards WHERE paid_date = ?`).bind(f.new_paid).first<any>()
+      const rrOld = await db.prepare(`SELECT COUNT(*) AS c FROM referral_rewards WHERE paid_date = ?`).bind(f.old_paid).first<any>()
+      const txDrAt = await db.prepare(`
+        SELECT COUNT(*) AS c FROM transactions t
+        INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+        WHERE t.type='daily_qkey' AND dr.paid_date = ? AND t.created_at = ?
+      `).bind(f.new_paid, f.new_created_at).first<any>()
+      const txRrAt = await db.prepare(`
+        SELECT COUNT(*) AS c FROM transactions t
+        INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+        WHERE t.type='referral_reward' AND rr.paid_date = ? AND t.created_at = ?
+      `).bind(f.new_paid, f.new_created_at).first<any>()
+
+      results.push({
+        ...f,
+        batch_result_count: res.length,
+        after: {
+          daily_rewards_at_new_paid: Number(drNew?.c || 0),
+          daily_rewards_at_old_paid: Number(drOld?.c || 0),
+          referral_rewards_at_new_paid: Number(rrNew?.c || 0),
+          referral_rewards_at_old_paid: Number(rrOld?.c || 0),
+          daily_qkey_tx_aligned: Number(txDrAt?.c || 0),
+          referral_tx_aligned: Number(txRrAt?.c || 0),
+        },
+      })
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      results,
+      balance_change: '없음',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
