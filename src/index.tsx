@@ -55760,4 +55760,180 @@ app.get('/api/diag/fix-user44-balance-516', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// scan-519-paid — 5/19 paid 전체 현재 상태 검사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "5월 18일 확정분의 오늘 19일 페이드되는거 정확하지 않다
+//   영구룰에 의거해서 중복절대없이 바텀업으로 정밀하게 18일 확정분을 넣자
+//   지금 들어간것을 다시 검토하지말고 전부 제거후에 내 룰대로만 다시 넣어줘"
+//
+// 검사:
+//   1) 5/19 paid 의 DR (전부)
+//   2) 5/19 paid 의 RR level=1/2 (PURGE 대상)
+//   3) 5/19 paid 의 RR level=0 (direct_referral, 보존 대상)
+//   4) 5/19 paid 의 TX 매핑 (시각 기반 + ref_id 기반)
+//   5) reward_date 분포 (5/18 reward 정상치인지 검증)
+//   6) user 별 balance 차감 예정 (direct level=0 제외)
+//   7) 다른 paid_date 보존 baseline
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-519-paid', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    const PAID = '2026-05-19'
+
+    // 1) DR 전체
+    const dr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE paid_date=?
+      ORDER BY id
+    `).bind(PAID).all<any>()
+
+    // 2) RR 전체 (level 별)
+    const rr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE paid_date=?
+      ORDER BY level, id
+    `).bind(PAID).all<any>()
+
+    const drRows = dr.results || []
+    const rrRows = rr.results || []
+    const rrL0 = rrRows.filter((r:any) => r.level === 0)
+    const rrL1 = rrRows.filter((r:any) => r.level === 1)
+    const rrL2 = rrRows.filter((r:any) => r.level === 2)
+
+    // 3) reward_date 분포
+    const drByRd: Record<string, { count: number, qkey: number }> = {}
+    for (const d of drRows as any[]) {
+      const k = d.reward_date
+      if (!drByRd[k]) drByRd[k] = { count: 0, qkey: 0 }
+      drByRd[k].count++
+      drByRd[k].qkey += Number(d.qkey || 0)
+    }
+    const rrByLevelRd: Record<string, { count: number, qkey: number }> = {}
+    for (const r of rrRows as any[]) {
+      const k = `L${r.level}-${r.reward_date}`
+      if (!rrByLevelRd[k]) rrByLevelRd[k] = { count: 0, qkey: 0 }
+      rrByLevelRd[k].count++
+      rrByLevelRd[k].qkey += Number(r.reward_amount || 0)
+    }
+
+    // 4) TX 매핑 (ref_id IN DR/RR ids)
+    const drIds = (drRows as any[]).map(d => d.id)
+    const rrIds = (rrRows as any[]).map(r => r.id)
+    let txByDrRef: any[] = []
+    let txByRrRef: any[] = []
+    if (drIds.length > 0) {
+      const ph = drIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id, description, created_at
+        FROM transactions
+        WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...drIds).all<any>()
+      txByDrRef = (r.results || []) as any[]
+    }
+    if (rrIds.length > 0) {
+      const ph = rrIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id, description, created_at
+        FROM transactions
+        WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...rrIds).all<any>()
+      txByRrRef = (r.results || []) as any[]
+    }
+
+    // 5) 5/19 시각 window TX (시간대 정규시각)
+    // KST 5/19 08:00 = UTC 5/18 23:00
+    const txByTime = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward','direct_referral')
+        AND created_at >= '2026-05-18 23:00:00'
+        AND created_at < '2026-05-19 23:00:00'
+      ORDER BY created_at, id
+    `).all<any>()
+
+    // 6) direct_referral 보존 대상 (level=0) 의 reward_date 확인
+    const directInfo = rrL0.map((r:any) => ({
+      id: r.id, referrer_id: r.referrer_id, referee_id: r.referee_id,
+      reward_amount: r.reward_amount, reward_date: r.reward_date, created_at: r.created_at,
+    }))
+
+    // 7) balance 차감 예정 (DR + RR L1/L2 만, RR L0 보존 → 차감 제외)
+    const balanceDecrement: Record<number, { from_dr: number, from_rr_l12: number, total: number }> = {}
+    for (const d of drRows as any[]) {
+      const uid = d.user_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { from_dr: 0, from_rr_l12: 0, total: 0 }
+      balanceDecrement[uid].from_dr += Number(d.qkey || 0)
+    }
+    for (const r of [...rrL1, ...rrL2] as any[]) {
+      const uid = r.referrer_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { from_dr: 0, from_rr_l12: 0, total: 0 }
+      balanceDecrement[uid].from_rr_l12 += Number(r.reward_amount || 0)
+    }
+    for (const uid of Object.keys(balanceDecrement)) {
+      const b = balanceDecrement[Number(uid)]
+      b.total = b.from_dr + b.from_rr_l12
+    }
+    const affectedUserIds = Object.keys(balanceDecrement).map(Number)
+    const userBalances: any[] = []
+    for (const uid of affectedUserIds) {
+      const u = await db.prepare(`SELECT id, qkey_balance, name FROM users WHERE id=?`).bind(uid).first()
+      if (u) userBalances.push(u)
+    }
+
+    // 8) 다른 paid_date snapshot
+    const otherPaid = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date BETWEEN '2026-05-11' AND '2026-05-20'
+      GROUP BY paid_date ORDER BY paid_date
+    `).all<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      paid_date: PAID,
+      counts: {
+        dr_total: drRows.length,
+        dr_qkey: (drRows as any[]).reduce((a,b)=>a+Number(b.qkey||0),0),
+        rr_l0_preserve: rrL0.length,
+        rr_l0_qkey: rrL0.reduce((a:number, b:any)=>a+Number(b.reward_amount||0),0),
+        rr_l1_purge: rrL1.length,
+        rr_l1_qkey: rrL1.reduce((a:number, b:any)=>a+Number(b.reward_amount||0),0),
+        rr_l2_purge: rrL2.length,
+        rr_l2_qkey: rrL2.reduce((a:number, b:any)=>a+Number(b.reward_amount||0),0),
+        tx_by_dr_ref: txByDrRef.length,
+        tx_by_rr_ref: txByRrRef.length,
+        tx_by_time_window: (txByTime.results || []).length,
+      },
+      dr_by_reward_date: drByRd,
+      rr_by_level_reward_date: rrByLevelRd,
+      direct_referral_preserved: directInfo,
+      purge_plan: {
+        description: 'DR 전체 + RR L1/L2 전체 + 대응 TX (DR ref + RR L1/L2 ref + 시각window orphan) DELETE, balance 차감, direct L0 보존',
+        dr_to_delete: drRows.length,
+        rr_l12_to_delete: rrL1.length + rrL2.length,
+        balance_users_affected: affectedUserIds.length,
+        balance_total_decrement: Object.values(balanceDecrement).reduce((a,b)=>a+b.total,0),
+        user_sample: userBalances.slice(0, 10).map(u => ({
+          ...u,
+          decrement: balanceDecrement[u.id]?.total ?? 0,
+          after: Number(u.qkey_balance) - (balanceDecrement[u.id]?.total ?? 0),
+        })),
+      },
+      sample_tx_time_window: (txByTime.results || []).slice(0, 10),
+      other_paid_dr_snapshot: otherPaid.results || [],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
