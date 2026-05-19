@@ -56475,6 +56475,80 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// inspect-tx-desc-history — 다른 paid_date 의 referral_reward description 확인 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/inspect-tx-desc-history', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    // 다른 paid_date(5/12~5/18) 의 referral_reward TX description 샘플
+    // 5/19 TX 는 분리해서 표시
+    const sample518 = await db.prepare(`
+      SELECT t.id, t.user_id, t.type, t.amount, t.description, t.ref_id, t.created_at, r.level
+      FROM transactions t
+      LEFT JOIN referral_rewards r ON r.id = t.ref_id
+      WHERE t.type='referral_reward' AND t.coin_type='QKEY'
+        AND t.created_at >= '2026-05-17 23:00:00' AND t.created_at < '2026-05-18 23:00:00'
+      ORDER BY t.id
+      LIMIT 20
+    `).all<any>()
+
+    const sample519 = await db.prepare(`
+      SELECT t.id, t.user_id, t.type, t.amount, t.description, t.ref_id, t.created_at, r.level
+      FROM transactions t
+      LEFT JOIN referral_rewards r ON r.id = t.ref_id
+      WHERE t.type='referral_reward' AND t.coin_type='QKEY'
+        AND t.created_at >= '2026-05-18 23:00:00' AND t.created_at < '2026-05-19 23:00:00'
+      ORDER BY t.id
+      LIMIT 20
+    `).all<any>()
+
+    const sampleOld = await db.prepare(`
+      SELECT t.id, t.user_id, t.type, t.amount, t.description, t.ref_id, t.created_at, r.level
+      FROM transactions t
+      LEFT JOIN referral_rewards r ON r.id = t.ref_id
+      WHERE t.type='referral_reward' AND t.coin_type='QKEY'
+        AND t.created_at >= '2026-05-11 23:00:00' AND t.created_at < '2026-05-12 23:00:00'
+      ORDER BY t.id
+      LIMIT 20
+    `).all<any>()
+
+    // description distinct 패턴 (5/19 제외 전체)
+    const distinct = await db.prepare(`
+      SELECT description, COUNT(*) as cnt
+      FROM transactions
+      WHERE type='referral_reward' AND coin_type='QKEY'
+        AND NOT (created_at >= '2026-05-18 23:00:00' AND created_at < '2026-05-19 23:00:00')
+      GROUP BY description ORDER BY cnt DESC LIMIT 20
+    `).all<any>()
+
+    const distinct519 = await db.prepare(`
+      SELECT description, COUNT(*) as cnt
+      FROM transactions
+      WHERE type='referral_reward' AND coin_type='QKEY'
+        AND created_at >= '2026-05-18 23:00:00' AND created_at < '2026-05-19 23:00:00'
+      GROUP BY description ORDER BY cnt DESC
+    `).all<any>()
+
+    return c.json({
+      ok: true,
+      sample_518: sample518.results || [],
+      sample_519: sample519.results || [],
+      sample_old_512: sampleOld.results || [],
+      distinct_descriptions_pre_519: distinct.results || [],
+      distinct_descriptions_519: distinct519.results || [],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // verify-519-bottom-up — 5/19 paid 바텀업 정합 검증 (READ-ONLY)
 // ════════════════════════════════════════════════════════════════════════
 // 검증 항목:
