@@ -34747,6 +34747,165 @@ app.get('/api/diag/cron-h-plan-monitor', async (c) => {
 })
 
 // ============================================================================
+// user-ledger-replay (2026-05-19): 단일 회원 transactions 전체 chronological replay
+// ============================================================================
+//   목적: 사장님 명령 - 음수/불일치 회원의 DRY-RUN ledger replay
+//   영구룰 #지상최고 (중복지급 절대금지): read-only, DB 미수정
+//   running_balance 계산 + 위반 type 분리 + 마지막 잔액 vs 현재 qkey_balance 비교
+//   사용: GET /api/diag/user-ledger-replay?key=<ADMIN_PW>&user_id=9&coin=QKEY
+app.get('/api/diag/user-ledger-replay', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || c.req.query('password') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const userId = Number(c.req.query('user_id') || '0')
+    const coin = (c.req.query('coin') || 'QKEY').toUpperCase()
+    if (!userId) return c.json({ error: 'user_id required' }, 400)
+    const db = c.env.DB
+
+    // user info
+    const user = await db.prepare(`
+      SELECT id, email, name, qta_balance, qx_balance, usdt_balance, qkey_balance,
+             usdt_withdrawable
+      FROM users WHERE id = ?
+    `).bind(userId).first() as any
+    if (!user) return c.json({ error: `user_id ${userId} not found` }, 404)
+
+    const balanceCol = coin === 'QKEY' ? 'qkey_balance'
+                     : coin === 'USDT' ? 'usdt_balance'
+                     : coin === 'QTA' ? 'qta_balance'
+                     : coin === 'QX' ? 'qx_balance' : 'qkey_balance'
+    const currentBalance = Number(user[balanceCol] || 0)
+
+    // chronological transactions
+    const txs = await db.prepare(`
+      SELECT id, type, coin_type, amount, description, ref_id,
+             created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM transactions
+      WHERE user_id = ? AND coin_type = ?
+      ORDER BY created_at ASC, id ASC
+    `).bind(userId, coin).all()
+
+    const txList = (txs.results || []) as any[]
+
+    // withdrawals (active states)
+    const wds = await db.prepare(`
+      SELECT id, amount, status,
+             COALESCE(processed_at, requested_at, created_at) AS event_at,
+             datetime(COALESCE(processed_at, requested_at, created_at), '+9 hours') AS kst_at
+      FROM withdrawals
+      WHERE user_id = ? AND coin_type = ?
+        AND status IN ('approved','completed','processing','pending')
+      ORDER BY event_at ASC, id ASC
+    `).bind(userId, coin).all()
+    const wdList = (wds.results || []) as any[]
+
+    // 영구룰 정상 type
+    const LEGIT_TYPES = new Set(['daily_qkey', 'referral_reward', 'swap_in', 'swap_out'])
+
+    // chronological replay (tx + withdrawal 합쳐서 시간순)
+    const events: any[] = []
+    for (const t of txList) {
+      events.push({
+        kind: 'tx',
+        event_at: t.created_at,
+        kst_at: t.kst_at,
+        id: Number(t.id),
+        type: String(t.type),
+        amount: Number(t.amount),
+        description: String(t.description || ''),
+        ref_id: t.ref_id != null ? Number(t.ref_id) : null,
+        legit: LEGIT_TYPES.has(String(t.type)),
+      })
+    }
+    for (const w of wdList) {
+      events.push({
+        kind: 'withdrawal',
+        event_at: w.event_at,
+        kst_at: w.kst_at,
+        id: Number(w.id),
+        type: `withdrawal_${w.status}`,
+        amount: -Math.abs(Number(w.amount)),  // withdrawal 은 balance 감소
+        description: `Withdrawal ${w.status}`,
+        ref_id: null,
+        legit: true,
+      })
+    }
+    events.sort((a, b) => {
+      if (a.event_at < b.event_at) return -1
+      if (a.event_at > b.event_at) return 1
+      // same timestamp: tx first then withdrawal
+      if (a.kind !== b.kind) return a.kind === 'tx' ? -1 : 1
+      return (a.id || 0) - (b.id || 0)
+    })
+
+    // running balance (영구룰 공식만)
+    let runningLegit = 0
+    let runningAll = 0
+    const replay = events.map(e => {
+      runningAll += e.amount
+      if (e.legit) runningLegit += e.amount
+      return {
+        ...e,
+        running_balance_legit: runningLegit,    // 영구룰 정상 type 만 누적
+        running_balance_all: runningAll,        // 위반 type 포함 누적
+      }
+    })
+
+    // 합계
+    const sumByType: Record<string, { cnt: number, sum: number, legit: boolean }> = {}
+    for (const e of events) {
+      const key = e.type
+      if (!sumByType[key]) sumByType[key] = { cnt: 0, sum: 0, legit: e.legit }
+      sumByType[key].cnt++
+      sumByType[key].sum += e.amount
+    }
+
+    // 검증
+    const expectedLegitFinal = runningLegit
+    const expectedAllFinal = runningAll
+    const diffVsLegit = currentBalance - expectedLegitFinal
+    const diffVsAll = currentBalance - expectedAllFinal
+
+    // 영구룰 위반 type 집계
+    const illegalTypes = Object.entries(sumByType)
+      .filter(([_, v]) => !v.legit)
+      .map(([type, v]) => ({ type, ...v }))
+
+    return c.json({
+      ok: true,
+      user_id: userId,
+      email: String(user.email || ''),
+      name: String(user.name || ''),
+      coin,
+      current_balance: currentBalance,
+      formula_legit: 'Σ(daily_qkey + referral_reward + swap_in + swap_out) - Σ(withdrawals active)',
+      sum_by_type: sumByType,
+      illegal_types: illegalTypes,
+      event_count: events.length,
+      tx_count: txList.length,
+      withdrawal_count: wdList.length,
+      // 마지막 5건은 보여주고 전체는 별도 endpoint 로
+      first_event_kst: events.length > 0 ? events[0].kst_at : null,
+      last_event_kst: events.length > 0 ? events[events.length-1].kst_at : null,
+      verdict: {
+        expected_balance_legit_only: expectedLegitFinal,
+        expected_balance_all_types: expectedAllFinal,
+        diff_vs_legit: diffVsLegit,
+        diff_vs_all: diffVsAll,
+        legit_match: Math.abs(diffVsLegit) < 0.01,
+        all_match: Math.abs(diffVsAll) < 0.01,
+      },
+      replay,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: error?.message || String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
 // negative-balance-report (2026-05-19): 음수 잔액 회원 전수 보고
 // ============================================================================
 //   목적: 사장님 명령 - 음수 잔액 회원 명단 + 진입금액 + 데일리 배당 + 스왑 현황
