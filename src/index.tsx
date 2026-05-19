@@ -55936,4 +55936,258 @@ app.get('/api/diag/scan-519-paid', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// purge-519-paid — 5/19 paid 전량 PURGE (DRY-RUN + EXEC)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 결재 완료 (2026-05-19):
+//   ① PURGE 승인 ✅
+//   ② Negative balance: 옵션 A (그대로 차감)
+//   ③ 재INSERT 룰 확인 ✅
+//
+// 대상:
+//   - daily_rewards WHERE paid_date='2026-05-19'         (58건)
+//   - referral_rewards WHERE paid_date='2026-05-19' AND level IN (1,2)  (62건)
+//   - transactions: DR ref + RR L1/L2 ref 매핑
+//   - users.qkey_balance -= per-user decrement
+//
+// 보존:
+//   - referral_rewards level=0 (direct_referral) — id 1783, 3250
+//   - 다른 paid_date 의 모든 데이터
+//
+// 가드:
+//   - paid_date='2026-05-19' 매 쿼리 강제 명시
+//   - RR DELETE 는 level IN (1,2) 만 (L0 보존)
+//   - TX DELETE 는 ref_id IN (수집한 DR/RR id list) 만 (시각 window 단독 사용 금지)
+//
+// DRY-RUN: GET /api/diag/purge-519-paid?key=ADMIN_PW
+// EXEC:    GET /api/diag/purge-519-paid?key=ADMIN_PW&confirm=PURGE_519
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/purge-519-paid', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'PURGE_519'
+    const db = c.env.DB
+
+    const PAID = '2026-05-19'
+
+    // ─── PHASE 0: 대상 수집 ─────────────────────────────────
+    const dr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date
+      FROM daily_rewards WHERE paid_date=?
+      ORDER BY id
+    `).bind(PAID).all<any>()
+    const drRows = (dr.results || []) as any[]
+    const drIds = drRows.map(d => d.id)
+
+    const rrL12 = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date
+      FROM referral_rewards WHERE paid_date=? AND level IN (1,2)
+      ORDER BY level, id
+    `).bind(PAID).all<any>()
+    const rrRows = (rrL12.results || []) as any[]
+    const rrIds = rrRows.map(r => r.id)
+
+    // L0 (보존) 별도 카운트 (실행 전후 검증용)
+    const rrL0 = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_amount
+      FROM referral_rewards WHERE paid_date=? AND level=0
+      ORDER BY id
+    `).bind(PAID).all<any>()
+    const rrL0Rows = (rrL0.results || []) as any[]
+
+    // 대응 TX 수집 (ref_id 기반만, 시간 window 절대 사용 금지)
+    let txByDrRef: any[] = []
+    let txByRrRef: any[] = []
+    if (drIds.length > 0) {
+      const ph = drIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id
+        FROM transactions
+        WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...drIds).all<any>()
+      txByDrRef = (r.results || []) as any[]
+    }
+    if (rrIds.length > 0) {
+      const ph = rrIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id
+        FROM transactions
+        WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...rrIds).all<any>()
+      txByRrRef = (r.results || []) as any[]
+    }
+    const txIds = [...txByDrRef.map(t => t.id), ...txByRrRef.map(t => t.id)]
+
+    // per-user balance decrement (DR + RR L1/L2 합산)
+    const balanceDecrement: Record<number, { from_dr: number, from_rr_l12: number, total: number }> = {}
+    for (const d of drRows) {
+      const uid = d.user_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { from_dr: 0, from_rr_l12: 0, total: 0 }
+      balanceDecrement[uid].from_dr += Number(d.qkey || 0)
+    }
+    for (const r of rrRows) {
+      const uid = r.referrer_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { from_dr: 0, from_rr_l12: 0, total: 0 }
+      balanceDecrement[uid].from_rr_l12 += Number(r.reward_amount || 0)
+    }
+    for (const uid of Object.keys(balanceDecrement)) {
+      const b = balanceDecrement[Number(uid)]
+      b.total = b.from_dr + b.from_rr_l12
+    }
+    const affectedUserIds = Object.keys(balanceDecrement).map(Number).sort((a,b)=>a-b)
+
+    // 실행 전 balance 스냅샷
+    const beforeBalances: any[] = []
+    for (const uid of affectedUserIds) {
+      const u = await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id=?`).bind(uid).first<any>()
+      if (u) beforeBalances.push({
+        ...u,
+        decrement: balanceDecrement[uid].total,
+        after: Number(u.qkey_balance) - balanceDecrement[uid].total,
+      })
+    }
+
+    const summary = {
+      paid_date: PAID,
+      dr_to_delete: drRows.length,
+      dr_total_qkey: drRows.reduce((a,b)=>a+Number(b.qkey||0), 0),
+      rr_l12_to_delete: rrRows.length,
+      rr_l12_total_qkey: rrRows.reduce((a,b)=>a+Number(b.reward_amount||0), 0),
+      rr_l0_preserved: rrL0Rows.length,
+      rr_l0_preserved_qkey: rrL0Rows.reduce((a,b)=>a+Number(b.reward_amount||0), 0),
+      rr_l0_preserved_ids: rrL0Rows.map(r => r.id),
+      tx_by_dr_ref: txByDrRef.length,
+      tx_by_rr_ref: txByRrRef.length,
+      tx_total_to_delete: txIds.length,
+      balance_users_affected: affectedUserIds.length,
+      balance_total_decrement: Object.values(balanceDecrement).reduce((a,b)=>a+b.total, 0),
+    }
+
+    // ─── 가드 검증 (DRY-RUN/EXEC 공통) ─────────────────────
+    const guards: string[] = []
+    if (rrL0Rows.length !== 2) guards.push(`rr_l0_count_mismatch: expected 2, got ${rrL0Rows.length}`)
+    const expectedL0Ids = [1783, 3250]
+    const actualL0Ids = rrL0Rows.map(r => r.id).sort((a,b)=>a-b)
+    if (JSON.stringify(actualL0Ids) !== JSON.stringify(expectedL0Ids)) {
+      guards.push(`rr_l0_ids_mismatch: expected [1783,3250], got [${actualL0Ids.join(',')}]`)
+    }
+    if (drRows.length === 0 && rrRows.length === 0) {
+      guards.push(`nothing_to_purge: 5/19 paid 데이터 없음 (이미 PURGE 됐을 수 있음)`)
+    }
+
+    if (!isExec) {
+      // ─── DRY-RUN ─────────────────────────────────
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        confirm_token_required: 'PURGE_519',
+        summary,
+        guards_warnings: guards,
+        before_balance_sample: beforeBalances.slice(0, 10),
+        before_balance_negative_users: beforeBalances.filter(u => Number(u.qkey_balance) < 0),
+        dr_id_range: drIds.length > 0 ? [Math.min(...drIds), Math.max(...drIds)] : [],
+        rr_l12_id_range: rrIds.length > 0 ? [Math.min(...rrIds), Math.max(...rrIds)] : [],
+        tx_id_range: txIds.length > 0 ? [Math.min(...txIds), Math.max(...txIds)] : [],
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─── EXEC (PURGE_519) ─────────────────────────────────
+    if (guards.length > 0) {
+      return c.json({
+        ok: false,
+        mode: 'EXEC_ABORTED',
+        reason: 'guards_failed',
+        guards,
+        duration_ms: Date.now() - t0,
+      }, 409)
+    }
+
+    const exec: any = { steps: [] }
+
+    // STEP 1: TX DELETE (DR ref + RR L1/L2 ref)
+    let txDeleted = 0
+    if (txIds.length > 0) {
+      // 청크 단위로 (D1 SQL 변수 제한 회피)
+      const CHUNK = 50
+      for (let i = 0; i < txIds.length; i += CHUNK) {
+        const chunk = txIds.slice(i, i + CHUNK)
+        const ph = chunk.map(() => '?').join(',')
+        const r = await db.prepare(`
+          DELETE FROM transactions
+          WHERE id IN (${ph})
+            AND coin_type='QKEY'
+            AND type IN ('daily_qkey','referral_reward')
+        `).bind(...chunk).run()
+        txDeleted += (r.meta?.changes || 0)
+      }
+    }
+    exec.steps.push({ step: 'tx_delete', deleted: txDeleted, expected: txIds.length })
+
+    // STEP 2: referral_rewards L1/L2 DELETE (paid_date 가드 + level 가드)
+    const rrDel = await db.prepare(`
+      DELETE FROM referral_rewards
+      WHERE paid_date=? AND level IN (1,2)
+    `).bind(PAID).run()
+    const rrDeleted = rrDel.meta?.changes || 0
+    exec.steps.push({ step: 'rr_l12_delete', deleted: rrDeleted, expected: rrRows.length })
+
+    // STEP 3: daily_rewards DELETE (paid_date 가드)
+    const drDel = await db.prepare(`
+      DELETE FROM daily_rewards
+      WHERE paid_date=?
+    `).bind(PAID).run()
+    const drDeleted = drDel.meta?.changes || 0
+    exec.steps.push({ step: 'dr_delete', deleted: drDeleted, expected: drRows.length })
+
+    // STEP 4: users.qkey_balance 차감 (옵션 A: negative 그대로 차감)
+    let balanceUpdated = 0
+    for (const uid of affectedUserIds) {
+      const dec = balanceDecrement[uid].total
+      const r = await db.prepare(`
+        UPDATE users SET qkey_balance = qkey_balance - ? WHERE id=?
+      `).bind(dec, uid).run()
+      balanceUpdated += (r.meta?.changes || 0)
+    }
+    exec.steps.push({ step: 'balance_decrement', updated: balanceUpdated, expected: affectedUserIds.length })
+
+    // STEP 5: 사후 검증
+    const afterDr = await db.prepare(`SELECT COUNT(*) as cnt FROM daily_rewards WHERE paid_date=?`).bind(PAID).first<any>()
+    const afterRrL12 = await db.prepare(`SELECT COUNT(*) as cnt FROM referral_rewards WHERE paid_date=? AND level IN (1,2)`).bind(PAID).first<any>()
+    const afterRrL0 = await db.prepare(`SELECT COUNT(*) as cnt FROM referral_rewards WHERE paid_date=? AND level=0`).bind(PAID).first<any>()
+
+    // 차감 후 balance 스냅샷
+    const afterBalances: any[] = []
+    for (const uid of affectedUserIds) {
+      const u = await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id=?`).bind(uid).first<any>()
+      if (u) afterBalances.push(u)
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC_DONE',
+      confirm: 'PURGE_519',
+      summary,
+      exec,
+      after_verify: {
+        dr_remaining: Number(afterDr?.cnt || 0),
+        rr_l12_remaining: Number(afterRrL12?.cnt || 0),
+        rr_l0_remaining: Number(afterRrL0?.cnt || 0),
+        rr_l0_expected: 2,
+      },
+      before_balance_sample: beforeBalances.slice(0, 10),
+      after_balance_sample: afterBalances.slice(0, 10),
+      after_balance_negative_users: afterBalances.filter(u => Number(u.qkey_balance) < 0),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
