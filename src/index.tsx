@@ -61129,4 +61129,288 @@ app.get('/api/diag/fix-solbat-tree-missing', async (c) => {
 })
 
 
+// ============================================================================
+// rollback-solbat-tree-partial — Cloudflare 524 timeout 으로 부분 실행된 INSERT 제거
+// 표식: description 에 'solbat-tree-fix' 포함된 모든 데이터
+// DRY-RUN: GET /api/diag/rollback-solbat-tree-partial?pw=ADMIN_PW
+// EXEC:    GET /api/diag/rollback-solbat-tree-partial?pw=ADMIN_PW&confirm=ROLLBACK_SOLBAT_TREE_PARTIAL
+// ============================================================================
+app.get('/api/diag/rollback-solbat-tree-partial', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const isExec = c.req.query('confirm') === 'ROLLBACK_SOLBAT_TREE_PARTIAL'
+
+  try {
+    // 1) 마커가 있는 transactions 식별
+    const markedTxRows = await c.env.DB.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description FROM transactions
+      WHERE description LIKE '%solbat-tree-fix%'
+    `).all()
+    const markedTxs = (markedTxRows.results || []) as any[]
+
+    const drIds = new Set<number>()
+    const rrIds = new Set<number>()
+    for (const t of markedTxs) {
+      if (t.type === 'daily_qkey' && t.ref_id) drIds.add(t.ref_id)
+      else if (t.type === 'referral_reward' && t.ref_id) rrIds.add(t.ref_id)
+    }
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        tx_count: markedTxs.length,
+        tx_id_range: markedTxs.length ? [Math.min(...markedTxs.map(t=>t.id)), Math.max(...markedTxs.map(t=>t.id))] : null,
+        daily_rewards_count: drIds.size,
+        referral_rewards_count: rrIds.size,
+        sample_tx: markedTxs.slice(0, 5),
+        hint: 'Add &confirm=ROLLBACK_SOLBAT_TREE_PARTIAL to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC: DELETE 순서 = transactions → daily_rewards → referral_rewards
+    // qkey_balance UPDATE 는 안함 (애초에 UPDATE 안된 상태였음)
+    const delTx = await c.env.DB.prepare(`DELETE FROM transactions WHERE description LIKE '%solbat-tree-fix%'`).run()
+    
+    let delDr = 0
+    if (drIds.size > 0) {
+      const drArr = Array.from(drIds)
+      // 50개 chunk
+      for (let i = 0; i < drArr.length; i += 50) {
+        const chunk = drArr.slice(i, i+50)
+        const ph = chunk.map(() => '?').join(',')
+        const r = await c.env.DB.prepare(`DELETE FROM daily_rewards WHERE id IN (${ph})`).bind(...chunk).run()
+        delDr += (r.meta?.changes || 0)
+      }
+    }
+    
+    let delRr = 0
+    if (rrIds.size > 0) {
+      const rrArr = Array.from(rrIds)
+      for (let i = 0; i < rrArr.length; i += 50) {
+        const chunk = rrArr.slice(i, i+50)
+        const ph = chunk.map(() => '?').join(',')
+        const r = await c.env.DB.prepare(`DELETE FROM referral_rewards WHERE id IN (${ph})`).bind(...chunk).run()
+        delRr += (r.meta?.changes || 0)
+      }
+    }
+
+    // 사후 검증
+    const gb = await c.env.DB.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS s FROM users`).first() as any
+    const gt = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE coin_type = 'QKEY'`).first() as any
+
+    return c.json({
+      mode: 'EXEC_DONE',
+      deleted: {
+        transactions: delTx.meta?.changes || 0,
+        daily_rewards: delDr,
+        referral_rewards: delRr,
+      },
+      global: {
+        total_qkey_balance: gb?.s,
+        total_qkey_tx_sum: gt?.s,
+        integrity: gb?.s === gt?.s ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+        diff: (gb?.s ?? 0) - (gt?.s ?? 0),
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================================
+// fix-solbat-tree-missing-v2 — chunked 처리로 Cloudflare 524 timeout 회피
+// 한 번에 한 날짜(?d=YYYY-MM-DD)만 처리, 5번 호출
+// DRY-RUN: GET /api/diag/fix-solbat-tree-missing-v2?pw=ADMIN_PW&d=2026-05-05
+// EXEC:    GET /api/diag/fix-solbat-tree-missing-v2?pw=ADMIN_PW&d=2026-05-05&confirm=FIX_SOLBAT_V2
+// ============================================================================
+app.get('/api/diag/fix-solbat-tree-missing-v2', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const isExec = c.req.query('confirm') === 'FIX_SOLBAT_V2'
+
+  const targetDate = c.req.query('d') || ''
+  const ALLOWED_DATES = ['2026-05-05','2026-05-09','2026-05-10','2026-05-16','2026-05-17']
+  if (!ALLOWED_DATES.includes(targetDate)) {
+    return c.json({ error: 'INVALID_DATE', allowed: ALLOWED_DATES, hint: 'Use ?d=YYYY-MM-DD' }, 400)
+  }
+
+  try {
+    const SOLBAT_UID = 44
+
+    // 1) 트리 식별
+    const l1Rows = await c.env.DB.prepare(`SELECT id FROM users WHERE referrer_id = ?`).bind(SOLBAT_UID).all()
+    const l1Ids = (l1Rows.results || []).map((r: any) => r.id)
+    const ph = l1Ids.map(() => '?').join(',')
+    const l2Rows = await c.env.DB.prepare(`SELECT id FROM users WHERE referrer_id IN (${ph})`).bind(...l1Ids).all()
+    const l2Ids = (l2Rows.results || []).map((r: any) => r.id)
+    const allTargets = Array.from(new Set([SOLBAT_UID, ...l1Ids, ...l2Ids])).sort((a,b)=>a-b)
+
+    // user info
+    const phT = allTargets.map(() => '?').join(',')
+    const uRows = await c.env.DB.prepare(`SELECT id, name, referrer_id, qkey_balance FROM users WHERE id IN (${phT})`).bind(...allTargets).all()
+    const userMap: Record<number, any> = {}
+    for (const u of (uRows.results || []) as any[]) userMap[u.id] = u
+    // 상위 referrer 조회 (트리 외부일 수 있음)
+    const extraReferrers = new Set<number>()
+    for (const u of Object.values(userMap) as any[]) {
+      if (u.referrer_id && !userMap[u.referrer_id]) extraReferrers.add(u.referrer_id)
+    }
+    if (extraReferrers.size > 0) {
+      const eArr = Array.from(extraReferrers)
+      const ePh = eArr.map(() => '?').join(',')
+      const eRows = await c.env.DB.prepare(`SELECT id, name, referrer_id, qkey_balance FROM users WHERE id IN (${ePh})`).bind(...eArr).all()
+      for (const u of (eRows.results || []) as any[]) userMap[u.id] = u
+    }
+
+    // reward_date = paid_date - 1
+    const rd = new Date(targetDate)
+    rd.setDate(rd.getDate() - 1)
+    const rewardDate = rd.toISOString().slice(0,10)
+
+    // 2) staking 전부 한번에 조회
+    const stkRows = await c.env.DB.prepare(`
+      SELECT id, user_id, amount, daily_rate, start_date, status FROM staking
+      WHERE user_id IN (${phT}) AND status = 'active'
+    `).bind(...allTargets).all()
+    const allStakings = (stkRows.results || []) as any[]
+
+    type DailyPlan = { user_id: number, staking_id: number, amount: number }
+    type RrPlan = { referrer_id: number, referee_id: number, staking_id: number, level: number, original: number, amount: number }
+    const dailyPlans: DailyPlan[] = []
+    const rrPlans: RrPlan[] = []
+
+    for (const s of allStakings) {
+      const startDay = String(s.start_date).slice(0,10)
+      if (startDay > rewardDate) continue
+      const dailyQkey = Math.floor(s.amount * s.daily_rate * 150)
+      const uid = s.user_id
+
+      // 중복 체크 (daily_rewards)
+      const dupDr = await c.env.DB.prepare(`
+        SELECT id FROM daily_rewards WHERE user_id = ? AND staking_id = ? AND paid_date = ?
+      `).bind(uid, s.id, targetDate).first()
+      if (dupDr) continue
+
+      dailyPlans.push({ user_id: uid, staking_id: s.id, amount: dailyQkey })
+
+      const ref1 = userMap[uid]?.referrer_id
+      if (ref1) {
+        const dupL1 = await c.env.DB.prepare(`
+          SELECT id FROM referral_rewards WHERE referrer_id=? AND referee_id=? AND staking_id=? AND paid_date=? AND level=1
+        `).bind(ref1, uid, s.id, targetDate).first()
+        if (!dupL1) rrPlans.push({ referrer_id: ref1, referee_id: uid, staking_id: s.id, level: 1, original: dailyQkey, amount: Math.floor(dailyQkey*0.2) })
+        const ref2 = userMap[ref1]?.referrer_id
+        if (ref2) {
+          const dupL2 = await c.env.DB.prepare(`
+            SELECT id FROM referral_rewards WHERE referrer_id=? AND referee_id=? AND staking_id=? AND paid_date=? AND level=2
+          `).bind(ref2, uid, s.id, targetDate).first()
+          if (!dupL2) rrPlans.push({ referrer_id: ref2, referee_id: uid, staking_id: s.id, level: 2, original: dailyQkey, amount: Math.floor(dailyQkey*0.1) })
+        }
+      }
+    }
+
+    // 회원별 보충 합계
+    const perUser: Record<number, number> = {}
+    for (const p of dailyPlans) perUser[p.user_id] = (perUser[p.user_id]||0) + p.amount
+    for (const r of rrPlans) perUser[r.referrer_id] = (perUser[r.referrer_id]||0) + r.amount
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN', date: targetDate, reward_date: rewardDate,
+        targets: allTargets,
+        plan: {
+          daily_inserts: dailyPlans.length,
+          l1_inserts: rrPlans.filter(r=>r.level===1).length,
+          l2_inserts: rrPlans.filter(r=>r.level===2).length,
+          tx_inserts: dailyPlans.length + rrPlans.length,
+          total_qkey: dailyPlans.reduce((a,p)=>a+p.amount,0) + rrPlans.reduce((a,r)=>a+r.amount,0),
+        },
+        per_user_supplement: perUser,
+        hint: 'Add &confirm=FIX_SOLBAT_V2 to execute this date',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC
+    const inserted = { daily: 0, l1: 0, l2: 0, tx: 0 }
+    const failed: any[] = []
+    const balUpd: Record<number, number> = {}
+
+    for (const p of dailyPlans) {
+      try {
+        const di = await c.env.DB.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(p.user_id, p.staking_id, p.amount, rewardDate, targetDate, targetDate).run()
+        const drId = di.meta.last_row_id
+        inserted.daily++
+
+        await c.env.DB.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(p.user_id, p.amount, `일일 배당 보충 (paid ${targetDate}, dr_id=${drId}) [solbat-tree-v2]`, drId, targetDate).run()
+        inserted.tx++
+        balUpd[p.user_id] = (balUpd[p.user_id]||0) + p.amount
+      } catch (e:any) {
+        failed.push({ phase:'daily', user_id:p.user_id, staking_id:p.staking_id, error:String(e?.message||e) })
+      }
+    }
+
+    for (const r of rrPlans) {
+      try {
+        const ri = await c.env.DB.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(r.referrer_id, r.referee_id, r.level, r.original, r.amount, rewardDate, targetDate, r.staking_id, targetDate).run()
+        const rrId = ri.meta.last_row_id
+        if (r.level===1) inserted.l1++; else inserted.l2++
+
+        await c.env.DB.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(r.referrer_id, r.amount, `추천 보너스 (Level ${r.level}) [solbat-tree-v2 paid ${targetDate} rr_id=${rrId}]`, rrId, targetDate).run()
+        inserted.tx++
+        balUpd[r.referrer_id] = (balUpd[r.referrer_id]||0) + r.amount
+      } catch (e:any) {
+        failed.push({ phase:'rr', level:r.level, referrer_id:r.referrer_id, referee_id:r.referee_id, error:String(e?.message||e) })
+      }
+    }
+
+    // UPDATE balances
+    for (const [uid, delta] of Object.entries(balUpd)) {
+      try {
+        await c.env.DB.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, Number(uid)).run()
+      } catch (e:any) {
+        failed.push({ phase:'balance_update', user_id:Number(uid), delta, error:String(e?.message||e) })
+      }
+    }
+
+    // 사후 검증
+    const gb = await c.env.DB.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS s FROM users`).first() as any
+    const gt = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE coin_type='QKEY'`).first() as any
+
+    return c.json({
+      mode: 'EXEC_DONE', date: targetDate,
+      inserted, failed_count: failed.length, failed_sample: failed.slice(0,5),
+      balance_updates: balUpd,
+      global: {
+        total_qkey_balance: gb?.s,
+        total_qkey_tx_sum: gt?.s,
+        integrity: gb?.s === gt?.s ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+        diff: (gb?.s ?? 0) - (gt?.s ?? 0),
+      },
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
