@@ -56474,4 +56474,180 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// verify-519-bottom-up — 5/19 paid 바텀업 정합 검증 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 검증 항목:
+//   1) DR 58 / 186,000 (reward_date=5/18, paid_date=5/19)
+//   2) RR L0 (direct) 2 / 60,000 (보존, id 1783 + 3250)
+//   3) RR L1 (20%) 57 / 36,150 (DR 58 - top user 1)
+//   4) RR L2 (10%) 56 / 16,575 (DR 58 - top user 2)
+//   5) 모든 RR L1/L2 의 ratio 정확성
+//   6) TX 매핑 1:1 (DR ref, RR ref)
+//   7) created_at 정규시각 (UTC 5/18 23:00:00 DR / 23:00:01 RR)
+//   8) NO_DUPLICATES: (user_id, staking_id, reward_date, paid_date) 1건
+//   9) 다른 paid_date 영향 0 (5/11~5/18 보존)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/verify-519-bottom-up', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    const PAID = '2026-05-19'
+    const RD = '2026-05-18'
+    const errors: string[] = []
+    const warnings: string[] = []
+
+    // 1) DR 검증
+    const dr = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE paid_date=? ORDER BY id
+    `).bind(PAID).all<any>()
+    const drRows = (dr.results || []) as any[]
+    const drTotal = drRows.reduce((a,b)=>a+Number(b.qkey||0), 0)
+    if (drRows.length !== 58) errors.push(`DR count mismatch: expected 58, got ${drRows.length}`)
+    if (drTotal !== 186000) errors.push(`DR total mismatch: expected 186000, got ${drTotal}`)
+    for (const d of drRows) {
+      if (d.reward_date !== RD) errors.push(`DR id=${d.id} reward_date mismatch: ${d.reward_date}`)
+      if (d.created_at !== '2026-05-18 23:00:00') warnings.push(`DR id=${d.id} created_at: ${d.created_at}`)
+    }
+
+    // 2) RR 검증 (level 별)
+    const rr = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE paid_date=? ORDER BY level, id
+    `).bind(PAID).all<any>()
+    const rrRows = (rr.results || []) as any[]
+    const rrL0 = rrRows.filter(r => r.level === 0)
+    const rrL1 = rrRows.filter(r => r.level === 1)
+    const rrL2 = rrRows.filter(r => r.level === 2)
+
+    // L0 (보존)
+    const l0Ids = rrL0.map(r => r.id).sort((a,b)=>a-b)
+    if (l0Ids.length !== 2) errors.push(`RR L0 count mismatch: expected 2, got ${l0Ids.length}`)
+    if (JSON.stringify(l0Ids) !== JSON.stringify([1783, 3250])) {
+      errors.push(`RR L0 ids mismatch: expected [1783,3250], got [${l0Ids.join(',')}]`)
+    }
+    const l0Total = rrL0.reduce((a,b)=>a+Number(b.reward_amount||0), 0)
+    if (l0Total !== 60000) errors.push(`RR L0 total mismatch: expected 60000, got ${l0Total}`)
+
+    // L1
+    if (rrL1.length !== 57) errors.push(`RR L1 count mismatch: expected 57, got ${rrL1.length}`)
+    const l1Total = rrL1.reduce((a,b)=>a+Number(b.reward_amount||0), 0)
+    if (l1Total !== 36150) errors.push(`RR L1 total mismatch: expected 36150, got ${l1Total}`)
+
+    // L2
+    if (rrL2.length !== 56) errors.push(`RR L2 count mismatch: expected 56, got ${rrL2.length}`)
+    const l2Total = rrL2.reduce((a,b)=>a+Number(b.reward_amount||0), 0)
+    if (l2Total !== 16575) errors.push(`RR L2 total mismatch: expected 16575, got ${l2Total}`)
+
+    // 3) RR L1/L2 ratio 검증 (각 row 가 source_qkey 의 정확한 floor 비율인지)
+    let ratioOk = 0, ratioFail = 0
+    const ratioMismatches: any[] = []
+    for (const r of [...rrL1, ...rrL2]) {
+      const ratio = r.level === 1 ? 0.20 : 0.10
+      const expected = Math.floor(Number(r.original_amount) * ratio)
+      if (Number(r.reward_amount) === expected) ratioOk++
+      else {
+        ratioFail++
+        ratioMismatches.push({ id: r.id, level: r.level, original: r.original_amount, reward: r.reward_amount, expected })
+      }
+      if (r.reward_date !== RD) errors.push(`RR id=${r.id} reward_date mismatch: ${r.reward_date}`)
+    }
+    if (ratioFail > 0) errors.push(`RR ratio mismatch: ${ratioFail} rows fail`)
+
+    // 4) NO DUPLICATES check
+    const dupDr = await db.prepare(`
+      SELECT user_id, staking_id, reward_date, paid_date, COUNT(*) as cnt
+      FROM daily_rewards WHERE paid_date=?
+      GROUP BY user_id, staking_id, reward_date, paid_date HAVING cnt > 1
+    `).bind(PAID).all<any>()
+    if ((dupDr.results || []).length > 0) errors.push(`DR duplicates found: ${(dupDr.results || []).length}`)
+
+    const dupRr = await db.prepare(`
+      SELECT referrer_id, referee_id, level, reward_date, paid_date, staking_id, COUNT(*) as cnt
+      FROM referral_rewards WHERE paid_date=? AND level IN (1,2)
+      GROUP BY referrer_id, referee_id, level, reward_date, paid_date, staking_id HAVING cnt > 1
+    `).bind(PAID).all<any>()
+    if ((dupRr.results || []).length > 0) errors.push(`RR duplicates found: ${(dupRr.results || []).length}`)
+
+    // 5) TX 매핑 검증
+    const drIds = drRows.map(d => d.id)
+    const rrL12Ids = [...rrL1, ...rrL2].map(r => r.id)
+    let txByDrRef: any[] = []
+    let txByRrRef: any[] = []
+    if (drIds.length > 0) {
+      const ph = drIds.map(()=>'?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id FROM transactions
+        WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...drIds).all<any>()
+      txByDrRef = (r.results || []) as any[]
+    }
+    if (rrL12Ids.length > 0) {
+      const ph = rrL12Ids.map(()=>'?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id FROM transactions
+        WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...rrL12Ids).all<any>()
+      txByRrRef = (r.results || []) as any[]
+    }
+    if (txByDrRef.length !== drRows.length) errors.push(`TX DR mapping mismatch: ${txByDrRef.length} vs ${drRows.length}`)
+    if (txByRrRef.length !== rrL1.length + rrL2.length) {
+      errors.push(`TX RR mapping mismatch: ${txByRrRef.length} vs ${rrL1.length + rrL2.length}`)
+    }
+
+    // 6) TX 합계 = DR + RR L1/L2 합계
+    const txDrSum = txByDrRef.reduce((a,b)=>a+Number(b.amount||0), 0)
+    const txRrSum = txByRrRef.reduce((a,b)=>a+Number(b.amount||0), 0)
+    if (txDrSum !== drTotal) errors.push(`TX DR sum mismatch: ${txDrSum} vs ${drTotal}`)
+    if (txRrSum !== l1Total + l2Total) errors.push(`TX RR sum mismatch: ${txRrSum} vs ${l1Total + l2Total}`)
+
+    // 7) 다른 paid_date snapshot (영향 없음 확인)
+    const otherPaid = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date BETWEEN '2026-05-11' AND '2026-05-20'
+      GROUP BY paid_date ORDER BY paid_date
+    `).all<any>()
+
+    // 8) 5/18 reward_date but other paid_date check (다른 paid 에 5/18 reward 남아있는지)
+    const orphanRd = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt FROM daily_rewards
+      WHERE reward_date=? AND paid_date != ?
+      GROUP BY paid_date
+    `).bind(RD, PAID).all<any>()
+
+    const ok = errors.length === 0
+    return c.json({
+      ok,
+      verdict: ok ? 'BOTTOM_UP_OK' : 'BOTTOM_UP_FAIL',
+      paid_date: PAID, reward_date: RD,
+      counts: {
+        dr: drRows.length, dr_qkey: drTotal,
+        rr_l0_preserved: rrL0.length, rr_l0_qkey: l0Total, rr_l0_ids: l0Ids,
+        rr_l1: rrL1.length, rr_l1_qkey: l1Total,
+        rr_l2: rrL2.length, rr_l2_qkey: l2Total,
+        rr_total_l12: rrL1.length + rrL2.length, rr_total_l12_qkey: l1Total + l2Total,
+        tx_dr_mapped: txByDrRef.length, tx_dr_sum: txDrSum,
+        tx_rr_mapped: txByRrRef.length, tx_rr_sum: txRrSum,
+        ratio_ok: ratioOk, ratio_fail: ratioFail,
+      },
+      grand_total_5_19_qkey: drTotal + l0Total + l1Total + l2Total,
+      errors,
+      warnings,
+      ratio_mismatches: ratioMismatches.slice(0, 10),
+      other_paid_snapshot: otherPaid.results || [],
+      orphan_5_18_reward_in_other_paid: orphanRd.results || [],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
