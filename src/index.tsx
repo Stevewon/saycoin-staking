@@ -50466,7 +50466,7 @@ app.get('/api/diag/emerg-batch-scan', async (c) => {
       for (const ch of chunks) {
         const placeholders = ch.map(() => '?').join(',')
         const r = await db.prepare(`
-          SELECT id, user_id, paid_date, reward_qkey, created_at
+          SELECT id, user_id, paid_date, usdt_amount, created_at
           FROM daily_rewards WHERE id IN (${placeholders})
         `).bind(...ch).all<any>()
         drMatched.push(...(r.results || []))
@@ -50479,7 +50479,7 @@ app.get('/api/diag/emerg-batch-scan', async (c) => {
       for (const ch of chunks) {
         const placeholders = ch.map(() => '?').join(',')
         const r = await db.prepare(`
-          SELECT id, referrer_id, referee_id, level, paid_date, reward_qkey, created_at
+          SELECT id, referrer_id, referee_id, level, paid_date, reward_amount, created_at
           FROM referral_rewards WHERE id IN (${placeholders})
         `).bind(...ch).all<any>()
         rrMatched.push(...(r.results || []))
