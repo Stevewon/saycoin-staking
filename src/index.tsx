@@ -34747,6 +34747,238 @@ app.get('/api/diag/cron-h-plan-monitor', async (c) => {
 })
 
 // ============================================================================
+// negative-balance-report (2026-05-19): 음수 잔액 회원 전수 보고
+// ============================================================================
+//   목적: 사장님 명령 - 음수 잔액 회원 명단 + 진입금액 + 데일리 배당 + 스왑 현황
+//   대상 컬럼: users.qta_balance, qx_balance, qkey_balance, usdt_balance
+//              + usdt_withdrawable, qta_initial, qx_initial (있을 시)
+//   read-only, 잔액/DB 미수정
+//   사용: GET /api/diag/negative-balance-report?key=<ADMIN_PW>
+app.get('/api/diag/negative-balance-report', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || c.req.query('password') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // ── A. users 테이블 컬럼 동적 검출 (스키마 변동 대비) ──
+    const colsRes = await db.prepare(`PRAGMA table_info(users)`).all()
+    const allCols = (colsRes.results || []).map((r: any) => String(r.name))
+    const balanceCols = allCols.filter(c =>
+      c.endsWith('_balance') || c.endsWith('_withdrawable') || c.endsWith('_initial')
+    )
+
+    if (balanceCols.length === 0) {
+      return c.json({ error: 'no balance columns found in users', allCols }, 500)
+    }
+
+    // ── B. 음수 잔액 회원 SELECT (any balance column < 0) ──
+    const whereClause = balanceCols.map(c => `${c} < 0`).join(' OR ')
+    const selectCols = ['id', 'email', 'name', 'created_at', ...balanceCols]
+    const rows = await db.prepare(`
+      SELECT ${selectCols.join(', ')}
+      FROM users
+      WHERE ${whereClause}
+      ORDER BY id ASC
+    `).all()
+
+    const users = (rows.results || []) as any[]
+    if (users.length === 0) {
+      return c.json({
+        ok: true,
+        balance_columns_checked: balanceCols,
+        negative_user_count: 0,
+        verdict: 'PASS: 음수 잔액 회원 0명',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ── C. 각 회원의 스테이킹 진입금액 + 데일리 배당 + 스왑 현황 집계 ──
+    const userIds = users.map(u => Number(u.id))
+    const idPh = userIds.map(() => '?').join(',')
+
+    // C-1. 스테이킹 (진입금액) — 모든 상태
+    const stakingRows = await db.prepare(`
+      SELECT user_id, id AS staking_id, amount, status, start_date, end_date,
+             period_months, daily_rate, created_at
+      FROM staking
+      WHERE user_id IN (${idPh})
+      ORDER BY user_id ASC, id ASC
+    `).bind(...userIds).all()
+    const stakingByUser = new Map<number, any[]>()
+    for (const r of (stakingRows.results || []) as any[]) {
+      const uid = Number(r.user_id)
+      if (!stakingByUser.has(uid)) stakingByUser.set(uid, [])
+      stakingByUser.get(uid)!.push(r)
+    }
+
+    // C-2. 데일리 배당 (QKEY) — daily_rewards + matching tx daily_qkey
+    const dailyRwdRows = await db.prepare(`
+      SELECT user_id, COUNT(*) AS cnt, COALESCE(SUM(usdt_amount), 0) AS sum_qkey,
+             MIN(paid_date) AS first_paid, MAX(paid_date) AS last_paid
+      FROM daily_rewards
+      WHERE user_id IN (${idPh})
+      GROUP BY user_id
+    `).bind(...userIds).all()
+    const dailyByUser = new Map<number, any>()
+    for (const r of (dailyRwdRows.results || []) as any[]) {
+      dailyByUser.set(Number(r.user_id), r)
+    }
+
+    // C-3. 추천 보상 (RR) - 받은 것
+    const rrRows = await db.prepare(`
+      SELECT referrer_id AS user_id, level,
+             COUNT(*) AS cnt, COALESCE(SUM(reward_amount), 0) AS sum_qkey
+      FROM referral_rewards
+      WHERE referrer_id IN (${idPh})
+      GROUP BY referrer_id, level
+    `).bind(...userIds).all()
+    const rrByUser = new Map<number, { l1_cnt: number, l1_sum: number, l2_cnt: number, l2_sum: number }>()
+    for (const r of (rrRows.results || []) as any[]) {
+      const uid = Number(r.user_id)
+      const lv = Number(r.level)
+      const entry = rrByUser.get(uid) || { l1_cnt: 0, l1_sum: 0, l2_cnt: 0, l2_sum: 0 }
+      if (lv === 1) { entry.l1_cnt = Number(r.cnt); entry.l1_sum = Number(r.sum_qkey) }
+      else if (lv === 2) { entry.l2_cnt = Number(r.cnt); entry.l2_sum = Number(r.sum_qkey) }
+      rrByUser.set(uid, entry)
+    }
+
+    // C-4. 스왑 (transactions WHERE type IN swap_in/swap_out, 모든 coin_type)
+    const swapRows = await db.prepare(`
+      SELECT user_id, type, coin_type,
+             COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS sum_amount,
+             MIN(datetime(created_at,'+9 hours')) AS first_kst,
+             MAX(datetime(created_at,'+9 hours')) AS last_kst
+      FROM transactions
+      WHERE user_id IN (${idPh})
+        AND type IN ('swap_in','swap_out')
+      GROUP BY user_id, type, coin_type
+      ORDER BY user_id ASC, type ASC, coin_type ASC
+    `).bind(...userIds).all()
+    const swapByUser = new Map<number, any[]>()
+    for (const r of (swapRows.results || []) as any[]) {
+      const uid = Number(r.user_id)
+      if (!swapByUser.has(uid)) swapByUser.set(uid, [])
+      swapByUser.get(uid)!.push(r)
+    }
+
+    // C-5. 출금 (withdrawal)
+    const wRows = await db.prepare(`
+      SELECT user_id, coin_type,
+             COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS sum_amount
+      FROM transactions
+      WHERE user_id IN (${idPh})
+        AND type IN ('withdrawal','withdrawal_request','withdrawal_approved')
+      GROUP BY user_id, coin_type
+    `).bind(...userIds).all()
+    const wdrByUser = new Map<number, any[]>()
+    for (const r of (wRows.results || []) as any[]) {
+      const uid = Number(r.user_id)
+      if (!wdrByUser.has(uid)) wdrByUser.set(uid, [])
+      wdrByUser.get(uid)!.push(r)
+    }
+
+    // ── D. 회원별 통합 보고서 구성 ──
+    const report = users.map(u => {
+      const uid = Number(u.id)
+      const stakings = stakingByUser.get(uid) || []
+      const activeStaking = stakings.filter(s => s.status === 'active')
+      const totalStakingAmount = stakings.reduce((acc, s) => acc + Number(s.amount || 0), 0)
+      const activeStakingAmount = activeStaking.reduce((acc, s) => acc + Number(s.amount || 0), 0)
+
+      const daily = dailyByUser.get(uid)
+      const rr = rrByUser.get(uid) || { l1_cnt: 0, l1_sum: 0, l2_cnt: 0, l2_sum: 0 }
+      const swaps = swapByUser.get(uid) || []
+      const withdrawals = wdrByUser.get(uid) || []
+
+      // 음수인 컬럼 식별
+      const negativeCols: Record<string, number> = {}
+      for (const col of balanceCols) {
+        const v = Number((u as any)[col] || 0)
+        if (v < 0) negativeCols[col] = v
+      }
+
+      // balance row 전체
+      const balances: Record<string, number> = {}
+      for (const col of balanceCols) balances[col] = Number((u as any)[col] || 0)
+
+      return {
+        user_id: uid,
+        email: String(u.email || ''),
+        name: String(u.name || ''),
+        registered_kst: String(u.created_at || ''),
+        negative_balance: negativeCols,
+        all_balances: balances,
+        staking: {
+          total_count: stakings.length,
+          active_count: activeStaking.length,
+          total_amount_usdt: totalStakingAmount,
+          active_amount_usdt: activeStakingAmount,
+          stakings: stakings.map(s => ({
+            id: Number(s.staking_id),
+            amount_usdt: Number(s.amount),
+            status: String(s.status),
+            daily_rate: Number(s.daily_rate || 0),
+            period_months: Number(s.period_months || 0),
+            start_date: s.start_date,
+            end_date: s.end_date,
+          })),
+        },
+        daily_reward: daily ? {
+          count: Number(daily.cnt),
+          total_qkey: Number(daily.sum_qkey),
+          first_paid_date: daily.first_paid,
+          last_paid_date: daily.last_paid,
+        } : { count: 0, total_qkey: 0 },
+        referral_reward: {
+          l1_count: rr.l1_cnt, l1_total_qkey: rr.l1_sum,
+          l2_count: rr.l2_cnt, l2_total_qkey: rr.l2_sum,
+          total_qkey: rr.l1_sum + rr.l2_sum,
+        },
+        swap: swaps.map(s => ({
+          direction: String(s.type),  // swap_in | swap_out
+          coin: String(s.coin_type),
+          count: Number(s.cnt),
+          sum_amount: Number(s.sum_amount),
+          first_kst: s.first_kst,
+          last_kst: s.last_kst,
+        })),
+        withdrawal: withdrawals.map(w => ({
+          coin: String(w.coin_type),
+          count: Number(w.cnt),
+          sum_amount: Number(w.sum_amount),
+        })),
+      }
+    })
+
+    // ── E. 음수 컬럼별 그룹 합계 ──
+    const negColSummary: Record<string, { count: number, sum: number }> = {}
+    for (const u of users) {
+      for (const col of balanceCols) {
+        const v = Number((u as any)[col] || 0)
+        if (v < 0) {
+          if (!negColSummary[col]) negColSummary[col] = { count: 0, sum: 0 }
+          negColSummary[col].count++
+          negColSummary[col].sum += v
+        }
+      }
+    }
+
+    return c.json({
+      ok: true,
+      generated_at_kst: kstDateStr(new Date()) + ' ' + new Date(new Date().getTime() + 9*3600*1000).toISOString().slice(11,19),
+      balance_columns_checked: balanceCols,
+      negative_user_count: users.length,
+      negative_column_summary: negColSummary,
+      report,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: error?.message || String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
 // cron-kst08-verify (2026-05-19): KST 08:00 cron 직후 종합 검증 (one-shot)
 // ============================================================================
 //   영구룰 #정규시각 (2026-05-19) 검증 포함:
