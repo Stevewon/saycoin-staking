@@ -60727,4 +60727,154 @@ app.get('/api/diag/fix-missing-daily-qkey', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// fix-iinsil2-staking-reward — 이인실2(76) staking_reward 위반 TX 제거
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19):
+//   "이인실2는 69,040개 이어야 하는데 119,040 있다고 표시된다함
+//    정밀하게 점검하고 수정하자"
+//
+// 진단:
+//   tx_id=822: type=staking_reward, amount=+50,000 QKEY
+//   2026-05-05T09:43:13 (staking 시작 즉시 일회성 보너스)
+//   영구룰 LEGAL 타입 외 → 위반 TX
+//
+// 액션:
+//   1) tx_id=822 DELETE (한정적으로 staking_reward + user=76 + amount=50000)
+//   2) users.qkey_balance 119,040 → 69,040 (-50,000)
+//   3) 사후검증: balance == SUM(QKEY tx) 일치 확인
+//
+// 안전장치:
+//   - 정확히 tx_id=822 만 대상 (오삭제 방지)
+//   - DRY-RUN 먼저, EXEC 는 confirm 파라미터 필요
+//   - INSERT 한 보충 TX 와 무관 (ref_id 가 NULL 이라 무관)
+//
+// DRY-RUN: GET /api/diag/fix-iinsil2-staking-reward?pw=ADMIN_PW
+// EXEC:    GET /api/diag/fix-iinsil2-staking-reward?pw=ADMIN_PW&confirm=REMOVE_TX822_IINSIL2
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/fix-iinsil2-staking-reward', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+    const isExec = c.req.query('confirm') === 'REMOVE_TX822_IINSIL2'
+
+    const TARGET_TX_ID = 822
+    const TARGET_USER_ID = 76
+    const TARGET_AMOUNT = 50000
+    const TARGET_TYPE = 'staking_reward'
+
+    // 1) 대상 TX 정확히 식별
+    const tx = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, created_at
+      FROM transactions WHERE id = ?
+    `).bind(TARGET_TX_ID).first<any>()
+
+    if (!tx) {
+      return c.json({ error: 'TARGET_TX_NOT_FOUND', tx_id: TARGET_TX_ID }, 404)
+    }
+
+    // 사전 검증: 정확히 일치하는지
+    const checks = {
+      user_id_match: tx.user_id === TARGET_USER_ID,
+      type_match: tx.type === TARGET_TYPE,
+      amount_match: Number(tx.amount) === TARGET_AMOUNT,
+      coin_type_match: tx.coin_type === 'QKEY',
+    }
+    const allChecksPass = Object.values(checks).every(v => v === true)
+    if (!allChecksPass) {
+      return c.json({
+        error: 'SAFETY_CHECK_FAILED',
+        target_tx: tx,
+        checks,
+        expected: { user_id: TARGET_USER_ID, type: TARGET_TYPE, amount: TARGET_AMOUNT, coin_type: 'QKEY' },
+      }, 400)
+    }
+
+    // 2) 현재 user 상태
+    const u = await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id=?`).bind(TARGET_USER_ID).first<any>()
+
+    // 3) 현재 user TX 합계 (사전 정합성 확인)
+    const txSumBefore = (await db.prepare(`
+      SELECT SUM(amount) AS s FROM transactions WHERE user_id=? AND coin_type='QKEY'
+    `).bind(TARGET_USER_ID).first<any>())?.s
+
+    const beforeBalance = Number(u?.qkey_balance || 0)
+    const afterBalance = beforeBalance - TARGET_AMOUNT
+    const afterTxSum = Number(txSumBefore || 0) - TARGET_AMOUNT
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        target_tx: tx,
+        safety_checks: checks,
+        user: {
+          id: u?.id, name: u?.name,
+          current_balance: beforeBalance,
+          current_tx_sum: txSumBefore,
+          balance_eq_tx_sum_before: beforeBalance === Number(txSumBefore || 0),
+        },
+        plan: {
+          action_1: `DELETE FROM transactions WHERE id=${TARGET_TX_ID}`,
+          action_2: `UPDATE users SET qkey_balance=${afterBalance} WHERE id=${TARGET_USER_ID}`,
+          expected_after_balance: afterBalance,
+          expected_after_tx_sum: afterTxSum,
+          member_claim: 69040,
+          matches_member_claim: afterBalance === 69040,
+        },
+        exec_hint: 'add &confirm=REMOVE_TX822_IINSIL2 to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // 4) EXEC
+    // 4-1) DELETE TX
+    const delRes = await db.prepare(`DELETE FROM transactions WHERE id=?`).bind(TARGET_TX_ID).run()
+    const deleted = (delRes.meta as any)?.changes ?? 0
+
+    // 4-2) UPDATE user balance
+    const updRes = await db.prepare(`UPDATE users SET qkey_balance=? WHERE id=?`).bind(afterBalance, TARGET_USER_ID).run()
+    const updated = (updRes.meta as any)?.changes ?? 0
+
+    // 5) 사후 검증
+    const uAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id=?`).bind(TARGET_USER_ID).first<any>()
+    const txSumAfter = (await db.prepare(`
+      SELECT SUM(amount) AS s FROM transactions WHERE user_id=? AND coin_type='QKEY'
+    `).bind(TARGET_USER_ID).first<any>())?.s
+    const txExists = await db.prepare(`SELECT id FROM transactions WHERE id=?`).bind(TARGET_TX_ID).first<any>()
+
+    // 전역 정합성
+    const totalBal = (await db.prepare(`SELECT SUM(qkey_balance) AS s FROM users`).first<any>())?.s
+    const totalTx = (await db.prepare(`SELECT SUM(amount) AS s FROM transactions WHERE coin_type='QKEY'`).first<any>())?.s
+
+    return c.json({
+      mode: 'EXEC',
+      deleted_tx_id: TARGET_TX_ID,
+      delete_changes: deleted,
+      update_changes: updated,
+      user: {
+        id: TARGET_USER_ID,
+        name: u?.name,
+        before_balance: beforeBalance,
+        after_balance: Number(uAfter?.qkey_balance || 0),
+        after_tx_sum: txSumAfter,
+        balance_eq_tx_sum: Number(uAfter?.qkey_balance) === Number(txSumAfter) ? 'OK' : 'MISMATCH',
+        member_claim: 69040,
+        matches_claim: Number(uAfter?.qkey_balance) === 69040 ? 'EXACT_MATCH' : 'DIFFER',
+      },
+      tx_existence_after_delete: txExists ? 'STILL_EXISTS_ERROR' : 'DELETED_OK',
+      global_integrity: {
+        total_qkey_balance: totalBal,
+        total_qkey_tx_sum: totalTx,
+        match: totalBal === totalTx ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
