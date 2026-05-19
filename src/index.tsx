@@ -47941,12 +47941,12 @@ app.get('/api/diag/reward-date-status', async (c) => {
       })
     }
 
-    // active stakings (전체 + 5/18 이전 진입자)
+    // active stakings (전체)
     const activeStakings = await db.prepare(`
       SELECT COUNT(*) AS active_cnt,
              COUNT(DISTINCT user_id) AS active_users,
              COALESCE(SUM(amount),0) AS active_total_stake
-      FROM stakings
+      FROM staking
       WHERE status = 'active'
     `).first() as any
 
