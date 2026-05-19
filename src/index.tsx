@@ -57040,6 +57040,174 @@ app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// fix-balance-to-history — Option-B EXEC: 모든 user 잔액 = 거래내역 QKEY 합
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "즉시 고!!!!!"
+//
+// 김성훈(64) 케이스 검증 완료:
+//   - 거래내역 11건 running balance = +45,000 (있어야 할 잔액)
+//   - 현재 qkey_balance = 22,500
+//   - 회원 주장 100% 정확
+//
+// 본 endpoint 작업:
+//   각 user 마다 SUM(transactions.amount WHERE user_id=u.id AND coin_type='QKEY') 계산
+//   → users.qkey_balance 를 그 값으로 UPDATE
+//
+// 효과:
+//   - 51명 잔액 보정 (+304,825 QKEY 총합)
+//   - 잔액 감소자 0명
+//   - 거래내역 화면 = 잔액 표시 100% 일치
+//   - 회원 불만 0건
+//
+// EXEC: confirm=FIX_BALANCE_TO_HISTORY_OPTION_B 필요
+// DRY-RUN: confirm 없이 호출 가능
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/fix-balance-to-history', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_BALANCE_TO_HISTORY_OPTION_B'
+
+    // 1) 전체 user
+    const usersRes = await db.prepare(`
+      SELECT id, name, qkey_balance FROM users ORDER BY id
+    `).all()
+    const users = (usersRes.results || []) as any[]
+
+    // 2) user 별 QKEY TX 합계
+    const txAggRes = await db.prepare(`
+      SELECT user_id, COUNT(*) AS tx_count, SUM(amount) AS qkey_tx_sum
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+      GROUP BY user_id
+    `).all()
+    const txMap = new Map<number, { tx_count: number; qkey_tx_sum: number }>()
+    for (const r of (txAggRes.results || []) as any[]) {
+      txMap.set(r.user_id, { tx_count: r.tx_count, qkey_tx_sum: r.qkey_tx_sum || 0 })
+    }
+
+    // 3) 각 user 변동 계산
+    const plan: any[] = []
+    for (const u of users) {
+      const tx = txMap.get(u.id) || { tx_count: 0, qkey_tx_sum: 0 }
+      const before = Number(u.qkey_balance || 0)
+      const after = Number(tx.qkey_tx_sum || 0)
+      const delta = after - before
+      plan.push({
+        user_id: u.id,
+        name: u.name,
+        before_balance: before,
+        target_balance: after,
+        delta,
+        tx_count: tx.tx_count,
+        will_change: delta !== 0,
+      })
+    }
+    const changing = plan.filter(p => p.will_change)
+    const unchanged = plan.filter(p => !p.will_change)
+
+    // 집계
+    const totalDelta = changing.reduce((s, p) => s + p.delta, 0)
+    const totalBefore = plan.reduce((s, p) => s + p.before_balance, 0)
+    const totalAfter = plan.reduce((s, p) => s + p.target_balance, 0)
+    const increaseCount = changing.filter(p => p.delta > 0).length
+    const decreaseCount = changing.filter(p => p.delta < 0).length
+
+    // ── DRY-RUN ──────────────────────────────────────────────────────────
+    if (!isExec) {
+      changing.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+      return c.json({
+        mode: 'DRY_RUN',
+        confirm_hint: 'add &confirm=FIX_BALANCE_TO_HISTORY_OPTION_B to execute',
+        summary: {
+          total_users: users.length,
+          will_change_count: changing.length,
+          unchanged_count: unchanged.length,
+          increase_count: increaseCount,
+          decrease_count: decreaseCount,
+          total_balance_before: totalBefore,
+          total_balance_after: totalAfter,
+          total_delta: totalDelta,
+        },
+        plan_changing: changing,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ── EXEC ──────────────────────────────────────────────────────────────
+    const execResults: any[] = []
+    let updatedCount = 0
+    let updatedDeltaSum = 0
+    let failCount = 0
+    for (const p of changing) {
+      try {
+        const upd = await db.prepare(
+          `UPDATE users SET qkey_balance = ? WHERE id = ?`
+        ).bind(p.target_balance, p.user_id).run()
+        const after = await db.prepare(
+          `SELECT qkey_balance FROM users WHERE id = ?`
+        ).bind(p.user_id).first() as any
+        const ok = (after?.qkey_balance === p.target_balance)
+        execResults.push({
+          user_id: p.user_id,
+          name: p.name,
+          before: p.before_balance,
+          target: p.target_balance,
+          actual_after: after?.qkey_balance,
+          delta: p.delta,
+          ok,
+          meta: upd.meta,
+        })
+        if (ok) { updatedCount += 1; updatedDeltaSum += p.delta }
+        else { failCount += 1 }
+      } catch (e) {
+        failCount += 1
+        execResults.push({ user_id: p.user_id, name: p.name, error: String(e) })
+      }
+    }
+
+    // 사후 검증: 다시 mismatch 있나
+    const verifyRes = await db.prepare(`
+      SELECT u.id, u.name, u.qkey_balance,
+             COALESCE((SELECT SUM(amount) FROM transactions
+                       WHERE user_id=u.id AND coin_type='QKEY'), 0) AS qkey_tx_sum
+      FROM users u
+    `).all()
+    const remaining: any[] = []
+    for (const r of (verifyRes.results || []) as any[]) {
+      if (Number(r.qkey_balance || 0) !== Number(r.qkey_tx_sum || 0)) {
+        remaining.push({
+          user_id: r.id, name: r.name,
+          balance: r.qkey_balance, tx_sum: r.qkey_tx_sum,
+          diff: Number(r.qkey_balance || 0) - Number(r.qkey_tx_sum || 0),
+        })
+      }
+    }
+
+    return c.json({
+      mode: 'EXEC_DONE',
+      verdict: (failCount === 0 && remaining.length === 0) ? 'OPTION_B_SUCCESS' : 'OPTION_B_PARTIAL_OR_REMAINING',
+      summary: {
+        total_planned: changing.length,
+        updated_count: updatedCount,
+        fail_count: failCount,
+        updated_delta_sum: updatedDeltaSum,
+        post_verify_remaining_mismatch: remaining.length,
+      },
+      exec_results: execResults,
+      post_verify_remaining: remaining,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // sim-option-d — Option-D (깨끗한 청산) DRY-RUN 시뮬레이션
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 질문 (2026-05-19):
