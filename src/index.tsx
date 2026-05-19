@@ -57529,6 +57529,305 @@ app.get('/api/diag/fix-balance-to-history', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// fix-daily-missing — daily_rewards 마스터 기준 미지급 daily_qkey 보충
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19):
+//   "Option-1: 즉시 미지급 보충 EXEC ... 이중지급 절대안됨!!!!!!!!"
+//
+// 원리:
+//   - daily_rewards (마스터 원장) 21건 vs transactions.daily_qkey (지급) 14건
+//     처럼 master 가 더 많으면 그 차이만큼 누락 = 보충 대상
+//   - master 1건당 TX 1건 원칙: (user_id, paid_date) 키로 master 카운트가 N이면
+//     TX 도 N건이어야 함. TX 가 부족하면 부족한 만큼만 INSERT
+//
+// 안전장치 (이중지급 방지 3중):
+//   (1) 사전 검사: (user_id, paid_date) 마다 master_cnt vs tx_cnt 계산 후
+//                  추가할 건수 = master_cnt - tx_cnt (음수면 0)
+//   (2) INSERT 시: ref_id = daily_rewards.id 채워서 향후 영구 추적 가능
+//   (3) INSERT 직후: 같은 (user_id, paid_date) 의 TX 카운트 재조회 → master 와
+//                    일치하면 OK, 초과하면 즉시 STOP & 다음 user 로
+//
+// EXEC: confirm=FIX_DAILY_MISSING_2026_05_19
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/fix-daily-missing', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+    const isExec = c.req.query('confirm') === 'FIX_DAILY_MISSING_2026_05_19'
+
+    // 헬퍼: UTC timestamp 문자열 → KST date string
+    const toKstDate = (utc: string): string => {
+      if (!utc) return ''
+      const datePart = utc.slice(0, 10)
+      const timePart = utc.length > 11 ? utc.slice(11, 19) : '00:00:00'
+      const hh = parseInt(timePart.slice(0, 2)) || 0
+      if (hh >= 15) {
+        const dt = new Date(datePart + 'T00:00:00Z')
+        dt.setUTCDate(dt.getUTCDate() + 1)
+        return dt.toISOString().slice(0, 10)
+      }
+      return datePart
+    }
+
+    // 1) daily_rewards 마스터 전부
+    const drRes = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards
+    `).all()
+    const drList = (drRes.results || []) as any[]
+
+    // 2) 기존 daily_qkey TX 전부
+    const txRes = await db.prepare(`
+      SELECT id, user_id, amount, created_at, ref_id
+      FROM transactions
+      WHERE coin_type = 'QKEY' AND type = 'daily_qkey'
+    `).all()
+    const txList = (txRes.results || []) as any[]
+
+    // 3) (user_id, paid_date) → master 건수 / tx 건수 집계
+    const masterByKey = new Map<string, any[]>()
+    for (const r of drList) {
+      const pd = r.paid_date || r.reward_date
+      const k = `${r.user_id}|${pd}`
+      if (!masterByKey.has(k)) masterByKey.set(k, [])
+      masterByKey.get(k)!.push(r)
+    }
+
+    const txByKey = new Map<string, any[]>()
+    for (const t of txList) {
+      const k = `${t.user_id}|${toKstDate(t.created_at)}`
+      if (!txByKey.has(k)) txByKey.set(k, [])
+      txByKey.get(k)!.push(t)
+    }
+
+    // ref_id 가 이미 채워진 master.id 들 (중복 방어 보강)
+    const usedRefIds = new Set<number>()
+    for (const t of txList) {
+      if (t.ref_id != null) usedRefIds.add(t.ref_id)
+    }
+
+    // 4) 보충 plan 작성
+    type PlanItem = {
+      user_id: number
+      paid_date: string
+      master_cnt: number
+      tx_cnt: number
+      missing: number
+      to_insert_dr_ids: number[]   // 어떤 master row 를 채워줄지
+      per_amount: number           // 한 건당 QKEY (staking.amount × rate × 150)
+      total_qkey: number
+    }
+    const plan: PlanItem[] = []
+
+    // staking 사전 로드
+    const stkRes = await db.prepare(`SELECT id, user_id, amount, daily_rate FROM staking`).all()
+    const stkMap = new Map<number, any>()
+    for (const s of (stkRes.results || []) as any[]) {
+      stkMap.set(s.id, s)
+    }
+
+    for (const [k, masters] of masterByKey.entries()) {
+      const txs = txByKey.get(k) || []
+      const missing = masters.length - txs.length
+      if (missing <= 0) continue   // 정상 또는 이중지급 (이중지급은 따로 처리)
+
+      const [uidStr, paidDate] = k.split('|')
+      const user_id = parseInt(uidStr)
+
+      // 추가로 채울 master rows: 이미 ref_id 로 사용된 거 제외, 누락 갯수만큼
+      const candidates = masters.filter(m => !usedRefIds.has(m.id))
+      const toInsert = candidates.slice(0, missing)
+      if (toInsert.length === 0) continue
+
+      // per_amount: 각 master 의 staking_id 에서 amount × rate × 150 계산
+      // (모든 master 가 같은 user 의 stake 별로 다를 수 있어 row 별 계산)
+      let totalQkey = 0
+      const refIds: number[] = []
+      for (const m of toInsert) {
+        const stk = stkMap.get(m.staking_id)
+        const per = stk ? Math.round(stk.amount * stk.daily_rate * 150) : (m.usdt_amount || 0)
+        totalQkey += per
+        refIds.push(m.id)
+        // 사용한 ref_id 즉시 등록 (다음 user/key 처리 시 중복 방지)
+        usedRefIds.add(m.id)
+      }
+      const firstPer = stkMap.get(toInsert[0].staking_id)
+      const perAmt = firstPer ? Math.round(firstPer.amount * firstPer.daily_rate * 150) : (toInsert[0].usdt_amount || 0)
+
+      plan.push({
+        user_id,
+        paid_date: paidDate,
+        master_cnt: masters.length,
+        tx_cnt: txs.length,
+        missing,
+        to_insert_dr_ids: refIds,
+        per_amount: perAmt,
+        total_qkey: totalQkey,
+      })
+    }
+
+    // user 별 총 보충액 집계
+    const summaryByUser = new Map<number, { name?: string; missing_cnt: number; total_qkey: number; dates: string[] }>()
+    const usersRes = await db.prepare(`SELECT id, name FROM users`).all()
+    const userMap = new Map<number, string>()
+    for (const u of (usersRes.results || []) as any[]) userMap.set(u.id, u.name)
+
+    for (const p of plan) {
+      const s = summaryByUser.get(p.user_id) || { name: userMap.get(p.user_id), missing_cnt: 0, total_qkey: 0, dates: [] }
+      s.missing_cnt += p.missing
+      s.total_qkey += p.total_qkey
+      s.dates.push(`${p.paid_date}(+${p.missing})`)
+      summaryByUser.set(p.user_id, s)
+    }
+
+    const summaryArr = Array.from(summaryByUser.entries()).map(([uid, s]) => ({
+      user_id: uid, name: s.name, missing_cnt: s.missing_cnt,
+      total_qkey: s.total_qkey, dates: s.dates,
+    }))
+    summaryArr.sort((a, b) => b.total_qkey - a.total_qkey)
+    const grandTotal = summaryArr.reduce((sum, s) => sum + s.total_qkey, 0)
+    const grandCnt = summaryArr.reduce((sum, s) => sum + s.missing_cnt, 0)
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        plan_count: plan.length,
+        total_users_affected: summaryArr.length,
+        total_missing_tx_count: grandCnt,
+        total_qkey_to_add: grandTotal,
+        per_user_summary: summaryArr,
+        exec_hint: 'add &confirm=FIX_DAILY_MISSING_2026_05_19 to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─────────── EXEC ───────────
+    const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19)
+
+    const execLog: any[] = []
+    let totalInserted = 0
+    let totalQkeyInserted = 0
+    let totalUpdatedBalance = 0
+    const balanceDelta = new Map<number, number>()  // user_id → 추가 QKEY
+
+    for (const p of plan) {
+      const stk0 = stkMap.get(
+        (drList.find(m => m.id === p.to_insert_dr_ids[0]) || {}).staking_id
+      )
+      for (const drId of p.to_insert_dr_ids) {
+        const masterRow = drList.find(m => m.id === drId)!
+        const stk = stkMap.get(masterRow.staking_id)
+        const perAmt = stk ? Math.round(stk.amount * stk.daily_rate * 150) : (masterRow.usdt_amount || 0)
+        const desc = `[supplement] daily_qkey ${perAmt} QKEY for paid_date ${p.paid_date} (dr_id=${drId})`
+
+        // (2-ⓐ) INSERT 직전 한번 더 (user, paid_date) tx 카운트 재조회 + master_cnt 비교
+        const recountRes = await db.prepare(`
+          SELECT COUNT(*) AS c FROM transactions
+          WHERE coin_type='QKEY' AND type='daily_qkey'
+            AND user_id = ? AND ref_id = ?
+        `).bind(p.user_id, drId).first() as any
+        if ((recountRes?.c ?? 0) > 0) {
+          execLog.push({ user_id: p.user_id, dr_id: drId, status: 'SKIP_ALREADY_INSERTED', recount: recountRes.c })
+          continue
+        }
+
+        try {
+          const ins = await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, created_at, ref_id)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
+          `).bind(p.user_id, perAmt, desc, nowUtc, drId).run()
+
+          totalInserted += 1
+          totalQkeyInserted += perAmt
+          balanceDelta.set(p.user_id, (balanceDelta.get(p.user_id) || 0) + perAmt)
+
+          // (2-ⓑ) 직후 카운트 — master_cnt 와 비교, 초과면 즉시 ROLLBACK
+          const postRes = await db.prepare(`
+            SELECT COUNT(*) AS c FROM transactions
+            WHERE coin_type='QKEY' AND type='daily_qkey'
+              AND user_id = ? AND ref_id IN (
+                SELECT id FROM daily_rewards WHERE user_id = ? AND (paid_date = ? OR (paid_date IS NULL AND reward_date = ?))
+              )
+          `).bind(p.user_id, p.user_id, p.paid_date, p.paid_date).first() as any
+          // 이 카운트 ≤ master_cnt 여야 정상
+          if ((postRes?.c ?? 0) > p.master_cnt) {
+            // 비정상: 방금 INSERT 한 TX 삭제
+            const insId = (ins.meta as any)?.last_row_id
+            if (insId) {
+              await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(insId).run()
+              totalInserted -= 1
+              totalQkeyInserted -= perAmt
+              balanceDelta.set(p.user_id, (balanceDelta.get(p.user_id) || 0) - perAmt)
+            }
+            execLog.push({
+              user_id: p.user_id, dr_id: drId, status: 'ROLLBACK_OVERPAID',
+              post_count: postRes.c, master_cnt: p.master_cnt, deleted_tx_id: insId,
+            })
+          } else {
+            execLog.push({
+              user_id: p.user_id, dr_id: drId, status: 'OK',
+              inserted_tx_id: (ins.meta as any)?.last_row_id, amount: perAmt,
+            })
+          }
+        } catch (e) {
+          execLog.push({ user_id: p.user_id, dr_id: drId, status: 'INSERT_FAIL', error: String(e) })
+        }
+      }
+    }
+
+    // 잔액 업데이트 (보충된 만큼)
+    for (const [uid, delta] of balanceDelta.entries()) {
+      if (delta === 0) continue
+      try {
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, uid).run()
+        totalUpdatedBalance += 1
+      } catch (e) {
+        execLog.push({ user_id: uid, status: 'BALANCE_UPDATE_FAIL', error: String(e) })
+      }
+    }
+
+    // 사후 무결성 — 전체 회원
+    const balSum = await db.prepare(`SELECT SUM(qkey_balance) AS s FROM users`).first() as any
+    const txSum = await db.prepare(`SELECT SUM(amount) AS s FROM transactions WHERE coin_type='QKEY'`).first() as any
+
+    // 사후 재점검: 미지급 다시 0건 확인
+    const verifyRes = await db.prepare(`
+      SELECT COUNT(*) AS c FROM daily_rewards
+    `).first() as any
+    const txCntRes = await db.prepare(`
+      SELECT COUNT(*) AS c FROM transactions WHERE coin_type='QKEY' AND type='daily_qkey'
+    `).first() as any
+
+    return c.json({
+      mode: 'EXEC',
+      total_dr_inserts_planned: plan.reduce((s, p) => s + p.to_insert_dr_ids.length, 0),
+      total_tx_inserted: totalInserted,
+      total_qkey_inserted: totalQkeyInserted,
+      users_balance_updated: totalUpdatedBalance,
+      per_user_balance_delta: Array.from(balanceDelta.entries()).map(([uid, d]) => ({
+        user_id: uid, name: userMap.get(uid), delta: d,
+      })).sort((a, b) => (b.delta as number) - (a.delta as number)),
+      post_integrity: {
+        total_qkey_balance: balSum?.s,
+        total_qkey_tx_sum: txSum?.s,
+        match: (balSum?.s === txSum?.s) ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+        total_daily_rewards: verifyRes?.c,
+        total_daily_qkey_tx: txCntRes?.c,
+        // 정상이면 daily_qkey_tx 가 daily_rewards 이상 (보충 후)
+      },
+      exec_log_sample: execLog.slice(0, 50),
+      exec_log_total: execLog.length,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // sim-option-d — Option-D (깨끗한 청산) DRY-RUN 시뮬레이션
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 질문 (2026-05-19):
