@@ -53525,4 +53525,245 @@ app.get('/api/diag/dup-512-paid', async (c) => {
 })
 
 
+// ★ 사장님 명령 (2026-05-19) ★
+// "5월 8일 확정치를 바로 5월 11일에 넣어줘! 중복없이! 내 영구룰에 의거 바텀업 방식으로!"
+// B 선택: 5/8 + 5/9 + 5/10 3일치 모두 5/11(월) paid 로 영구룰 #익일처리 정답
+//
+// 영구룰 적용:
+//   - paid_date = 2026-05-11
+//   - created_at_utc = 2026-05-10 23:00:00 (DR) / 23:00:01 (RR) = KST 5/11 08:00
+//   - reward_date 는 각 row 마다 5/8 / 5/9 / 5/10 중 staking 의 accrual 에 따라 결정
+//   - 바텀업: STEP B (own_daily) → STEP D (L1 20%) → STEP E (L2 10%)
+//   - 영구룰 #스테이킹별독립: (user, staking, reward_date) 단위 1건
+//   - 영구룰 #지상최고: 중복 검사 → 있으면 SKIP
+//
+// 5/12 때 검증된 동일 batch 패턴:
+//   ?batch=dr      — own_daily 누락분 INSERT (각 reward_date 별 처리)
+//   ?batch=rr-l1   — L1 매칭 누락분 INSERT
+//   ?batch=rr-l2   — L2 매칭 누락분 INSERT
+//
+// 사용:
+//   DRY-RUN: GET /api/diag/insert-511-paid?key=ADMIN_PW&batch=dr
+//   EXEC:    GET /api/diag/insert-511-paid?key=ADMIN_PW&batch=dr&confirm=INSERT_511
+app.get('/api/diag/insert-511-paid', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const batch = c.req.query('batch') || 'dr'
+    const isExec = confirm === 'INSERT_511'
+    const db = c.env.DB
+
+    const PAID_DATE = '2026-05-11'
+    const REWARD_DATES = ['2026-05-08', '2026-05-09', '2026-05-10']  // 금/토/일 → 5/11 paid
+    const CREATED_AT_UTC = '2026-05-10 23:00:00'      // KST 5/11 08:00
+    const CREATED_AT_RR_UTC = '2026-05-10 23:00:01'   // KST 5/11 08:00:01
+    const USD_TO_QKEY = 150
+
+    // ─────────────────────────────────────────────────────────
+    // BATCH=dr: own_daily 누락분 INSERT
+    // ─────────────────────────────────────────────────────────
+    if (batch === 'dr') {
+      const plan: { user_id: number, staking_id: number, reward_date: string, qkey: number }[] = []
+      const userStakeTotalCache = new Map<number, number>()
+      const userPaidCache = new Map<number, number>()
+
+      // 사용자 누적 (5/11 paid 제외, 즉 PAID_DATE 와 created_at 5/10 23:00 ~ 5/11 23:59 UTC 제외)
+      async function getPaidExcl(uid: number): Promise<number> {
+        if (userPaidCache.has(uid)) return userPaidCache.get(uid)!
+        const r = await db.prepare(`
+          SELECT COALESCE(SUM(amount),0) as total FROM transactions
+          WHERE user_id=? AND coin_type='QKEY'
+            AND type IN ('daily_qkey','referral_reward')
+            AND NOT (created_at >= '2026-05-10 23:00:00' AND created_at < '2026-05-12 00:00:00')
+        `).bind(uid).first() as any
+        const v = Number(r?.total || 0)
+        userPaidCache.set(uid, v)
+        return v
+      }
+      async function getStakeTotal(uid: number): Promise<number> {
+        if (userStakeTotalCache.has(uid)) return userStakeTotalCache.get(uid)!
+        const r = await db.prepare(`
+          SELECT COALESCE(SUM(amount),0) as total FROM staking
+          WHERE user_id=? AND status IN ('active','completed','capped')
+        `).bind(uid).first() as any
+        const v = Number(r?.total || 0)
+        userStakeTotalCache.set(uid, v)
+        return v
+      }
+
+      // 각 reward_date 별로 active staking 처리
+      const userVirtualPaid = new Map<number, number>()  // 5/11 paid 까지의 누적 시뮬레이션
+      for (const rd of REWARD_DATES) {
+        const cands = await db.prepare(`
+          SELECT s.user_id, s.id as staking_id, s.amount, s.period_days, s.period_months, s.daily_rate,
+                 (SELECT COUNT(*) FROM daily_rewards WHERE staking_id=s.id AND paid_date != ?) as rc_excl
+          FROM staking s
+          WHERE s.status IN ('active','capped','completed')
+            AND date(s.start_date,'+9 hours') <= ?
+            AND date(s.end_date,'+9 hours') >= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM daily_rewards d
+              WHERE d.staking_id = s.id AND d.reward_date = ? AND d.paid_date = ?
+            )
+          ORDER BY s.id
+        `).bind(PAID_DATE, rd, rd, rd, PAID_DATE).all<any>()
+        const rows = (cands.results || []) as any[]
+
+        for (const s of rows) {
+          const periodDays = s.period_days || (s.period_months * 30)
+          if (Number(s.rc_excl) >= periodDays) continue
+          // 200% cap
+          const st = await getStakeTotal(s.user_id)
+          const baseline = await getPaidExcl(s.user_id)
+          const virtualPaid = userVirtualPaid.get(s.user_id) || baseline
+          const target = st * 2 * USD_TO_QKEY
+          if (target > 0 && virtualPaid >= target) continue
+          const dailyRate = s.daily_rate || getDailyRate(s.amount)
+          let qkey = Math.round(s.amount * dailyRate * USD_TO_QKEY)
+          const remaining = target - virtualPaid
+          if (qkey > remaining) qkey = Math.max(0, Math.floor(remaining))
+          if (qkey <= 0) continue
+          plan.push({ user_id: s.user_id, staking_id: s.staking_id, reward_date: rd, qkey })
+          userVirtualPaid.set(s.user_id, virtualPaid + qkey)
+        }
+      }
+
+      if (!isExec) {
+        // by reward_date 집계
+        const byRd: Record<string, { count: number, total_qkey: number }> = {}
+        for (const p of plan) {
+          if (!byRd[p.reward_date]) byRd[p.reward_date] = { count: 0, total_qkey: 0 }
+          byRd[p.reward_date].count++
+          byRd[p.reward_date].total_qkey += p.qkey
+        }
+        return c.json({
+          ok: true, mode: 'DRY_RUN', batch: 'dr',
+          confirm_token_required: 'INSERT_511',
+          paid_date: PAID_DATE, reward_dates: REWARD_DATES,
+          plan_count: plan.length,
+          total_qkey: plan.reduce((a,b)=>a+b.qkey,0),
+          by_reward_date: byRd,
+          sample: plan.slice(0, 10),
+          duration_ms: Date.now() - t0,
+        })
+      }
+
+      let inserted = 0, total = 0
+      const errs: any[] = []
+      for (const p of plan) {
+        try {
+          const ins = await db.prepare(`
+            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).bind(p.user_id, p.staking_id, p.qkey, p.reward_date, PAID_DATE, CREATED_AT_UTC).run()
+          const drId = (ins as any)?.meta?.last_row_id ?? null
+          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(p.qkey, p.user_id).run()
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
+          `).bind(p.user_id, p.qkey, '일일 배당 (QKEY)', drId, CREATED_AT_UTC).run()
+          inserted++; total += p.qkey
+        } catch (e: any) {
+          errs.push({ user_id: p.user_id, staking_id: p.staking_id, reward_date: p.reward_date, error: String(e?.message || e) })
+        }
+      }
+      return c.json({ ok: true, mode: 'EXEC', batch: 'dr', inserted, total_qkey: total, errors: errs.slice(0,10), duration_ms: Date.now() - t0 })
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // BATCH=rr-l1 / rr-l2
+    // ─────────────────────────────────────────────────────────
+    if (batch === 'rr-l1' || batch === 'rr-l2') {
+      const level = batch === 'rr-l1' ? 1 : 2
+      const ratio = level === 1 ? 0.20 : 0.10
+
+      // 5/11 paid dr 전체 (방금 INSERT 한 것 포함)
+      const drList = await db.prepare(`
+        SELECT id as dr_id, user_id as referee, staking_id, reward_date, usdt_amount as qkey
+        FROM daily_rewards WHERE paid_date = ?
+      `).bind(PAID_DATE).all<any>()
+      const drs = (drList.results || []) as any[]
+
+      const plan: any[] = []
+      for (const d of drs) {
+        let referrer: number | null = null
+        const u1 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(d.referee).first() as any
+        if (level === 1) {
+          referrer = u1?.referrer_id ?? null
+        } else {
+          if (!u1?.referrer_id) continue
+          const u2 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(u1.referrer_id).first() as any
+          referrer = u2?.referrer_id ?? null
+        }
+        if (!referrer) continue
+        // referrer 가 그 reward_date 시점에 active 여야 함
+        const act = await db.prepare(`
+          SELECT 1 FROM staking
+          WHERE user_id=? AND status IN ('active','capped','completed')
+            AND date(start_date,'+9 hours') <= ? AND date(end_date,'+9 hours') >= ?
+          LIMIT 1
+        `).bind(referrer, d.reward_date, d.reward_date).first() as any
+        if (!act) continue
+        // 중복 가드: (referrer, referee, level, reward_date, staking_id, paid_date)
+        const dup = await db.prepare(`
+          SELECT 1 FROM referral_rewards
+          WHERE referrer_id=? AND referee_id=? AND level=? AND reward_date=? AND paid_date=?
+            AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
+          LIMIT 1
+        `).bind(referrer, d.referee, level, d.reward_date, PAID_DATE, d.staking_id, d.qkey).first() as any
+        if (dup) continue
+        const reward = Math.round(d.qkey * ratio)
+        if (reward <= 0) continue
+        plan.push({ referrer_id: referrer, referee_id: d.referee, level, staking_id: d.staking_id, reward_date: d.reward_date, qkey: d.qkey, reward })
+      }
+
+      if (!isExec) {
+        const byRd: Record<string, { count: number, total: number }> = {}
+        for (const p of plan) {
+          if (!byRd[p.reward_date]) byRd[p.reward_date] = { count: 0, total: 0 }
+          byRd[p.reward_date].count++
+          byRd[p.reward_date].total += p.reward
+        }
+        return c.json({
+          ok: true, mode: 'DRY_RUN', batch,
+          confirm_token_required: 'INSERT_511',
+          plan_count: plan.length,
+          total_reward: plan.reduce((a,b)=>a+b.reward,0),
+          by_reward_date: byRd,
+          sample: plan.slice(0, 10),
+          duration_ms: Date.now() - t0,
+        })
+      }
+
+      let inserted = 0, total = 0
+      const errs: any[] = []
+      for (const p of plan) {
+        try {
+          const ins = await db.prepare(`
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(p.referrer_id, p.referee_id, p.level, p.qkey, p.reward, p.reward_date, PAID_DATE, p.staking_id, CREATED_AT_RR_UTC).run()
+          const rrId = (ins as any)?.meta?.last_row_id ?? null
+          await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(p.reward, p.referrer_id).run()
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+            VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+          `).bind(p.referrer_id, p.reward, `추천 보너스 (Level ${p.level})`, rrId, CREATED_AT_RR_UTC).run()
+          inserted++; total += p.reward
+        } catch (e: any) {
+          errs.push({ referrer_id: p.referrer_id, referee_id: p.referee_id, error: String(e?.message || e) })
+        }
+      }
+      return c.json({ ok: true, mode: 'EXEC', batch, inserted, total_reward: total, errors: errs.slice(0,10), duration_ms: Date.now() - t0 })
+    }
+
+    return c.json({ error: 'invalid batch', valid: ['dr','rr-l1','rr-l2'] }, 400)
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
