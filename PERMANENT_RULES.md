@@ -1,6 +1,6 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-19 (★ 영구룰 #지상최고 + #정규시각 KST 08:00 + #관리자보정정당 + #위반type가감 + #이중구조절대금지 — 사장님 직접 명령)
+**최종 업데이트**: 2026-05-19 (★ 영구룰 #지상최고 + #정규시각 KST 08:00 + #관리자보정정당 + #위반type가감 + #이중구조절대금지 + #익일처리코드영구반영 (D 명령) — 사장님 직접 명령)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
 
@@ -357,6 +357,41 @@ INSERT INTO referral_rewards (..., created_at) VALUES (..., ?)
 | 공휴일 → | 다음 영업일 |
 
 ⚠️ **#1 직접매출 10% 쿠키는 익일처리 적용 안 함** (매출 발생 즉시 지급, 휴일 무관).
+
+### 🔴 D 명령 — 코드 영구 반영 (2026-05-19 사장님 명령)
+
+**사장님 직접 인용**:
+> "5월 7일확정분이 5월 8일에 찍혀야 하고 5월 8일 확정분이 11일날 표시가 되야한다 첫 평일임으로, 5월 15일꺼는 5월 18일로 찍혀야 하고 또 첫 평일이기 때문에 그게 내 영구정책이다! 이 룰에 맞게 수정하라! 맞는 날짜는 놔두고!"
+
+#### 코드 위치 (src/index.tsx)
+- **헬퍼 함수**: `nextBusinessDayKstStr(rewardDateStr)` (line ~4540 부근)
+- **cron 본체**: line ~4973 `for (const accrualDate of accrualDates)` 루프 내 즉시 계산:
+  ```typescript
+  const accrualPaidDate = nextBusinessDayKstStr(accrualDate)
+  const accrualDailyCreatedAtUtc = createdAtUtcForPaidDate(accrualPaidDate, 0)
+  const accrualReferralCreatedAtUtc = createdAtUtcForPaidDate(accrualPaidDate, 1)
+  ```
+- **모든 INSERT (daily_rewards, transactions daily_qkey, referral_rewards L1/L2, transactions referral_reward)** 에서 `today` 대신 `accrualPaidDate` 사용
+
+#### 위반 패턴 (사고 방지)
+- ❌ `paid_date = today` (cron 실행일) — backfill 시 5/8 reward 도 5/12 paid 되는 위반
+- ❌ `created_at` 을 cron 실행일 기준 단일 값으로 사용
+- ✅ `paid_date = nextBusinessDayKstStr(accrualDate)` — 각 reward 별 독립 계산
+- ✅ `created_at = createdAtUtcForPaidDate(accrualPaidDate)` — paid_date 의 KST 08:00
+
+#### 검증 매트릭스 (2026-05-19 EXEC 결과)
+```
+평일 → 다음날:                        금/토/일 → 월요일:
+5/7(목) → 5/8(금) ✅                  5/8(금) → 5/11(월) ✅
+5/11(월) → 5/12(화) ✅                5/9(토) → 5/11(월) ✅
+5/12(화) → 5/13(수) ✅                5/15(금) → 5/18(월) ✅
+5/13(수) → 5/14(목) ✅                5/2(토) → 5/4(월) ✅
+5/14(목) → 5/15(금) ✅                5/3(일) → 5/4(월) ✅
+5/18(월) → 5/19(화) ✅                4/25(토) → 4/27(월) ✅
+                                       4/26(일) → 4/27(월) ✅
+                                       4/19(일) → 4/20(월) ✅
+```
+- daily_rewards 위반 0/18, referral_rewards 위반 0/24 (paid-vs-reward-matrix endpoint)
 
 ---
 

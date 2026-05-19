@@ -4537,6 +4537,44 @@ function getPrevBusinessDayKst(today: Date): { dateStr: string, daysBack: number
   return { dateStr: kstDateStr(new Date(today.getTime() - 24 * 60 * 60 * 1000)), daysBack: 1 }
 }
 
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// 영구룰 #익일처리 (PERMANENT_RULES.md L347) — 사장님 영구명령 (2026-05-19)
+//
+// **다음 영업일(KST) 계산** — reward_date → paid_date 결정용
+//
+// 사장님 직접 인용:
+//   "5/7(목) 확정 → 5/8(금) 표시"
+//   "5/8(금) 확정 → 5/11(월) 표시" (토/일 skip)
+//   "5/15(금) 확정 → 5/18(월) 표시" (토/일 skip)
+//
+// 사용처: cron 본체에서 paid_date = nextBusinessDayKstStr(reward_date) 로 INSERT
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+function nextBusinessDayKstStr(rewardDateStr: string): string {
+  // rewardDateStr 'YYYY-MM-DD' 을 KST 자정으로 해석
+  const base = new Date(rewardDateStr + 'T00:00:00+09:00')
+  // 최대 14일까지 앞으로 탐색 (연휴 대비)
+  for (let i = 1; i <= 14; i++) {
+    const candidate = new Date(base.getTime() + i * 24 * 60 * 60 * 1000)
+    const { isBusinessDay } = isKoreanBusinessDay(candidate)
+    if (isBusinessDay) {
+      return kstDateStr(candidate)
+    }
+  }
+  // 안전 fallback (일반적으로 도달 불가)
+  return kstDateStr(new Date(base.getTime() + 24 * 60 * 60 * 1000))
+}
+
+// 영구룰 #정규시각 — paid_date 의 KST 08:00 = UTC (paid_date - 1) 23:00
+// 사용처: created_at INSERT 시
+function createdAtUtcForPaidDate(paidDateStr: string, extraSeconds: number = 0): string {
+  // paid_date KST 08:00 = UTC (prev-day) 23:00:00
+  const paidObj = new Date(paidDateStr + 'T00:00:00+09:00')
+  const prevDay = new Date(paidObj.getTime() - 24 * 60 * 60 * 1000)
+  const prevDayKst = kstDateStr(prevDay)
+  const ss = String(extraSeconds).padStart(2, '0')
+  return `${prevDayKst} 23:00:${ss}`
+}
+
 // ★★ B 보강 (2026-05-06 확정) ★★
 // 사장님 룰 (재확정):
 //  1) 휴일/공휴일 매출도 직판수당은 즉시 지급 (이미 staking-approve 에서 처리)
@@ -4933,6 +4971,15 @@ app.post('/api/rewards/daily', async (c) => {
         const stakingProcessed: string[] = []
 
         for (const accrualDate of accrualDates) {
+          // ★★★ 영구룰 #익일처리 (2026-05-19 사장님 D 명령) ★★★
+          //   paid_date = nextBusinessDay(accrualDate) — 각 reward 별로 독립 계산
+          //   기존: paid_date = today (cron 실행일) → backfill 시 5/8 reward 도 5/12 paid 되는 위반
+          //   정정: 5/8 reward → paid=5/11, 5/11 reward → paid=5/12 처럼 reward 별 정답 paid
+          //   created_at = paid_date 의 KST 08:00 (= UTC paid_date-1 23:00)
+          const accrualPaidDate = nextBusinessDayKstStr(accrualDate)
+          const accrualDailyCreatedAtUtc = createdAtUtcForPaidDate(accrualPaidDate, 0)
+          const accrualReferralCreatedAtUtc = createdAtUtcForPaidDate(accrualPaidDate, 1)
+
           // 거치기간 일수 초과 시 종료
           const currentRewardedCount = staking.rewarded_count + stakingProcessed.length
           if (currentRewardedCount >= periodDays) {
@@ -4984,14 +5031,14 @@ app.post('/api/rewards/daily', async (c) => {
 
           // [본인 배당 지급]
           //   reward_date = accrualDate (해당 평일)
-          //   paid_date   = today       (오늘 cron 실행일)
+          //   paid_date   = nextBusinessDayKstStr(accrualDate)  ★ 영구룰 #익일처리 (2026-05-19 D 명령)
           //   ★ 영구룰 #정규시각 (2026-05-19) — created_at = paid_date KST 08:00 (= UTC prev-day 23:00)
           //     사고 방지: DB default CURRENT_TIMESTAMP 사용 금지 (5/18 사고)
           // [패치 2026-05-11] ref_id 1:1 매핑 — daily_rewards INSERT 후 last_row_id 캡처
           const drIns = await db.prepare(`
             INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
-          `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, today, dailyCreatedAtUtc).run()
+          `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, accrualPaidDate, accrualDailyCreatedAtUtc).run()
           const drId = (drIns as any)?.meta?.last_row_id ?? null
 
           await db.prepare(`
@@ -5006,11 +5053,11 @@ app.post('/api/rewards/daily', async (c) => {
             LIMIT 1
           `).bind(drId).first()
           if (!dqExists2) {
-            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00)
+            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00, accrualPaidDate 기준)
             await db.prepare(`
               INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
               VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
-            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId, dailyCreatedAtUtc).run()
+            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId, accrualDailyCreatedAtUtc).run()
           }
 
           rewardedCount++
@@ -5045,7 +5092,7 @@ app.post('/api/rewards/daily', async (c) => {
                   WHERE referrer_id = ? AND referee_id = ? AND level = 1
                     AND (reward_date = ? OR paid_date = ?)
                     AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
-                `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate, today, staking.staking_id, qkeyAmount).first()
+                `).bind(level1Referrer.referrer_id, staking.user_id, accrualDate, accrualPaidDate, staking.staking_id, qkeyAmount).first()
 
                 if (l1Exists.count === 0) {
                   let level1Reward = Math.round(qkeyAmount * 0.20)
@@ -5070,7 +5117,7 @@ app.post('/api/rewards/daily', async (c) => {
                       const rrL1Ins = await db.prepare(`
                         INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
                         VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
-                      `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today, staking.staking_id, dailyCreatedAtUtc).run()
+                      `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, accrualPaidDate, staking.staking_id, accrualDailyCreatedAtUtc).run()
                       const rrL1Id = (rrL1Ins as any)?.meta?.last_row_id ?? null
 
                       // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
@@ -5080,11 +5127,11 @@ app.post('/api/rewards/daily', async (c) => {
                         LIMIT 1
                       `).bind(rrL1Id).first()
                       if (!l1TxExists2) {
-                        // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00:01, DR 보다 1초 늦게)
+                        // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00:01, DR 보다 1초 늦게, accrualPaidDate 기준)
                         await db.prepare(`
                           INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
                           VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
-                        `).bind(level1Referrer.referrer_id, level1Reward, '추천 보너스 (Level 1)', rrL1Id, referralCreatedAtUtc).run()
+                        `).bind(level1Referrer.referrer_id, level1Reward, '추천 보너스 (Level 1)', rrL1Id, accrualReferralCreatedAtUtc).run()
                       }
                     }
                   }
@@ -5116,7 +5163,7 @@ app.post('/api/rewards/daily', async (c) => {
                       WHERE referrer_id = ? AND referee_id = ? AND level = 2
                         AND (reward_date = ? OR paid_date = ?)
                         AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
-                    `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate, today, staking.staking_id, qkeyAmount).first()
+                    `).bind(level2Referrer.referrer_id, staking.user_id, accrualDate, accrualPaidDate, staking.staking_id, qkeyAmount).first()
 
                     if (l2Exists.count === 0) {
                       let level2Reward = Math.round(qkeyAmount * 0.10)
@@ -5140,7 +5187,7 @@ app.post('/api/rewards/daily', async (c) => {
                           const rrL2Ins = await db.prepare(`
                             INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
                             VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?)
-                          `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today, staking.staking_id, dailyCreatedAtUtc).run()
+                          `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, accrualPaidDate, staking.staking_id, accrualDailyCreatedAtUtc).run()
                           const rrL2Id = (rrL2Ins as any)?.meta?.last_row_id ?? null
 
                           // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
@@ -5150,11 +5197,11 @@ app.post('/api/rewards/daily', async (c) => {
                             LIMIT 1
                           `).bind(rrL2Id).first()
                           if (!l2TxExists2) {
-                            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00:01)
+                            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00:01, accrualPaidDate 기준)
                             await db.prepare(`
                               INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
                               VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
-                            `).bind(level2Referrer.referrer_id, level2Reward, '추천 보너스 (Level 2)', rrL2Id, referralCreatedAtUtc).run()
+                            `).bind(level2Referrer.referrer_id, level2Reward, '추천 보너스 (Level 2)', rrL2Id, accrualReferralCreatedAtUtc).run()
                           }
                         }
                       }
