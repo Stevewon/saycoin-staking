@@ -56475,6 +56475,184 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// fix-519-tx-description — 5/19 referral_reward TX description 정정 (DRY-RUN + EXEC)
+// ════════════════════════════════════════════════════════════════════════
+// 문제: UI 의 dash 화면 로직 (src/index.tsx:24488)
+//   if (reward.description.indexOf('Level 1') >= 0) → '성과금(1대)'
+//   else → '성과금(2대)'
+//
+// 현재 5/19 TX:
+//   L1 RR: 'L1 추천 보상 (QKEY)' → 'Level 1' 미포함 → 화면에 '성과금(2대)' ❌
+//   L2 RR: 'L2 추천 보상 (QKEY)' → 'Level 1' 미포함 → 화면에 '성과금(2대)' (우연히 맞음)
+//
+// 수정안:
+//   L1 RR TX description → 'Level 1 추천 보상 (QKEY)'
+//   L2 RR TX description → 'Level 2 추천 보상 (QKEY)'
+//
+// 가드:
+//   - 5/19 paid 의 RR L1/L2 ref 만 (다른 날짜 절대 영향 X)
+//   - referral_rewards.id 통해 정확히 매핑 (ref_id 기반)
+//   - amount/coin_type/type 변경 없음 (description 만)
+//   - balance 변경 없음
+//
+// DRY-RUN: GET /api/diag/fix-519-tx-description?key=ADMIN_PW
+// EXEC:    GET /api/diag/fix-519-tx-description?key=ADMIN_PW&confirm=FIX_519_TX_DESC
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/fix-519-tx-description', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_519_TX_DESC'
+    const db = c.env.DB
+
+    const PAID = '2026-05-19'
+    const NEW_L1 = 'Level 1 추천 보상 (QKEY)'
+    const NEW_L2 = 'Level 2 추천 보상 (QKEY)'
+
+    // 5/19 paid 의 RR L1/L2 ids 수집
+    const rrL1 = await db.prepare(`
+      SELECT id FROM referral_rewards WHERE paid_date=? AND level=1
+    `).bind(PAID).all<any>()
+    const rrL2 = await db.prepare(`
+      SELECT id FROM referral_rewards WHERE paid_date=? AND level=2
+    `).bind(PAID).all<any>()
+    const l1Ids = (rrL1.results || []).map((r:any) => r.id)
+    const l2Ids = (rrL2.results || []).map((r:any) => r.id)
+
+    // 매핑된 TX 확인 (chunked)
+    const CHUNK = 50
+    let txL1: any[] = []
+    let txL2: any[] = []
+    if (l1Ids.length > 0) {
+      for (let i = 0; i < l1Ids.length; i += CHUNK) {
+        const chunk = l1Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, ref_id, description, amount FROM transactions
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all<any>()
+        txL1 = txL1.concat((r.results || []) as any[])
+      }
+    }
+    if (l2Ids.length > 0) {
+      for (let i = 0; i < l2Ids.length; i += CHUNK) {
+        const chunk = l2Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, ref_id, description, amount FROM transactions
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all<any>()
+        txL2 = txL2.concat((r.results || []) as any[])
+      }
+    }
+
+    // 변경 전 distinct description
+    const distinctL1Before: Record<string, number> = {}
+    for (const t of txL1) distinctL1Before[t.description] = (distinctL1Before[t.description] || 0) + 1
+    const distinctL2Before: Record<string, number> = {}
+    for (const t of txL2) distinctL2Before[t.description] = (distinctL2Before[t.description] || 0) + 1
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        confirm_token_required: 'FIX_519_TX_DESC',
+        paid_date: PAID,
+        rr_l1_count: l1Ids.length,
+        rr_l2_count: l2Ids.length,
+        tx_l1_mapped: txL1.length,
+        tx_l2_mapped: txL2.length,
+        distinct_l1_before: distinctL1Before,
+        distinct_l2_before: distinctL2Before,
+        new_desc_l1: NEW_L1,
+        new_desc_l2: NEW_L2,
+        sample_l1: txL1.slice(0, 5),
+        sample_l2: txL2.slice(0, 5),
+        guards: [
+          '오직 paid_date=2026-05-19 의 RR L1/L2 ref_id 매핑 TX 만',
+          'description 만 UPDATE (amount/type/coin_type/created_at 무변경)',
+          'balance 영향 0',
+          '다른 날짜 영향 0',
+        ],
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC
+    let updL1 = 0, updL2 = 0
+    if (l1Ids.length > 0) {
+      for (let i = 0; i < l1Ids.length; i += CHUNK) {
+        const chunk = l1Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          UPDATE transactions SET description=?
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(NEW_L1, ...chunk).run()
+        updL1 += (r.meta?.changes || 0)
+      }
+    }
+    if (l2Ids.length > 0) {
+      for (let i = 0; i < l2Ids.length; i += CHUNK) {
+        const chunk = l2Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          UPDATE transactions SET description=?
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(NEW_L2, ...chunk).run()
+        updL2 += (r.meta?.changes || 0)
+      }
+    }
+
+    // 사후 검증
+    let txL1After: any[] = []
+    let txL2After: any[] = []
+    if (l1Ids.length > 0) {
+      for (let i = 0; i < l1Ids.length; i += CHUNK) {
+        const chunk = l1Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT description, COUNT(*) as cnt FROM transactions
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+          GROUP BY description
+        `).bind(...chunk).all<any>()
+        txL1After = txL1After.concat((r.results || []) as any[])
+      }
+    }
+    if (l2Ids.length > 0) {
+      for (let i = 0; i < l2Ids.length; i += CHUNK) {
+        const chunk = l2Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT description, COUNT(*) as cnt FROM transactions
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+          GROUP BY description
+        `).bind(...chunk).all<any>()
+        txL2After = txL2After.concat((r.results || []) as any[])
+      }
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC_DONE',
+      confirm: 'FIX_519_TX_DESC',
+      paid_date: PAID,
+      updated_l1: updL1,
+      updated_l2: updL2,
+      expected_l1: txL1.length,
+      expected_l2: txL2.length,
+      distinct_l1_after: txL1After,
+      distinct_l2_after: txL2After,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // inspect-tx-desc-history — 다른 paid_date 의 referral_reward description 확인 (READ-ONLY)
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/inspect-tx-desc-history', async (c) => {
