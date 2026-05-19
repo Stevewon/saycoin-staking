@@ -54540,4 +54540,184 @@ app.get('/api/diag/inspect-511-rr-violations', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// delete-511-rr-violations — 5/9 reward level=1/2 위반 8건 DELETE (DRY-RUN + EXEC)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19):
+//   Scenario A confirmed — balance 차감 안 됨 (TX 매핑 0건)
+//   → RR 8건만 DELETE, balance/TX 손대지 마라
+//
+// 보존 대상 (절대 삭제 안 함):
+//   id 680, 681, 683 (5/8 reward level=0 직접매출분)
+//   id 684 (5/9 reward level=0 직접매출분)
+//
+// 삭제 대상 (영구룰 위반):
+//   id IN (1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203)
+//   모두: referrer_id=69, reward_date='2026-05-09', level IN (1,2), paid_date='2026-05-11'
+//
+// 3중 가드:
+//   1) id IN 명시적 8개 list
+//   2) reward_date = '2026-05-09' AND level IN (1,2) AND paid_date='2026-05-11' AND referrer_id=69
+//   3) NOT (level=0) — 직접매출분 보존
+//
+// DRY-RUN: GET /api/diag/delete-511-rr-violations?key=ADMIN_PW
+// EXEC:    GET /api/diag/delete-511-rr-violations?key=ADMIN_PW&confirm=DELETE_511_RR_VIOLATIONS
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/delete-511-rr-violations', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'DELETE_511_RR_VIOLATIONS'
+    const db = c.env.DB
+
+    const VIOLATION_IDS = [1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203]
+    const PRESERVE_IDS = [680, 681, 683, 684]
+
+    // 3중 가드 SELECT — 정확히 8건만 매칭되는지 사전 확인
+    const placeholders = VIOLATION_IDS.map(() => '?').join(',')
+    const targets = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE id IN (${placeholders})
+        AND reward_date = '2026-05-09'
+        AND level IN (1, 2)
+        AND paid_date = '2026-05-11'
+        AND referrer_id = 69
+      ORDER BY id
+    `).bind(...VIOLATION_IDS).all<any>()
+
+    const targetRows = (targets.results || []) as any[]
+    const totalQkey = targetRows.reduce((a, b:any) => a + Number(b.reward_amount||0), 0)
+
+    // 가드 위반 검사: 8건 정확히 매칭되어야 함
+    const guardOk = targetRows.length === 8 && totalQkey === 2595
+
+    // 보존 대상이 안전한지 (delete query 가 이들에 영향 안 미치는지)
+    const preservePh = PRESERVE_IDS.map(() => '?').join(',')
+    const wouldAffectPreserve = await db.prepare(`
+      SELECT COUNT(*) as cnt FROM referral_rewards
+      WHERE id IN (${preservePh})
+        AND id IN (${placeholders})
+    `).bind(...PRESERVE_IDS, ...VIOLATION_IDS).first() as any
+    const preserveSafe = Number(wouldAffectPreserve?.cnt || 0) === 0
+
+    // TX 매핑 재확인 (Scenario A 검증)
+    const txCheck = await db.prepare(`
+      SELECT COUNT(*) as cnt FROM transactions
+      WHERE type='referral_reward' AND coin_type='QKEY'
+        AND ref_id IN (${placeholders})
+    `).bind(...VIOLATION_IDS).first() as any
+    const txCount = Number(txCheck?.cnt || 0)
+    const scenarioAOk = txCount === 0
+
+    // referrer 69 의 현재 balance (변동 없어야 함)
+    const u69Before = await db.prepare(`SELECT id, qkey_balance FROM users WHERE id=69`).first() as any
+
+    // 다른 paid_date 영향 없음 확인
+    const otherPaidCheck = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt
+      FROM referral_rewards
+      WHERE paid_date != '2026-05-11'
+        AND id IN (${placeholders})
+    `).bind(...VIOLATION_IDS).all<any>()
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        confirm_token_required: 'DELETE_511_RR_VIOLATIONS',
+        guard_check: {
+          target_count: targetRows.length,
+          target_qkey: totalQkey,
+          expected_count: 8,
+          expected_qkey: 2595,
+          guard_ok: guardOk,
+          preserve_safe: preserveSafe,
+          scenario_a_tx_count: txCount,
+          scenario_a_ok: scenarioAOk,
+          other_paid_affected: (otherPaidCheck.results || []).length,
+        },
+        targets: targetRows,
+        preserve_ids: PRESERVE_IDS,
+        referrer_69_balance_before: u69Before,
+        balance_action: 'NONE (Scenario A — TX 매핑 0건, balance 차감 안 됨, 손대지 마라)',
+        tx_action: 'NONE (대응 TX 없음)',
+        delete_action: `DELETE FROM referral_rewards WHERE id IN (${VIOLATION_IDS.join(',')})`,
+        safety_assertions: [
+          guardOk ? 'PASS: 8건 정확히 매칭' : 'FAIL: 매칭 건수 불일치',
+          preserveSafe ? 'PASS: 보존 대상 (680,681,683,684) 영향 없음' : 'FAIL: 보존 대상 위협',
+          scenarioAOk ? 'PASS: Scenario A 확정 (TX 0건)' : 'FAIL: TX 존재 — balance 처리 재검토 필요',
+        ],
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─── EXEC ───
+    // 가드 fail 이면 실행 거부
+    if (!guardOk || !preserveSafe || !scenarioAOk) {
+      return c.json({
+        ok: false,
+        mode: 'EXEC_BLOCKED',
+        reason: 'safety guard failed',
+        guard_check: { guardOk, preserveSafe, scenarioAOk, targetCount: targetRows.length, totalQkey, txCount },
+      }, 400)
+    }
+
+    // 명시적 id 만 DELETE (3중 WHERE 가드)
+    const delResult = await db.prepare(`
+      DELETE FROM referral_rewards
+      WHERE id IN (${placeholders})
+        AND reward_date = '2026-05-09'
+        AND level IN (1, 2)
+        AND paid_date = '2026-05-11'
+        AND referrer_id = 69
+    `).bind(...VIOLATION_IDS).run()
+
+    const deleted = (delResult as any)?.meta?.changes ?? 0
+
+    // POST-VERIFY: 보존 대상 4건 그대로 있는지
+    const preserveStillThere = await db.prepare(`
+      SELECT id FROM referral_rewards WHERE id IN (${preservePh})
+    `).bind(...PRESERVE_IDS).all<any>()
+
+    // POST-VERIFY: 5/11 paid 의 남은 RR
+    const remaining511 = await db.prepare(`
+      SELECT COUNT(*) as cnt, COALESCE(SUM(reward_amount),0) as total_qkey
+      FROM referral_rewards WHERE paid_date='2026-05-11'
+    `).first() as any
+
+    // POST-VERIFY: referrer 69 balance 변동 없음
+    const u69After = await db.prepare(`SELECT id, qkey_balance FROM users WHERE id=69`).first() as any
+    const balanceUnchanged = Number(u69Before?.qkey_balance) === Number(u69After?.qkey_balance)
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      deleted_count: deleted,
+      expected_count: 8,
+      delete_ok: deleted === 8,
+      post_verify: {
+        preserve_rows_still_exist: (preserveStillThere.results || []).length,
+        preserve_expected: 4,
+        preserve_ok: (preserveStillThere.results || []).length === 4,
+        remaining_511_rr_count: Number(remaining511?.cnt || 0),
+        remaining_511_rr_qkey: Number(remaining511?.total_qkey || 0),
+        expected_remaining_count: 4,
+        expected_remaining_qkey: 225000,  // 45000+105000+60000+15000
+        referrer_69_balance_before: Number(u69Before?.qkey_balance || 0),
+        referrer_69_balance_after: Number(u69After?.qkey_balance || 0),
+        balance_unchanged: balanceUnchanged,
+        balance_change_expected: 0,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
