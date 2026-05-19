@@ -51269,4 +51269,315 @@ app.get('/api/diag/fix-paid-date-canonical', async (c) => {
 })
 
 
+// ============================================================
+// 영구룰 100% 진단 — paid_date 별 reward_date 분포 + KST 표시 검증
+// ============================================================
+app.get('/api/diag/paid-vs-reward-matrix', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // 영구룰 #익일처리: 다음 영업일
+    function nextBusinessDay(ymd: string): string {
+      const [Y, M, D] = ymd.split('-').map(Number)
+      const dt = new Date(Date.UTC(Y, M - 1, D))
+      while (true) {
+        dt.setUTCDate(dt.getUTCDate() + 1)
+        const dow = dt.getUTCDay()
+        if (dow !== 0 && dow !== 6) break
+      }
+      const y = dt.getUTCFullYear()
+      const m = String(dt.getUTCMonth() + 1).padStart(2, '0')
+      const d = String(dt.getUTCDate()).padStart(2, '0')
+      return `${y}-${m}-${d}`
+    }
+    function prevDayUtc23(ymd: string): string {
+      const [Y, M, D] = ymd.split('-').map(Number)
+      const dt = new Date(Date.UTC(Y, M - 1, D))
+      dt.setUTCDate(dt.getUTCDate() - 1)
+      const y = dt.getUTCFullYear()
+      const m = String(dt.getUTCMonth() + 1).padStart(2, '0')
+      const d = String(dt.getUTCDate()).padStart(2, '0')
+      return `${y}-${m}-${d} 23:00:00`
+    }
+
+    // daily_rewards (paid_date, reward_date) 매트릭스
+    const drMatrix = await db.prepare(`
+      SELECT paid_date, reward_date, COUNT(*) AS c, MIN(created_at) AS sample_created
+      FROM daily_rewards
+      GROUP BY paid_date, reward_date
+      ORDER BY paid_date DESC, reward_date DESC
+    `).all<any>()
+    const rrMatrix = await db.prepare(`
+      SELECT paid_date, reward_date, COUNT(*) AS c, MIN(created_at) AS sample_created
+      FROM referral_rewards
+      GROUP BY paid_date, reward_date
+      ORDER BY paid_date DESC, reward_date DESC
+    `).all<any>()
+
+    function kstFromUtc(utcStr: string | null): string {
+      if (!utcStr) return ''
+      // SQLite 저장값을 UTC 로 보고 +9h
+      const m = utcStr.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/)
+      if (!m) return utcStr
+      const [_, Y, Mo, D, h, mi, s] = m
+      const dt = new Date(Date.UTC(+Y, +Mo - 1, +D, +h, +mi, +s))
+      dt.setUTCHours(dt.getUTCHours() + 9)
+      const y2 = dt.getUTCFullYear()
+      const mo2 = String(dt.getUTCMonth() + 1).padStart(2, '0')
+      const d2 = String(dt.getUTCDate()).padStart(2, '0')
+      const h2 = String(dt.getUTCHours()).padStart(2, '0')
+      const mi2 = String(dt.getUTCMinutes()).padStart(2, '0')
+      return `${y2}-${mo2}-${d2} ${h2}:${mi2}`
+    }
+
+    // 각 그룹별 영구룰 검증
+    function check(row: any) {
+      const pd = row.paid_date
+      const rd = row.reward_date
+      if (!pd || !rd) return { ...row, verdict: '⚠️ NULL', expected_paid: null, expected_created: null }
+      const expectedPaid = nextBusinessDay(rd)
+      const expectedCreated = prevDayUtc23(pd)
+      const kstDisplay = kstFromUtc(row.sample_created)
+      const expectedKst = kstFromUtc(expectedCreated)
+      const paidOk = pd === expectedPaid
+      const createdOk = kstDisplay === expectedKst
+      return {
+        paid_date: pd,
+        reward_date: rd,
+        cnt: row.c,
+        expected_paid_per_rule: expectedPaid,
+        paid_date_correct: paidOk,
+        sample_created_utc: row.sample_created,
+        kst_display: kstDisplay,
+        expected_kst_display: expectedKst,
+        created_at_correct: createdOk,
+        verdict: paidOk && createdOk ? '✅ OK' : `🔴 ${!paidOk ? 'paid_date 위반 ' : ''}${!createdOk ? 'created_at 위반' : ''}`,
+      }
+    }
+
+    const drChecked = (drMatrix.results || []).map(check)
+    const rrChecked = (rrMatrix.results || []).map(check)
+    const drViolations = drChecked.filter((x: any) => x.verdict !== '✅ OK')
+    const rrViolations = rrChecked.filter((x: any) => x.verdict !== '✅ OK')
+
+    return c.json({
+      ok: true,
+      rule_refs: [
+        '#익일처리: paid_date = nextBusinessDay(reward_date)',
+        '#정규시각: KST display = paid_date 08:00 (= UTC paid_date-1 23:00)',
+      ],
+      daily_rewards: {
+        total_groups: drChecked.length,
+        violations: drViolations.length,
+        rows: drChecked,
+      },
+      referral_rewards: {
+        total_groups: rrChecked.length,
+        violations: rrViolations.length,
+        rows: rrChecked,
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================
+// 영구룰 100% 정정 v2 — paid_date 표시일 + created_at KST 08:00 정정
+// 사장님 인용 (2026-05-19):
+//   "5월 7일확정분이 5월 8일에 찍혀야 하고 5월 8일 확정분이 11일날 표시"
+//   "5월 15일꺼는 5월 18일로 찍혀야 하고 또 첫 평일이기 때문"
+//   "맞는 날짜는 놔두고!"
+// → reward_date 별로 영구룰 정답 paid_date 와 created_at 계산
+// → 현재 값과 다를 때만 UPDATE (맞는 건 놔둠)
+// → 잔액 변경 0 (UPDATE 만, paid_date + created_at)
+// ============================================================
+app.get('/api/diag/fix-paid-date-v2', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_V2'
+    const db = c.env.DB
+
+    function nextBusinessDay(ymd: string): string {
+      const [Y, M, D] = ymd.split('-').map(Number)
+      const dt = new Date(Date.UTC(Y, M - 1, D))
+      while (true) {
+        dt.setUTCDate(dt.getUTCDate() + 1)
+        const dow = dt.getUTCDay()
+        if (dow !== 0 && dow !== 6) break
+      }
+      const y = dt.getUTCFullYear()
+      const m = String(dt.getUTCMonth() + 1).padStart(2, '0')
+      const d = String(dt.getUTCDate()).padStart(2, '0')
+      return `${y}-${m}-${d}`
+    }
+    function prevDayUtc23(ymd: string): string {
+      const [Y, M, D] = ymd.split('-').map(Number)
+      const dt = new Date(Date.UTC(Y, M - 1, D))
+      dt.setUTCDate(dt.getUTCDate() - 1)
+      const y = dt.getUTCFullYear()
+      const m = String(dt.getUTCMonth() + 1).padStart(2, '0')
+      const d = String(dt.getUTCDate()).padStart(2, '0')
+      return `${y}-${m}-${d} 23:00:00`
+    }
+
+    // 모든 (reward_date, paid_date, created_at) 그룹 추출
+    const drGroups = await db.prepare(`
+      SELECT reward_date, paid_date, created_at, COUNT(*) AS c
+      FROM daily_rewards
+      WHERE reward_date IS NOT NULL
+      GROUP BY reward_date, paid_date, created_at
+      ORDER BY reward_date DESC
+    `).all<any>()
+    const rrGroups = await db.prepare(`
+      SELECT reward_date, paid_date, created_at, COUNT(*) AS c
+      FROM referral_rewards
+      WHERE reward_date IS NOT NULL
+      GROUP BY reward_date, paid_date, created_at
+      ORDER BY reward_date DESC
+    `).all<any>()
+
+    type Plan = {
+      table: 'daily_rewards' | 'referral_rewards'
+      reward_date: string
+      old_paid: string | null
+      old_created: string | null
+      new_paid: string
+      new_created: string
+      cnt: number
+      changes: string[]
+    }
+    const plans: Plan[] = []
+    for (const g of (drGroups.results || []) as any[]) {
+      const newPaid = nextBusinessDay(g.reward_date)
+      const newCreated = prevDayUtc23(newPaid)
+      const ch: string[] = []
+      if (g.paid_date !== newPaid) ch.push(`paid:${g.paid_date}→${newPaid}`)
+      if (g.created_at !== newCreated) ch.push(`created:${g.created_at}→${newCreated}`)
+      if (ch.length > 0) {
+        plans.push({
+          table: 'daily_rewards',
+          reward_date: g.reward_date,
+          old_paid: g.paid_date,
+          old_created: g.created_at,
+          new_paid: newPaid,
+          new_created: newCreated,
+          cnt: g.c,
+          changes: ch,
+        })
+      }
+    }
+    for (const g of (rrGroups.results || []) as any[]) {
+      const newPaid = nextBusinessDay(g.reward_date)
+      const newCreated = prevDayUtc23(newPaid)
+      const ch: string[] = []
+      if (g.paid_date !== newPaid) ch.push(`paid:${g.paid_date}→${newPaid}`)
+      if (g.created_at !== newCreated) ch.push(`created:${g.created_at}→${newCreated}`)
+      if (ch.length > 0) {
+        plans.push({
+          table: 'referral_rewards',
+          reward_date: g.reward_date,
+          old_paid: g.paid_date,
+          old_created: g.created_at,
+          new_paid: newPaid,
+          new_created: newCreated,
+          cnt: g.c,
+          changes: ch,
+        })
+      }
+    }
+
+    if (!isExec) {
+      // 정정 영향 합산
+      const summary = new Map<string, any>()
+      for (const p of plans) {
+        const k = `${p.table}|${p.reward_date}|${p.new_paid}`
+        if (!summary.has(k)) {
+          summary.set(k, {
+            table: p.table,
+            reward_date: p.reward_date,
+            target_paid_date: p.new_paid,
+            target_kst_display: `${p.new_paid} 08:00`,
+            rows_to_update: 0,
+          })
+        }
+        summary.get(k).rows_to_update += p.cnt
+      }
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        rule: 'paid_date = nextBusinessDay(reward_date), created_at = UTC paid_date-1 23:00 (= KST paid_date 08:00)',
+        plans_count: plans.length,
+        plans,
+        summary: Array.from(summary.values()),
+        balance_guarantee: 'users.qkey_balance / transactions.amount 미변경',
+        confirm_token_required: 'FIX_V2',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC
+    // 전략: reward_date 별로 UPDATE (table 별로 묶음)
+    // 같은 reward_date 안의 모든 행을 동일 paid_date + created_at 으로 통일
+    // tx (transactions) 의 created_at 도 같이 정정
+    const execResults: any[] = []
+
+    // reward_date 별 그룹화
+    const rdSet = new Set<string>()
+    for (const p of plans) rdSet.add(p.reward_date)
+
+    for (const rd of Array.from(rdSet).sort()) {
+      const newPaid = nextBusinessDay(rd)
+      const newCreated = prevDayUtc23(newPaid)
+      try {
+        const stmts: any[] = [
+          db.prepare(`UPDATE daily_rewards SET paid_date=?, created_at=? WHERE reward_date=? AND (paid_date!=? OR created_at!=?)`)
+            .bind(newPaid, newCreated, rd, newPaid, newCreated),
+          db.prepare(`UPDATE referral_rewards SET paid_date=?, created_at=? WHERE reward_date=? AND (paid_date!=? OR created_at!=?)`)
+            .bind(newPaid, newCreated, rd, newPaid, newCreated),
+          // tx created_at 도 정정 (ref_id 로 매칭)
+          db.prepare(`UPDATE transactions SET created_at=? WHERE type='daily_qkey' AND ref_id IN (SELECT id FROM daily_rewards WHERE reward_date=?) AND created_at!=?`)
+            .bind(newCreated, rd, newCreated),
+          db.prepare(`UPDATE transactions SET created_at=? WHERE type='referral_reward' AND ref_id IN (SELECT id FROM referral_rewards WHERE reward_date=?) AND created_at!=?`)
+            .bind(newCreated, rd, newCreated),
+        ]
+        const res = await db.batch(stmts)
+        execResults.push({
+          reward_date: rd,
+          new_paid_date: newPaid,
+          new_created_at_utc: newCreated,
+          new_kst_display: `${newPaid} 08:00`,
+          ok: true,
+          dr_changes: (res[0] as any)?.meta?.changes ?? null,
+          rr_changes: (res[1] as any)?.meta?.changes ?? null,
+          tx_dr_changes: (res[2] as any)?.meta?.changes ?? null,
+          tx_rr_changes: (res[3] as any)?.meta?.changes ?? null,
+        })
+      } catch (e) {
+        execResults.push({ reward_date: rd, ok: false, error: String(e) })
+      }
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      reward_dates_processed: execResults.length,
+      results: execResults,
+      balance_change: '없음 (users.qkey_balance / transactions.amount 미변경)',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
