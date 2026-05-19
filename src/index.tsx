@@ -54204,18 +54204,18 @@ app.get('/api/diag/insert-511-paid-v2', async (c) => {
           LIMIT 1
         `).bind(referrer, d.reward_date, d.reward_date).first() as any
         if (!act) continue
-        // 중복 차단: (referrer, referee, level, reward_date, paid_date)
+        // 중복 차단: (referrer_id, referee_id, level, reward_date, paid_date, staking_id)
         const exists = await db.prepare(`
           SELECT 1 FROM referral_rewards
-          WHERE user_id=? AND from_user_id=? AND level=? AND reward_date=? AND paid_date=?
+          WHERE referrer_id=? AND referee_id=? AND level=? AND reward_date=? AND paid_date=? AND staking_id=?
           LIMIT 1
-        `).bind(referrer, d.referee, level, d.reward_date, PAID_DATE).first() as any
+        `).bind(referrer, d.referee, level, d.reward_date, PAID_DATE, d.staking_id).first() as any
         if (exists) continue
         const rrQkey = Math.floor(Number(d.qkey) * ratio)
         if (rrQkey <= 0) continue
         plan.push({
           referrer, referee: d.referee, level, reward_date: d.reward_date,
-          qkey: rrQkey, source_dr_id: d.dr_id, ratio,
+          qkey: rrQkey, source_dr_id: d.dr_id, source_staking_id: d.staking_id, source_qkey: Number(d.qkey), ratio,
         })
       }
 
@@ -54243,9 +54243,9 @@ app.get('/api/diag/insert-511-paid-v2', async (c) => {
       for (const p of plan) {
         try {
           const ins = await db.prepare(`
-            INSERT INTO referral_rewards (user_id, from_user_id, level, amount, reward_date, paid_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).bind(p.referrer, p.referee, p.level, p.qkey, p.reward_date, PAID_DATE, CREATED_AT_RR_UTC).run()
+            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(p.referrer, p.referee, p.level, p.source_qkey, p.qkey, p.reward_date, PAID_DATE, p.source_staking_id, CREATED_AT_RR_UTC).run()
           const rrId = (ins as any)?.meta?.last_row_id ?? null
           await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(p.qkey, p.referrer).run()
           await db.prepare(`
