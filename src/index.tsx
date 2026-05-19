@@ -50574,34 +50574,19 @@ app.get('/api/diag/emerg-batch-purge', async (c) => {
     const txIds = txList.map((t: any) => Number(t.id))
     const stmts: any[] = []
 
-    // 2) transactions 삭제 (chunk 100)
+    // ⚠️ 중요: daily_rewards / referral_rewards 는 삭제하지 않음.
+    //   - paid_date 가 '2026-05-19' 인 정상 5/19 batch 1개만 존재
+    //   - tx 에서 중복 INSERT 된 5/20 표시분만 회수해야 함
+    //   - dr/rr 지우면 5/19 정상 지급 근거가 사라짐
+
+    // 1) transactions 삭제 (chunk 100)
     for (let i = 0; i < txIds.length; i += 100) {
       const ch = txIds.slice(i, i + 100)
       const ph = ch.map(() => '?').join(',')
       stmts.push(db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...ch))
     }
 
-    // 3) daily_rewards 삭제 (참조된 id 만, chunk 100)
-    if (refDaily.length > 0) {
-      const uniq = Array.from(new Set(refDaily))
-      for (let i = 0; i < uniq.length; i += 100) {
-        const ch = uniq.slice(i, i + 100)
-        const ph = ch.map(() => '?').join(',')
-        stmts.push(db.prepare(`DELETE FROM daily_rewards WHERE id IN (${ph})`).bind(...ch))
-      }
-    }
-
-    // 4) referral_rewards 삭제
-    if (refRR.length > 0) {
-      const uniq = Array.from(new Set(refRR))
-      for (let i = 0; i < uniq.length; i += 100) {
-        const ch = uniq.slice(i, i + 100)
-        const ph = ch.map(() => '?').join(',')
-        stmts.push(db.prepare(`DELETE FROM referral_rewards WHERE id IN (${ph})`).bind(...ch))
-      }
-    }
-
-    // 5) users.qkey_balance 차감 (사용자별 1행씩)
+    // 2) users.qkey_balance 차감 (사용자별 1행씩) - tx 합계만큼
     for (const [uid, amt] of Object.entries(userDeduct)) {
       stmts.push(db.prepare(`
         UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?
@@ -50614,8 +50599,9 @@ app.get('/api/diag/emerg-batch-purge', async (c) => {
       ok: true,
       target_prefix: prefix,
       purged_tx: txIds.length,
-      purged_daily_rewards: refDaily.length,
-      purged_referral_rewards: refRR.length,
+      preserved_daily_rewards: refDaily.length,
+      preserved_referral_rewards: refRR.length,
+      note: 'daily_rewards / referral_rewards 는 보존됨 (정상 5/19 batch). tx 중복분만 삭제.',
       affected_users: Object.keys(userDeduct).length,
       total_qkey_deducted: Object.values(userDeduct).reduce((a, b) => a + b, 0),
       per_user_deduct_sample: Object.entries(userDeduct).slice(0, 10).map(([uid, v]) => ({ user_id: uid, deduct: v })),
