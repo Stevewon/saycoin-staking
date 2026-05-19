@@ -61558,4 +61558,196 @@ app.get('/api/diag/rollback-solbat-tree-v2', async (c) => {
 })
 
 
+// ============================================================================
+// solbat-tree-weekday-missing-scan — 솔밧 트리 평일 누락 정밀 점검 (read-only)
+// 휴일 무배당 영구룰 반영: 토/일/공휴일은 reward_date 가 될 수 없음
+// 점검 범위: 사장님 지정 5/4 ~ 5/18 중 평일만 추출
+//   - 5/4(월) 5/6(수) 5/7(목) 5/8(금) 5/11(월) 5/12(화) 5/13(수) 5/14(목) 5/15(금) 5/18(월)
+//   - 제외: 5/5(어린이날), 5/9(토), 5/10(일), 5/16(토), 5/17(일)
+// 비교 기준: 5/19 정상 패턴 = 본인 daily 750 + L1 referral 1050 + L2 referral 1950
+// 출력: 15명 × reward_date 행렬, 누락(0건/금액부족) 식별
+// 경로: GET /api/diag/solbat-tree-weekday-missing-scan?pw=ADMIN_PW
+// ============================================================================
+app.get('/api/diag/solbat-tree-weekday-missing-scan', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+
+  try {
+    // 솔밧 트리 15명
+    const SOLBAT = 44
+    const L1_IDS = [45, 47, 48, 50, 52, 54, 89]
+    const L2_IDS = [46, 49, 73, 74, 76, 90, 93]
+    const ALL_IDS = [SOLBAT, ...L1_IDS, ...L2_IDS]
+    const ph = ALL_IDS.map(() => '?').join(',')
+
+    // 점검 대상 평일 (휴일 제외)
+    const WEEKDAYS = [
+      '2026-05-04', // 월
+      '2026-05-06', // 수 (5/5 어린이날 다음날)
+      '2026-05-07', // 목
+      '2026-05-08', // 금
+      '2026-05-11', // 월
+      '2026-05-12', // 화
+      '2026-05-13', // 수
+      '2026-05-14', // 목
+      '2026-05-15', // 금
+      '2026-05-18', // 월
+    ]
+
+    // 5/19 기준 정상 패턴
+    const EXPECTED = {
+      self_daily: 750,
+      l1_referral_per_referee: 150, // L1 referrer 가 받는 1명당 = 150
+      l2_referral_per_referee: 75,  // L2 referrer 가 받는 1명당 = 75
+    }
+
+    // 회원 정보
+    const userRows = (await c.env.DB.prepare(
+      `SELECT id, email, name FROM users WHERE id IN (${ph})`
+    ).bind(...ALL_IDS).all()).results as any[]
+    const userMap: Record<number, any> = {}
+    for (const u of userRows) userMap[u.id] = u
+
+    // 1) 본인 daily_rewards (reward_date 별)
+    //    daily_rewards 컬럼에는 usdt_amount 만 있으므로 QKEY 환산은 tx 미러로 봐야 함
+    //    → transactions(type='daily_qkey', ref_id=dr.id) 의 amount 합으로 산출
+    const dailyRows = (await c.env.DB.prepare(`
+      SELECT dr.user_id, dr.reward_date,
+             COALESCE(SUM(t.amount), 0) AS qkey_sum,
+             COUNT(dr.id) AS dr_cnt
+      FROM daily_rewards dr
+      LEFT JOIN transactions t ON t.ref_id = dr.id AND t.type = 'daily_qkey' AND t.user_id = dr.user_id
+      WHERE dr.user_id IN (${ph})
+        AND dr.reward_date IN (${WEEKDAYS.map(() => '?').join(',')})
+      GROUP BY dr.user_id, dr.reward_date
+    `).bind(...ALL_IDS, ...WEEKDAYS).all()).results as any[]
+
+    // 2) referral_rewards (referrer_id 별)
+    const refRows = (await c.env.DB.prepare(`
+      SELECT rr.referrer_id AS user_id, rr.reward_date, rr.level,
+             COALESCE(SUM(rr.reward_amount), 0) AS qkey_sum,
+             COUNT(rr.id) AS rr_cnt
+      FROM referral_rewards rr
+      WHERE rr.referrer_id IN (${ph})
+        AND rr.reward_date IN (${WEEKDAYS.map(() => '?').join(',')})
+      GROUP BY rr.referrer_id, rr.reward_date, rr.level
+    `).bind(...ALL_IDS, ...WEEKDAYS).all()).results as any[]
+
+    // 3) 행렬 만들기
+    type Cell = { self_daily: number, l1_ref: number, l2_ref: number, total: number, dr_cnt: number, l1_cnt: number, l2_cnt: number }
+    const matrix: Record<number, Record<string, Cell>> = {}
+    for (const uid of ALL_IDS) {
+      matrix[uid] = {}
+      for (const d of WEEKDAYS) {
+        matrix[uid][d] = { self_daily: 0, l1_ref: 0, l2_ref: 0, total: 0, dr_cnt: 0, l1_cnt: 0, l2_cnt: 0 }
+      }
+    }
+    for (const r of dailyRows) {
+      if (matrix[r.user_id]?.[r.reward_date]) {
+        matrix[r.user_id][r.reward_date].self_daily = Number(r.qkey_sum) || 0
+        matrix[r.user_id][r.reward_date].dr_cnt = Number(r.dr_cnt) || 0
+      }
+    }
+    for (const r of refRows) {
+      const cell = matrix[r.user_id]?.[r.reward_date]
+      if (!cell) continue
+      if (r.level === 1) {
+        cell.l1_ref = Number(r.qkey_sum) || 0
+        cell.l1_cnt = Number(r.rr_cnt) || 0
+      } else if (r.level === 2) {
+        cell.l2_ref = Number(r.qkey_sum) || 0
+        cell.l2_cnt = Number(r.rr_cnt) || 0
+      }
+    }
+    for (const uid of ALL_IDS) {
+      for (const d of WEEKDAYS) {
+        const c2 = matrix[uid][d]
+        c2.total = c2.self_daily + c2.l1_ref + c2.l2_ref
+      }
+    }
+
+    // 4) 솔밧 본인 (5/19 패턴 = 750+1050+1950=3750) 일치 검증
+    //    솔밧 = 본인 750 + L1 1050(=150×7) + L2 1950(=75×26 approx?? — 5/19 실측값 사용)
+    //    여기는 5/19 실측 그대로: 본인 750 / L1 1050 / L2 1950 / total 3750
+    const solbatPattern: any[] = []
+    for (const d of WEEKDAYS) {
+      const c2 = matrix[SOLBAT][d]
+      const expected_self = 750
+      const expected_l1 = 1050
+      const expected_l2 = 1950
+      const expected_total = 3750
+      solbatPattern.push({
+        reward_date: d,
+        self_daily: c2.self_daily,
+        l1_ref: c2.l1_ref,
+        l2_ref: c2.l2_ref,
+        total: c2.total,
+        expected_total,
+        diff: c2.total - expected_total,
+        status: c2.total === expected_total ? 'OK'
+              : c2.total === 0 ? 'MISSING_ALL'
+              : 'PARTIAL',
+        detail: {
+          self_diff: c2.self_daily - expected_self,
+          l1_diff: c2.l1_ref - expected_l1,
+          l2_diff: c2.l2_ref - expected_l2,
+        }
+      })
+    }
+
+    // 5) 회원별 reward_date 별 self_daily 누락 여부 (단순 0 vs >0)
+    //    각 회원 자기 daily 가 0 인 reward_date 만 보고
+    const perUserMissing: any[] = []
+    for (const uid of ALL_IDS) {
+      const u = userMap[uid] || { name: '?', email: '?' }
+      const missDays: string[] = []
+      const partialDays: any[] = []
+      for (const d of WEEKDAYS) {
+        const c2 = matrix[uid][d]
+        if (c2.self_daily === 0 && c2.l1_ref === 0 && c2.l2_ref === 0) {
+          missDays.push(d)
+        } else if (c2.self_daily === 0) {
+          partialDays.push({ date: d, l1_ref: c2.l1_ref, l2_ref: c2.l2_ref })
+        }
+      }
+      perUserMissing.push({
+        user_id: uid,
+        name: u.name,
+        email: u.email,
+        level: uid === SOLBAT ? 0 : (L1_IDS.includes(uid) ? 1 : 2),
+        missing_all_days: missDays,
+        partial_days_self_zero: partialDays,
+      })
+    }
+
+    // 6) 평일별 그랜드 토탈
+    const dailySummary = WEEKDAYS.map(d => {
+      let sum = 0, missCount = 0
+      for (const uid of ALL_IDS) {
+        const c2 = matrix[uid][d]
+        sum += c2.total
+        if (c2.self_daily === 0 && c2.l1_ref === 0 && c2.l2_ref === 0) missCount++
+      }
+      return { reward_date: d, total_qkey: sum, users_missing_all: missCount }
+    })
+
+    return c.json({
+      mode: 'READ_ONLY',
+      reference_pattern: '5/19 정상: solbat 본인 750 + L1 1050 + L2 1950 = 3,750/일',
+      checked_weekdays: WEEKDAYS,
+      holidays_excluded: ['2026-05-05(어린이날)', '2026-05-09(토)', '2026-05-10(일)', '2026-05-16(토)', '2026-05-17(일)'],
+      solbat_pattern_check: solbatPattern,
+      per_user_missing: perUserMissing,
+      daily_summary: dailySummary,
+      raw_matrix: matrix,
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
