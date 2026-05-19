@@ -54414,4 +54414,130 @@ app.get('/api/diag/inspect-511-existing-rr', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// inspect-511-rr-violations — 삭제 대상 8건 (id 1196-1203) 정밀 검사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 보존: id 680, 681, 683 (5/8 reward level=0, 직접매출분)
+// 보존: id 684 (5/9 reward level=0, 직접매출분)
+// 삭제: id 1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203 (5/9 reward level=1/2, 영구룰 위반)
+//
+// 검사 항목:
+//   1) 각 RR row 상세
+//   2) referrer 69 의 qkey_balance 현재값
+//   3) 대응 transactions row 매핑 시도 (다양한 방식)
+//   4) 삭제 후 balance 변동량 사전 계산
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/inspect-511-rr-violations', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    const VIOLATION_IDS = [1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203]
+    const PRESERVE_IDS = [680, 681, 683, 684]  // 직접매출분 보존
+
+    // 1) 삭제 대상 8건 상세
+    const placeholders = VIOLATION_IDS.map(() => '?').join(',')
+    const violations = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE id IN (${placeholders})
+      ORDER BY id
+    `).bind(...VIOLATION_IDS).all<any>()
+
+    // 2) 보존 대상 4건 상세 (확인용)
+    const preservePh = PRESERVE_IDS.map(() => '?').join(',')
+    const preserves = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE id IN (${preservePh})
+      ORDER BY id
+    `).bind(...PRESERVE_IDS).all<any>()
+
+    // 3) referrer 69 의 현재 qkey_balance
+    const u69 = await db.prepare(`SELECT id, qkey_balance, name, email FROM users WHERE id=69`).first() as any
+
+    // 4) transactions 매핑 시도 (3가지 방식)
+    // 방식 A: ref_id = rr.id (이전 inspect 에서 0건)
+    const txByRefId = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE type='referral_reward' AND coin_type='QKEY'
+        AND ref_id IN (${placeholders})
+      ORDER BY ref_id, id
+    `).bind(...VIOLATION_IDS).all<any>()
+
+    // 방식 B: referrer 69 의 5/10 23:00 UTC 시각 referral_reward TX
+    const txByTime = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE user_id=69 AND type='referral_reward' AND coin_type='QKEY'
+        AND created_at >= '2026-05-10 23:00:00'
+        AND created_at < '2026-05-11 00:00:00'
+      ORDER BY id
+    `).all<any>()
+
+    // 방식 C: referrer 69 의 5/10 23:00 UTC 시각 모든 TX
+    const txAllByTime = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE user_id=69
+        AND created_at >= '2026-05-10 23:00:00'
+        AND created_at < '2026-05-11 00:00:00'
+      ORDER BY id
+    `).all<any>()
+
+    // 삭제 후 balance 차감 예정 금액
+    const violationSum = (violations.results || []).reduce((a, b:any) => a + Number(b.reward_amount||0), 0)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_INSPECT',
+      violation_targets: {
+        ids: VIOLATION_IDS,
+        count: (violations.results || []).length,
+        total_qkey_to_subtract: violationSum,
+        rows: violations.results || [],
+      },
+      preserve_targets: {
+        ids: PRESERVE_IDS,
+        count: (preserves.results || []).length,
+        rows: preserves.results || [],
+      },
+      referrer_69_balance: u69,
+      tx_mapping_attempts: {
+        by_ref_id: {
+          description: 'ref_id IN VIOLATION_IDS (전형적 매핑)',
+          count: (txByRefId.results || []).length,
+          rows: txByRefId.results || [],
+        },
+        by_user_69_time: {
+          description: 'referrer=69 type=referral_reward at 2026-05-10 23:00 UTC',
+          count: (txByTime.results || []).length,
+          rows: txByTime.results || [],
+        },
+        by_user_69_all_time: {
+          description: 'referrer=69 ALL TX at 2026-05-10 23:00 UTC (referral 외 포함)',
+          count: (txAllByTime.results || []).length,
+          rows: txAllByTime.results || [],
+        },
+      },
+      delete_plan: {
+        description: '삭제 시 영향',
+        will_delete_rr_count: 8,
+        will_delete_rr_qkey_total: violationSum,
+        will_decrement_balance: `users.qkey_balance for user_id=69 by ${violationSum}`,
+        will_delete_tx_strategy: 'TBD — tx_mapping_attempts 결과 따라 결정',
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
