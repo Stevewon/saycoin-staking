@@ -56579,21 +56579,29 @@ app.get('/api/diag/verify-519-bottom-up', async (c) => {
     const rrL12Ids = [...rrL1, ...rrL2].map(r => r.id)
     let txByDrRef: any[] = []
     let txByRrRef: any[] = []
+    // D1 SQL 변수 한계 회피: 50개 청크로 IN 절 분할
+    const CHUNK = 50
     if (drIds.length > 0) {
-      const ph = drIds.map(()=>'?').join(',')
-      const r = await db.prepare(`
-        SELECT id, user_id, type, amount, ref_id FROM transactions
-        WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
-      `).bind(...drIds).all<any>()
-      txByDrRef = (r.results || []) as any[]
+      for (let i = 0; i < drIds.length; i += CHUNK) {
+        const chunk = drIds.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, user_id, type, amount, ref_id FROM transactions
+          WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all<any>()
+        txByDrRef = txByDrRef.concat((r.results || []) as any[])
+      }
     }
     if (rrL12Ids.length > 0) {
-      const ph = rrL12Ids.map(()=>'?').join(',')
-      const r = await db.prepare(`
-        SELECT id, user_id, type, amount, ref_id FROM transactions
-        WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
-      `).bind(...rrL12Ids).all<any>()
-      txByRrRef = (r.results || []) as any[]
+      for (let i = 0; i < rrL12Ids.length; i += CHUNK) {
+        const chunk = rrL12Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, user_id, type, amount, ref_id FROM transactions
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+        `).bind(...chunk).all<any>()
+        txByRrRef = txByRrRef.concat((r.results || []) as any[])
+      }
     }
     if (txByDrRef.length !== drRows.length) errors.push(`TX DR mapping mismatch: ${txByDrRef.length} vs ${drRows.length}`)
     if (txByRrRef.length !== rrL1.length + rrL2.length) {
