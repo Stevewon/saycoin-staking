@@ -56904,6 +56904,142 @@ app.get('/api/diag/scan-balance-vs-tx', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-all-balance-vs-history — 김주성 케이스 전 계정 점검
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19):
+//   "전 계정을 김주성 케이스로 점검하고 현재 합산액과 최종 합산이 되야할 금액을
+//    비교 보고하라!"
+//
+// 김주성 케이스 정의:
+//   - admin 화면 거래내역에 표시되는 QKEY 코인 항목 합계 = 51,450
+//   - 현재 qkey_balance 표시       = 44,100
+//   - 차이 -7,350 = 어제 우리 B EXEC 가 잘못 차감한 분
+//
+// 본 endpoint 가 하는 일:
+//   - 모든 user 에 대해
+//     SUM(transactions.amount WHERE user_id=u.id AND coin_type='QKEY') 계산
+//   - users.qkey_balance 와 비교
+//   - 차이가 0 이 아닌 user 전체 list + 부호별 분류 + 750/7350 배수 분석
+//
+// READ-ONLY. 어떤 DB 변경도 없음.
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+
+    // 전체 user
+    const allUsers = await db.prepare(`
+      SELECT id, name, qkey_balance FROM users ORDER BY id
+    `).all()
+    const users = (allUsers.results || []) as any[]
+
+    // 전체 user 의 QKEY-only TX 합계 (한 번 쿼리)
+    const txAgg = await db.prepare(`
+      SELECT user_id,
+             COUNT(*) AS tx_count,
+             SUM(amount) AS qkey_tx_sum
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+      GROUP BY user_id
+    `).all()
+    const txMap = new Map<number, { tx_count: number; qkey_tx_sum: number }>()
+    for (const r of (txAgg.results || []) as any[]) {
+      txMap.set(r.user_id, { tx_count: r.tx_count, qkey_tx_sum: r.qkey_tx_sum || 0 })
+    }
+
+    // type 별 breakdown (mismatch user 만 별도)
+    const reports: any[] = []
+    for (const u of users) {
+      const tx = txMap.get(u.id) || { tx_count: 0, qkey_tx_sum: 0 }
+      const actual = Number(u.qkey_balance || 0)
+      const should = Number(tx.qkey_tx_sum || 0)
+      const diff = actual - should
+      reports.push({
+        user_id: u.id,
+        name: u.name,
+        current_balance: actual,           // 현재 합산액 (qkey_balance)
+        history_sum_should: should,        // 최종 합산이 되야할 금액 (QKEY TX 합계)
+        diff_balance_minus_should: diff,
+        tx_count: tx.tx_count,
+        match: diff === 0,
+      })
+    }
+
+    const mismatches = reports.filter(r => !r.match)
+    const matched = reports.filter(r => r.match)
+
+    // 부호별 분류
+    const negative = mismatches.filter(r => r.diff_balance_minus_should < 0)
+    const positive = mismatches.filter(r => r.diff_balance_minus_should > 0)
+
+    // 배수 분석 (750, 7350)
+    const mod750 = mismatches.filter(r => r.diff_balance_minus_should % 750 === 0).length
+    const mod7350 = mismatches.filter(r => r.diff_balance_minus_should % 7350 === 0).length
+
+    // mismatch user 의 type breakdown 조회 (개별 user QKEY TX type 별 sum)
+    const mismatchUserIds = mismatches.map(r => r.user_id)
+    const breakdownMap = new Map<number, Record<string, { cnt: number; sum: number }>>()
+    if (mismatchUserIds.length > 0) {
+      // 50개 청크로 분할 (D1 variable limit)
+      const CHUNK = 50
+      for (let i = 0; i < mismatchUserIds.length; i += CHUNK) {
+        const chunk = mismatchUserIds.slice(i, i + CHUNK)
+        const placeholders = chunk.map(() => '?').join(',')
+        const rows = await db.prepare(`
+          SELECT user_id, type, COUNT(*) AS cnt, SUM(amount) AS sum
+          FROM transactions
+          WHERE coin_type = 'QKEY' AND user_id IN (${placeholders})
+          GROUP BY user_id, type
+        `).bind(...chunk).all()
+        for (const r of (rows.results || []) as any[]) {
+          if (!breakdownMap.has(r.user_id)) breakdownMap.set(r.user_id, {})
+          breakdownMap.get(r.user_id)![r.type] = { cnt: r.cnt, sum: r.sum || 0 }
+        }
+      }
+    }
+
+    // mismatch user 에 type_breakdown 첨부 + |diff| desc 정렬
+    for (const m of mismatches) {
+      m.type_breakdown = breakdownMap.get(m.user_id) || {}
+    }
+    mismatches.sort((a, b) => Math.abs(b.diff_balance_minus_should) - Math.abs(a.diff_balance_minus_should))
+
+    const sumOfDiffs = mismatches.reduce((s, r) => s + r.diff_balance_minus_should, 0)
+    const sumOfAbsDiffs = mismatches.reduce((s, r) => s + Math.abs(r.diff_balance_minus_should), 0)
+
+    return c.json({
+      verdict: mismatches.length === 0 ? 'ALL_MATCH' : 'MISMATCH_FOUND',
+      definition: {
+        case_name: 'kim_jusung_case',
+        rule: 'SUM(transactions.amount WHERE coin_type=QKEY) === users.qkey_balance',
+        explanation: 'admin 거래내역 QKEY 항목 합 = 현재 잔액 표시 이어야 함',
+      },
+      summary: {
+        total_users: users.length,
+        match_count: matched.length,
+        mismatch_count: mismatches.length,
+        sum_of_diffs: sumOfDiffs,         // 음수면 잔액 부족
+        sum_of_abs_diffs: sumOfAbsDiffs,
+        mismatch_negative_count: negative.length,
+        mismatch_positive_count: positive.length,
+        mismatch_negative_total: negative.reduce((s, r) => s + r.diff_balance_minus_should, 0),
+        mismatch_positive_total: positive.reduce((s, r) => s + r.diff_balance_minus_should, 0),
+        diff_mod_750_count: mod750,
+        diff_mod_7350_count: mod7350,
+      },
+      mismatches,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // purge-holiday-513-legacy — 휴일진입자 5/13 legacy daily_reward 잔재 제거
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "b를 발빠르게 처리하고"
