@@ -50404,4 +50404,228 @@ app.get('/api/diag/inspect-paid-date-window', async (c) => {
 })
 
 
+// ============================================================================
+// 🚨 EMERGENCY 2026-05-19: 5/20 (event_at='2026-05-19 23:00') 중복 batch 조사·삭제
+// ============================================================================
+// 발견: transactions 테이블에 event_at='2026-05-19 23:00:00' (KST 5/20 08:00) 행이
+//      이미 박혀있음. 그러나 KST 5/19 14시 현재 5/20 cron 은 실행되지 않아야 하며
+//      paid_date='2026-05-20' 행은 daily_rewards/referral_rewards 에 0건이다.
+//      → transactions 테이블에만 존재하는 "유령 중복 batch" 로 추정.
+//
+// /api/diag/emerg-batch-scan?key=<ADMIN_PW>&target=2026-05-19T23:00:00
+//   - 영향 사용자 수, 행 수, 합계, ref_id 분포, daily_rewards/referral_rewards 매칭 여부
+//   - READ-ONLY (DRY-RUN)
+//
+// /api/diag/emerg-batch-purge?key=<ADMIN_PW>&target=2026-05-19T23:00:00&confirm=PURGE_5_20_BATCH
+//   - tx 삭제 + users.qkey_balance/locked 차감 + 매칭되는 dr/rr 삭제
+//   - atomic batch
+app.get('/api/diag/emerg-batch-scan', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || c.req.query('password') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const target = c.req.query('target') || '2026-05-19 23:00:00'
+
+    // event_at LIKE 'target%' (초까지 같이 매칭 - rr_tx 는 23:00:01 이라 LIKE 'target prefix%' 사용)
+    const prefix = target.replace('T', ' ').slice(0, 16) // '2026-05-19 23:00'
+
+    const txs = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+      FROM transactions
+      WHERE created_at LIKE ? || '%'
+      ORDER BY id ASC
+    `).bind(prefix).all<any>()
+    const txList = txs.results || []
+
+    // 사용자별 집계
+    const byUser: Record<string, { count: number; qkey_sum: number; types: Record<string, number> }> = {}
+    let totalQkey = 0
+    const typeCount: Record<string, number> = {}
+    const refIdsDaily: number[] = []
+    const refIdsRR: number[] = []
+    for (const t of txList) {
+      const uid = String(t.user_id)
+      if (!byUser[uid]) byUser[uid] = { count: 0, qkey_sum: 0, types: {} }
+      byUser[uid].count += 1
+      byUser[uid].types[t.type] = (byUser[uid].types[t.type] || 0) + 1
+      if (t.coin_type === 'QKEY' || t.coin_type === 'qkey') {
+        byUser[uid].qkey_sum += Number(t.amount || 0)
+        totalQkey += Number(t.amount || 0)
+      }
+      typeCount[t.type] = (typeCount[t.type] || 0) + 1
+      if (t.type === 'daily_qkey' && t.ref_id) refIdsDaily.push(Number(t.ref_id))
+      if (t.type === 'referral_reward' && t.ref_id) refIdsRR.push(Number(t.ref_id))
+    }
+
+    // 참조된 daily_rewards / referral_rewards 확인
+    const drMatched: any[] = []
+    if (refIdsDaily.length > 0) {
+      const chunks = []
+      for (let i = 0; i < refIdsDaily.length; i += 50) chunks.push(refIdsDaily.slice(i, i + 50))
+      for (const ch of chunks) {
+        const placeholders = ch.map(() => '?').join(',')
+        const r = await db.prepare(`
+          SELECT id, user_id, paid_date, reward_qkey, created_at
+          FROM daily_rewards WHERE id IN (${placeholders})
+        `).bind(...ch).all<any>()
+        drMatched.push(...(r.results || []))
+      }
+    }
+    const rrMatched: any[] = []
+    if (refIdsRR.length > 0) {
+      const chunks = []
+      for (let i = 0; i < refIdsRR.length; i += 50) chunks.push(refIdsRR.slice(i, i + 50))
+      for (const ch of chunks) {
+        const placeholders = ch.map(() => '?').join(',')
+        const r = await db.prepare(`
+          SELECT id, referrer_id, referee_id, level, paid_date, reward_qkey, created_at
+          FROM referral_rewards WHERE id IN (${placeholders})
+        `).bind(...ch).all<any>()
+        rrMatched.push(...(r.results || []))
+      }
+    }
+
+    // paid_date 분포
+    const drPaidDateDist: Record<string, number> = {}
+    for (const r of drMatched) drPaidDateDist[r.paid_date] = (drPaidDateDist[r.paid_date] || 0) + 1
+    const rrPaidDateDist: Record<string, number> = {}
+    for (const r of rrMatched) rrPaidDateDist[r.paid_date] = (rrPaidDateDist[r.paid_date] || 0) + 1
+
+    // 1차 batch (event_at='2026-05-18 23:00:00') 와 ref_id 충돌하는 사용자/일별 행이 있는지 (이중지급 증거)
+    const otherPrefix = '2026-05-18 23:00'
+    const otherTxs = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id
+      FROM transactions
+      WHERE created_at LIKE ? || '%'
+    `).bind(otherPrefix).all<any>()
+    const otherDailyByUser: Record<string, number> = {}
+    for (const t of (otherTxs.results || [])) {
+      if (t.type === 'daily_qkey') otherDailyByUser[String(t.user_id)] = (otherDailyByUser[String(t.user_id)] || 0) + 1
+    }
+    const dupUsers = Object.keys(byUser).filter(uid => {
+      // 이 사용자가 5/20 batch 에도 daily_qkey 가 있고, 5/19 batch 에도 daily_qkey 가 있으면 이중지급
+      return (byUser[uid].types['daily_qkey'] || 0) > 0 && (otherDailyByUser[uid] || 0) > 0
+    })
+
+    return c.json({
+      ok: true,
+      target_prefix: prefix,
+      tx_total: txList.length,
+      tx_total_qkey: totalQkey,
+      tx_type_count: typeCount,
+      affected_users: Object.keys(byUser).length,
+      per_user_sample: Object.entries(byUser).slice(0, 5).map(([uid, v]) => ({ user_id: uid, ...v })),
+      ref_daily_total: refIdsDaily.length,
+      ref_rr_total: refIdsRR.length,
+      daily_rewards_matched: drMatched.length,
+      referral_rewards_matched: rrMatched.length,
+      dr_paid_date_dist: drPaidDateDist,
+      rr_paid_date_dist: rrPaidDateDist,
+      dr_sample: drMatched.slice(0, 5),
+      rr_sample: rrMatched.slice(0, 5),
+      double_paid_users_with_5_19_batch: dupUsers.length,
+      double_paid_users_sample: dupUsers.slice(0, 10),
+      tx_sample_first5: txList.slice(0, 5),
+      tx_sample_last5: txList.slice(-5),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+app.get('/api/diag/emerg-batch-purge', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || c.req.query('password') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    if (confirm !== 'PURGE_5_20_BATCH') {
+      return c.json({ error: 'confirm token required: confirm=PURGE_5_20_BATCH' }, 400)
+    }
+    const db = c.env.DB
+    const target = c.req.query('target') || '2026-05-19 23:00:00'
+    const prefix = target.replace('T', ' ').slice(0, 16)
+
+    // 1) 대상 tx 전체 SELECT (삭제 전 백업/집계)
+    const txs = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id
+      FROM transactions
+      WHERE created_at LIKE ? || '%'
+    `).bind(prefix).all<any>()
+    const txList = txs.results || []
+    if (txList.length === 0) {
+      return c.json({ ok: true, note: 'no rows to purge', duration_ms: Date.now() - t0 })
+    }
+
+    // 사용자별 차감액 계산 (QKEY only)
+    const userDeduct: Record<string, number> = {}
+    const refDaily: number[] = []
+    const refRR: number[] = []
+    for (const t of txList) {
+      if (t.coin_type === 'QKEY' || t.coin_type === 'qkey') {
+        userDeduct[String(t.user_id)] = (userDeduct[String(t.user_id)] || 0) + Number(t.amount || 0)
+      }
+      if (t.type === 'daily_qkey' && t.ref_id) refDaily.push(Number(t.ref_id))
+      if (t.type === 'referral_reward' && t.ref_id) refRR.push(Number(t.ref_id))
+    }
+
+    const txIds = txList.map((t: any) => Number(t.id))
+    const stmts: any[] = []
+
+    // 2) transactions 삭제 (chunk 100)
+    for (let i = 0; i < txIds.length; i += 100) {
+      const ch = txIds.slice(i, i + 100)
+      const ph = ch.map(() => '?').join(',')
+      stmts.push(db.prepare(`DELETE FROM transactions WHERE id IN (${ph})`).bind(...ch))
+    }
+
+    // 3) daily_rewards 삭제 (참조된 id 만, chunk 100)
+    if (refDaily.length > 0) {
+      const uniq = Array.from(new Set(refDaily))
+      for (let i = 0; i < uniq.length; i += 100) {
+        const ch = uniq.slice(i, i + 100)
+        const ph = ch.map(() => '?').join(',')
+        stmts.push(db.prepare(`DELETE FROM daily_rewards WHERE id IN (${ph})`).bind(...ch))
+      }
+    }
+
+    // 4) referral_rewards 삭제
+    if (refRR.length > 0) {
+      const uniq = Array.from(new Set(refRR))
+      for (let i = 0; i < uniq.length; i += 100) {
+        const ch = uniq.slice(i, i + 100)
+        const ph = ch.map(() => '?').join(',')
+        stmts.push(db.prepare(`DELETE FROM referral_rewards WHERE id IN (${ph})`).bind(...ch))
+      }
+    }
+
+    // 5) users.qkey_balance 차감 (사용자별 1행씩)
+    for (const [uid, amt] of Object.entries(userDeduct)) {
+      stmts.push(db.prepare(`
+        UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?
+      `).bind(Number(amt), Number(uid)))
+    }
+
+    const res = await db.batch(stmts)
+
+    return c.json({
+      ok: true,
+      target_prefix: prefix,
+      purged_tx: txIds.length,
+      purged_daily_rewards: refDaily.length,
+      purged_referral_rewards: refRR.length,
+      affected_users: Object.keys(userDeduct).length,
+      total_qkey_deducted: Object.values(userDeduct).reduce((a, b) => a + b, 0),
+      per_user_deduct_sample: Object.entries(userDeduct).slice(0, 10).map(([uid, v]) => ({ user_id: uid, deduct: v })),
+      batch_result_count: res.length,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
