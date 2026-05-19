@@ -52903,4 +52903,327 @@ app.get('/api/diag/resume-512', async (c) => {
 })
 
 
+// ★ 사장님 명령 (2026-05-19) ★
+// "바텀업 정산을 통해서 11일확정치 12일날 지급이 지금 맞아? 틀리면 바텀업 방식으로 무조건 12일날 확정 지급"
+//
+// READ-ONLY 정합 검증:
+//   - 5/11 reward_date 의 모든 staking 에 대해 영구룰 바텀업 정답값 계산
+//   - 현재 DB 의 5/12 paid_date 데이터와 1:1 대조
+//   - 누락 / 과지급 / 금액 불일치 / 영구룰 위반 모두 표시
+//
+// 진단만, INSERT/UPDATE/DELETE 없음
+//
+// 사용: GET /api/diag/verify-512-bottom-up?key=ADMIN_PW
+app.get('/api/diag/verify-512-bottom-up', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    const PAID_DATE = '2026-05-12'
+    const REWARD_DATE = '2026-05-11'
+    const CREATED_AT_UTC_EXPECTED = '2026-05-11 23:00:00'
+    const USD_TO_QKEY = 150
+
+    // ─────────────────────────────────────────────────────────
+    // STEP B: 5/11 active staking 전수 → own_daily 정답값 계산
+    // ─────────────────────────────────────────────────────────
+    const stakings = await db.prepare(`
+      SELECT s.user_id, s.id as staking_id, s.amount, s.period_days, s.period_months,
+             s.daily_rate, s.status,
+             date(s.start_date,'+9 hours') as start_date_kst,
+             date(s.end_date,'+9 hours') as end_date_kst,
+             (SELECT COUNT(*) FROM daily_rewards WHERE staking_id=s.id AND paid_date != ?) as rc_excl
+      FROM staking s
+      WHERE s.status IN ('active','capped','completed')
+        AND date(s.start_date,'+9 hours') <= ?
+        AND date(s.end_date,'+9 hours') >= ?
+      ORDER BY s.id
+    `).bind(PAID_DATE, REWARD_DATE, REWARD_DATE).all<any>()
+    const sRows = (stakings.results || []) as any[]
+
+    // 200% Cap 캐시 (5/12 가산 제외 기준)
+    const userStakeTotalCache = new Map<number, number>()
+    const userPaidExclCache = new Map<number, number>()
+    async function getCap(uid: number): Promise<{ target: number, paid: number }> {
+      let st = userStakeTotalCache.get(uid)
+      if (st === undefined) {
+        const r = await db.prepare(`
+          SELECT COALESCE(SUM(amount),0) as total FROM staking
+          WHERE user_id=? AND status IN ('active','completed','capped')
+        `).bind(uid).first() as any
+        st = Number(r?.total || 0)
+        userStakeTotalCache.set(uid, st)
+      }
+      let pd = userPaidExclCache.get(uid)
+      if (pd === undefined) {
+        const r = await db.prepare(`
+          SELECT COALESCE(SUM(amount),0) as total FROM transactions
+          WHERE user_id=? AND coin_type='QKEY'
+            AND type IN ('daily_qkey','referral_reward')
+            AND NOT (created_at >= '2026-05-11 23:00:00' AND created_at < '2026-05-13 00:00:00')
+        `).bind(uid).first() as any
+        pd = Number(r?.total || 0)
+        userPaidExclCache.set(uid, pd)
+      }
+      return { target: st * 2 * USD_TO_QKEY, paid: pd }
+    }
+
+    // STEP B: own_daily 정답 plan
+    type OwnPlan = { user_id: number, staking_id: number, expected_qkey: number, period_end: boolean, capped: boolean }
+    const ownExpected: OwnPlan[] = []
+    let stepBPeriodEnd = 0
+    let stepBCapped = 0
+    const userVirtualPaid = new Map<number, number>() // cap simulation 가산
+    for (const s of sRows) {
+      const periodDays = s.period_days || (s.period_months * 30)
+      if (Number(s.rc_excl) >= periodDays) {
+        ownExpected.push({ user_id: s.user_id, staking_id: s.staking_id, expected_qkey: 0, period_end: true, capped: false })
+        stepBPeriodEnd++
+        continue
+      }
+      const cap = await getCap(s.user_id)
+      const virtualPaid = userVirtualPaid.get(s.user_id) || cap.paid
+      if (cap.target > 0 && virtualPaid >= cap.target) {
+        ownExpected.push({ user_id: s.user_id, staking_id: s.staking_id, expected_qkey: 0, period_end: false, capped: true })
+        stepBCapped++
+        continue
+      }
+      const dailyRate = s.daily_rate || getDailyRate(s.amount)
+      let qkey = Math.round(s.amount * dailyRate * USD_TO_QKEY)
+      const remaining = cap.target - virtualPaid
+      if (qkey > remaining) qkey = Math.max(0, Math.floor(remaining))
+      ownExpected.push({ user_id: s.user_id, staking_id: s.staking_id, expected_qkey: qkey, period_end: false, capped: false })
+      userVirtualPaid.set(s.user_id, virtualPaid + qkey)
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // STEP D/E: L1/L2 정답 plan (own_daily 의 referee → 추천인 체인)
+    // ─────────────────────────────────────────────────────────
+    type RefPlan = { referrer_id: number, referee_id: number, level: 1|2, staking_id: number, original: number, expected_reward: number, skipped_reason: string | null }
+    const refExpected: RefPlan[] = []
+    const userRefMap = new Map<number, { l1: number|null, l2: number|null }>()
+    async function loadRefs(uid: number) {
+      if (userRefMap.has(uid)) return userRefMap.get(uid)!
+      const u1 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(uid).first() as any
+      const l1 = u1?.referrer_id ?? null
+      let l2: number | null = null
+      if (l1) {
+        const u2 = await db.prepare(`SELECT referrer_id FROM users WHERE id=?`).bind(l1).first() as any
+        l2 = u2?.referrer_id ?? null
+      }
+      const v = { l1, l2 }
+      userRefMap.set(uid, v)
+      return v
+    }
+    const activeAtCache = new Map<number, boolean>()
+    async function isActiveAt(uid: number, dateStr: string): Promise<boolean> {
+      if (activeAtCache.has(uid)) return activeAtCache.get(uid)!
+      const r = await db.prepare(`
+        SELECT 1 FROM staking
+        WHERE user_id=? AND status IN ('active','capped','completed')
+          AND date(start_date,'+9 hours') <= ? AND date(end_date,'+9 hours') >= ?
+        LIMIT 1
+      `).bind(uid, dateStr, dateStr).first() as any
+      const v = !!r
+      activeAtCache.set(uid, v)
+      return v
+    }
+
+    for (const op of ownExpected) {
+      if (op.expected_qkey <= 0) continue
+      const refs = await loadRefs(op.user_id)
+      // L1
+      if (refs.l1) {
+        const l1Active = await isActiveAt(refs.l1, REWARD_DATE)
+        if (!l1Active) {
+          refExpected.push({ referrer_id: refs.l1, referee_id: op.user_id, level: 1, staking_id: op.staking_id, original: op.expected_qkey, expected_reward: 0, skipped_reason: 'L1_not_active' })
+        } else {
+          const cap = await getCap(refs.l1)
+          const virtualPaid = userVirtualPaid.get(refs.l1) || cap.paid
+          if (cap.target > 0 && virtualPaid >= cap.target) {
+            refExpected.push({ referrer_id: refs.l1, referee_id: op.user_id, level: 1, staking_id: op.staking_id, original: op.expected_qkey, expected_reward: 0, skipped_reason: 'L1_capped' })
+          } else {
+            let r = Math.round(op.expected_qkey * 0.20)
+            const rem = cap.target - virtualPaid
+            if (r > rem) r = Math.max(0, Math.floor(rem))
+            if (r > 0) {
+              refExpected.push({ referrer_id: refs.l1, referee_id: op.user_id, level: 1, staking_id: op.staking_id, original: op.expected_qkey, expected_reward: r, skipped_reason: null })
+              userVirtualPaid.set(refs.l1, virtualPaid + r)
+            }
+          }
+        }
+      }
+      // L2
+      if (refs.l2) {
+        const l2Active = await isActiveAt(refs.l2, REWARD_DATE)
+        if (!l2Active) {
+          refExpected.push({ referrer_id: refs.l2, referee_id: op.user_id, level: 2, staking_id: op.staking_id, original: op.expected_qkey, expected_reward: 0, skipped_reason: 'L2_not_active' })
+        } else {
+          const cap = await getCap(refs.l2)
+          const virtualPaid = userVirtualPaid.get(refs.l2) || cap.paid
+          if (cap.target > 0 && virtualPaid >= cap.target) {
+            refExpected.push({ referrer_id: refs.l2, referee_id: op.user_id, level: 2, staking_id: op.staking_id, original: op.expected_qkey, expected_reward: 0, skipped_reason: 'L2_capped' })
+          } else {
+            let r = Math.round(op.expected_qkey * 0.10)
+            const rem = cap.target - virtualPaid
+            if (r > rem) r = Math.max(0, Math.floor(rem))
+            if (r > 0) {
+              refExpected.push({ referrer_id: refs.l2, referee_id: op.user_id, level: 2, staking_id: op.staking_id, original: op.expected_qkey, expected_reward: r, skipped_reason: null })
+              userVirtualPaid.set(refs.l2, virtualPaid + r)
+            }
+          }
+        }
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 현재 DB 상태
+    // ─────────────────────────────────────────────────────────
+    const drCur = await db.prepare(`
+      SELECT user_id, staking_id, usdt_amount, created_at FROM daily_rewards
+      WHERE paid_date = ? AND reward_date = ?
+    `).bind(PAID_DATE, REWARD_DATE).all<any>()
+    const drRows = (drCur.results || []) as any[]
+    const drMap = new Map<string, any>()
+    for (const r of drRows) drMap.set(`${r.user_id}|${r.staking_id}`, r)
+
+    // referral_rewards 5/12 paid 5/11 reward
+    const rrCur = await db.prepare(`
+      SELECT referrer_id, referee_id, level, staking_id, original_amount, reward_amount, created_at
+      FROM referral_rewards WHERE paid_date = ? AND reward_date = ?
+    `).bind(PAID_DATE, REWARD_DATE).all<any>()
+    const rrRows = (rrCur.results || []) as any[]
+    const rrMap = new Map<string, any>()
+    for (const r of rrRows) rrMap.set(`${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`, r)
+
+    // ─────────────────────────────────────────────────────────
+    // 차이 분석
+    // ─────────────────────────────────────────────────────────
+    const drMissing: any[] = []
+    const drAmountMismatch: any[] = []
+    const drCreatedAtAbnormal: any[] = []
+    for (const op of ownExpected) {
+      if (op.expected_qkey <= 0) continue
+      const k = `${op.user_id}|${op.staking_id}`
+      const cur = drMap.get(k)
+      if (!cur) {
+        drMissing.push({ user_id: op.user_id, staking_id: op.staking_id, expected: op.expected_qkey })
+      } else {
+        if (Number(cur.usdt_amount) !== op.expected_qkey) {
+          drAmountMismatch.push({ user_id: op.user_id, staking_id: op.staking_id, expected: op.expected_qkey, current: Number(cur.usdt_amount), diff: op.expected_qkey - Number(cur.usdt_amount) })
+        }
+        if (cur.created_at !== CREATED_AT_UTC_EXPECTED) {
+          drCreatedAtAbnormal.push({ user_id: op.user_id, staking_id: op.staking_id, current_created_at: cur.created_at, expected: CREATED_AT_UTC_EXPECTED })
+        }
+      }
+    }
+
+    // dr 과지급 (정답 expected_qkey 가 0 이거나 plan 에 없는데 DB 에 있는 경우)
+    const ownPlanKeys = new Set(ownExpected.filter(o=>o.expected_qkey>0).map(o=>`${o.user_id}|${o.staking_id}`))
+    const drOverpaid: any[] = []
+    for (const r of drRows) {
+      const k = `${r.user_id}|${r.staking_id}`
+      if (!ownPlanKeys.has(k)) {
+        drOverpaid.push({ user_id: r.user_id, staking_id: r.staking_id, current: Number(r.usdt_amount) })
+      }
+    }
+
+    const rrMissing: any[] = []
+    const rrAmountMismatch: any[] = []
+    const rrCreatedAtAbnormal: any[] = []
+    for (const rp of refExpected) {
+      if (rp.expected_reward <= 0) continue
+      const k = `${rp.referrer_id}|${rp.referee_id}|${rp.level}|${rp.staking_id}`
+      const cur = rrMap.get(k)
+      if (!cur) {
+        rrMissing.push({ referrer_id: rp.referrer_id, referee_id: rp.referee_id, level: rp.level, staking_id: rp.staking_id, expected: rp.expected_reward })
+      } else {
+        if (Number(cur.reward_amount) !== rp.expected_reward) {
+          rrAmountMismatch.push({ referrer_id: rp.referrer_id, referee_id: rp.referee_id, level: rp.level, staking_id: rp.staking_id, expected: rp.expected_reward, current: Number(cur.reward_amount), diff: rp.expected_reward - Number(cur.reward_amount) })
+        }
+        // 영구룰: rr created_at 은 23:00:00 또는 23:00:01 모두 허용 (DR 후 1초)
+        if (cur.created_at !== '2026-05-11 23:00:00' && cur.created_at !== '2026-05-11 23:00:01') {
+          rrCreatedAtAbnormal.push({ referrer_id: rp.referrer_id, referee_id: rp.referee_id, level: rp.level, staking_id: rp.staking_id, current_created_at: cur.created_at })
+        }
+      }
+    }
+
+    // rr 과지급
+    const refPlanKeys = new Set(refExpected.filter(r=>r.expected_reward>0).map(r=>`${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`))
+    const rrOverpaid: any[] = []
+    for (const r of rrRows) {
+      const k = `${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`
+      if (!refPlanKeys.has(k)) {
+        rrOverpaid.push({ referrer_id: r.referrer_id, referee_id: r.referee_id, level: r.level, staking_id: r.staking_id, current: Number(r.reward_amount) })
+      }
+    }
+
+    // 합계
+    const ownTotalExpected = ownExpected.reduce((a,b) => a + b.expected_qkey, 0)
+    const ownTotalCurrent = drRows.reduce((a,r) => a + Number(r.usdt_amount), 0)
+    const refL1TotalExpected = refExpected.filter(r=>r.level===1).reduce((a,b) => a + b.expected_reward, 0)
+    const refL2TotalExpected = refExpected.filter(r=>r.level===2).reduce((a,b) => a + b.expected_reward, 0)
+    const rrL1TotalCurrent = rrRows.filter(r=>r.level===1).reduce((a,r) => a + Number(r.reward_amount), 0)
+    const rrL2TotalCurrent = rrRows.filter(r=>r.level===2).reduce((a,r) => a + Number(r.reward_amount), 0)
+
+    const allOk =
+      drMissing.length === 0 && drAmountMismatch.length === 0 && drCreatedAtAbnormal.length === 0 && drOverpaid.length === 0 &&
+      rrMissing.length === 0 && rrAmountMismatch.length === 0 && rrCreatedAtAbnormal.length === 0 && rrOverpaid.length === 0
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_VERIFY',
+      paid_date: PAID_DATE,
+      reward_date: REWARD_DATE,
+      created_at_utc_expected: CREATED_AT_UTC_EXPECTED,
+      rule_refs: [
+        '#바텀업정산: leaf→위 STEP B(own) → D(L1) → E(L2)',
+        '#스테이킹별독립: (user,staking,reward_date) 단위',
+        '#익일처리: 5/11(월) reward → paid=5/12(화)',
+        '#정규시각: created_at = 2026-05-11 23:00:00 UTC (KST 5/12 08:00)',
+      ],
+      step_b_own_daily: {
+        total_stakings_in_scope: sRows.length,
+        skip_period_end: stepBPeriodEnd,
+        skip_capped: stepBCapped,
+        expected_rows: ownExpected.filter(o=>o.expected_qkey>0).length,
+        expected_total_qkey: ownTotalExpected,
+        current_rows: drRows.length,
+        current_total_qkey: ownTotalCurrent,
+        missing: drMissing,
+        amount_mismatch: drAmountMismatch,
+        created_at_abnormal: drCreatedAtAbnormal,
+        overpaid_not_in_plan: drOverpaid,
+      },
+      step_d_l1: {
+        expected_rows: refExpected.filter(r=>r.level===1 && r.expected_reward>0).length,
+        expected_total_qkey: refL1TotalExpected,
+        current_rows: rrRows.filter(r=>r.level===1).length,
+        current_total_qkey: rrL1TotalCurrent,
+        missing: rrMissing.filter(r=>r.level===1),
+        amount_mismatch: rrAmountMismatch.filter(r=>r.level===1),
+        created_at_abnormal: rrCreatedAtAbnormal.filter(r=>r.level===1),
+        overpaid_not_in_plan: rrOverpaid.filter(r=>r.level===1),
+      },
+      step_e_l2: {
+        expected_rows: refExpected.filter(r=>r.level===2 && r.expected_reward>0).length,
+        expected_total_qkey: refL2TotalExpected,
+        current_rows: rrRows.filter(r=>r.level===2).length,
+        current_total_qkey: rrL2TotalCurrent,
+        missing: rrMissing.filter(r=>r.level===2),
+        amount_mismatch: rrAmountMismatch.filter(r=>r.level===2),
+        created_at_abnormal: rrCreatedAtAbnormal.filter(r=>r.level===2),
+        overpaid_not_in_plan: rrOverpaid.filter(r=>r.level===2),
+      },
+      verdict: allOk ? 'BOTTOM_UP_OK' : 'BOTTOM_UP_VIOLATION',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
