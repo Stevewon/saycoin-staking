@@ -52039,4 +52039,190 @@ app.get('/api/diag/exec-518-reward-today', async (c) => {
 })
 
 
+// READ-ONLY: 5/12 reward_date 전수조사 - 중복 의심 row 추적
+// GET /api/diag/audit-512-rewards?key=ADMIN_PW
+// 영구룰 #지상최고: 중복지급 0.001%도 안됨 - 사장님 명령 (스샷 증거)
+// 비정규 시각 (08:00 외 created_at) row + 동일 (user, staking, reward_date) 다중 row 검출
+app.get('/api/diag/audit-512-rewards', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') {
+      return c.json({ error: 'unauthorized' }, 403)
+    }
+    const db = c.env.DB
+
+    // 5/12 reward_date 의 모든 daily_rewards
+    const dr512All = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards
+      WHERE reward_date = '2026-05-12'
+      ORDER BY user_id, staking_id, created_at
+    `).all<any>()
+    const drRows = (dr512All.results || []) as any[]
+
+    // 5/12 reward_date 의 모든 referral_rewards
+    const rr512All = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id, original_amount, reward_amount, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE reward_date = '2026-05-12'
+      ORDER BY referrer_id, referee_id, level, staking_id, created_at
+    `).all<any>()
+    const rrRows = (rr512All.results || []) as any[]
+
+    // 동일 (user_id, staking_id, reward_date) 페어 중복 검출 - daily_rewards
+    const drGroupMap = new Map<string, any[]>()
+    for (const r of drRows) {
+      const k = `${r.user_id}|${r.staking_id}|${r.reward_date}`
+      if (!drGroupMap.has(k)) drGroupMap.set(k, [])
+      drGroupMap.get(k)!.push(r)
+    }
+    const drDuplicates: any[] = []
+    for (const [k, rows] of drGroupMap) {
+      if (rows.length >= 2) {
+        drDuplicates.push({
+          key: k,
+          dup_count: rows.length,
+          rows: rows.map(r => ({
+            id: r.id, user_id: r.user_id, staking_id: r.staking_id,
+            usdt_amount: r.usdt_amount, paid_date: r.paid_date, created_at: r.created_at,
+          })),
+        })
+      }
+    }
+
+    // 동일 (referrer, referee, level, staking_id, reward_date) 페어 중복 검출 - referral_rewards
+    const rrGroupMap = new Map<string, any[]>()
+    for (const r of rrRows) {
+      const k = `${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}|${r.reward_date}`
+      if (!rrGroupMap.has(k)) rrGroupMap.set(k, [])
+      rrGroupMap.get(k)!.push(r)
+    }
+    const rrDuplicates: any[] = []
+    for (const [k, rows] of rrGroupMap) {
+      if (rows.length >= 2) {
+        rrDuplicates.push({
+          key: k,
+          dup_count: rows.length,
+          rows: rows.map(r => ({
+            id: r.id, referrer_id: r.referrer_id, referee_id: r.referee_id, level: r.level,
+            staking_id: r.staking_id, reward_amount: r.reward_amount,
+            paid_date: r.paid_date, created_at: r.created_at,
+          })),
+        })
+      }
+    }
+
+    // 비정규 시각 검출 (영구룰 #정규시각: created_at = UTC paid_date-1 23:00:00, 즉 5/12 reward → '2026-05-12 23:00:00')
+    // 정확히 '2026-05-12 23:00:00' ~ '2026-05-12 23:00:09' (extraSeconds 0-9 허용) 외는 비정규
+    const isNormalCreatedAt = (s: string) => {
+      if (!s) return false
+      return /^2026-05-12 23:00:0[0-9]$/.test(s)
+    }
+    const drAbnormal = drRows.filter(r => !isNormalCreatedAt(r.created_at)).map(r => ({
+      id: r.id, user_id: r.user_id, staking_id: r.staking_id,
+      usdt_amount: r.usdt_amount, paid_date: r.paid_date, created_at: r.created_at,
+    }))
+    const rrAbnormal = rrRows.filter(r => !isNormalCreatedAt(r.created_at)).map(r => ({
+      id: r.id, referrer_id: r.referrer_id, referee_id: r.referee_id, level: r.level,
+      staking_id: r.staking_id, reward_amount: r.reward_amount,
+      paid_date: r.paid_date, created_at: r.created_at,
+    }))
+
+    // paid_date 별 그룹 통계
+    const drByPaid: Record<string, number> = {}
+    const rrByPaid: Record<string, number> = {}
+    for (const r of drRows) drByPaid[r.paid_date || 'NULL'] = (drByPaid[r.paid_date || 'NULL'] || 0) + 1
+    for (const r of rrRows) rrByPaid[r.paid_date || 'NULL'] = (rrByPaid[r.paid_date || 'NULL'] || 0) + 1
+
+    // created_at 별 시각 분포 (어떤 시각에 INSERT 됐는지 확인)
+    const drByCreatedAt: Record<string, number> = {}
+    const rrByCreatedAt: Record<string, number> = {}
+    for (const r of drRows) drByCreatedAt[r.created_at || 'NULL'] = (drByCreatedAt[r.created_at || 'NULL'] || 0) + 1
+    for (const r of rrRows) rrByCreatedAt[r.created_at || 'NULL'] = (rrByCreatedAt[r.created_at || 'NULL'] || 0) + 1
+
+    // transactions 5/12-5/13 일일배당 의심 중복
+    const txAll = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, created_at
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND (type IN ('daily_qkey','daily_reward','staking_reward','referral_reward','referral_qkey'))
+        AND created_at >= '2026-05-12 00:00:00'
+        AND created_at <  '2026-05-14 00:00:00'
+      ORDER BY user_id, created_at
+    `).all<any>()
+    const txRows = (txAll.results || []) as any[]
+    const txByCreatedAt: Record<string, number> = {}
+    for (const r of txRows) {
+      const h = (r.created_at || '').substring(0,16) // 분 단위
+      txByCreatedAt[h] = (txByCreatedAt[h] || 0) + 1
+    }
+    // 동일 (user_id, type, amount, 분단위 created_at) 중복 검출
+    const txGroupMap = new Map<string, any[]>()
+    for (const r of txRows) {
+      const minBucket = (r.created_at || '').substring(0,16)
+      const k = `${r.user_id}|${r.type}|${r.amount}|${minBucket}`
+      if (!txGroupMap.has(k)) txGroupMap.set(k, [])
+      txGroupMap.get(k)!.push(r)
+    }
+    const txDuplicates: any[] = []
+    for (const [k, rows] of txGroupMap) {
+      if (rows.length >= 2) {
+        txDuplicates.push({
+          key: k,
+          dup_count: rows.length,
+          ids: rows.map(r => r.id),
+          sample_description: rows[0].description,
+          sample_created_at: rows[0].created_at,
+        })
+      }
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_AUDIT',
+      reward_date_audited: '2026-05-12',
+      rule_refs: [
+        '#지상최고: 중복지급 0.001%도 안됨',
+        '#스테이킹별독립: UNIQUE (referrer, referee, level, staking_id, reward_date)',
+        '#정규시각: created_at = UTC paid_date-1 23:00:00 (5/12 reward → 2026-05-12 23:00:00)',
+        '#익일처리: 5/12(화) reward → paid_date=2026-05-13(수)',
+      ],
+      daily_rewards: {
+        total_rows: drRows.length,
+        unique_groups: drGroupMap.size,
+        duplicate_groups: drDuplicates.length,
+        abnormal_created_at_count: drAbnormal.length,
+        by_paid_date: drByPaid,
+        by_created_at: drByCreatedAt,
+        duplicates: drDuplicates,
+        abnormal_rows: drAbnormal,
+      },
+      referral_rewards: {
+        total_rows: rrRows.length,
+        unique_groups: rrGroupMap.size,
+        duplicate_groups: rrDuplicates.length,
+        abnormal_created_at_count: rrAbnormal.length,
+        by_paid_date: rrByPaid,
+        by_created_at: rrByCreatedAt,
+        duplicates: rrDuplicates,
+        abnormal_rows: rrAbnormal.slice(0, 100), // limit
+      },
+      transactions: {
+        total_rows: txRows.length,
+        duplicate_groups: txDuplicates.length,
+        by_created_at_minute: txByCreatedAt,
+        duplicates: txDuplicates.slice(0, 100),
+      },
+      verdict: (drDuplicates.length === 0 && rrDuplicates.length === 0 && drAbnormal.length === 0 && rrAbnormal.length === 0)
+        ? 'CLEAN'
+        : 'DUPLICATE_OR_ABNORMAL_DETECTED',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
