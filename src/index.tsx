@@ -48173,26 +48173,20 @@ app.get('/api/diag/normalize-tx-time-kst-08', async (c) => {
     `).bind(...paidDates).all()
     const nullRefRows = (nullRefTxRows.results || []) as any[]
 
-    // ── 중복 발생 가능성 사전 점검 (지상최고 명령)
-    // tx UPDATE 시 (user_id, type, ref_id, kst_date) 가 이미 KST 08:00 으로 있는 다른 tx 와
-    // 충돌하면 UNIQUE INDEX 가 막아주지만, 사장님 명령상 사전에 점검해 STOP
-    const collisionCheck: any[] = []
-    const tgtTxAll = [...drTxRows, ...rrTxRows]
-    for (const tx of tgtTxAll) {
-      const refId = tx.ref_id
-      if (refId == null) continue
-      // 같은 (user_id, type, ref_id) 가 이미 또 있는지 (UNIQUE INDEX 가 막아주지만 한번 더 확인)
-      const dup = await db.prepare(`
-        SELECT COUNT(*) AS cnt FROM transactions
-        WHERE user_id=? AND type=? AND ref_id=?
-      `).bind(Number(tx.user_id), String(tx.type), refId).first() as any
-      if (Number(dup?.cnt || 0) > 1) {
-        collisionCheck.push({
-          tx_id: tx.id, user_id: tx.user_id, type: tx.type, ref_id: refId,
-          existing_cnt: Number(dup.cnt)
-        })
-      }
-    }
+    // ── 중복 발생 가능성 사전 점검 (지상최고 명령) — 단일 집계 쿼리로 N+1 회피
+    // (user_id, type, ref_id) 가 이미 2건 이상 존재하는 경우 STOP
+    // 단, UNIQUE INDEX (uq_tx_daily_qkey_ref, uq_tx_referral_ref) 가 이미 적용되어 있으므로
+    // 이 충돌이 발견되면 DB 정합성 문제. UPDATE created_at 은 UNIQUE INDEX 와 무관하므로 안전.
+    const dupAgg = await db.prepare(`
+      SELECT user_id, type, ref_id, COUNT(*) AS cnt
+      FROM transactions
+      WHERE type IN ('daily_qkey','referral_reward')
+        AND ref_id IS NOT NULL
+      GROUP BY user_id, type, ref_id
+      HAVING COUNT(*) > 1
+      LIMIT 50
+    `).all()
+    const collisionCheck = (dupAgg.results || []) as any[]
     if (collisionCheck.length > 0) {
       return c.json({
         ok: false,
