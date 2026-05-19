@@ -4643,7 +4643,7 @@ app.post('/api/rewards/daily', async (c) => {
     if (!isCronCall && !internalManualCall) {
       return c.json({
         success: false,
-        error: '강제 일괄 배당은 비활성화되었습니다. 매 평일 KST 07:00 cron 자동 실행 전용입니다. 개별 보정은 /api/admin/rewards/manual-adjust 를 사용하세요.',
+        error: '강제 일괄 배당은 비활성화되었습니다. 매 평일 KST 08:00 cron 자동 실행 전용입니다. 개별 보정은 /api/admin/rewards/manual-adjust 를 사용하세요.',
         blocked: true
       }, 403)
     }
@@ -4704,19 +4704,38 @@ app.post('/api/rewards/daily', async (c) => {
           todayKstForLock,
           internalManualCall ? 'manual_admin' : 'cron_auto',
           internalManualCall ? 'admin-manual-button' : 'github-actions',
-          internalManualCall ? '어드민 수동 실행 버튼' : 'GitHub Actions cron (KST 07:00)'
+          internalManualCall ? '어드민 수동 실행 버튼' : 'GitHub Actions cron (KST 08:00)'
         ).run()
       } catch(e) {}
     }
-    // ★ 사장님 2026-05-07 명확화 ★
-    //   "한국시간으로 익일 01시 정도에 cron 이 돌면서 전날 24시간동안 매출을 점검해서
-    //    아침 7시에 뿌려주라는 의미" — 즉, 기준일 = 어제 (KST 00:00:00 ~ 23:59:59)
-    //   cron 실행 시각: KST 01:00 (UTC 16:00 전일 평일 0-4)
-    //   reward_date = 어제(KST)  /  paid_date = 오늘(KST 01:00 처리, 사용자 UI 상 07시 지급 라벨)
+    // ★ 사장님 2026-05-07 명확화 (UPDATED 2026-05-19: KST 08:00 정규시각) ★
+    //   기준일 = 어제 (KST 00:00:00 ~ 23:59:59)
+    //   cron 실행 시각: KST 08:00 (UTC 23:00 prev-day) — GitHub Actions schedule '0 23 * * *'
+    //   reward_date = 어제(KST)  /  paid_date = 오늘(KST)
+    //   tx/DR/RR created_at = KST 08:00 of paid_date (= UTC prev-day 23:00) [영구룰 #정규시각 2026-05-19]
     //
-    //   기존 today 기준 → yesterdayKst 기준으로 전면 변경
+    //   기존 today 기준 -> yesterdayKst 기준으로 전면 변경 (2026-05-07)
     const today = kstDateStr(now)
     const yesterdayKst = kstDateStr(new Date(now.getTime() - 24 * 60 * 60 * 1000))
+
+    // ★★★★★ 영구룰 #정규시각 (2026-05-19 변경) — KST 08:00 통일 ★★★★★
+    //   기존: KST 15:15 (= UTC 06:15)  ← 폐기
+    //   현재: KST 08:00 (= UTC 23:00 of paid_date - 1day)
+    //   사장님 명령: "매일 아침 08시에 배당을 할것"
+    //   DB 저장값은 UTC, 사용자 화면은 +9h 보정으로 paid_date KST 08:00 표시
+    //
+    //   계산 방식:
+    //     paid_date = today (KST 날짜, 예: '2026-05-20')
+    //     KST 08:00 of '2026-05-20' = UTC 23:00 of '2026-05-19'
+    //     → UTC datetime string: '${today - 1day} 23:00:00'
+    //
+    //   사고 방지: DB default CURRENT_TIMESTAMP 사용 절대 금지 (5/18 19:04 사고)
+    //              INSERT 시 created_at 명시 필수
+    const paidDateObj = new Date(today + 'T00:00:00+09:00')
+    const prevDayObj = new Date(paidDateObj.getTime() - 24 * 60 * 60 * 1000)
+    const prevDayKstStr = kstDateStr(prevDayObj)  // 'YYYY-MM-DD' for paid_date - 1day (KST)
+    const dailyCreatedAtUtc = `${prevDayKstStr} 23:00:00`       // KST 08:00:00 of paid_date
+    const referralCreatedAtUtc = `${prevDayKstStr} 23:00:01`    // KST 08:00:01 (RR 은 1초 늦게 — 정규 cron 순서 모사)
 
     // ★ 사장님 정책 (2026-05-08 영구) — 진입 차단 룰 변경 ★
     //   기존: 어제(KST)가 휴일이면 cron 전체 차단 → 휴일 진입자 첫 평일 데일리 누락 발생
@@ -4966,11 +4985,13 @@ app.post('/api/rewards/daily', async (c) => {
           // [본인 배당 지급]
           //   reward_date = accrualDate (해당 평일)
           //   paid_date   = today       (오늘 cron 실행일)
+          //   ★ 영구룰 #정규시각 (2026-05-19) — created_at = paid_date KST 08:00 (= UTC prev-day 23:00)
+          //     사고 방지: DB default CURRENT_TIMESTAMP 사용 금지 (5/18 사고)
           // [패치 2026-05-11] ref_id 1:1 매핑 — daily_rewards INSERT 후 last_row_id 캡처
           const drIns = await db.prepare(`
-            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, today).run()
+            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, today, dailyCreatedAtUtc).run()
           const drId = (drIns as any)?.meta?.last_row_id ?? null
 
           await db.prepare(`
@@ -4985,10 +5006,11 @@ app.post('/api/rewards/daily', async (c) => {
             LIMIT 1
           `).bind(drId).first()
           if (!dqExists2) {
+            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00)
             await db.prepare(`
-              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
-              VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
-            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId).run()
+              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+              VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
+            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId, dailyCreatedAtUtc).run()
           }
 
           rewardedCount++
@@ -5044,10 +5066,11 @@ app.post('/api/rewards/daily', async (c) => {
 
                       // [패치 2026-05-11] ref_id 1:1 매핑 — referral_rewards 먼저 INSERT 후 last_row_id 캡처
                       // H plan (2026-05-13): staking_id 명시 INSERT (G2-B 영구 인프라 활용)
+                      // ★ 영구룰 #정규시각 (2026-05-19) — created_at = paid_date KST 08:00
                       const rrL1Ins = await db.prepare(`
-                        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
-                        VALUES (?, ?, 1, ?, ?, ?, ?, ?)
-                      `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today, staking.staking_id).run()
+                        INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+                        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+                      `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, today, staking.staking_id, dailyCreatedAtUtc).run()
                       const rrL1Id = (rrL1Ins as any)?.meta?.last_row_id ?? null
 
                       // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
@@ -5057,10 +5080,11 @@ app.post('/api/rewards/daily', async (c) => {
                         LIMIT 1
                       `).bind(rrL1Id).first()
                       if (!l1TxExists2) {
+                        // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00:01, DR 보다 1초 늦게)
                         await db.prepare(`
-                          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
-                          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
-                        `).bind(level1Referrer.referrer_id, level1Reward, '추천 보너스 (Level 1)', rrL1Id).run()
+                          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+                          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+                        `).bind(level1Referrer.referrer_id, level1Reward, '추천 보너스 (Level 1)', rrL1Id, referralCreatedAtUtc).run()
                       }
                     }
                   }
@@ -5112,10 +5136,11 @@ app.post('/api/rewards/daily', async (c) => {
 
                           // [패치 2026-05-11] ref_id 1:1 매핑 — referral_rewards 먼저 INSERT 후 last_row_id 캡처
                           // H plan (2026-05-13): staking_id 명시 INSERT (G2-B 영구 인프라 활용)
+                          // ★ 영구룰 #정규시각 (2026-05-19) — created_at = paid_date KST 08:00
                           const rrL2Ins = await db.prepare(`
-                            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
-                            VALUES (?, ?, 2, ?, ?, ?, ?, ?)
-                          `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today, staking.staking_id).run()
+                            INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+                            VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?)
+                          `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, today, staking.staking_id, dailyCreatedAtUtc).run()
                           const rrL2Id = (rrL2Ins as any)?.meta?.last_row_id ?? null
 
                           // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
@@ -5125,10 +5150,11 @@ app.post('/api/rewards/daily', async (c) => {
                             LIMIT 1
                           `).bind(rrL2Id).first()
                           if (!l2TxExists2) {
+                            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00:01)
                             await db.prepare(`
-                              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
-                              VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
-                            `).bind(level2Referrer.referrer_id, level2Reward, '추천 보너스 (Level 2)', rrL2Id).run()
+                              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+                              VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+                            `).bind(level2Referrer.referrer_id, level2Reward, '추천 보너스 (Level 2)', rrL2Id, referralCreatedAtUtc).run()
                           }
                         }
                       }
@@ -16745,7 +16771,7 @@ app.get('/api/admin/diag/rewards', async (c) => {
 // 룰 (재확정):
 //   - KST 어제 00:00:00 ~ 23:59:59 사이에 staking-approve 된 회원 = 어제 매출자
 //   - 가입 시간이 KST 00:01 이든 23:59 이든 무조건 같은 KST 날짜로 묶음
-//   - 점검 cron 은 익일 KST 01:00, 지급 cron 은 익일 KST 07:00 으로 분리
+//   - 점검 cron 은 익일 KST 01:00, 지급 cron 은 익일 KST 08:00 으로 분리
 // body:
 //   { targetDate: 'YYYY-MM-DD' (KST, 점검 대상일, 기본=어제 KST),
 //     paidDate:   'YYYY-MM-DD' (KST, 지급일,    기본=오늘 KST),
@@ -18640,7 +18666,7 @@ app.post('/api/admin/rewards/set-daily-paid-date', async (c) => {
 })
 
 // ★★ 어드민 통합 수동 보정 엔드포인트 (2026-05-06 신설) ★★
-// 사용처: 평일 KST 07:00 자동 cron 후 사장님이 임의 수정 필요 시 사용
+// 사용처: 평일 KST 08:00 자동 cron 후 사장님이 임의 수정 필요 시 사용
 //
 // action 종류:
 //  1) "update_amount"  — 특정 daily_rewards 또는 referral_rewards 행의 금액 수정 (잔액 자동 동기화)
@@ -26313,7 +26339,7 @@ app.get('/admin/dashboard', (c) => {
             // 일일 배당금 지급 실행 (사장님 2026-05-07 지시로 비활성화 — cron 자동 전용)
             // ============================================
             async function executeDailyReward() {
-                alert('일일 배당은 매 평일 KST 07:00 cron 자동 실행 전용입니다. 개별 회원 보정은 회원관리 → 잔액 조정 또는 /api/admin/rewards/manual-adjust 를 사용해 주세요.');
+                alert('일일 배당은 매 평일 KST 08:00 cron 자동 실행 전용입니다. 개별 회원 보정은 회원관리 → 잔액 조정 또는 /api/admin/rewards/manual-adjust 를 사용해 주세요.');
                 return;
             }
 
@@ -34300,7 +34326,7 @@ app.get('/api/diag/lucky4492-permanent-rule-correction', async (c) => {
 })
 
 // ============================================================================
-// H plan 5/14 cron 모니터링 endpoint (2026-05-13 작성, 5/14 07:00 KST cron 후 사용)
+// H plan 5/14 cron 모니터링 endpoint (2026-05-13 작성, 5/14 08:00 KST cron 후 사용)
 // ============================================================================
 //   목적: 영구 룰 100% 준수 자동 cron 첫 가동 검증
 //   사용: GET /api/diag/cron-h-plan-monitor?password=...&paid_date=2026-05-14
@@ -34702,7 +34728,7 @@ app.get('/api/diag/cron-h-plan-monitor', async (c) => {
         'L1=20%, L2=10% 절대',
         '#bottom-up: leaf first → parent matching',
         '#이중지급 절대 금지',
-        '#일일 cron 단일화 (KST 07:00 GitHub Actions)',
+        '#일일 cron 단일화 (KST 08:00 GitHub Actions)',
         '#휴일진입자 보호 (각 staking start_kst_date 시점 활성 여부)',
         'staking.daily_rate D1 직접 조회',
         '1 USDT = 150 QKEY',
@@ -37272,7 +37298,7 @@ app.post('/api/diag/fix-solbat-clean-slate-3750', async (c) => {
 //   동작:
 //     1) daily_cron_lock 에 (today_kst, 'manual_admin', note='사장님 18일 절대 차단 명령') INSERT
 //     2) 이미 lock 있으면 그대로 유지 (idempotent)
-//     3) 이후 KST 07:00 GitHub Actions cron 호출 시 existingLock.source='manual_admin' ≠ incoming='cron_auto'
+//     3) 이후 KST 08:00 GitHub Actions cron 호출 시 existingLock.source='manual_admin' ne incoming='cron_auto'
 //        → 즉시 423 Locked 반환, 배당 처리 0건
 //     4) 사장님 수동 실행 시점에 ?force=GO&unlock=GO 로 해제 가능
 //
@@ -37346,7 +37372,7 @@ app.post('/api/diag/admin-block-today-cron', async (c) => {
     return c.json({
       ok: true,
       mode: 'LOCKED',
-      message: `${todayKst} 자동 cron 차단 완료. KST 07:00 GitHub Actions 호출 시 즉시 423 Locked 반환됩니다.`,
+      message: `${todayKst} 자동 cron 차단 완료. KST 08:00 GitHub Actions 호출 시 즉시 423 Locked 반환됩니다.`,
       lock,
       verification: {
         daily_rewards_with_today_rd: drCount,
@@ -43729,9 +43755,12 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
     //   ★ timeout 방지: 직렬 await N번 대신 db.batch() 로 한번에
     let drInserted = 0
     let drTxInserted = 0
-    //   ★ 영구룰 #정규시각: created_at = paid_date 의 KST 15:15 (= UTC 06:15)
+    //   ★ 영구룰 #정규시각 (2026-05-19 변경): created_at = paid_date 의 KST 08:00 (= UTC prev-day 23:00)
+    //     KST 15:15 → KST 08:00 폐기 후 통일
     //     EXEC 시각 INSERT 사고 (5/18 19:04 사건) 방지
-    const dividendCreatedAtUtc = `${payoutDate} 06:15:00`
+    const _payoutPrevDayObj = new Date(payoutDate + 'T00:00:00+09:00')
+    const _payoutPrevDayKst = kstDateStr(new Date(_payoutPrevDayObj.getTime() - 24 * 60 * 60 * 1000))
+    const dividendCreatedAtUtc = `${_payoutPrevDayKst} 23:00:00`  // KST 08:00:00 of payoutDate
     if (expectedDRs.length > 0) {
       // ── (E4-1) DR batch INSERT ──
       for (let i = 0; i < expectedDRs.length; i += CHUNK_SIZE) {
@@ -43757,10 +43786,10 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
         drIdMap.set(`${r.user_id}|${r.staking_id}`, Number(r.id))
       }
       // ── (E4-3) tx batch INSERT (ref_id = dr.id) ──
-      //   ★ created_at: paid_date 의 KST 15:15 정규시각 (= UTC 06:15) — 영구룰 #정규시각
+      //   ★ created_at: paid_date 의 KST 08:00 정규시각 (= UTC prev-day 23:00) — 영구룰 #정규시각 (2026-05-19)
       //     EXEC 실행 시각으로 INSERT 되면 사용자 거래내역 UX 가 EXEC 시각으로 표시되는 사고 (5/18 19:04 사건)
-      //     DB 저장값은 UTC, 화면 표시는 +9h 보정으로 KST 15:15 표시
-      const txCreatedAtUtc = `${payoutDate} 06:15:00`  // = KST 15:15 정규 cron 시각
+      //     DB 저장값은 UTC, 화면 표시는 +9h 보정으로 KST 08:00 표시
+      const txCreatedAtUtc = `${_payoutPrevDayKst} 23:00:00`  // = KST 08:00 정규 cron 시각
       const drTxStmts = expectedDRs.map(dr => {
         const drId = drIdMap.get(`${dr.user_id}|${dr.staking_id}`) ?? null
         return db.prepare(`
@@ -43801,8 +43830,8 @@ async function diagRecalcDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
         rrIdMap.set(`${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id}`, Number(r.id))
       }
       // ── (E5-3) tx batch INSERT (ref_id = rr.id) ──
-      //   ★ created_at: paid_date 의 KST 15:15 정규시각 (= UTC 06:15) — 영구룰 #정규시각
-      const rrTxCreatedAtUtc = `${payoutDate} 06:15:01`  // RR 은 DR 보다 1초 늦게 (정규 cron 순서 모사)
+      //   ★ created_at: paid_date 의 KST 08:00 정규시각 (= UTC prev-day 23:00) — 영구룰 #정규시각 (2026-05-19)
+      const rrTxCreatedAtUtc = `${_payoutPrevDayKst} 23:00:01`  // RR 은 DR 보다 1초 늦게 (KST 08:00:01)
       const rrTxStmts = expectedRRs.map(rr => {
         const rrId = rrIdMap.get(`${rr.referrer_id}|${rr.referee_id}|${rr.level}|${rr.staking_id}`) ?? null
         const desc = rr.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
@@ -44884,9 +44913,10 @@ async function diagRecalcMultiDayDividend(c: any, mode: 'DRY_RUN' | 'EXEC') {
       const expectedDRs = stage.expectedDRs
       const expectedRRs = stage.expectedRRs
 
-      // ★ 영구룰 #정규시각: created_at = paid_date KST 15:15 (= UTC 06:15) ★
-      const drCreatedAt = `${payoutDate} 06:15:00`
-      const rrCreatedAt = `${payoutDate} 06:15:01`
+      // ★ 영구룰 #정규시각 (2026-05-19 변경): created_at = paid_date KST 08:00 (= UTC prev-day 23:00) ★
+      const _prevKstStr_r3 = kstDateStr(new Date(new Date(payoutDate + 'T00:00:00+09:00').getTime() - 24 * 60 * 60 * 1000))
+      const drCreatedAt = `${_prevKstStr_r3} 23:00:00`
+      const rrCreatedAt = `${_prevKstStr_r3} 23:00:01`
 
       // ── (1) DR batch INSERT ──
       for (let i = 0; i < expectedDRs.length; i += CHUNK) {
@@ -45487,8 +45517,10 @@ async function diagRecalcSingleRewardDate(c: any, mode: 'DRY_RUN' | 'EXEC') {
 
     // ── EXEC-4: RECALC DR INSERT ──
     const t4 = Date.now()
-    const drCreatedAt = `${TARGET_PAID_DATE} 06:15:00`
-    const rrCreatedAt = `${TARGET_PAID_DATE} 06:15:01`
+    // PERMANENT_RULE #regular-time (2026-05-19): KST 08:00 = UTC (paid_date - 1day) 23:00
+    const _prevKstStr_e4 = kstDateStr(new Date(new Date(TARGET_PAID_DATE + 'T00:00:00+09:00').getTime() - 24 * 60 * 60 * 1000))
+    const drCreatedAt = `${_prevKstStr_e4} 23:00:00`  // KST 08:00:00 of paid_date
+    const rrCreatedAt = `${_prevKstStr_e4} 23:00:01`  // KST 08:00:01 of paid_date
 
     for (let i = 0; i < expectedDRs.length; i += CHUNK) {
       const chunk = expectedDRs.slice(i, i + CHUNK)
@@ -46155,8 +46187,10 @@ async function diagRecalcMaySeven(c: any, mode: 'DRY_RUN' | 'EXEC') {
     }
 
     // (e) DR INSERT
-    const drCreatedAt = `${TARGET_PAID_DATE} 06:15:00`  // KST 15:15
-    const rrCreatedAt = `${TARGET_PAID_DATE} 06:15:01`
+    // PERMANENT_RULE #regular-time (2026-05-19): KST 08:00 = UTC (paid_date - 1day) 23:00
+    const _prevKstStr_e = kstDateStr(new Date(new Date(TARGET_PAID_DATE + 'T00:00:00+09:00').getTime() - 24 * 60 * 60 * 1000))
+    const drCreatedAt = `${_prevKstStr_e} 23:00:00`  // KST 08:00:00 of paid_date
+    const rrCreatedAt = `${_prevKstStr_e} 23:00:01`  // KST 08:00:01 of paid_date
 
     for (let i = 0; i < expectedDRs.length; i += CHUNK) {
       const chunk = expectedDRs.slice(i, i + CHUNK)
@@ -46787,8 +46821,10 @@ async function diagRecalcMaySix(c: any, mode: 'DRY_RUN' | 'EXEC') {
     }
 
     // (e) DR INSERT
-    const drCreatedAt = `${TARGET_PAID_DATE} 06:15:00`  // KST 15:15
-    const rrCreatedAt = `${TARGET_PAID_DATE} 06:15:01`
+    // PERMANENT_RULE #regular-time (2026-05-19): KST 08:00 = UTC (paid_date - 1day) 23:00
+    const _prevKstStr_e = kstDateStr(new Date(new Date(TARGET_PAID_DATE + 'T00:00:00+09:00').getTime() - 24 * 60 * 60 * 1000))
+    const drCreatedAt = `${_prevKstStr_e} 23:00:00`  // KST 08:00:00 of paid_date
+    const rrCreatedAt = `${_prevKstStr_e} 23:00:01`  // KST 08:00:01 of paid_date
 
     for (let i = 0; i < expectedDRs.length; i += CHUNK) {
       const chunk = expectedDRs.slice(i, i + CHUNK)
@@ -48871,21 +48907,30 @@ app.get('/api/diag/fix-duplicate-daily-reward-tx', async (c) => {
   }
 })
 
-// fix-irregular-time-tx: 영구룰 #정규시각(15:15 KST = 06:15 UTC) 위반 일일배당 tx 만 created_at 정정
-// 보호: 다른 날짜/다른 종류 tx 절대 보호. 영구룰 준수 tx 도 보호.
-// 대상 KST 날짜: 2026-05-07, 2026-05-11 (사장님 명령으로 고정)
-// DRY-RUN: GET /api/diag/fix-irregular-time-tx?key=ADMIN_PW
-// EXEC:    GET /api/diag/fix-irregular-time-tx?key=ADMIN_PW&exec=true
+// fix-irregular-time-tx: [DEPRECATED 2026-05-19]
+// 이전 영구룰(KST 15:15 = UTC 06:15) 기준 코드. 영구룰 #정규시각 변경(KST 08:00 = UTC prev-day 23:00)으로 무효화.
+// normalize-tx-time-kst-08 endpoint 가 모든 일일배당 tx 를 KST 08:00 으로 정규화 완료(2,153 row).
+// 이 endpoint 재실행 시 정규화된 KST 08:00 tx 를 손상시킬 위험 → 영구 비활성화.
+// 410 Gone 즉시 반환. 본문 로직은 historical reference 로 보존.
 app.get('/api/diag/fix-irregular-time-tx', async (c) => {
+  // [DEPRECATED 2026-05-19] PERMANENT_RULE #regular-time changed: KST 15:15 -> KST 08:00.
+  // normalize-tx-time-kst-08 has already normalized all daily-reward tx to KST 08:00 (2,153 rows).
+  // Re-executing this endpoint would corrupt normalized data -> permanently disabled (410 Gone).
+  return c.json({
+    ok: false,
+    error: 'GONE: endpoint deprecated by PERMANENT_RULE #regular-time change (2026-05-19)',
+    note: 'Old rule: KST 15:15. New rule: KST 08:00. Use normalize-tx-time-kst-08 if needed.',
+  }, 410)
+  // legacy code below never executes (return above), retained for historical reference
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
     if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
     const exec = (c.req.query('exec') || '').toLowerCase() === 'true'
 
-    // ★ 하드코딩 대상 KST 날짜 (사장님 명령)
+    // ★ 하드코딩 대상 KST 날짜 (사장님 명령) [DEPRECATED]
     const TARGET_KST_DATES = ['2026-05-07', '2026-05-11']
-    // ★ 정규 시각: 15:15:00 KST = 06:15:00 UTC
+    // ★ 정규 시각: 15:15:00 KST = 06:15:00 UTC [DEPRECATED - now KST 08:00 = UTC prev-day 23:00]
     const REGULAR_UTC_TIME = '06:15:00'
 
     const db = c.env.DB
