@@ -53226,4 +53226,303 @@ app.get('/api/diag/verify-512-bottom-up', async (c) => {
 })
 
 
+// ★ 사장님 명령 (2026-05-19) ★
+// "11일 확정치 12일 지급건이 중복이 있는지 확인하고 있으면 삭제"
+//
+// 동작:
+//   STEP 1: paid_date='2026-05-12' 의 모든 dr/rr/tx 검사
+//     - DR 중복 기준: (user_id, staking_id, reward_date, paid_date) — 영구룰 #스테이킹별독립
+//     - RR 중복 기준: (referrer_id, referee_id, level, staking_id, reward_date, paid_date) — 영구룰
+//     - TX 중복 기준: (user_id, type, ref_id) — ref_id 가 동일하면 중복
+//                    + (user_id, type, amount, created_at) — ref_id NULL 인 잔재
+//   STEP 2: DRY-RUN — 중복 row id 전체 보고 (변경 0)
+//   STEP 3: EXEC (confirm 필수) — 중복 중 가장 큰 id (= 늦게 INSERT 된 것) 삭제 + 잔액 보정
+//
+// 사용:
+//   DRY-RUN: GET /api/diag/dup-512-paid?key=ADMIN_PW
+//   EXEC:    GET /api/diag/dup-512-paid?key=ADMIN_PW&confirm=DELETE_DUP_512
+app.get('/api/diag/dup-512-paid', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'DELETE_DUP_512'
+    const db = c.env.DB
+
+    const PAID_DATE = '2026-05-12'
+
+    // ─────────────────────────────────────────────────────────
+    // STEP 1: daily_rewards paid_date=5/12 중복 검사
+    // (user_id, staking_id, reward_date) — paid_date 동일이므로 자동 같음
+    // ─────────────────────────────────────────────────────────
+    const drAll = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE paid_date = ?
+      ORDER BY user_id, staking_id, id
+    `).bind(PAID_DATE).all<any>()
+    const drRows = (drAll.results || []) as any[]
+    const drGroupMap = new Map<string, any[]>()
+    for (const r of drRows) {
+      const k = `${r.user_id}|${r.staking_id}|${r.reward_date}`
+      if (!drGroupMap.has(k)) drGroupMap.set(k, [])
+      drGroupMap.get(k)!.push(r)
+    }
+    const drDuplicates: { key: string, rows: any[], keep_id: number, delete_ids: number[] }[] = []
+    for (const [k, rows] of drGroupMap) {
+      if (rows.length >= 2) {
+        // keep = 가장 작은 id (먼저 INSERT), delete = 나머지
+        const sorted = rows.slice().sort((a, b) => a.id - b.id)
+        drDuplicates.push({
+          key: k,
+          rows: sorted,
+          keep_id: sorted[0].id,
+          delete_ids: sorted.slice(1).map(r => r.id),
+        })
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // STEP 2: referral_rewards paid_date=5/12 중복 검사
+    // (referrer_id, referee_id, level, staking_id, reward_date)
+    // ─────────────────────────────────────────────────────────
+    const rrAll = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, staking_id, original_amount, reward_amount, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE paid_date = ?
+      ORDER BY referrer_id, referee_id, level, staking_id, id
+    `).bind(PAID_DATE).all<any>()
+    const rrRows = (rrAll.results || []) as any[]
+    const rrGroupMap = new Map<string, any[]>()
+    for (const r of rrRows) {
+      const k = `${r.referrer_id}|${r.referee_id}|${r.level}|${r.staking_id ?? 'NULL'}|${r.reward_date}`
+      if (!rrGroupMap.has(k)) rrGroupMap.set(k, [])
+      rrGroupMap.get(k)!.push(r)
+    }
+    const rrDuplicates: { key: string, rows: any[], keep_id: number, delete_ids: number[] }[] = []
+    for (const [k, rows] of rrGroupMap) {
+      if (rows.length >= 2) {
+        const sorted = rows.slice().sort((a, b) => a.id - b.id)
+        rrDuplicates.push({
+          key: k,
+          rows: sorted,
+          keep_id: sorted[0].id,
+          delete_ids: sorted.slice(1).map(r => r.id),
+        })
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // STEP 3: transactions 중복 검사 (5/11 23:00 ~ 5/13 00:00 UTC)
+    // (a) ref_id 기준 — 동일 ref_id 가 두 번이면 중복
+    // (b) ref_id NULL 잔재 — (user_id, type, amount, created_at) 같으면 중복
+    // ─────────────────────────────────────────────────────────
+    const txAll = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+      FROM transactions
+      WHERE coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward','daily_reward','referral_qkey')
+        AND created_at >= '2026-05-11 23:00:00' AND created_at < '2026-05-13 00:00:00'
+      ORDER BY user_id, type, ref_id, id
+    `).all<any>()
+    const txRows = (txAll.results || []) as any[]
+
+    // (a) ref_id 기준 중복
+    const txByRef = new Map<string, any[]>()
+    for (const r of txRows) {
+      if (r.ref_id === null || r.ref_id === undefined) continue
+      const k = `${r.user_id}|${r.type}|${r.ref_id}`
+      if (!txByRef.has(k)) txByRef.set(k, [])
+      txByRef.get(k)!.push(r)
+    }
+    const txDupByRef: { key: string, rows: any[], keep_id: number, delete_ids: number[], delete_amount_per_user: number }[] = []
+    for (const [k, rows] of txByRef) {
+      if (rows.length >= 2) {
+        const sorted = rows.slice().sort((a, b) => a.id - b.id)
+        const deleteRows = sorted.slice(1)
+        txDupByRef.push({
+          key: k,
+          rows: sorted,
+          keep_id: sorted[0].id,
+          delete_ids: deleteRows.map(r => r.id),
+          delete_amount_per_user: deleteRows.reduce((a, b) => a + Number(b.amount), 0),
+        })
+      }
+    }
+
+    // (b) ref_id NULL 잔재 중복
+    const txByNullRef = new Map<string, any[]>()
+    for (const r of txRows) {
+      if (r.ref_id !== null && r.ref_id !== undefined) continue
+      const k = `${r.user_id}|${r.type}|${r.amount}|${r.created_at}`
+      if (!txByNullRef.has(k)) txByNullRef.set(k, [])
+      txByNullRef.get(k)!.push(r)
+    }
+    const txDupNullRef: { key: string, rows: any[], keep_id: number, delete_ids: number[], delete_amount_per_user: number }[] = []
+    for (const [k, rows] of txByNullRef) {
+      if (rows.length >= 2) {
+        const sorted = rows.slice().sort((a, b) => a.id - b.id)
+        const deleteRows = sorted.slice(1)
+        txDupNullRef.push({
+          key: k,
+          rows: sorted,
+          keep_id: sorted[0].id,
+          delete_ids: deleteRows.map(r => r.id),
+          delete_amount_per_user: deleteRows.reduce((a, b) => a + Number(b.amount), 0),
+        })
+      }
+    }
+
+    // 사용자별 잔액 차감액 집계 (삭제 대상 tx 만)
+    const userDeductMap = new Map<number, number>()
+    for (const g of [...txDupByRef, ...txDupNullRef]) {
+      const uid = g.rows[0].user_id as number
+      userDeductMap.set(uid, (userDeductMap.get(uid) || 0) + g.delete_amount_per_user)
+    }
+    const userDeducts = Array.from(userDeductMap.entries()).map(([uid, amt]) => ({ user_id: uid, deduct_qkey: amt }))
+
+    const totalDrDelete = drDuplicates.reduce((a, g) => a + g.delete_ids.length, 0)
+    const totalRrDelete = rrDuplicates.reduce((a, g) => a + g.delete_ids.length, 0)
+    const totalTxDelete = txDupByRef.reduce((a, g) => a + g.delete_ids.length, 0)
+                       + txDupNullRef.reduce((a, g) => a + g.delete_ids.length, 0)
+    const totalDeductQkey = userDeducts.reduce((a, b) => a + b.deduct_qkey, 0)
+
+    // ─────────────────────────────────────────────────────────
+    // DRY-RUN
+    // ─────────────────────────────────────────────────────────
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        confirm_token_required: 'DELETE_DUP_512',
+        paid_date: PAID_DATE,
+        rule_refs: [
+          '#지상최고: 중복지급 0.001%도 안됨',
+          '#스테이킹별독립: (user, staking, reward_date) 1건',
+          '#관리자보정정당: admin_adjustment 절대 건드리지 않음 (이 endpoint 는 daily_qkey/referral_reward 만 대상)',
+        ],
+        daily_rewards: {
+          total_rows: drRows.length,
+          unique_groups: drGroupMap.size,
+          duplicate_groups: drDuplicates.length,
+          total_to_delete: totalDrDelete,
+          duplicates: drDuplicates,
+        },
+        referral_rewards: {
+          total_rows: rrRows.length,
+          unique_groups: rrGroupMap.size,
+          duplicate_groups: rrDuplicates.length,
+          total_to_delete: totalRrDelete,
+          duplicates: rrDuplicates,
+        },
+        transactions: {
+          total_rows: txRows.length,
+          dup_by_ref_id_groups: txDupByRef.length,
+          dup_by_null_ref_groups: txDupNullRef.length,
+          total_to_delete: totalTxDelete,
+          duplicates_by_ref: txDupByRef,
+          duplicates_null_ref: txDupNullRef,
+        },
+        balance_correction: {
+          users_affected: userDeducts.length,
+          total_deduct_qkey: totalDeductQkey,
+          deducts: userDeducts,
+        },
+        verdict: (totalDrDelete + totalRrDelete + totalTxDelete) === 0 ? 'NO_DUPLICATES' : 'DUPLICATES_FOUND',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // EXEC: 잔액 차감 → tx 삭제 → rr 삭제 → dr 삭제
+    // ─────────────────────────────────────────────────────────
+    const errors: any[] = []
+    let balanceUsersAdjusted = 0
+    let txDeleted = 0
+    let rrDeleted = 0
+    let drDeleted = 0
+
+    // 1) 잔액 차감 (먼저)
+    for (const ud of userDeducts) {
+      try {
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`)
+          .bind(ud.deduct_qkey, ud.user_id).run()
+        balanceUsersAdjusted++
+      } catch (e: any) {
+        errors.push({ phase: 'balance_deduct', user_id: ud.user_id, error: String(e?.message || e) })
+      }
+    }
+
+    // 2) transactions 삭제
+    const allTxDeleteIds: number[] = []
+    for (const g of txDupByRef) allTxDeleteIds.push(...g.delete_ids)
+    for (const g of txDupNullRef) allTxDeleteIds.push(...g.delete_ids)
+    if (allTxDeleteIds.length > 0) {
+      const chunkSize = 50
+      for (let i = 0; i < allTxDeleteIds.length; i += chunkSize) {
+        const chunk = allTxDeleteIds.slice(i, i + chunkSize)
+        const placeholders = chunk.map(() => '?').join(',')
+        try {
+          await db.prepare(`DELETE FROM transactions WHERE id IN (${placeholders})`).bind(...chunk).run()
+          txDeleted += chunk.length
+        } catch (e: any) {
+          errors.push({ phase: 'tx_delete', error: String(e?.message || e) })
+        }
+      }
+    }
+
+    // 3) referral_rewards 삭제
+    const allRrDeleteIds: number[] = []
+    for (const g of rrDuplicates) allRrDeleteIds.push(...g.delete_ids)
+    if (allRrDeleteIds.length > 0) {
+      const chunkSize = 50
+      for (let i = 0; i < allRrDeleteIds.length; i += chunkSize) {
+        const chunk = allRrDeleteIds.slice(i, i + chunkSize)
+        const placeholders = chunk.map(() => '?').join(',')
+        try {
+          await db.prepare(`DELETE FROM referral_rewards WHERE id IN (${placeholders})`).bind(...chunk).run()
+          rrDeleted += chunk.length
+        } catch (e: any) {
+          errors.push({ phase: 'rr_delete', error: String(e?.message || e) })
+        }
+      }
+    }
+
+    // 4) daily_rewards 삭제
+    const allDrDeleteIds: number[] = []
+    for (const g of drDuplicates) allDrDeleteIds.push(...g.delete_ids)
+    if (allDrDeleteIds.length > 0) {
+      const chunkSize = 50
+      for (let i = 0; i < allDrDeleteIds.length; i += chunkSize) {
+        const chunk = allDrDeleteIds.slice(i, i + chunkSize)
+        const placeholders = chunk.map(() => '?').join(',')
+        try {
+          await db.prepare(`DELETE FROM daily_rewards WHERE id IN (${placeholders})`).bind(...chunk).run()
+          drDeleted += chunk.length
+        } catch (e: any) {
+          errors.push({ phase: 'dr_delete', error: String(e?.message || e) })
+        }
+      }
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      paid_date: PAID_DATE,
+      executed: {
+        balance_users_adjusted: balanceUsersAdjusted,
+        total_deduct_qkey: totalDeductQkey,
+        tx_deleted: txDeleted,
+        rr_deleted: rrDeleted,
+        dr_deleted: drDeleted,
+      },
+      errors_count: errors.length,
+      errors: errors.slice(0, 20),
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
