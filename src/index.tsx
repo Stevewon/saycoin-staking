@@ -54898,4 +54898,230 @@ app.get('/api/diag/verify-511-bottom-up', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// inspect-516-paid — 5/16 paid_date 전체 내역 정밀 검사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19):
+//   "16일 내역은 내 영구룰에 어긋나니 어드민과 전 사용자내역에서 제거하라!"
+//   "5월 15일 확정치가 이미 18일날 찍혀있으니 16일 찍은거는 잘못한거야!"
+//   "내말듣고 다른거 절대 건들지말고 그냥 지워!!!"
+//
+// 영구룰 위반 근거:
+//   - 5/16 은 토요일 (휴일) → 영구룰 #익일처리 위반
+//   - 5/15(금) reward 의 정답 paid_date = 5/18(월) (이미 처리됨)
+//
+// 검사 항목:
+//   1) 5/16 paid 의 DR 전체
+//   2) 5/16 paid 의 RR 전체 (level 별)
+//   3) 5/16 관련 TX (ref_id 매핑 + 시각 기반)
+//   4) user 별 balance 차감 예정 금액 계산
+//   5) 다른 paid_date 보존 baseline
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/inspect-516-paid', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    const PAID_DATE = '2026-05-16'
+
+    // 1) DR 전체
+    const drList = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards
+      WHERE paid_date = ?
+      ORDER BY id
+    `).bind(PAID_DATE).all<any>()
+    const drs = drList.results || []
+
+    // 2) RR 전체
+    const rrList = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE paid_date = ?
+      ORDER BY level, id
+    `).bind(PAID_DATE).all<any>()
+    const rrs = rrList.results || []
+
+    // 3) reward_date 분포
+    const drByRd: Record<string, { count: number, qkey: number }> = {}
+    for (const d of drs as any[]) {
+      const k = d.reward_date
+      if (!drByRd[k]) drByRd[k] = { count: 0, qkey: 0 }
+      drByRd[k].count++
+      drByRd[k].qkey += Number(d.qkey || 0)
+    }
+    const rrByLevelRd: Record<string, { count: number, qkey: number }> = {}
+    for (const r of rrs as any[]) {
+      const k = `L${r.level}-${r.reward_date}`
+      if (!rrByLevelRd[k]) rrByLevelRd[k] = { count: 0, qkey: 0 }
+      rrByLevelRd[k].count++
+      rrByLevelRd[k].qkey += Number(r.reward_amount || 0)
+    }
+
+    // 4) DR 의 created_at 시각 분포 (정규시각 검증)
+    const drCreatedAtDist = await db.prepare(`
+      SELECT created_at, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date = ?
+      GROUP BY created_at
+      ORDER BY created_at
+    `).bind(PAID_DATE).all<any>()
+
+    // 5) RR 의 created_at 시각 분포
+    const rrCreatedAtDist = await db.prepare(`
+      SELECT created_at, level, COUNT(*) as cnt, COALESCE(SUM(reward_amount),0) as qkey
+      FROM referral_rewards
+      WHERE paid_date = ?
+      GROUP BY created_at, level
+      ORDER BY created_at, level
+    `).bind(PAID_DATE).all<any>()
+
+    // 6) TX 매핑 시도 (ref_id 기반)
+    // 5/16 paid 의 DR id 들 → daily_qkey TX (ref_id 매칭)
+    const drIds = (drs as any[]).map(d => d.id)
+    const txDrMatched: any[] = []
+    if (drIds.length > 0) {
+      // batch query
+      const ph = drIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+        FROM transactions
+        WHERE type='daily_qkey' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...drIds).all<any>()
+      txDrMatched.push(...(r.results || []))
+    }
+
+    // 5/16 paid 의 RR id 들 → referral_reward TX (ref_id 매칭)
+    const rrIds = (rrs as any[]).map(r => r.id)
+    const txRrMatched: any[] = []
+    if (rrIds.length > 0) {
+      const ph = rrIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+        FROM transactions
+        WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+      `).bind(...rrIds).all<any>()
+      txRrMatched.push(...(r.results || []))
+    }
+
+    // 7) 시각 기반 보조 매핑 (DR created_at 시각의 모든 TX)
+    const txByTime = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward')
+        AND created_at >= '2026-05-15 23:00:00'
+        AND created_at < '2026-05-16 23:00:00'
+      ORDER BY created_at, id
+    `).all<any>()
+
+    // 8) user 별 balance 차감 예정 금액
+    const balanceDecrement: Record<number, { dr_qkey: number, rr_qkey: number, total: number }> = {}
+    for (const d of drs as any[]) {
+      const uid = d.user_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { dr_qkey: 0, rr_qkey: 0, total: 0 }
+      balanceDecrement[uid].dr_qkey += Number(d.qkey || 0)
+      balanceDecrement[uid].total += Number(d.qkey || 0)
+    }
+    for (const r of rrs as any[]) {
+      const uid = r.referrer_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { dr_qkey: 0, rr_qkey: 0, total: 0 }
+      balanceDecrement[uid].rr_qkey += Number(r.reward_amount || 0)
+      balanceDecrement[uid].total += Number(r.reward_amount || 0)
+    }
+
+    // 9) 다른 paid_date baseline (절대 보존 검증용)
+    const otherPaid = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date >= '2026-05-11' AND paid_date <= '2026-05-19'
+      GROUP BY paid_date
+      ORDER BY paid_date
+    `).all<any>()
+
+    const otherRrPaid = await db.prepare(`
+      SELECT paid_date, level, COUNT(*) as cnt, COALESCE(SUM(reward_amount),0) as qkey
+      FROM referral_rewards
+      WHERE paid_date >= '2026-05-11' AND paid_date <= '2026-05-19'
+      GROUP BY paid_date, level
+      ORDER BY paid_date, level
+    `).all<any>()
+
+    // 10) 영구룰 위반 확인: 5/16 은 토요일 (휴일)
+    // 영구룰 #익일처리: 5/15(금) reward → 5/18(월) paid 가 정답
+    // 5/18 paid 가 이미 존재하는지 확인 (사장님 말씀 검증)
+    const paid518Check = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM daily_rewards WHERE paid_date='2026-05-18') as dr_cnt,
+        (SELECT COALESCE(SUM(usdt_amount),0) FROM daily_rewards WHERE paid_date='2026-05-18') as dr_qkey,
+        (SELECT COUNT(*) FROM referral_rewards WHERE paid_date='2026-05-18') as rr_cnt
+    `).first() as any
+
+    // 11) 5/18 paid 의 reward_date 분포 (5/15 reward 가 정확히 포함되어 있는지)
+    const paid518RewardDates = await db.prepare(`
+      SELECT reward_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date='2026-05-18'
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).all<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_INSPECT',
+      paid_date: PAID_DATE,
+      day_of_week: '토요일 (휴일)',
+      violation_basis: '영구룰 #익일처리: 5/15(금) reward 는 5/18(월) paid 가 정답, 5/16(토)에 paid 발생 = 위반',
+      counts: {
+        dr_count: drs.length,
+        dr_total_qkey: (drs as any[]).reduce((a, b) => a + Number(b.qkey||0), 0),
+        rr_count: rrs.length,
+        rr_total_qkey: (rrs as any[]).reduce((a, b) => a + Number(b.reward_amount||0), 0),
+        tx_matched_by_dr_ref_id: txDrMatched.length,
+        tx_matched_by_rr_ref_id: txRrMatched.length,
+        tx_by_time_window: (txByTime.results || []).length,
+      },
+      dr_by_reward_date: drByRd,
+      rr_by_level_reward_date: rrByLevelRd,
+      dr_created_at_distribution: drCreatedAtDist.results || [],
+      rr_created_at_distribution: rrCreatedAtDist.results || [],
+      tx_mapping: {
+        by_dr_ref_id_count: txDrMatched.length,
+        by_dr_ref_id_sum: txDrMatched.reduce((a, b:any) => a + Number(b.amount||0), 0),
+        by_dr_ref_id_sample: txDrMatched.slice(0, 5),
+        by_rr_ref_id_count: txRrMatched.length,
+        by_rr_ref_id_sum: txRrMatched.reduce((a, b:any) => a + Number(b.amount||0), 0),
+        by_rr_ref_id_sample: txRrMatched.slice(0, 5),
+        by_time_count: (txByTime.results || []).length,
+        by_time_sample: (txByTime.results || []).slice(0, 10),
+      },
+      balance_decrement_plan: {
+        unique_users: Object.keys(balanceDecrement).length,
+        total_qkey_to_subtract: Object.values(balanceDecrement).reduce((a, b) => a + b.total, 0),
+        sample: Object.entries(balanceDecrement).slice(0, 10).map(([uid, v]) => ({ user_id: Number(uid), ...v })),
+      },
+      preservation_check: {
+        paid_518_exists: paid518Check,
+        paid_518_reward_dates: paid518RewardDates.results || [],
+        note_518: '사장님 말씀: 5/15 확정치는 이미 18일날 찍혀있음 — 위 데이터로 검증',
+      },
+      other_paid_dr_snapshot: otherPaid.results || [],
+      other_paid_rr_snapshot: otherRrPaid.results || [],
+      safety_guards_for_delete: [
+        'WHERE paid_date = 2026-05-16 만 DELETE',
+        'DR + RR + TX (ref_id IN DR/RR ids) DELETE',
+        'users.qkey_balance -= 정확한 차감액 (per user)',
+        '다른 paid_date 절대 영향 없음 (특히 5/11 BOTTOM_UP_OK, 5/12 BOTTOM_UP_OK, 5/18 존재)',
+      ],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
