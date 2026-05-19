@@ -47965,6 +47965,92 @@ app.get('/api/diag/reward-date-status', async (c) => {
 })
 
 // ============================================================================
+// tx-time-distribution: tx/DR/RR 의 created_at KST 시각 분포 점검 (READ-ONLY)
+// 사장님 영구룰 #정규시각 (2026-05-19 변경): 매일 KST 08:00:00 통일, 15:15 폐기
+// GET /api/diag/tx-time-distribution?key=ADMIN_PW
+// ============================================================================
+app.get('/api/diag/tx-time-distribution', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+  const t0 = Date.now()
+  try {
+    // tx (daily_qkey + referral_reward) KST 시각 분포
+    const txTimeDist = await db.prepare(`
+      SELECT
+        date(created_at,'+9 hours') AS kst_date,
+        strftime('%H:%M', created_at, '+9 hours') AS kst_hhmm,
+        type,
+        COUNT(*) AS cnt,
+        COALESCE(SUM(amount),0) AS total_amt
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey'
+        AND type IN ('daily_qkey','referral_reward')
+      GROUP BY kst_date, kst_hhmm, type
+      ORDER BY kst_date DESC, kst_hhmm ASC, type ASC
+    `).all()
+
+    // DR created_at KST 시각 분포
+    const drTimeDist = await db.prepare(`
+      SELECT
+        paid_date,
+        strftime('%H:%M', created_at, '+9 hours') AS kst_hhmm,
+        COUNT(*) AS cnt,
+        COALESCE(SUM(usdt_amount),0) AS total_usdt
+      FROM daily_rewards
+      GROUP BY paid_date, kst_hhmm
+      ORDER BY paid_date DESC, kst_hhmm ASC
+    `).all()
+
+    // RR created_at KST 시각 분포
+    const rrTimeDist = await db.prepare(`
+      SELECT
+        paid_date,
+        strftime('%H:%M', created_at, '+9 hours') AS kst_hhmm,
+        COUNT(*) AS cnt,
+        COALESCE(SUM(reward_amount),0) AS total_qkey
+      FROM referral_rewards
+      GROUP BY paid_date, kst_hhmm
+      ORDER BY paid_date DESC, kst_hhmm ASC
+    `).all()
+
+    // tx 가 KST 08:00 이 아닌 row 카운트
+    const offNormCnt = await db.prepare(`
+      SELECT
+        COUNT(*) AS cnt
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey'
+        AND type IN ('daily_qkey','referral_reward')
+        AND strftime('%H:%M:%S', created_at, '+9 hours') != '08:00:00'
+    `).first() as any
+
+    // KST 08:00 인 row 카운트
+    const normCnt = await db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey'
+        AND type IN ('daily_qkey','referral_reward')
+        AND strftime('%H:%M:%S', created_at, '+9 hours') = '08:00:00'
+    `).first() as any
+
+    return c.json({
+      ok: true,
+      target_kst_time: '08:00:00',
+      summary: {
+        tx_at_08_00: Number(normCnt?.cnt || 0),
+        tx_off_norm: Number(offNormCnt?.cnt || 0),
+      },
+      tx_distribution: txTimeDist.results || [],
+      dr_distribution: drTimeDist.results || [],
+      rr_distribution: rrTimeDist.results || [],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
 // normalize-coin-type-qkey: 소문자 'qkey' → 'QKEY' 대문자 정규화
 // 영구룰 #중복지급금지 보강 — coin_type 대소문자 불일치로 인한 중복 검출 실패 방지
 // DRY-RUN: GET /api/diag/normalize-coin-type-qkey?key=ADMIN_PW
