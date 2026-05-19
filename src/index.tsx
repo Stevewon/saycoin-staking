@@ -51627,4 +51627,55 @@ app.get('/api/diag/fix-paid-date-v2', async (c) => {
 })
 
 
+// ============================================================
+// D 명령 검증 — nextBusinessDayKstStr 헬퍼 단위 테스트
+// 사장님 영구룰 #익일처리 매트릭스 자동 검증
+// ============================================================
+app.get('/api/diag/test-next-business-day', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+  // 사장님 직접 검증 매트릭스
+  const cases = [
+    // 평일 → 다음날
+    { reward: '2026-05-07', expected: '2026-05-08', label: '5/7(목) → 5/8(금)' },
+    { reward: '2026-05-11', expected: '2026-05-12', label: '5/11(월) → 5/12(화)' },
+    { reward: '2026-05-12', expected: '2026-05-13', label: '5/12(화) → 5/13(수)' },
+    { reward: '2026-05-13', expected: '2026-05-14', label: '5/13(수) → 5/14(목)' },
+    { reward: '2026-05-14', expected: '2026-05-15', label: '5/14(목) → 5/15(금)' },
+    { reward: '2026-05-18', expected: '2026-05-19', label: '5/18(월) → 5/19(화)' },
+    // 금/토/일 → 월요일
+    { reward: '2026-05-08', expected: '2026-05-11', label: '5/8(금) → 5/11(월)' },
+    { reward: '2026-05-09', expected: '2026-05-11', label: '5/9(토) → 5/11(월)' },
+    { reward: '2026-05-15', expected: '2026-05-18', label: '5/15(금) → 5/18(월)' },
+    { reward: '2026-05-02', expected: '2026-05-04', label: '5/2(토) → 5/4(월)' },
+    { reward: '2026-05-03', expected: '2026-05-04', label: '5/3(일) → 5/4(월)' },
+    { reward: '2026-04-25', expected: '2026-04-27', label: '4/25(토) → 4/27(월)' },
+    { reward: '2026-04-26', expected: '2026-04-27', label: '4/26(일) → 4/27(월)' },
+    { reward: '2026-04-19', expected: '2026-04-20', label: '4/19(일) → 4/20(월)' },
+  ]
+  const results = cases.map((c0) => {
+    const actual = nextBusinessDayKstStr(c0.reward)
+    const ok = actual === c0.expected
+    const createdAtUtc = createdAtUtcForPaidDate(actual, 0)
+    return {
+      label: c0.label,
+      reward_date: c0.reward,
+      expected_paid_date: c0.expected,
+      actual_paid_date: actual,
+      created_at_utc: createdAtUtc,
+      kst_display: `${actual} 08:00`,
+      ok,
+    }
+  })
+  const passed = results.filter(r => r.ok).length
+  return c.json({
+    ok: passed === cases.length,
+    passed: `${passed}/${cases.length}`,
+    rule: '영구룰 #익일처리 (사장님 D 명령 2026-05-19)',
+    results,
+  })
+})
+
+
 export default app
