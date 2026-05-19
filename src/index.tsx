@@ -54267,4 +54267,150 @@ app.get('/api/diag/insert-511-paid-v2', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// inspect-511-existing-rr — 5/11 paid 에 이미 있는 RR 12건 정밀 검사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 목적: 영구룰 위반(reward_date=5/9) 인 row 를 식별
+// 보존 대상: reward_date=5/8 (영구룰 #익일처리 정상)
+// 제거 대상: reward_date=5/9 (휴일이라 reward_date 자체가 없어야 함)
+//
+// 또한 사장님 정정 후 정답에 따라 5/10 reward 도 있어야 하는데 (휴일진입자),
+// 현재 누락 상태라면 batch=rr-l1/l2 가 처리할 예정
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/inspect-511-existing-rr', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    // 5/11 paid 의 모든 RR 상세
+    const rrAll = await db.prepare(`
+      SELECT id, user_id as referrer, from_user_id as referee, level, amount,
+             reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE paid_date = '2026-05-11'
+      ORDER BY reward_date, id
+    `).all<any>()
+    const rrs = (rrAll.results || []) as any[]
+
+    // reward_date 별 그룹핑
+    const byRd: Record<string, any[]> = {}
+    for (const r of rrs) {
+      if (!byRd[r.reward_date]) byRd[r.reward_date] = []
+      byRd[r.reward_date].push(r)
+    }
+
+    // 영구룰 분류
+    // 정답 reward_date for 5/11 paid: 5/8 (기존회원), 5/10 (휴일진입자)
+    // 위반 reward_date: 5/9 (휴일에 reward 없음)
+    const ALLOWED_RD = ['2026-05-08', '2026-05-10']
+    const valid: any[] = []
+    const violation: any[] = []
+    for (const r of rrs) {
+      if (ALLOWED_RD.includes(r.reward_date)) valid.push(r)
+      else violation.push(r)
+    }
+
+    // 5/11 paid 의 모든 RR 에 대해 corresponding TX 매핑 (ref_id = rr.id, type='referral_reward')
+    const txByRrId: Record<number, any> = {}
+    for (const r of rrs) {
+      const tx = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, ref_id, created_at, description
+        FROM transactions
+        WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id = ?
+        LIMIT 1
+      `).bind(r.id).first() as any
+      if (tx) txByRrId[r.id] = tx
+    }
+
+    // 중복 검사: 같은 (referrer, referee, level, reward_date, paid_date) 가 2개 이상?
+    const dupCheck = await db.prepare(`
+      SELECT user_id as referrer, from_user_id as referee, level, reward_date, paid_date, COUNT(*) as cnt
+      FROM referral_rewards
+      WHERE paid_date = '2026-05-11'
+      GROUP BY user_id, from_user_id, level, reward_date, paid_date
+      HAVING COUNT(*) > 1
+    `).all<any>()
+
+    // 위반 row 가 제거되면, 위반 row 의 referrer 의 balance 가 줄어야 하는데
+    // 영구룰 #관리자보정정당 위반 위험 사전 점검
+    const violationByReferrer: Record<number, number> = {}
+    for (const v of violation) {
+      violationByReferrer[v.referrer] = (violationByReferrer[v.referrer] || 0) + Number(v.amount || 0)
+    }
+
+    // 예정 INSERT 와의 중복 가능성 사전 점검:
+    // batch=rr-l1/l2 가 INSERT 할 (referrer, referee, level, reward_date=5/8, paid=5/11) 가
+    // 현재 valid 5/8 reward RR 와 정확히 같으면 중복! 사전 차단 필요
+    const valid58 = valid.filter(v => v.reward_date === '2026-05-08')
+    const collisionCheck: any[] = []
+    for (const v of valid58) {
+      // batch=rr-l1/l2 는 paid=5/11 dr 기반으로 만들것이므로 dr 의 (referee, reward_date=5/8) 와 매칭
+      // 즉 dr (user_id=v.referee, reward_date='2026-05-08', paid=5/11) 가 INSERT 되면
+      // 그 referee 의 referrer (= v.referrer) 의 (level=v.level) RR 가 plan 에 들어감
+      // 그게 이미 valid58 의 v 와 동일하면 중복
+      collisionCheck.push({
+        rr_id: v.id, referrer: v.referrer, referee: v.referee, level: v.level,
+        reward_date: v.reward_date, amount: v.amount,
+        warning: 'IF batch=rr-l1/l2 includes referee with reward_date=5/8, this row will become DUPLICATE',
+      })
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_INSPECT',
+      paid_date: '2026-05-11',
+      total_existing_rr: rrs.length,
+      by_reward_date: Object.fromEntries(
+        Object.entries(byRd).map(([k, v]) => [k, {
+          count: v.length,
+          total_qkey: v.reduce((a:number, b:any) => a + Number(b.amount||0), 0),
+          rows: v,
+        }])
+      ),
+      valid_rows: {
+        description: 'reward_date IN (2026-05-08, 2026-05-10) — 영구룰 정상',
+        count: valid.length,
+        total_qkey: valid.reduce((a, b) => a + Number(b.amount||0), 0),
+        rows: valid,
+      },
+      violation_rows: {
+        description: 'reward_date NOT IN (2026-05-08, 2026-05-10) — 영구룰 위반 (5/9 등)',
+        count: violation.length,
+        total_qkey: violation.reduce((a, b) => a + Number(b.amount||0), 0),
+        rows: violation,
+        by_referrer_qkey: violationByReferrer,
+      },
+      tx_mapping: {
+        description: '각 RR row 에 대응하는 transactions row (ref_id 기준)',
+        mapped_count: Object.keys(txByRrId).length,
+        sample: Object.values(txByRrId).slice(0, 5),
+        unmapped_rr_ids: rrs.filter(r => !txByRrId[r.id]).map(r => r.id),
+      },
+      duplicates_within_existing: {
+        count: (dupCheck.results || []).length,
+        rows: dupCheck.results || [],
+      },
+      collision_risk_with_planned_insert: {
+        description: 'batch=rr-l1/l2 가 INSERT 할 row 와 이미 있는 valid row 가 중복될 수 있는지',
+        suspicious_count: collisionCheck.length,
+        sample: collisionCheck.slice(0, 10),
+        mitigation: 'insert-511-paid-v2 batch=rr-l1/l2 는 NOT EXISTS 가드 있음 → 중복 INSERT 안 됨',
+      },
+      action_recommendation: {
+        step_1: 'DELETE violation_rows (reward_date 위반) — 별도 endpoint delete-511-rr-violations 작성 예정',
+        step_2: 'batch=dr DRY-RUN → EXEC',
+        step_3: 'batch=rr-l1 DRY-RUN → EXEC (NOT EXISTS 가드로 valid 5/8 row 와 중복 방지)',
+        step_4: 'batch=rr-l2 DRY-RUN → EXEC (동일)',
+        step_5: 'verify-511-bottom-up READ-ONLY 검증',
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
