@@ -61750,4 +61750,203 @@ app.get('/api/diag/solbat-tree-weekday-missing-scan', async (c) => {
 })
 
 
+// ============================================================================
+// solbat-tree-staking-coverage — 솔밧 트리 15명 staking 활성 기간 정밀 점검 (read-only)
+// 목적: "정당한 누락(staking 없음)" vs "진짜 누락(staking 있는데 배당 없음)" 구분
+// 컬럼: staking.start_date / end_date / status / reset_at / amount / daily_rate
+// 5/4 ~ 5/18 평일 10일 각 reward_date 에 대해, 회원별 활성 staking 여부 + amount + expected QKEY
+//   - expected_daily_qkey = SUM(amount * daily_rate * 150) for active stakings on that date
+//   - active 판정: start_date <= reward_date <= end_date AND status='active' AND reset_at IS NULL
+// 매트릭스: 실제 받은 self_daily QKEY vs expected_daily_qkey → diff 도출
+// 경로: GET /api/diag/solbat-tree-staking-coverage?pw=ADMIN_PW
+// ============================================================================
+app.get('/api/diag/solbat-tree-staking-coverage', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+
+  try {
+    const SOLBAT = 44
+    const L1_IDS = [45, 47, 48, 50, 52, 54, 89]
+    const L2_IDS = [46, 49, 73, 74, 76, 90, 93]
+    const ALL_IDS = [SOLBAT, ...L1_IDS, ...L2_IDS]
+    const ph = ALL_IDS.map(() => '?').join(',')
+
+    const WEEKDAYS = [
+      '2026-05-04','2026-05-06','2026-05-07','2026-05-08','2026-05-11',
+      '2026-05-12','2026-05-13','2026-05-14','2026-05-15','2026-05-18',
+    ]
+
+    // 회원 정보
+    const userRows = (await c.env.DB.prepare(
+      `SELECT id, email, name, qkey_balance FROM users WHERE id IN (${ph})`
+    ).bind(...ALL_IDS).all()).results as any[]
+    const userMap: Record<number, any> = {}
+    for (const u of userRows) userMap[u.id] = u
+
+    // 트리 15명의 모든 staking
+    const stakingRows = (await c.env.DB.prepare(`
+      SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at,
+             datetime(created_at, '+9 hours') AS created_kst
+      FROM staking
+      WHERE user_id IN (${ph})
+      ORDER BY user_id ASC, created_at ASC
+    `).bind(...ALL_IDS).all()).results as any[]
+
+    // 회원별 staking 목록 모음
+    const stakingByUser: Record<number, any[]> = {}
+    for (const uid of ALL_IDS) stakingByUser[uid] = []
+    for (const s of stakingRows) stakingByUser[s.user_id].push(s)
+
+    // 실제 받은 self_daily QKEY (이전 scan 과 동일 방식 — daily_rewards 원장 + tx 미러 join 합)
+    const dailyRows = (await c.env.DB.prepare(`
+      SELECT dr.user_id, dr.reward_date,
+             COALESCE(SUM(t.amount), 0) AS qkey_sum,
+             COUNT(dr.id) AS dr_cnt
+      FROM daily_rewards dr
+      LEFT JOIN transactions t ON t.ref_id = dr.id AND t.type = 'daily_qkey' AND t.user_id = dr.user_id
+      WHERE dr.user_id IN (${ph})
+        AND dr.reward_date IN (${WEEKDAYS.map(() => '?').join(',')})
+      GROUP BY dr.user_id, dr.reward_date
+    `).bind(...ALL_IDS, ...WEEKDAYS).all()).results as any[]
+    const actualMap: Record<string, { qkey_sum: number, dr_cnt: number }> = {}
+    for (const r of dailyRows) {
+      actualMap[`${r.user_id}|${r.reward_date}`] = {
+        qkey_sum: Number(r.qkey_sum) || 0,
+        dr_cnt: Number(r.dr_cnt) || 0,
+      }
+    }
+
+    // 각 회원 × 각 reward_date 별 active staking 판정 + expected
+    type Cell = {
+      active_stakings: { id: number, amount: number, daily_rate: number, expected_qkey: number }[]
+      expected_total: number
+      actual_qkey: number
+      dr_cnt: number
+      diff: number
+      status: 'OK' | 'MISSING' | 'PARTIAL' | 'EXTRA' | 'NO_STAKING_OK' | 'GHOST_DR'
+    }
+    const matrix: Record<number, Record<string, Cell>> = {}
+
+    for (const uid of ALL_IDS) {
+      matrix[uid] = {}
+      const userStakings = stakingByUser[uid] || []
+      for (const d of WEEKDAYS) {
+        const active = userStakings.filter(s => {
+          // active 판정:
+          //   1) reset_at 이 있으면 무효
+          //   2) status 가 'active' 여야 함 (closed/expired 제외)
+          //   3) start_date <= d <= end_date (문자열 비교로 충분 YYYY-MM-DD)
+          if (s.reset_at) return false
+          if (s.status !== 'active') return false
+          if (!s.start_date || !s.end_date) return false
+          return s.start_date <= d && d <= s.end_date
+        })
+        const cellStakings = active.map(s => ({
+          id: s.id,
+          amount: Number(s.amount),
+          daily_rate: Number(s.daily_rate),
+          expected_qkey: Math.round(Number(s.amount) * Number(s.daily_rate) * 150),
+        }))
+        const expected = cellStakings.reduce((a, x) => a + x.expected_qkey, 0)
+        const actual = actualMap[`${uid}|${d}`]?.qkey_sum || 0
+        const drCnt = actualMap[`${uid}|${d}`]?.dr_cnt || 0
+        let status: Cell['status'] = 'OK'
+        if (expected === 0 && actual === 0 && drCnt === 0) status = 'NO_STAKING_OK'
+        else if (expected === 0 && (actual > 0 || drCnt > 0)) status = 'EXTRA'  // staking 없는데 받음 (위반)
+        else if (expected > 0 && actual === 0 && drCnt === 0) status = 'MISSING'  // 진짜 누락
+        else if (expected > 0 && drCnt > 0 && actual === 0) status = 'GHOST_DR'   // 원장 있는데 tx 미러 없음
+        else if (actual !== expected) status = 'PARTIAL'
+        matrix[uid][d] = {
+          active_stakings: cellStakings,
+          expected_total: expected,
+          actual_qkey: actual,
+          dr_cnt: drCnt,
+          diff: actual - expected,
+          status,
+        }
+      }
+    }
+
+    // 회원별 요약
+    const perUserSummary: any[] = []
+    for (const uid of ALL_IDS) {
+      const u = userMap[uid] || { name: '?', email: '?' }
+      const userStakings = stakingByUser[uid] || []
+      const activeCount = userStakings.filter(s => !s.reset_at && s.status === 'active').length
+      const issuesByStatus: Record<string, string[]> = { MISSING: [], GHOST_DR: [], PARTIAL: [], EXTRA: [] }
+      let realMissingQkey = 0
+      let ghostDrQkey = 0
+      let partialDiffQkey = 0
+      let extraQkey = 0
+      for (const d of WEEKDAYS) {
+        const c2 = matrix[uid][d]
+        if (c2.status === 'MISSING') { issuesByStatus.MISSING.push(d); realMissingQkey += c2.expected_total }
+        else if (c2.status === 'GHOST_DR') { issuesByStatus.GHOST_DR.push(d); ghostDrQkey += c2.expected_total }
+        else if (c2.status === 'PARTIAL') { issuesByStatus.PARTIAL.push(d); partialDiffQkey += (c2.expected_total - c2.actual_qkey) }
+        else if (c2.status === 'EXTRA') { issuesByStatus.EXTRA.push(d); extraQkey += c2.actual_qkey }
+      }
+      perUserSummary.push({
+        user_id: uid,
+        name: u.name,
+        email: u.email,
+        level: uid === SOLBAT ? 0 : (L1_IDS.includes(uid) ? 1 : 2),
+        qkey_balance: u.qkey_balance,
+        total_stakings: userStakings.length,
+        active_stakings: activeCount,
+        stakings_summary: userStakings.map(s => ({
+          id: s.id, amount: s.amount, daily_rate: s.daily_rate,
+          start: s.start_date, end: s.end_date,
+          status: s.status, reset_at: s.reset_at,
+          expected_daily_qkey: !s.reset_at && s.status === 'active' ? Math.round(Number(s.amount) * Number(s.daily_rate) * 150) : 0,
+        })),
+        issues: issuesByStatus,
+        real_missing_qkey: realMissingQkey,
+        ghost_dr_qkey: ghostDrQkey,
+        partial_diff_qkey: partialDiffQkey,
+        extra_qkey: extraQkey,
+      })
+    }
+
+    // 트리 그랜드 토탈
+    const grandTotal = {
+      total_users: perUserSummary.length,
+      total_stakings: perUserSummary.reduce((a, u) => a + u.total_stakings, 0),
+      total_active_stakings: perUserSummary.reduce((a, u) => a + u.active_stakings, 0),
+      real_missing_qkey_sum: perUserSummary.reduce((a, u) => a + u.real_missing_qkey, 0),
+      ghost_dr_qkey_sum: perUserSummary.reduce((a, u) => a + u.ghost_dr_qkey, 0),
+      partial_diff_qkey_sum: perUserSummary.reduce((a, u) => a + u.partial_diff_qkey, 0),
+      extra_qkey_sum: perUserSummary.reduce((a, u) => a + u.extra_qkey, 0),
+    }
+
+    // 평일별 트리 합계 expected vs actual
+    const dailyTotals = WEEKDAYS.map(d => {
+      let expSum = 0, actSum = 0, missCount = 0, ghostCount = 0
+      for (const uid of ALL_IDS) {
+        const c2 = matrix[uid][d]
+        expSum += c2.expected_total
+        actSum += c2.actual_qkey
+        if (c2.status === 'MISSING') missCount++
+        if (c2.status === 'GHOST_DR') ghostCount++
+      }
+      return { reward_date: d, expected_total: expSum, actual_total: actSum, diff: actSum - expSum, missing_users: missCount, ghost_dr_users: ghostCount }
+    })
+
+    return c.json({
+      mode: 'READ_ONLY',
+      note: 'expected = staking.amount × daily_rate × 150 (L0 영구룰), active 판정 = !reset_at AND status=active AND start_date<=d<=end_date',
+      checked_weekdays: WEEKDAYS,
+      grand_total: grandTotal,
+      daily_totals: dailyTotals,
+      per_user_summary: perUserSummary,
+      matrix,
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
