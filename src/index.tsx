@@ -5252,6 +5252,30 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
       }, 400)
     }
 
+    // ============================================================
+    // ★ 영구룰 #정규시각 (2026-05-19 KST 08:00 통일) + 사장님 09:00 게이트 명령 ★
+    // 매일 KST 08:00 자동 cron 이 정규 실행 → 사용자는 09:00 까지 cron 결과 대기
+    // 09:00 이후에도 cron 결과 없으면 (= daily_cron_lock 비어있으면) 긴급 수동 버튼 사용
+    // 09:00 이전 수동 누르면 423 차단 (08:00 cron 도착 대기) — 사장님 명령
+    // 우회: &force=GO (사장님 별도 명령으로만 강제 실행 가능)
+    // ============================================================
+    const forceQ = c.req.query('force') || ''
+    const nowForGate = new Date()
+    // KST hour = UTC hour + 9 (mod 24)
+    const kstHourNow = (nowForGate.getUTCHours() + 9) % 24
+    const kstMinNow = nowForGate.getUTCMinutes()
+    const kstHhmmNow = String(kstHourNow).padStart(2, '0') + ':' + String(kstMinNow).padStart(2, '0')
+    if (kstHourNow < 9 && forceQ !== 'GO') {
+      return c.json({
+        success: false,
+        error: `긴급 수동 버튼은 KST 09:00 이후에만 사용 가능합니다 (현재 KST ${kstHhmmNow}). 매일 KST 08:00 자동 cron 결과를 우선 대기하세요. 강제 실행: &force=GO&unlock=GO`,
+        blocked_by: 'kst_09_gate',
+        current_kst: kstHhmmNow,
+        rule: '영구룰 #정규시각 KST 08:00 + 09:00 이전 수동 차단 (사장님 2026-05-19 명령)',
+        unlock_hint: '강제 실행 (사장님 명령): POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO'
+      }, 423)
+    }
+
     const db = c.env.DB
     const now = new Date()
     const todayKst = kstDateStr(now)
@@ -5271,9 +5295,9 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
     } catch(e) {}
 
     // 사장님 강제 해제 옵션 (영구 룰 위반 아님 — 사장님 별도 명령으로만 해제)
-    const force = c.req.query('force') || ''
+    // 위에서 이미 forceQ 선언했으므로 재선언하지 않음
     const unlock = c.req.query('unlock') || ''
-    if (force === 'GO' && unlock === 'GO') {
+    if (forceQ === 'GO' && unlock === 'GO') {
       await db.prepare(`DELETE FROM daily_cron_lock WHERE lock_date = ?`).bind(todayKst).run()
       return c.json({
         success: true,
@@ -5287,7 +5311,7 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
       SELECT source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
     `).bind(todayKst).first() as any
     if (existingLock) {
-      const srcLabel = existingLock.source === 'cron_auto' ? '자동 cron (KST 07:00)' : '어드민 수동 버튼'
+      const srcLabel = existingLock.source === 'cron_auto' ? '자동 cron (KST 08:00)' : '어드민 수동 버튼'
       return c.json({
         success: false,
         error: `오늘(${todayKst}) 데일리 배당은 이미 [${srcLabel}] 에 의해 ${existingLock.locked_at} 에 실행되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
@@ -24702,9 +24726,9 @@ app.get('/admin/dashboard', (c) => {
                 <div class="bg-white rounded-lg shadow-md p-4 sm:p-6 mb-4 sm:mb-6">
                     <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                         <div class="flex-1">
-                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clock text-blue-600 mr-2"></i>일일 배당 자동화 (KST 07:00)</h3>
-                            <p class="text-sm text-gray-600 mt-1">매 평일 한국시간 오전 7시에 GitHub Actions cron 으로 자동 지급됩니다 (월~금)</p>
-                            <p class="text-xs text-gray-500 mt-1">개별 회원 보정은 아래 회원관리 → '잔액 조정' 또는 '/api/admin/rewards/manual-adjust' 사용</p>
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clock text-blue-600 mr-2"></i>일일 배당 자동화 (KST 08:00)</h3>
+                            <p class="text-sm text-gray-600 mt-1">매일 한국시간 오전 8시에 GitHub Actions cron 으로 자동 지급 (영구룰 #정규시각)</p>
+                            <p class="text-xs text-gray-500 mt-1">08:00 cron 실패 시 → 09:00 이후 아래 긴급 버튼 사용. 개별 보정은 회원관리 → '잔액 조정'</p>
                             <!-- 오늘자 락 상태 -->
                             <div id="cronLockStatus" class="mt-2 text-xs"></div>
                         </div>
@@ -24712,13 +24736,13 @@ app.get('/admin/dashboard', (c) => {
                             <!-- 정상 cron 안내 (회색) -->
                             <button disabled
                                 class="px-4 py-2 bg-gray-200 text-gray-500 rounded-lg font-medium cursor-not-allowed text-xs sm:text-sm whitespace-nowrap"
-                                title="평상시는 cron 자동 실행">
-                                <i class="fas fa-robot mr-1"></i>자동 cron (KST 07:00)
+                                title="매일 KST 08:00 자동 실행 (영구룰 #정규시각)">
+                                <i class="fas fa-robot mr-1"></i>자동 cron (KST 08:00)
                             </button>
-                            <!-- 수동 실행 비상 버튼 (사장님 2026-05-12 영구 룰) -->
+                            <!-- 수동 실행 비상 버튼 (사장님 2026-05-12 영구 룰 + 2026-05-19 09:00 게이트) -->
                             <button onclick="executeManualDailyTrigger()"
                                 class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold text-xs sm:text-sm whitespace-nowrap"
-                                title="자동 cron 실패 시(09:00 KST 미실행) 사장님 수동 실행. 누르면 같은 날 자동 cron 영구 차단.">
+                                title="08:00 자동 cron 실패 시 09:00 이후에만 사용 가능. 누르면 같은 날 자동 cron 영구 차단. KST 09:00 이전은 서버측 423 차단됨.">
                                 <i class="fas fa-bolt mr-1"></i>긴급 수동 실행 (09:00 후)
                             </button>
                         </div>
@@ -26300,8 +26324,10 @@ app.get('/admin/dashboard', (c) => {
             // ============================================
             async function executeManualDailyTrigger() {
                 var confirmMsg = '⚠️ 긴급 수동 데일리 배당 실행\\n\\n'
-                    + '이 버튼은 자동 cron 이 KST 09:00까지 실행되지 않은 비상 상황 전용입니다.\\n\\n'
-                    + '【영구 룰】 한 번 누르면 같은 날 자동 cron 은 사장님 별도 명령 없이 작동하지 않습니다.\\n\\n'
+                    + '이 버튼은 KST 08:00 자동 cron 이 실패하여 09:00 이후에도 결과 없을 때 사용하는 비상 버튼입니다.\\n\\n'
+                    + '【영구룰 #정규시각】 정규 배당은 매일 KST 08:00 GitHub Actions cron 으로 1회만 실행.\\n'
+                    + '【영구룰 #지상최고】 중복지급 절대금지 — 한 번 누르면 같은 날 자동 cron 은 영구 차단됩니다.\\n\\n'
+                    + 'KST 09:00 이전에는 서버측에서 자동 차단(423)됩니다.\\n\\n'
                     + '진짜 실행하시겠습니까?';
                 if (!confirm(confirmMsg)) return;
                 var confirmMsg2 = '⚠️⚠️ 최종 확인 ⚠️⚠️\\n\\n오늘 데일리 배당을 수동으로 실행합니다.\\n실수 클릭이 아니라면 [확인]을 눌러주세요.';

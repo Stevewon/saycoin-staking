@@ -1,12 +1,67 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-18 (★ 영구룰 #GitHub빌드강제 추가 — 사장님 직접 명령)
+**최종 업데이트**: 2026-05-19 (★ 영구룰 #지상최고 신규 추가 + #정규시각 KST 15:15 → KST 08:00 변경 — 사장님 직접 명령)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
 
 ---
 
-## 🛠️ 영구룰 #GitHub빌드강제 (MOST CRITICAL — 빌드/배포 사전조건)
+## 👑 영구룰 #지상최고 (SUPREME — 모든 룰의 최상위)
+
+> **절대로 그 어떤 경우도 중복지급이 있으면 안 되고, 중복 지급이 될 것 같으면 무조건 중지한다. 이 명령은 지상 최고의 명령이다.**
+
+### 우선순위
+- **이 룰은 모든 다른 영구룰보다 우선한다.**
+- 다른 룰과 충돌하면 무조건 이 룰이 이긴다.
+- 의심만 들어도 STOP. 확신 없으면 EXEC 절대 금지.
+
+### 절대 원칙
+1. ❌ **중복지급 의심 0.001% 라도 있으면 EXEC 금지** — 100% 확신 없으면 DRY_RUN 만
+2. ❌ DRY_RUN 결과를 사장님께 보고하지 않고 EXEC 진행 금지
+3. ❌ 사장님 명시적 승인 없이 EXEC 금지
+4. ❌ collision/UNIQUE INDEX 위반 가능성 발견 시 즉시 STOP, 보고
+5. ❌ 'INSERT 가 들어가는 endpoint' 는 항상 PRE/POST collision check 필수
+
+### 필수 안전장치 (모든 정산/픽스/normalize endpoint)
+1. ✅ **PRE collision check** — 시작 전 GROUP BY HAVING > 1 로 중복 검사
+2. ✅ **POST collision check** — 작업 후 동일 검사 재실행
+3. ✅ **DRY_RUN 모드 필수** — 영향 row 수 + safety_check 사전 보고
+4. ✅ **사장님 결재** — DRY_RUN 결과 보고 → 명시 승인 → EXEC
+5. ✅ **POST-VERIFY** — balance ↔ tx 정합 (matched_before = matched_after)
+6. ✅ **UNIQUE INDEX 기반 DB 차원 가드** (uq_tx_daily_qkey_ref, uq_tx_referral_ref)
+7. ✅ collision 발견 시 **423 BLOCKED** 즉시 반환, 어떤 INSERT/UPDATE 도 실행 안 함
+
+### 작업 종류별 안전 등급
+| 작업 | 위험도 | 필수 절차 |
+|---|:---:|---|
+| INSERT (recalc/backfill) | 🔴 최고 | PRE + POST collision + DRY_RUN + 사장님 결재 + POST-VERIFY |
+| UPDATE amount/balance | 🔴 최고 | 위와 동일 |
+| UPDATE created_at only | 🟡 중 | DRY_RUN + 사장님 결재 + POST-VERIFY (collision 불가능하나 검증) |
+| SELECT only (조회) | 🟢 낮음 | 자유 |
+| DELETE | 🔴 최고 | 위와 동일 + 별도 백업 |
+
+### DB 차원 영구 가드 (현재 적용 완료)
+```sql
+-- migrations/0015_add_tx_unique_indexes.sql
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tx_daily_qkey_ref
+  ON transactions (user_id, ref_id)
+  WHERE type = 'daily_qkey' AND ref_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tx_referral_ref
+  ON transactions (user_id, ref_id)
+  WHERE type = 'referral_reward' AND ref_id IS NOT NULL;
+```
+→ 코드 버그 발생해도 **DB 가 INSERT 거부**. 영구 가드.
+
+**⚠️ 사장님 직접 인용 (2026-05-19, 본 룰 제정)**:
+> "옵션 2로 가고 나머지는 하루하루 내가 영구룰로 조정을 거치는게 맞을듯해! **절대로 그 어떤경우도 중복지급이 있으면 안되고 중복 지급이 될것같으면 무조건 중지! 이 명령을 지상 최고의 명령으로 준수할것!**"
+
+**위반 시 결과**: 그 즉시 시스템 신뢰 파괴. 사용자 자산 손실. 사장님 격노. 회복 불가능 가능.
+
+**이 룰은 다른 모든 룰의 위에 있다. 다른 룰이 EXEC 를 권하더라도, 이 룰이 의심을 표하면 STOP 한다.**
+
+---
+
+## 🛠️ 영구룰 #GitHub빌드강제 (CRITICAL — 빌드/배포 사전조건)
 
 > **빌드/배포는 반드시 GitHub Actions 를 통해 명시적으로 트리거하고, 워크플로 성공을 명시적으로 확인한 뒤에만 다음 단계로 진행한다.**
 
@@ -49,9 +104,15 @@
 
 ---
 
-## 🕒 영구룰 #정규시각 (MOST CRITICAL — 사용자 거래내역 UX)
+## 🕒 영구룰 #정규시각 (CRITICAL — 사용자 거래내역 UX)
 
-> **DR/RR/tx INSERT 시 created_at 은 반드시 paid_date 의 KST 15:15 (= UTC 06:15) 정규 cron 시각으로 명시한다.**
+> **DR/RR/tx INSERT 시 created_at 은 반드시 paid_date 의 KST 08:00 (= UTC 23:00 of previous day) 정규 배당 시각으로 명시한다.**
+
+### ⚠️ 2026-05-19 변경 사항
+- **이전**: KST 15:15 (= UTC 06:15) — 폐기됨
+- **현재**: **KST 08:00 (= UTC 23:00 of `paid_date - 1`)** ← 신규 기준
+- 변경 사유: 사장님 명령 — 매일 아침 08시 정규 배당으로 통일
+- 마이그레이션 완료: 2026-05-19 EXEC 로 5/7~5/19 paid_date 의 2,153 row 모두 KST 08:00 으로 보정 완료
 
 ### 절대 금지
 1. ❌ `INSERT INTO transactions (...) VALUES (...)` 에서 created_at 컬럼 생략
@@ -59,26 +120,33 @@
    - → 사용자 거래내역 화면에 **오늘 EXEC 한 시각이 추천보너스 시각으로 표시** → 사장님 격노 사고
 2. ❌ `created_at = CURRENT_TIMESTAMP` 명시
 3. ❌ 어드민 백필/recalc 시 created_at 을 "지금 시각" 으로 두는 것
+4. ❌ **KST 15:15 사용 금지** (2026-05-19 폐기)
 
-### 필수 형식
+### 필수 형식 (2026-05-19 기준)
 ```typescript
-const dividendCreatedAtUtc = `${payoutDate} 06:15:00`  // KST 15:15:00 = UTC 06:15:00 (DR/RR/daily_qkey tx)
-const rrTxCreatedAtUtc = `${payoutDate} 06:15:01`      // RR tx 는 정규 cron 순서 모사로 1초 늦게
-INSERT INTO transactions (..., created_at) VALUES (..., ?)
-INSERT INTO daily_rewards (..., created_at) VALUES (..., ?)
+// KST 08:00 = UTC 23:00 of previous day
+// 예: paid_date='2026-05-19' → created_at='2026-05-18 23:00:00' (UTC)
+const dividendCreatedAtUtc = `${getPrevDateUtc(payoutDate)} 23:00:00`  // KST 08:00:00
+const rrTxCreatedAtUtc     = `${getPrevDateUtc(payoutDate)} 23:00:01`  // RR tx 는 1초 늦게
+
+// SQLite 에서는 datetime() 함수로 간편 작성 가능
+// datetime('${paidDate} 23:00:00')  ← 표시상 paid_date 23:00 이지만 SQLite 가 UTC 로 저장
+// 단 paid_date 와 1일 차이가 나므로 주의 — 권장 패턴은 위 prev-date 명시
+INSERT INTO transactions    (..., created_at) VALUES (..., ?)
+INSERT INTO daily_rewards   (..., created_at) VALUES (..., ?)
 INSERT INTO referral_rewards (..., created_at) VALUES (..., ?)
 ```
 
 ### 적용 범위
-- **모든 어드민 정산 endpoint** (recalc-day-dividend, fix-missing-tx 등)
-- 정규 cron 은 이미 KST 15:15 에 INSERT 하므로 자연스럽게 충족됨
-- 어드민/recalc EXEC 만 위험
+- **모든 정산 endpoint** (정규 cron, manual emergency, recalc, backfill 등)
+- **모든 어드민 INSERT** (created_at 명시 필수)
 
-### 사고 이력 (2026-05-18)
-- recalc-day-dividend EXEC 4번 (5/11~5/14 reward) 의 tx.created_at 이 5/18 KST 19:04/19:12/19:14/19:17 로 박힘 → 사용자 거래내역에 "추천보너스 다량 5/18 저녁" 으로 표시 → 사장님 격노 → 4건 모두 reverse (657건/936,375 QKEY)
+### 사고 이력
+- **2026-05-18**: recalc-day-dividend EXEC 4번 (5/11~5/14 reward) 의 tx.created_at 이 5/18 KST 19:04/19:12/19:14/19:17 로 박힘 → 사용자 거래내역에 "추천보너스 다량 5/18 저녁" 으로 표시 → 사장님 격노 → 4건 모두 reverse (657건/936,375 QKEY)
+- **2026-05-19**: KST 15:15 정책 폐기, KST 08:00 통일 결정. 기존 5/7~5/19 paid_date 의 2,153 row (DR 415 + RR 816 + tx 922) 모두 KST 08:00 으로 normalize EXEC 완료. balance ↔ tx 정합 63/63 유지.
 
-**⚠️ 사장님 직접 인용 (2026-05-18, 사고 직후 직접 명령)**:
-> "너의 사고인 recalc-day-dividend EXEC 가 tx.created_at 을 paid_date 의 적절한 KST 시각이 아니라 EXEC 실행 시각으로 INSERT 한 것이 근본 원인이니 다음 EXEC 부터는 created_at 도 영구룰 정확 적용 하도록 코드 수정 필요"
+**⚠️ 사장님 직접 인용 (2026-05-19, 변경 명령)**:
+> "a 로 가고 매일 kst 08:00 시로 보정하고 13시 15분은 완전히 없앨것! **무조건 내 영구룰에 근거해서 매일 아침 08시에 배당을 할것!**"
 
 ---
 
@@ -311,6 +379,8 @@ strftime('%Y-%m-%dT%H:%M:%S', created_at, '+9 hours')  -- KST ISO 8601 (Safari �
 | 2026-05-18 | recalc-day-dividend 2번 EXEC timeout → 5/18 KST 17:53/17:54 에 referral_reward tx 105건 / 50,700 QKEY 중복 INSERT | N+1 SELECT + 30s Worker timeout 후에도 사용자별 loop 가 계속 실행됨. 첫 EXEC timeout 후 두번째 EXEC 보냄. | #중복지급금지 #스테이킹별독립 |
 | 2026-05-18 | 빌드 deploy 실패 인지 못하고 endpoint 404 후 재시도 루프 | `git push` 자동 감지 의존. GitHub Actions 빌드 status 명시 확인 안 함. Cloudflare API 가 commit message 거부 (Invalid UTF-8) 인 줄도 모름. | #GitHub빌드강제 |
 | 2026-05-18 | recalc-day-dividend EXEC 의 tx.created_at 이 EXEC 실행 시각 (5/18 19:04/19:12/19:14/19:17 KST) 으로 INSERT 됨 → 사용자 거래내역 UX 가 5/18 추천보너스 다량으로 표시 → 사장님 격노 ("또 중복지급한 상태니!") → reverse 657건/936,375 QKEY EXEC | INSERT INTO transactions 에 created_at 명시 안 함 → DB default CURRENT_TIMESTAMP 적용 → EXEC 시각이 박힘. 사용자 화면은 tx.created_at +9h 보정으로 KST 표시. | #정규시각 #중복지급금지 |
+| 2026-05-19 | GitHub Actions schedule (`0 22 * * *` = KST 07:00) 자동 cron 이 의도와 무관하게 실행됨 (5/19 KST 08:11-08:16 자동 처리). workflow 변경 차단 시도 했으나 GitHub App workflows permission 부족으로 push 거부. 결과적으로 5/18 reward → 5/19 paid 익일처리 자동 완료. | (1) cron 차단 코드가 commit 못 됨 (workflows scope 권한 없음). (2) 사장님이 매일 수동 emergency 버튼 사용을 원했으나 자동 cron 이 먼저 실행. (3) 사용자 데이터는 정상 — 익일처리 영구룰 충족. | #익일처리 |
+| 2026-05-19 | 정규시각 영구룰 변경 (KST 15:15 → KST 08:00). 기존 1,064 tx 가 KST 08:00 아님 발견. 옵션 2 (정규 cron 결과만) 선택 → 5/7~5/19 9개 paid_date 의 2,153 row UPDATE 로 KST 08:00 통일 완료. PRE/POST collision check + POST-VERIFY 모두 통과 (63/63 matched 유지). | 정책 변경에 따른 데이터 정합 정렬. UPDATE only 라 중복 위험 0. 영구룰 #지상최고 가드 적용된 첫 작업. | #지상최고 #정규시각 |
 | 이전 다수 | 클라이언트 inline JS SyntaxError | 백틱 안 이스케이프 시퀀스 깨짐 | (CRITICAL_RULES.md 참조) |
 
 ---
