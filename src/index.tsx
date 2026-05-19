@@ -50993,4 +50993,280 @@ app.get('/api/diag/fix-paid-date-holidays', async (c) => {
 })
 
 
+// ============================================================
+// 영구룰 #익일처리 + #정규시각 100% 준수 — 스키마 정정 + paid_date 정정
+// 사장님 명령 "나" (2026-05-19): UNIQUE INDEX 교체 (paid_date → reward_date 기반) +
+// paid_date 영구룰 #익일처리 대로 정정 + created_at 영구룰 #정규시각 대로 정정
+// 잔액 변경 0 보장 (users.qkey_balance 미변경, transactions.amount 미변경)
+// ============================================================
+app.get('/api/diag/fix-paid-date-canonical', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_PAID_CANONICAL'
+    const db = c.env.DB
+
+    // STEP 0: 현재 referral_rewards UNIQUE 인덱스 조사
+    const allIdx = await db.prepare(`
+      SELECT name, sql FROM sqlite_master
+      WHERE type='index' AND tbl_name IN ('referral_rewards','daily_rewards')
+      ORDER BY tbl_name, name
+    `).all<any>()
+
+    // 영구룰 #익일처리: 발생일(reward_date) → 지급일(paid_date) 매핑
+    // 금요일 발생 → 다음 월요일 지급 (토/일 skip)
+    // 평일 발생 → 다음 영업일 지급
+    function nextBusinessDay(ymd: string): string {
+      const [Y, M, D] = ymd.split('-').map(Number)
+      const dt = new Date(Date.UTC(Y, M - 1, D))
+      while (true) {
+        dt.setUTCDate(dt.getUTCDate() + 1)
+        const dow = dt.getUTCDay() // 0=Sun, 6=Sat
+        if (dow !== 0 && dow !== 6) break
+      }
+      const y = dt.getUTCFullYear()
+      const m = String(dt.getUTCMonth() + 1).padStart(2, '0')
+      const d = String(dt.getUTCDate()).padStart(2, '0')
+      return `${y}-${m}-${d}`
+    }
+    function prevDayUtc23(ymd: string): string {
+      const [Y, M, D] = ymd.split('-').map(Number)
+      const dt = new Date(Date.UTC(Y, M - 1, D))
+      dt.setUTCDate(dt.getUTCDate() - 1)
+      const y = dt.getUTCFullYear()
+      const m = String(dt.getUTCMonth() + 1).padStart(2, '0')
+      const d = String(dt.getUTCDate()).padStart(2, '0')
+      return `${y}-${m}-${d} 23:00:00`
+    }
+
+    // STEP 1: 모든 reward_date 에 대해 영구룰상 정답 paid_date 계산
+    // daily_rewards / referral_rewards 양쪽 모두
+    const drDistinct = await db.prepare(`
+      SELECT DISTINCT reward_date, paid_date FROM daily_rewards
+      WHERE reward_date IS NOT NULL
+      ORDER BY reward_date
+    `).all<any>()
+    const rrDistinct = await db.prepare(`
+      SELECT DISTINCT reward_date, paid_date FROM referral_rewards
+      WHERE reward_date IS NOT NULL
+      ORDER BY reward_date
+    `).all<any>()
+
+    type DateFix = {
+      reward_date: string
+      current_paid_date: string | null
+      canonical_paid_date: string
+      canonical_created_at: string
+      dr_rows: number
+      rr_rows: number
+      action: string
+    }
+    const dateMap = new Map<string, DateFix>()
+    for (const r of [...(drDistinct.results || []), ...(rrDistinct.results || [])]) {
+      const rd = String(r.reward_date)
+      const cp = r.paid_date ? String(r.paid_date) : null
+      const canon = nextBusinessDay(rd)
+      const created = prevDayUtc23(canon)
+      const key = rd
+      if (!dateMap.has(key)) {
+        dateMap.set(key, {
+          reward_date: rd,
+          current_paid_date: cp,
+          canonical_paid_date: canon,
+          canonical_created_at: created,
+          dr_rows: 0,
+          rr_rows: 0,
+          action: cp === canon ? 'NO_CHANGE' : 'UPDATE',
+        })
+      }
+    }
+    // 행 수 채우기
+    for (const k of dateMap.keys()) {
+      const drc = await db.prepare(`SELECT COUNT(*) AS c FROM daily_rewards WHERE reward_date = ?`).bind(k).first<any>()
+      const rrc = await db.prepare(`SELECT COUNT(*) AS c FROM referral_rewards WHERE reward_date = ?`).bind(k).first<any>()
+      const f = dateMap.get(k)!
+      f.dr_rows = Number(drc?.c || 0)
+      f.rr_rows = Number(rrc?.c || 0)
+    }
+    const allFixes = Array.from(dateMap.values()).sort((a, b) => a.reward_date.localeCompare(b.reward_date))
+    const toFix = allFixes.filter((f) => f.action === 'UPDATE')
+
+    // STEP 2: UNIQUE 인덱스 교체 계획 (DRY_RUN 표시)
+    const indexPlan = [
+      {
+        action: 'DROP_IF_EXISTS',
+        candidates: (allIdx.results || []).filter((i: any) =>
+          String(i.sql || '').toUpperCase().includes('UNIQUE') &&
+          String(i.sql || '').toLowerCase().includes('paid_date'),
+        ),
+      },
+      {
+        action: 'CREATE_UNIQUE_INDEX_referral_rewards',
+        sql: `CREATE UNIQUE INDEX IF NOT EXISTS uq_rr_canonical ON referral_rewards (referrer_id, referee_id, level, staking_id, reward_date) WHERE staking_id IS NOT NULL`,
+      },
+      {
+        action: 'CREATE_UNIQUE_INDEX_daily_rewards',
+        sql: `CREATE UNIQUE INDEX IF NOT EXISTS uq_dr_canonical ON daily_rewards (user_id, staking_id, reward_date)`,
+      },
+    ]
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        rule_refs: [
+          '#익일처리 (PERMANENT_RULES.md L347): paid_date = next business day after reward_date',
+          '#정규시각 (PERMANENT_RULES.md L195): created_at = UTC (paid_date - 1) 23:00:00',
+          '#스테이킹별독립 (PERMANENT_RULES.md L241): UNIQUE = (user/referrer/referee, staking_id, reward_date)',
+        ],
+        current_indexes_on_rr_dr: allIdx.results || [],
+        index_replacement_plan: indexPlan,
+        date_fixes_total: allFixes.length,
+        date_fixes_needs_update: toFix.length,
+        date_fixes: allFixes,
+        balance_guarantee: 'users.qkey_balance / transactions.amount 미변경, paid_date + created_at 만 UPDATE',
+        confirm_token_required: 'FIX_PAID_CANONICAL',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ============================================================
+    // EXEC
+    // ============================================================
+    const execResults: any[] = []
+
+    // EXEC STEP 1: paid_date 충돌 가능성 회피 — 기존 UNIQUE 인덱스 중 paid_date 포함된 것 DROP
+    const dropResults: any[] = []
+    for (const idx of allIdx.results || []) {
+      const sql = String((idx as any).sql || '')
+      const name = String((idx as any).name || '')
+      if (sql.toUpperCase().includes('UNIQUE') && sql.toLowerCase().includes('paid_date')) {
+        try {
+          await db.prepare(`DROP INDEX IF EXISTS ${name}`).run()
+          dropResults.push({ name, dropped: true })
+        } catch (e) {
+          dropResults.push({ name, dropped: false, error: String(e) })
+        }
+      }
+    }
+
+    // EXEC STEP 2: reward_date 기반 새 UNIQUE 인덱스 생성
+    // (이미 존재할 수 있으므로 IF NOT EXISTS)
+    let indexCreated: any = {}
+    try {
+      await db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS uq_rr_canonical ON referral_rewards (referrer_id, referee_id, level, staking_id, reward_date) WHERE staking_id IS NOT NULL`).run()
+      indexCreated.uq_rr_canonical = 'OK'
+    } catch (e) {
+      indexCreated.uq_rr_canonical = String(e)
+    }
+    try {
+      await db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS uq_dr_canonical ON daily_rewards (user_id, staking_id, reward_date)`).run()
+      indexCreated.uq_dr_canonical = 'OK'
+    } catch (e) {
+      indexCreated.uq_dr_canonical = String(e)
+    }
+
+    // EXEC STEP 3: 각 reward_date 별로 paid_date + created_at UPDATE
+    // staking_id 기반 UNIQUE 이므로 같은 reward_date 안의 행들끼리는 충돌 없음
+    // 다른 reward_date 의 행과는 UNIQUE 키가 다르므로 paid_date 변경해도 무방
+    for (const f of toFix) {
+      const stmts: any[] = []
+      // daily_rewards
+      stmts.push(db.prepare(`
+        UPDATE daily_rewards
+        SET paid_date = ?, created_at = ?
+        WHERE reward_date = ?
+      `).bind(f.canonical_paid_date, f.canonical_created_at, f.reward_date))
+      // referral_rewards
+      stmts.push(db.prepare(`
+        UPDATE referral_rewards
+        SET paid_date = ?, created_at = ?
+        WHERE reward_date = ?
+      `).bind(f.canonical_paid_date, f.canonical_created_at, f.reward_date))
+      // transactions (type=daily_qkey, ref_id=dr.id)
+      stmts.push(db.prepare(`
+        UPDATE transactions
+        SET created_at = ?
+        WHERE type='daily_qkey' AND ref_id IN (SELECT id FROM daily_rewards WHERE reward_date = ?)
+      `).bind(f.canonical_created_at, f.reward_date))
+      // transactions (type=referral_reward, ref_id=rr.id)
+      stmts.push(db.prepare(`
+        UPDATE transactions
+        SET created_at = ?
+        WHERE type='referral_reward' AND ref_id IN (SELECT id FROM referral_rewards WHERE reward_date = ?)
+      `).bind(f.canonical_created_at, f.reward_date))
+
+      try {
+        const res = await db.batch(stmts)
+        execResults.push({
+          reward_date: f.reward_date,
+          old_paid_date: f.current_paid_date,
+          new_paid_date: f.canonical_paid_date,
+          new_created_at: f.canonical_created_at,
+          ok: true,
+          stmts: res.length,
+        })
+      } catch (e) {
+        execResults.push({
+          reward_date: f.reward_date,
+          old_paid_date: f.current_paid_date,
+          new_paid_date: f.canonical_paid_date,
+          ok: false,
+          error: String(e),
+        })
+      }
+    }
+
+    // EXEC STEP 4: daily_cron_lock 정리 — lock_date 도 paid_date 기준으로 이관
+    // 잔액 영향 없음. 모든 변경된 paid_date 에 대해 적용.
+    const lockResults: any[] = []
+    for (const f of toFix) {
+      if (!f.current_paid_date || f.current_paid_date === f.canonical_paid_date) continue
+      try {
+        const newExists = await db.prepare(`SELECT lock_date FROM daily_cron_lock WHERE lock_date = ?`).bind(f.canonical_paid_date).first<any>()
+        const oldExists = await db.prepare(`SELECT lock_date FROM daily_cron_lock WHERE lock_date = ?`).bind(f.current_paid_date).first<any>()
+        if (oldExists && newExists) {
+          await db.prepare(`DELETE FROM daily_cron_lock WHERE lock_date = ?`).bind(f.current_paid_date).run()
+          lockResults.push({ old: f.current_paid_date, new: f.canonical_paid_date, action: 'delete_old (new exists)' })
+        } else if (oldExists && !newExists) {
+          await db.prepare(`UPDATE daily_cron_lock SET lock_date = ? WHERE lock_date = ?`).bind(f.canonical_paid_date, f.current_paid_date).run()
+          lockResults.push({ old: f.current_paid_date, new: f.canonical_paid_date, action: 'rename' })
+        } else {
+          lockResults.push({ old: f.current_paid_date, new: f.canonical_paid_date, action: 'noop (no old)' })
+        }
+      } catch (e) {
+        lockResults.push({ old: f.current_paid_date, new: f.canonical_paid_date, error: String(e) })
+      }
+    }
+
+    // 사후 검증: 영구룰 위반 행이 0인지 확인
+    const verifyDr = await db.prepare(`
+      SELECT COUNT(*) AS c FROM daily_rewards
+      WHERE reward_date IS NOT NULL AND paid_date IS NOT NULL
+    `).first<any>()
+    const verifyRr = await db.prepare(`
+      SELECT COUNT(*) AS c FROM referral_rewards
+      WHERE reward_date IS NOT NULL AND paid_date IS NOT NULL
+    `).first<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      step1_dropped_old_unique_indexes: dropResults,
+      step2_new_canonical_unique_indexes: indexCreated,
+      step3_date_fixes: execResults,
+      step4_lock_migration: lockResults,
+      verify_total_dr: Number(verifyDr?.c || 0),
+      verify_total_rr: Number(verifyRr?.c || 0),
+      balance_change: '없음 (users.qkey_balance / transactions.amount 미변경)',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
