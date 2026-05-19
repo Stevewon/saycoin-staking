@@ -55124,4 +55124,417 @@ app.get('/api/diag/inspect-516-paid', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// scan-516-all-traces — 5/16 관련 모든 잔재 전수조사 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령: "사용자내역에 아직도 있다는거야! 잔존하는 16일이 있다면
+//              전부 어드민이고 사용자내역에서고 지워달라는거야"
+//
+// 검사 범위 (전수조사):
+//   1) daily_rewards WHERE paid_date='2026-05-16'
+//   2) referral_rewards WHERE paid_date='2026-05-16'
+//   3) transactions WHERE created_at in 5/15 23:00 ~ 5/16 23:00 UTC (KST 5/16 08:00 ~ 5/17 08:00)
+//   4) transactions WHERE description LIKE '%5/16%' or '%16일%' (보조)
+//   5) 위 TX 의 영향받은 user 별 balance 차감 예정 금액
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-516-all-traces', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    // 1) DR with paid_date=5/16
+    const dr516 = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards WHERE paid_date='2026-05-16'
+      ORDER BY id
+    `).all<any>()
+
+    // 2) RR with paid_date=5/16
+    const rr516 = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards WHERE paid_date='2026-05-16'
+      ORDER BY id
+    `).all<any>()
+
+    // 3) TX in 5/16 정규시각 window (KST 5/16 08:00 = UTC 5/15 23:00)
+    //    KST 5/17 08:00 까지 24시간 (cron 다 끝나는 시간)
+    const txWindow = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward')
+        AND created_at >= '2026-05-15 23:00:00'
+        AND created_at < '2026-05-16 23:00:00'
+      ORDER BY created_at, id
+    `).all<any>()
+
+    // 4) TX with NULL ref_id (orphan, 5/16 의심)
+    const txOrphans = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id, description, created_at
+      FROM transactions
+      WHERE coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward')
+        AND ref_id IS NULL
+        AND created_at >= '2026-05-15 00:00:00'
+        AND created_at < '2026-05-17 00:00:00'
+      ORDER BY created_at, id
+    `).all<any>()
+
+    // 5) TX 의 user_id 별 balance 차감 예정 (txWindow + txOrphans 합집합)
+    const allTxIds = new Set<number>()
+    const txMap = new Map<number, any>()
+    for (const t of (txWindow.results || []) as any[]) {
+      allTxIds.add(t.id)
+      txMap.set(t.id, t)
+    }
+    for (const t of (txOrphans.results || []) as any[]) {
+      allTxIds.add(t.id)
+      txMap.set(t.id, t)
+    }
+    const txTargets = Array.from(txMap.values())
+
+    const balanceDecrement: Record<number, number> = {}
+    for (const t of txTargets) {
+      const uid = t.user_id
+      balanceDecrement[uid] = (balanceDecrement[uid] || 0) + Number(t.amount || 0)
+    }
+
+    // 6) 각 영향 user 의 현재 qkey_balance
+    const userIds = Object.keys(balanceDecrement).map(Number)
+    const userBalances: any[] = []
+    for (const uid of userIds) {
+      const u = await db.prepare(`SELECT id, qkey_balance, name, email FROM users WHERE id=?`).bind(uid).first()
+      if (u) userBalances.push(u)
+    }
+
+    // 7) 보존 검증: 5/15 reward 의 5/18 paid 가 정확히 있는지 (user 44 등)
+    const paid518For44 = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount as qkey, reward_date, paid_date, created_at
+      FROM daily_rewards
+      WHERE paid_date='2026-05-18' AND user_id IN (${userIds.length > 0 ? userIds.map(() => '?').join(',') : '0'})
+      ORDER BY user_id, staking_id
+    `).bind(...userIds).all<any>()
+
+    // 8) RR 도 동일 검증
+    const rr518For44 = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_amount, staking_id, reward_date, paid_date
+      FROM referral_rewards
+      WHERE paid_date='2026-05-18' AND referrer_id IN (${userIds.length > 0 ? userIds.map(() => '?').join(',') : '0'})
+      ORDER BY referrer_id, level
+    `).bind(...userIds).all<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_SCAN',
+      paid_date: '2026-05-16',
+      day_of_week: '토요일 (휴일) - 영구룰 #익일처리 위반',
+      traces: {
+        daily_rewards: {
+          count: (dr516.results || []).length,
+          rows: dr516.results || [],
+        },
+        referral_rewards: {
+          count: (rr516.results || []).length,
+          rows: rr516.results || [],
+        },
+        tx_window: {
+          description: 'TX in 5/15 23:00 UTC ~ 5/16 23:00 UTC (KST 5/16 08:00 ~ 5/17 08:00)',
+          count: (txWindow.results || []).length,
+          total_qkey: (txWindow.results || []).reduce((a, b:any) => a + Number(b.amount||0), 0),
+          rows: txWindow.results || [],
+        },
+        tx_orphans: {
+          description: 'TX with NULL ref_id in 5/15 00:00 ~ 5/17 00:00 (over-broad sanity check)',
+          count: (txOrphans.results || []).length,
+          rows: txOrphans.results || [],
+        },
+      },
+      total_targets: {
+        dr_to_delete: (dr516.results || []).length,
+        rr_to_delete: (rr516.results || []).length,
+        tx_to_delete: txTargets.length,
+        tx_total_qkey: txTargets.reduce((a, b:any) => a + Number(b.amount||0), 0),
+      },
+      balance_decrement_plan: {
+        unique_users: userIds.length,
+        per_user: Object.entries(balanceDecrement).map(([uid, amt]) => {
+          const u = userBalances.find(x => x.id === Number(uid))
+          return {
+            user_id: Number(uid),
+            current_balance: u?.qkey_balance ?? null,
+            decrement: amt,
+            after_balance: u ? (Number(u.qkey_balance) - amt) : null,
+            name: u?.name ?? null,
+            email: u?.email ?? null,
+          }
+        }),
+      },
+      preservation_check: {
+        description: '같은 user 의 5/18 paid (정상치) 가 있는지 — 5/16 잘못 들어간 분과 별개로 보존되어야 함',
+        dr_518_for_affected_users: paid518For44.results || [],
+        rr_518_for_affected_users: rr518For44.results || [],
+      },
+      safety_guards: [
+        'paid_date=2026-05-16 DR/RR 만 DELETE',
+        '명시적 TX id IN 리스트로만 DELETE',
+        'user 별 정확한 차감액으로 balance UPDATE',
+        '5/18 paid 데이터 절대 보존 (별도 row)',
+        '5/11, 5/12 BOTTOM_UP_OK 보존',
+      ],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
+// delete-516-all-traces — 5/16 모든 잔재 완전 삭제 (DRY-RUN + EXEC)
+// ════════════════════════════════════════════════════════════════════════
+// confirm token: DELETE_516_ALL
+//
+// DRY-RUN: GET /api/diag/delete-516-all-traces?key=ADMIN_PW
+// EXEC:    GET /api/diag/delete-516-all-traces?key=ADMIN_PW&confirm=DELETE_516_ALL
+//
+// 가드:
+//   1) paid_date='2026-05-16' DR/RR 만 (다른 날짜 절대 안 건드림)
+//   2) TX 는 명시적 id list (스캔으로 찾은 것만)
+//   3) user 별 정확한 차감액으로 balance UPDATE
+//   4) 5/18 paid 데이터 보존 검증
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/delete-516-all-traces', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'DELETE_516_ALL'
+    const db = c.env.DB
+
+    // ─── Phase 1: 삭제 대상 식별 (scan 과 동일 로직) ───
+    const dr516 = await db.prepare(`
+      SELECT id, user_id, usdt_amount as qkey FROM daily_rewards WHERE paid_date='2026-05-16'
+    `).all<any>()
+    const rr516 = await db.prepare(`
+      SELECT id, referrer_id, reward_amount FROM referral_rewards WHERE paid_date='2026-05-16'
+    `).all<any>()
+    const txWindow = await db.prepare(`
+      SELECT id, user_id, type, amount FROM transactions
+      WHERE coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward')
+        AND created_at >= '2026-05-15 23:00:00'
+        AND created_at < '2026-05-16 23:00:00'
+    `).all<any>()
+
+    const drRows = (dr516.results || []) as any[]
+    const rrRows = (rr516.results || []) as any[]
+    const txRows = (txWindow.results || []) as any[]
+
+    // ─── Phase 2: balance 차감액 계산 ───
+    // DR row 별로 user 차감 (DR 가 있으면 그 user 가 받았다는 뜻)
+    // 단, 같은 transaction 이 ref_id 매핑되어 있으면 중복 차감 위험 — 사전 점검
+    const balanceDecrement: Record<number, { from_dr: number, from_rr: number, from_tx: number, total: number }> = {}
+
+    for (const d of drRows) {
+      const uid = d.user_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { from_dr: 0, from_rr: 0, from_tx: 0, total: 0 }
+      balanceDecrement[uid].from_dr += Number(d.qkey || 0)
+    }
+    for (const r of rrRows) {
+      const uid = r.referrer_id
+      if (!balanceDecrement[uid]) balanceDecrement[uid] = { from_dr: 0, from_rr: 0, from_tx: 0, total: 0 }
+      balanceDecrement[uid].from_rr += Number(r.reward_amount || 0)
+    }
+    // TX 중에서 DR/RR 의 ref_id 와 매칭 안 되는 orphan TX 만 추가 차감
+    // (만약 DR row 가 있고 그 ref_id 가 TX 가리키면 → DR 차감 으로 이미 처리됨, 중복 차감 방지)
+    const drIdSet = new Set(drRows.map(d => d.id))
+    const rrIdSet = new Set(rrRows.map(r => r.id))
+    const orphanTxs: any[] = []
+    for (const t of txRows) {
+      const isOrphan = !t.ref_id || (t.type === 'daily_qkey' && !drIdSet.has(t.ref_id)) || (t.type === 'referral_reward' && !rrIdSet.has(t.ref_id))
+      if (isOrphan) {
+        const uid = t.user_id
+        if (!balanceDecrement[uid]) balanceDecrement[uid] = { from_dr: 0, from_rr: 0, from_tx: 0, total: 0 }
+        balanceDecrement[uid].from_tx += Number(t.amount || 0)
+        orphanTxs.push(t)
+      }
+    }
+    for (const uid of Object.keys(balanceDecrement)) {
+      const b = balanceDecrement[Number(uid)]
+      b.total = b.from_dr + b.from_rr + b.from_tx
+    }
+
+    // user 현재 balance
+    const userIds = Object.keys(balanceDecrement).map(Number)
+    const userBalances: Record<number, any> = {}
+    for (const uid of userIds) {
+      const u = await db.prepare(`SELECT id, qkey_balance, name, email FROM users WHERE id=?`).bind(uid).first()
+      if (u) userBalances[uid] = u
+    }
+
+    // 가드: 차감 후 balance 가 음수 되면 안 됨
+    const negativeBalanceWarnings: any[] = []
+    for (const uid of userIds) {
+      const cur = Number(userBalances[uid]?.qkey_balance || 0)
+      const dec = balanceDecrement[uid].total
+      if (cur - dec < 0) {
+        negativeBalanceWarnings.push({
+          user_id: uid,
+          current_balance: cur,
+          decrement: dec,
+          after_balance: cur - dec,
+        })
+      }
+    }
+
+    // ─── Phase 3: DRY-RUN 또는 EXEC ───
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        confirm_token_required: 'DELETE_516_ALL',
+        targets: {
+          dr_count: drRows.length,
+          dr_total_qkey: drRows.reduce((a, b) => a + Number(b.qkey||0), 0),
+          rr_count: rrRows.length,
+          rr_total_qkey: rrRows.reduce((a, b) => a + Number(b.reward_amount||0), 0),
+          tx_count: txRows.length,
+          tx_total_qkey: txRows.reduce((a, b) => a + Number(b.amount||0), 0),
+          tx_orphan_count: orphanTxs.length,
+        },
+        delete_plan: {
+          dr_ids: drRows.map(d => d.id),
+          rr_ids: rrRows.map(r => r.id),
+          tx_ids: txRows.map(t => t.id),
+        },
+        balance_decrement_plan: Object.entries(balanceDecrement).map(([uid, v]) => ({
+          user_id: Number(uid),
+          current_balance: userBalances[Number(uid)]?.qkey_balance ?? null,
+          decrement_from_dr: v.from_dr,
+          decrement_from_rr: v.from_rr,
+          decrement_from_tx: v.from_tx,
+          decrement_total: v.total,
+          after_balance: userBalances[Number(uid)] ? (Number(userBalances[Number(uid)].qkey_balance) - v.total) : null,
+          name: userBalances[Number(uid)]?.name ?? null,
+          email: userBalances[Number(uid)]?.email ?? null,
+        })),
+        safety_warnings: {
+          negative_balance_count: negativeBalanceWarnings.length,
+          negative_balance_users: negativeBalanceWarnings,
+        },
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─── EXEC: 가드 fail 이면 거부 ───
+    if (negativeBalanceWarnings.length > 0) {
+      return c.json({
+        ok: false,
+        mode: 'EXEC_BLOCKED',
+        reason: 'negative balance warnings',
+        negative_balance_users: negativeBalanceWarnings,
+      }, 400)
+    }
+
+    // 1) DR DELETE (paid_date='2026-05-16' 가드)
+    let drDeleted = 0
+    if (drRows.length > 0) {
+      const drIds = drRows.map(d => d.id)
+      const ph = drIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        DELETE FROM daily_rewards
+        WHERE paid_date='2026-05-16' AND id IN (${ph})
+      `).bind(...drIds).run()
+      drDeleted = (r as any)?.meta?.changes ?? 0
+    }
+
+    // 2) RR DELETE (paid_date='2026-05-16' 가드)
+    let rrDeleted = 0
+    if (rrRows.length > 0) {
+      const rrIds = rrRows.map(r => r.id)
+      const ph = rrIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        DELETE FROM referral_rewards
+        WHERE paid_date='2026-05-16' AND id IN (${ph})
+      `).bind(...rrIds).run()
+      rrDeleted = (r as any)?.meta?.changes ?? 0
+    }
+
+    // 3) TX DELETE (명시적 id list + 시각 가드)
+    let txDeleted = 0
+    if (txRows.length > 0) {
+      const txIds = txRows.map(t => t.id)
+      const ph = txIds.map(() => '?').join(',')
+      const r = await db.prepare(`
+        DELETE FROM transactions
+        WHERE coin_type='QKEY'
+          AND type IN ('daily_qkey','referral_reward')
+          AND created_at >= '2026-05-15 23:00:00'
+          AND created_at < '2026-05-16 23:00:00'
+          AND id IN (${ph})
+      `).bind(...txIds).run()
+      txDeleted = (r as any)?.meta?.changes ?? 0
+    }
+
+    // 4) balance UPDATE (user 별 정확한 차감)
+    let balanceUpdated = 0
+    const balanceResults: any[] = []
+    for (const uid of userIds) {
+      const dec = balanceDecrement[uid].total
+      if (dec <= 0) continue
+      const r = await db.prepare(`
+        UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?
+      `).bind(dec, uid).run()
+      const changes = (r as any)?.meta?.changes ?? 0
+      balanceUpdated += changes
+      const after = await db.prepare(`SELECT qkey_balance FROM users WHERE id=?`).bind(uid).first() as any
+      balanceResults.push({
+        user_id: uid,
+        decrement: dec,
+        before: userBalances[uid]?.qkey_balance,
+        after: after?.qkey_balance,
+      })
+    }
+
+    // POST-VERIFY: 5/16 잔재 0건
+    const verifyDr = await db.prepare(`SELECT COUNT(*) as cnt FROM daily_rewards WHERE paid_date='2026-05-16'`).first() as any
+    const verifyRr = await db.prepare(`SELECT COUNT(*) as cnt FROM referral_rewards WHERE paid_date='2026-05-16'`).first() as any
+    const verifyTx = await db.prepare(`
+      SELECT COUNT(*) as cnt FROM transactions
+      WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward')
+        AND created_at >= '2026-05-15 23:00:00' AND created_at < '2026-05-16 23:00:00'
+    `).first() as any
+
+    // POST-VERIFY: 5/11, 5/12, 5/18 보존
+    const preserve = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date IN ('2026-05-11','2026-05-12','2026-05-13','2026-05-14','2026-05-15','2026-05-18','2026-05-19')
+      GROUP BY paid_date ORDER BY paid_date
+    `).all<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      deleted: { dr: drDeleted, rr: rrDeleted, tx: txDeleted },
+      balance_updates: { count: balanceUpdated, details: balanceResults },
+      post_verify: {
+        dr_516_remaining: Number(verifyDr?.cnt || 0),
+        rr_516_remaining: Number(verifyRr?.cnt || 0),
+        tx_516_window_remaining: Number(verifyTx?.cnt || 0),
+        all_zero_ok: Number(verifyDr?.cnt || 0) === 0 && Number(verifyRr?.cnt || 0) === 0 && Number(verifyTx?.cnt || 0) === 0,
+        other_paid_preserved: preserve.results || [],
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
