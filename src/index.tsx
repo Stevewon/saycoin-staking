@@ -60877,4 +60877,256 @@ app.get('/api/diag/fix-iinsil2-staking-reward', async (c) => {
 })
 
 
+// ============================================================================
+// fix-solbat-tree-missing — 솔밧(44) + 하부 L1/L2 누락 5일분 보충
+// 누락일자: 2026-05-05, 05-09, 05-10, 05-16, 05-17 (cron 미실행 추정)
+// 대상: 솔밧(44) + L1 7명(45,47,48,50,52,54,89) + L2 7명(46,49,73,74,76,90,93)
+// 보충 영역: 본인 daily_qkey + L1 referral_reward(20%) + L2 referral_reward(10%)
+// 영구룰: daily = amount * daily_rate * 150 (1일), L1=20%, L2=10%, 즉시 지급
+// 안전장치:
+//   1) (user_id, staking_id, paid_date) 중복 INSERT 차단 (daily_rewards)
+//   2) (referrer_id, referee_id, staking_id, paid_date, level) 중복 차단 (referral_rewards)
+//   3) staking.start_date <= reward_date 확인 (지급 자격)
+//   4) status='active' 만 지급
+//   5) 사후 검증: qkey_balance == tx_sum
+// DRY-RUN: GET /api/diag/fix-solbat-tree-missing?pw=ADMIN_PW
+// EXEC:    GET /api/diag/fix-solbat-tree-missing?pw=ADMIN_PW&confirm=FIX_SOLBAT_TREE_2026_05_19
+// ============================================================================
+app.get('/api/diag/fix-solbat-tree-missing', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const isExec = c.req.query('confirm') === 'FIX_SOLBAT_TREE_2026_05_19'
+
+  try {
+    const SOLBAT_UID = 44
+    const MISSING_DATES = ['2026-05-05','2026-05-09','2026-05-10','2026-05-16','2026-05-17']
+
+    // 1) 솔밧 하부 트리 식별 (L1 + L2)
+    const l1Rows = await c.env.DB.prepare(`SELECT id FROM users WHERE referrer_id = ?`).bind(SOLBAT_UID).all()
+    const l1Ids = (l1Rows.results || []).map((r: any) => r.id)
+    if (l1Ids.length === 0) return c.json({ error: 'NO_L1_FOUND', solbat_uid: SOLBAT_UID }, 400)
+
+    const placeholders = l1Ids.map(() => '?').join(',')
+    const l2Rows = await c.env.DB.prepare(`SELECT id FROM users WHERE referrer_id IN (${placeholders})`).bind(...l1Ids).all()
+    const l2Ids = (l2Rows.results || []).map((r: any) => r.id)
+
+    const allTargets = Array.from(new Set([SOLBAT_UID, ...l1Ids, ...l2Ids])).sort((a,b)=>a-b)
+
+    // referrer 매핑 (전체 회원)
+    const allUserRows = await c.env.DB.prepare(`SELECT id, name, referrer_id, qkey_balance FROM users`).all()
+    const userMap: Record<number, any> = {}
+    for (const u of (allUserRows.results || []) as any[]) userMap[u.id] = u
+
+    // 2) 보충 계획 산출
+    type DailyPlan = { user_id: number, staking_id: number, paid_date: string, reward_date: string, amount: number, name: string }
+    type RrPlan = { referrer_id: number, referee_id: number, staking_id: number, level: number, original: number, amount: number, paid_date: string, reward_date: string, referrer_name: string }
+
+    const dailyPlans: DailyPlan[] = []
+    const rrPlans: RrPlan[] = []
+
+    for (const md of MISSING_DATES) {
+      const rd = new Date(md)
+      rd.setDate(rd.getDate() - 1)
+      const rewardDate = rd.toISOString().slice(0,10)
+
+      for (const uid of allTargets) {
+        const stkRows = await c.env.DB.prepare(`
+          SELECT id, amount, daily_rate, start_date, status FROM staking 
+          WHERE user_id = ? AND status = 'active'
+        `).bind(uid).all()
+
+        for (const s of (stkRows.results || []) as any[]) {
+          const startDay = String(s.start_date).slice(0,10)
+          if (startDay > rewardDate) continue  // staking 시작 이후만
+
+          const dailyQkey = Math.floor(s.amount * s.daily_rate * 150)
+
+          // 중복 체크 (daily_rewards)
+          const dupDr = await c.env.DB.prepare(`
+            SELECT id FROM daily_rewards 
+            WHERE user_id = ? AND staking_id = ? AND paid_date = ?
+          `).bind(uid, s.id, md).first()
+          if (dupDr) continue  // 이미 존재
+
+          dailyPlans.push({
+            user_id: uid, staking_id: s.id, paid_date: md, reward_date: rewardDate,
+            amount: dailyQkey, name: userMap[uid]?.name || '?'
+          })
+
+          // L1 = referrer 20%
+          const refrer1 = userMap[uid]?.referrer_id
+          if (refrer1) {
+            const l1Amt = Math.floor(dailyQkey * 0.2)
+            const dupL1 = await c.env.DB.prepare(`
+              SELECT id FROM referral_rewards 
+              WHERE referrer_id = ? AND referee_id = ? AND staking_id = ? AND paid_date = ? AND level = 1
+            `).bind(refrer1, uid, s.id, md).first()
+            if (!dupL1) {
+              rrPlans.push({
+                referrer_id: refrer1, referee_id: uid, staking_id: s.id, level: 1,
+                original: dailyQkey, amount: l1Amt, paid_date: md, reward_date: rewardDate,
+                referrer_name: userMap[refrer1]?.name || '?'
+              })
+            }
+            // L2 = refrer1 의 referrer 10%
+            const refrer2 = userMap[refrer1]?.referrer_id
+            if (refrer2) {
+              const l2Amt = Math.floor(dailyQkey * 0.1)
+              const dupL2 = await c.env.DB.prepare(`
+                SELECT id FROM referral_rewards 
+                WHERE referrer_id = ? AND referee_id = ? AND staking_id = ? AND paid_date = ? AND level = 2
+              `).bind(refrer2, uid, s.id, md).first()
+              if (!dupL2) {
+                rrPlans.push({
+                  referrer_id: refrer2, referee_id: uid, staking_id: s.id, level: 2,
+                  original: dailyQkey, amount: l2Amt, paid_date: md, reward_date: rewardDate,
+                  referrer_name: userMap[refrer2]?.name || '?'
+                })
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 회원별 보충 합계
+    const perUser: Record<number, number> = {}
+    for (const p of dailyPlans) perUser[p.user_id] = (perUser[p.user_id] || 0) + p.amount
+    for (const r of rrPlans) perUser[r.referrer_id] = (perUser[r.referrer_id] || 0) + r.amount
+
+    const totalDaily = dailyPlans.reduce((a,p)=>a+p.amount, 0)
+    const totalL1 = rrPlans.filter(r=>r.level===1).reduce((a,r)=>a+r.amount, 0)
+    const totalL2 = rrPlans.filter(r=>r.level===2).reduce((a,r)=>a+r.amount, 0)
+    const grandTotal = totalDaily + totalL1 + totalL2
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        solbat_uid: SOLBAT_UID,
+        l1_ids: l1Ids, l2_ids: l2Ids, all_targets: allTargets,
+        missing_dates: MISSING_DATES,
+        plan: {
+          daily_inserts: dailyPlans.length,
+          l1_inserts: rrPlans.filter(r=>r.level===1).length,
+          l2_inserts: rrPlans.filter(r=>r.level===2).length,
+          tx_inserts_total: dailyPlans.length + rrPlans.length,
+          total_daily_qkey: totalDaily,
+          total_l1_qkey: totalL1,
+          total_l2_qkey: totalL2,
+          grand_total_qkey: grandTotal,
+        },
+        per_user_supplement: Object.entries(perUser).sort((a,b)=>Number(a[0])-Number(b[0])).map(([uid,amt]) => ({
+          user_id: Number(uid),
+          name: userMap[Number(uid)]?.name || '?',
+          current: userMap[Number(uid)]?.qkey_balance || 0,
+          supplement: amt,
+          after: (userMap[Number(uid)]?.qkey_balance || 0) + amt,
+        })),
+        sample_daily_plan: dailyPlans.slice(0, 10),
+        sample_rr_plan: rrPlans.slice(0, 10),
+        hint: 'Add &confirm=FIX_SOLBAT_TREE_2026_05_19 to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ========================== EXEC MODE ==========================
+    const inserted = { daily: 0, l1: 0, l2: 0, tx: 0 }
+    const failed: any[] = []
+    const balanceUpdates: Record<number, number> = {}
+
+    // INSERT daily_rewards + transactions(daily_qkey)
+    for (const p of dailyPlans) {
+      try {
+        const drIns = await c.env.DB.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(p.user_id, p.staking_id, p.amount, p.reward_date, p.paid_date, p.paid_date).run()
+        const drId = drIns.meta.last_row_id
+        inserted.daily++
+
+        await c.env.DB.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(
+          p.user_id, p.amount,
+          `일일 배당 보충 (paid ${p.paid_date}, dr_id=${drId}) [solbat-tree-fix]`,
+          drId, p.paid_date
+        ).run()
+        inserted.tx++
+        balanceUpdates[p.user_id] = (balanceUpdates[p.user_id] || 0) + p.amount
+      } catch (e: any) {
+        failed.push({ phase: 'daily', user_id: p.user_id, staking_id: p.staking_id, paid_date: p.paid_date, error: String(e?.message || e) })
+      }
+    }
+
+    // INSERT referral_rewards + transactions(referral_reward)
+    for (const r of rrPlans) {
+      try {
+        const rrIns = await c.env.DB.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(r.referrer_id, r.referee_id, r.level, r.original, r.amount, r.reward_date, r.paid_date, r.staking_id, r.paid_date).run()
+        const rrId = rrIns.meta.last_row_id
+        if (r.level === 1) inserted.l1++; else inserted.l2++
+
+        await c.env.DB.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, datetime(?, '-1 day', '+23 hours'))
+        `).bind(
+          r.referrer_id, r.amount,
+          `추천 보너스 (Level ${r.level}) [solbat-tree-fix paid ${r.paid_date} rr_id=${rrId}]`,
+          rrId, r.paid_date
+        ).run()
+        inserted.tx++
+        balanceUpdates[r.referrer_id] = (balanceUpdates[r.referrer_id] || 0) + r.amount
+      } catch (e: any) {
+        failed.push({ phase: 'rr', level: r.level, referrer_id: r.referrer_id, referee_id: r.referee_id, staking_id: r.staking_id, paid_date: r.paid_date, error: String(e?.message || e) })
+      }
+    }
+
+    // UPDATE users.qkey_balance
+    for (const [uid, delta] of Object.entries(balanceUpdates)) {
+      try {
+        await c.env.DB.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, Number(uid)).run()
+      } catch (e: any) {
+        failed.push({ phase: 'balance_update', user_id: Number(uid), delta, error: String(e?.message || e) })
+      }
+    }
+
+    // 사후 검증
+    const afterCheck: any[] = []
+    for (const uid of allTargets) {
+      const ur = await c.env.DB.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(uid).first() as any
+      const ts = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'QKEY'`).bind(uid).first() as any
+      afterCheck.push({
+        user_id: uid, name: userMap[uid]?.name || '?',
+        qkey_balance: ur?.qkey_balance, tx_sum: ts?.s,
+        match: ur?.qkey_balance === ts?.s ? 'OK' : 'MISMATCH'
+      })
+    }
+
+    // 전역 검증
+    const gb = await c.env.DB.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS s FROM users`).first() as any
+    const gt = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE coin_type = 'QKEY'`).first() as any
+
+    return c.json({
+      mode: 'EXEC_DONE',
+      inserted, failed_count: failed.length, failed_sample: failed.slice(0, 10),
+      plan_totals: { dailyPlans: dailyPlans.length, rrPlans: rrPlans.length },
+      after_check: afterCheck,
+      global: {
+        total_qkey_balance: gb?.s,
+        total_qkey_tx_sum: gt?.s,
+        integrity: gb?.s === gt?.s ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH'
+      },
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
