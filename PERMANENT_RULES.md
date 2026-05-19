@@ -475,3 +475,28 @@ strftime('%Y-%m-%dT%H:%M:%S', created_at, '+9 hours')  -- KST ISO 8601 (Safari �
 
 **이 파일은 사장님이 명시적으로 수정하기 전까지 절대 변경되지 않습니다.**
 **모든 정산/픽스/마이그레이션 작업 시작 전에 이 파일을 다시 읽고 영구룰을 확인하세요.**
+
+---
+
+## 🔒 영구룰 #UNIQUE인덱스적용 (2026-05-19 EMERGENCY)
+
+**배경**: 2026-05-19 KST 14시경 사장님이 모바일 화면에서 "05.20. 08:00" 표시 transaction 들을 발견.
+DB 조사 결과 `daily_rewards`/`referral_rewards` 는 5/19 paid_date 로 1batch 만 있었으나,
+`transactions` 테이블에서는 동일 `ref_id` 에 대해 **두 번 INSERT** 되어 있었음.
+
+**원인**: cron v1 (created_at 명시) 과 v2 (DEFAULT CURRENT_TIMESTAMP) 코드 경로가 둘 다 존재하여
+이론적으로 중복 INSERT 가능. 어플리케이션 레벨 EXISTS 가드만으로는 race condition 또는
+re-entry 시 차단 실패 가능.
+
+**조치**:
+1. `/api/diag/emerg-batch-purge` 로 5/20 표시 tx 171건 삭제, 53명 잔액 238,725 QKEY 차감
+2. `/api/diag/apply-tx-unique-index?exec=true` 로 DB UNIQUE INDEX 2개 적용:
+   - `uq_tx_daily_qkey_ref` : (user_id, ref_id) WHERE type='daily_qkey'
+   - `uq_tx_referral_ref`   : (user_id, ref_id) WHERE type='referral_reward'
+
+**효과**: 이후 어떤 경로로든 동일 `(user_id, type, ref_id)` 조합의 tx 두 번째 INSERT 는
+D1 SQLite 가 SQL 레벨에서 `UNIQUE constraint failed` 로 즉시 차단.
+
+**영구룰**:
+- 이 UNIQUE INDEX 2개는 절대 DROP 하지 않는다.
+- 새 cron / 백필 / 보정 코드 작성 시 반드시 ref_id 를 명시한다 (NULL ref_id 는 인덱스 검사 제외).
