@@ -56758,6 +56758,297 @@ app.get('/api/diag/scan-holiday-tx-double', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-user-full — 특정 user 의 전체 기간 모든 지급 항목 중복지급 전수조사
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "이제 박원태에 대해서 중복지급인지 아닌지 전수조사해서 보고할것"
+//
+// 입력: user_id (default 70 박원태), date_from, date_to (default 2026-05-11 ~ 2026-05-19)
+//
+// 영구룰 #지급항목 4종 모두 검증:
+//   1) direct_referral (L0): RR.level=0 ↔ TX.type='direct_referral' 1:1
+//   2) daily_qkey: DR ↔ TX.type='daily_qkey' 1:1
+//   3) referral_reward (L1/L2): RR.level>=1 ↔ TX.type='referral_reward' 1:1
+//   4) 본인 받은 모든 TX 의 ref_id 가 정상 RR/DR 에 매핑되는지
+//
+// 분석:
+//   A) RR 전체 dump (referrer_id = user 인 모든 row, 전 기간)
+//   B) DR 전체 dump (user_id = user 인 모든 row, 전 기간)
+//   C) TX 전체 dump (user_id = user, type IN (daily_qkey, referral_reward, direct_referral))
+//   D) RR.id ↔ TX.ref_id 매핑 (level 별)
+//   E) DR.id ↔ TX.ref_id 매핑
+//   F) 같은 ref_id 가 TX 에 2번 이상 → 진짜 중복지급
+//   G) ref_id 가 RR/DR 어디에도 없는 TX → orphan
+//   H) RR/DR 은 있는데 TX 없음 → missing
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-user-full', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW && c.req.query('key') !== ADMIN_PW) {
+    return c.json({ error: 'AUTH' }, 401)
+  }
+  try {
+    const userId = parseInt(c.req.query('user_id') || '70')
+    const dateFrom = c.req.query('date_from') || '2026-05-11'
+    const dateTo = c.req.query('date_to') || '2026-05-19'
+
+    // ── 1) user 정보 ───────────────────────────────────────────────────────
+    const userInfo = await c.env.DB.prepare(
+      `SELECT id, name, qkey_balance, referral_code FROM users WHERE id = ?`
+    ).bind(userId).first()
+
+    // ── 2) RR 전체 (referrer_id = user, paid_date 범위) ────────────────────
+    const rrRowsResult = await c.env.DB.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             reward_date, paid_date, staking_id, created_at,
+             date(created_at, '+9 hours') as created_kst_date,
+             time(created_at, '+9 hours') as created_kst_time
+      FROM referral_rewards
+      WHERE referrer_id = ?
+        AND paid_date BETWEEN ? AND ?
+      ORDER BY paid_date, level, referee_id, id
+    `).bind(userId, dateFrom, dateTo).all()
+    const rrRows = (rrRowsResult.results || []) as any[]
+
+    // ── 3) DR 전체 (user_id = user, paid_date 범위) ────────────────────────
+    const drRowsResult = await c.env.DB.prepare(`
+      SELECT id, user_id, staking_id, reward_date, paid_date,
+             usdt_amount as qkey_amount, qkey_amount as legacy_qkey_amount,
+             created_at,
+             date(created_at, '+9 hours') as created_kst_date,
+             time(created_at, '+9 hours') as created_kst_time
+      FROM daily_rewards
+      WHERE user_id = ?
+        AND paid_date BETWEEN ? AND ?
+      ORDER BY paid_date, staking_id, id
+    `).bind(userId, dateFrom, dateTo).all()
+    const drRows = (drRowsResult.results || []) as any[]
+
+    // ── 4) TX 전체 (user_id = user, 지급 type 만, KST date 범위) ──────────
+    const txRowsResult = await c.env.DB.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description, created_at,
+             date(created_at, '+9 hours') as kst_date,
+             time(created_at, '+9 hours') as kst_time
+      FROM transactions
+      WHERE user_id = ?
+        AND type IN ('daily_qkey', 'referral_reward', 'direct_referral')
+        AND date(created_at, '+9 hours') BETWEEN ? AND ?
+      ORDER BY kst_date, type, id
+    `).bind(userId, dateFrom, dateTo).all()
+    const txRows = (txRowsResult.results || []) as any[]
+
+    // ── 5) RR.id, DR.id 매핑 인덱스 구축 ────────────────────────────────────
+    const rrById = new Map<number, any>()
+    for (const rr of rrRows) rrById.set(rr.id, rr)
+    const drById = new Map<number, any>()
+    for (const dr of drRows) drById.set(dr.id, dr)
+
+    // ref_id 파싱 (TX 의 ref_id 는 string 도 가능, level=0 는 숫자만, L1/L2 는 prefix 있음)
+    // 영구룰 #ref_id_format 참조
+    const parseRefId = (refIdStr: any, type: string): number | null => {
+      if (refIdStr === null || refIdStr === undefined) return null
+      const s = String(refIdStr)
+      // 숫자 추출 (prefix 무시)
+      const m = s.match(/(\d+)/)
+      if (!m) return null
+      return parseInt(m[1])
+    }
+
+    // ── 6) TX 별 매핑 분석 ─────────────────────────────────────────────────
+    const txWithMapping = txRows.map(tx => {
+      const parsedRefId = parseRefId(tx.ref_id, tx.type)
+      let mappedTo: string | null = null
+      let mappedRecord: any = null
+      let amountMatch = false
+
+      if (tx.type === 'daily_qkey' && parsedRefId !== null) {
+        const dr = drById.get(parsedRefId)
+        if (dr) {
+          mappedTo = 'daily_rewards'
+          mappedRecord = { id: dr.id, staking_id: dr.staking_id, paid_date: dr.paid_date, qkey_amount: dr.qkey_amount }
+          amountMatch = Number(dr.qkey_amount) === Number(tx.amount)
+        }
+      } else if ((tx.type === 'referral_reward' || tx.type === 'direct_referral') && parsedRefId !== null) {
+        const rr = rrById.get(parsedRefId)
+        if (rr) {
+          mappedTo = 'referral_rewards'
+          mappedRecord = { id: rr.id, level: rr.level, referee_id: rr.referee_id, paid_date: rr.paid_date, reward_amount: rr.reward_amount }
+          amountMatch = Number(rr.reward_amount) === Number(tx.amount)
+        }
+      }
+
+      let status: string
+      if (!parsedRefId) status = 'ORPHAN_NO_REF'
+      else if (!mappedTo) status = 'ORPHAN_INVALID_REF'
+      else if (!amountMatch) status = 'AMOUNT_MISMATCH'
+      else status = 'OK_MAPPED'
+
+      return {
+        tx_id: tx.id,
+        type: tx.type,
+        amount: tx.amount,
+        ref_id_raw: tx.ref_id,
+        ref_id_parsed: parsedRefId,
+        kst_date: tx.kst_date,
+        kst_time: tx.kst_time,
+        description: tx.description,
+        mapped_to: mappedTo,
+        mapped_record: mappedRecord,
+        amount_match: amountMatch,
+        status,
+      }
+    })
+
+    // ── 7) TX 중복지급 검사: 같은 ref_id 가 같은 type 에서 2번 이상 ─────────
+    const txRefIdCount = new Map<string, any[]>()  // key = "type:parsedRefId"
+    for (const tx of txWithMapping) {
+      if (tx.ref_id_parsed === null) continue
+      const key = `${tx.type}:${tx.ref_id_parsed}`
+      if (!txRefIdCount.has(key)) txRefIdCount.set(key, [])
+      txRefIdCount.get(key)!.push(tx)
+    }
+    const duplicatePayments: any[] = []
+    for (const [key, txs] of txRefIdCount.entries()) {
+      if (txs.length >= 2) {
+        duplicatePayments.push({
+          ref_id_key: key,
+          tx_count: txs.length,
+          extra_count: txs.length - 1,
+          tx_ids: txs.map(t => t.tx_id),
+          amount: txs[0].amount,
+          extra_amount: (txs.length - 1) * Number(txs[0].amount),
+        })
+      }
+    }
+
+    // ── 8) RR/DR 별 TX 매핑 검증 (missing TX 탐지) ────────────────────────
+    const rrWithMapping = rrRows.map(rr => {
+      const matched = txWithMapping.filter(tx =>
+        (tx.type === 'referral_reward' || tx.type === 'direct_referral')
+        && tx.ref_id_parsed === rr.id
+      )
+      let expectedType = rr.level === 0 ? 'direct_referral' : 'referral_reward'
+      return {
+        rr_id: rr.id,
+        referee_id: rr.referee_id,
+        level: rr.level,
+        original_amount: rr.original_amount,
+        reward_amount: rr.reward_amount,
+        staking_id: rr.staking_id,
+        reward_date: rr.reward_date,
+        paid_date: rr.paid_date,
+        created_kst_date: rr.created_kst_date,
+        created_kst_time: rr.created_kst_time,
+        expected_tx_type: expectedType,
+        matched_tx_count: matched.length,
+        matched_tx_ids: matched.map(m => m.tx_id),
+        status: matched.length === 0 ? 'MISSING_TX'
+              : matched.length === 1 ? 'OK_1_TO_1'
+              : 'DOUBLE_TX',
+      }
+    })
+    const drWithMapping = drRows.map(dr => {
+      const matched = txWithMapping.filter(tx =>
+        tx.type === 'daily_qkey' && tx.ref_id_parsed === dr.id
+      )
+      return {
+        dr_id: dr.id,
+        staking_id: dr.staking_id,
+        reward_date: dr.reward_date,
+        paid_date: dr.paid_date,
+        qkey_amount: dr.qkey_amount,
+        created_kst_date: dr.created_kst_date,
+        created_kst_time: dr.created_kst_time,
+        matched_tx_count: matched.length,
+        matched_tx_ids: matched.map(m => m.tx_id),
+        status: matched.length === 0 ? 'MISSING_TX'
+              : matched.length === 1 ? 'OK_1_TO_1'
+              : 'DOUBLE_TX',
+      }
+    })
+
+    // ── 9) 통계 ────────────────────────────────────────────────────────────
+    const rrStats = {
+      total: rrRows.length,
+      level_0: rrRows.filter(r => r.level === 0).length,
+      level_1: rrRows.filter(r => r.level === 1).length,
+      level_2: rrRows.filter(r => r.level === 2).length,
+      total_amount: rrRows.reduce((s, r) => s + Number(r.reward_amount), 0),
+      ok_1_to_1: rrWithMapping.filter(r => r.status === 'OK_1_TO_1').length,
+      missing_tx: rrWithMapping.filter(r => r.status === 'MISSING_TX').length,
+      double_tx: rrWithMapping.filter(r => r.status === 'DOUBLE_TX').length,
+    }
+    const drStats = {
+      total: drRows.length,
+      total_amount: drRows.reduce((s, r) => s + Number(r.qkey_amount), 0),
+      ok_1_to_1: drWithMapping.filter(r => r.status === 'OK_1_TO_1').length,
+      missing_tx: drWithMapping.filter(r => r.status === 'MISSING_TX').length,
+      double_tx: drWithMapping.filter(r => r.status === 'DOUBLE_TX').length,
+    }
+    const txStats = {
+      total: txRows.length,
+      by_type: {
+        daily_qkey: txRows.filter(t => t.type === 'daily_qkey').length,
+        referral_reward: txRows.filter(t => t.type === 'referral_reward').length,
+        direct_referral: txRows.filter(t => t.type === 'direct_referral').length,
+      },
+      total_amount: txRows.reduce((s, t) => s + Number(t.amount), 0),
+      ok_mapped: txWithMapping.filter(t => t.status === 'OK_MAPPED').length,
+      orphan_no_ref: txWithMapping.filter(t => t.status === 'ORPHAN_NO_REF').length,
+      orphan_invalid_ref: txWithMapping.filter(t => t.status === 'ORPHAN_INVALID_REF').length,
+      amount_mismatch: txWithMapping.filter(t => t.status === 'AMOUNT_MISMATCH').length,
+    }
+
+    // ── 10) 최종 verdict ───────────────────────────────────────────────────
+    let verdict: string
+    if (duplicatePayments.length > 0) verdict = 'DOUBLE_PAYMENT_CONFIRMED'
+    else if (rrStats.missing_tx > 0 || drStats.missing_tx > 0) verdict = 'TX_MISSING'
+    else if (txStats.orphan_no_ref + txStats.orphan_invalid_ref > 0) verdict = 'ORPHAN_TX_FOUND'
+    else if (txStats.amount_mismatch > 0) verdict = 'AMOUNT_MISMATCH_FOUND'
+    else verdict = 'ALL_VALID_1_TO_1'
+
+    // ── 11) paid_date 별 집계 ──────────────────────────────────────────────
+    const perDate: Record<string, any> = {}
+    const allDates = new Set<string>()
+    rrRows.forEach(r => allDates.add(r.paid_date))
+    drRows.forEach(r => allDates.add(r.paid_date))
+    txRows.forEach(r => allDates.add(r.kst_date))
+    for (const d of allDates) {
+      perDate[d] = {
+        rr_count: rrRows.filter(r => r.paid_date === d).length,
+        rr_amount: rrRows.filter(r => r.paid_date === d).reduce((s, r) => s + Number(r.reward_amount), 0),
+        dr_count: drRows.filter(r => r.paid_date === d).length,
+        dr_amount: drRows.filter(r => r.paid_date === d).reduce((s, r) => s + Number(r.qkey_amount), 0),
+        tx_count: txRows.filter(r => r.kst_date === d).length,
+        tx_amount: txRows.filter(r => r.kst_date === d).reduce((s, r) => s + Number(r.amount), 0),
+      }
+    }
+
+    return c.json({
+      verdict,
+      user: userInfo,
+      scan_range: { date_from: dateFrom, date_to: dateTo },
+      summary: {
+        rr_stats: rrStats,
+        dr_stats: drStats,
+        tx_stats: txStats,
+        rr_dr_total: rrStats.total_amount + drStats.total_amount,
+        tx_total: txStats.total_amount,
+        diff_tx_minus_rrdr: txStats.total_amount - (rrStats.total_amount + drStats.total_amount),
+      },
+      double_payments: duplicatePayments,
+      per_date: perDate,
+      rr_with_mapping: rrWithMapping,
+      dr_with_mapping: drWithMapping,
+      tx_with_mapping: txWithMapping,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // scan-user-rr-detail — 특정 user 의 특정 날짜 추천수당 정밀 1:1 매핑 검증
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 명령 (2026-05-19): "19일자 박원태 추천수당 중복 지급인지 전수조사해서 보고할것!"
