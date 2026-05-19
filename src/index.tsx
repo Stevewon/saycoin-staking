@@ -54720,4 +54720,182 @@ app.get('/api/diag/delete-511-rr-violations', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// verify-511-bottom-up — 5/11 paid 바텀업 정합 검증 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 검증 항목:
+//   1) DR 54건 / 179,250 (GROUP A 49 + GROUP B 5)
+//   2) RR L1 53건 / 34,800 (20%)
+//   3) RR L2 52건 / 15,900 (10%)
+//   4) direct_referral level=0 4건 / 225,000 (보존)
+//   5) reward_date 분포: 5/8 + 5/9(direct only) + 5/10 만, 5/9 dr/L1/L2 = 0
+//   6) referrer 69 balance 변동 없음 (영구룰 #관리자보정정당)
+//   7) 5/12 paid BOTTOM_UP_OK 55건 보존
+//   8) NOT EXISTS: 동일 (referrer, referee, level, reward_date, paid_date, staking_id) 중복 0
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/verify-511-bottom-up', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    // 1) DR 집계
+    const drAgg = await db.prepare(`
+      SELECT reward_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date = '2026-05-11'
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).all<any>()
+
+    // 2) RR 집계 (level 별)
+    const rrAgg = await db.prepare(`
+      SELECT level, reward_date, COUNT(*) as cnt, COALESCE(SUM(reward_amount),0) as qkey
+      FROM referral_rewards
+      WHERE paid_date = '2026-05-11'
+      GROUP BY level, reward_date
+      ORDER BY level, reward_date
+    `).all<any>()
+
+    // 3) 영구룰 위반 검사: reward_date=5/9 의 dr 또는 level=1/2 rr 존재?
+    const violationDr = await db.prepare(`
+      SELECT COUNT(*) as cnt FROM daily_rewards
+      WHERE paid_date='2026-05-11' AND reward_date='2026-05-09'
+    `).first() as any
+    const violationRr = await db.prepare(`
+      SELECT COUNT(*) as cnt FROM referral_rewards
+      WHERE paid_date='2026-05-11' AND reward_date='2026-05-09' AND level IN (1,2)
+    `).first() as any
+
+    // 4) 중복 검사 (DR)
+    const dupDr = await db.prepare(`
+      SELECT user_id, staking_id, reward_date, paid_date, COUNT(*) as cnt
+      FROM daily_rewards
+      WHERE paid_date='2026-05-11'
+      GROUP BY user_id, staking_id, reward_date, paid_date
+      HAVING COUNT(*) > 1
+    `).all<any>()
+
+    // 5) 중복 검사 (RR)
+    const dupRr = await db.prepare(`
+      SELECT referrer_id, referee_id, level, reward_date, paid_date, staking_id, COUNT(*) as cnt
+      FROM referral_rewards
+      WHERE paid_date='2026-05-11'
+      GROUP BY referrer_id, referee_id, level, reward_date, paid_date, staking_id
+      HAVING COUNT(*) > 1
+    `).all<any>()
+
+    // 6) referrer 69 balance (영구룰 #관리자보정정당 — 변동 없어야 함, 단 새 RR L1/L2 받았으면 증가됨)
+    const u69 = await db.prepare(`SELECT id, qkey_balance FROM users WHERE id=69`).first() as any
+
+    // 7) 5/12 paid 보존 검증
+    const paid512 = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM daily_rewards WHERE paid_date='2026-05-12') as dr_cnt,
+        (SELECT COALESCE(SUM(usdt_amount),0) FROM daily_rewards WHERE paid_date='2026-05-12') as dr_qkey,
+        (SELECT COUNT(*) FROM referral_rewards WHERE paid_date='2026-05-12' AND level=1) as l1_cnt,
+        (SELECT COALESCE(SUM(reward_amount),0) FROM referral_rewards WHERE paid_date='2026-05-12' AND level=1) as l1_qkey,
+        (SELECT COUNT(*) FROM referral_rewards WHERE paid_date='2026-05-12' AND level=2) as l2_cnt,
+        (SELECT COALESCE(SUM(reward_amount),0) FROM referral_rewards WHERE paid_date='2026-05-12' AND level=2) as l2_qkey
+    `).first() as any
+
+    // 8) 다른 paid_date 영향 없음
+    const otherPaid = await db.prepare(`
+      SELECT paid_date, COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as qkey
+      FROM daily_rewards
+      WHERE paid_date >= '2026-05-09' AND paid_date <= '2026-05-15'
+      GROUP BY paid_date
+      ORDER BY paid_date
+    `).all<any>()
+
+    // 9) bottom-up cross-check: 각 (referee, reward_date) 에 dr 이 있어야 rr 이 있을 수 있음
+    const rrOrphans = await db.prepare(`
+      SELECT rr.id, rr.referrer_id, rr.referee_id, rr.level, rr.reward_date, rr.staking_id, rr.reward_amount
+      FROM referral_rewards rr
+      WHERE rr.paid_date='2026-05-11' AND rr.level IN (1,2)
+        AND NOT EXISTS (
+          SELECT 1 FROM daily_rewards d
+          WHERE d.user_id = rr.referee_id
+            AND d.staking_id = rr.staking_id
+            AND d.reward_date = rr.reward_date
+            AND d.paid_date = '2026-05-11'
+        )
+    `).all<any>()
+
+    // 검증 결과 종합
+    const dr = drAgg.results || []
+    const rr = rrAgg.results || []
+    const drTotal = dr.reduce((a, b:any) => a + Number(b.cnt||0), 0)
+    const drQkey = dr.reduce((a, b:any) => a + Number(b.qkey||0), 0)
+    const rrL1 = rr.filter((r:any) => r.level === 1)
+    const rrL2 = rr.filter((r:any) => r.level === 2)
+    const rrL0 = rr.filter((r:any) => r.level === 0)
+    const rrL1Total = rrL1.reduce((a, b:any) => a + Number(b.cnt||0), 0)
+    const rrL1Qkey = rrL1.reduce((a, b:any) => a + Number(b.qkey||0), 0)
+    const rrL2Total = rrL2.reduce((a, b:any) => a + Number(b.cnt||0), 0)
+    const rrL2Qkey = rrL2.reduce((a, b:any) => a + Number(b.qkey||0), 0)
+    const rrL0Total = rrL0.reduce((a, b:any) => a + Number(b.cnt||0), 0)
+    const rrL0Qkey = rrL0.reduce((a, b:any) => a + Number(b.qkey||0), 0)
+
+    const checks = {
+      dr_count_ok: drTotal === 54,
+      dr_qkey_ok: drQkey === 179250,
+      rr_l1_count_ok: rrL1Total === 53,
+      rr_l1_qkey_ok: rrL1Qkey === 34800,
+      rr_l2_count_ok: rrL2Total === 52,
+      rr_l2_qkey_ok: rrL2Qkey === 15900,
+      rr_l0_preserved: rrL0Total === 4 && rrL0Qkey === 225000,
+      no_dr_violation_59: Number(violationDr?.cnt || 0) === 0,
+      no_rr_violation_59: Number(violationRr?.cnt || 0) === 0,
+      no_dr_duplicates: (dupDr.results || []).length === 0,
+      no_rr_duplicates: (dupRr.results || []).length === 0,
+      no_rr_orphans: (rrOrphans.results || []).length === 0,
+      paid_512_preserved: Number(paid512?.dr_cnt || 0) === 55 && Number(paid512?.dr_qkey || 0) === 180750,
+    }
+    const allPass = Object.values(checks).every(v => v === true)
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_VERIFY',
+      result: allPass ? 'BOTTOM_UP_OK' : 'BOTTOM_UP_FAIL',
+      paid_date: '2026-05-11',
+      summary: {
+        dr: { count: drTotal, qkey: drQkey, expected_count: 54, expected_qkey: 179250 },
+        rr_l1: { count: rrL1Total, qkey: rrL1Qkey, expected_count: 53, expected_qkey: 34800 },
+        rr_l2: { count: rrL2Total, qkey: rrL2Qkey, expected_count: 52, expected_qkey: 15900 },
+        rr_l0_direct: { count: rrL0Total, qkey: rrL0Qkey, expected_count: 4, expected_qkey: 225000, note: 'direct_referral preserved' },
+      },
+      checks,
+      by_reward_date: {
+        dr: dr,
+        rr: rr,
+      },
+      violations: {
+        dr_reward_5_9: Number(violationDr?.cnt || 0),
+        rr_l1l2_reward_5_9: Number(violationRr?.cnt || 0),
+      },
+      duplicates: {
+        dr: dupDr.results || [],
+        rr: dupRr.results || [],
+      },
+      orphans: {
+        description: 'rr_l1/l2 with no matching dr (referee, staking, reward_date)',
+        count: (rrOrphans.results || []).length,
+        rows: (rrOrphans.results || []).slice(0, 10),
+      },
+      preservation: {
+        paid_512: paid512,
+        paid_512_expected: { dr_cnt: 55, dr_qkey: 180750 },
+        referrer_69_balance: u69,
+      },
+      other_paid_snapshot: otherPaid.results || [],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
