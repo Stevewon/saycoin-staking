@@ -61949,4 +61949,295 @@ app.get('/api/diag/solbat-tree-staking-coverage', async (c) => {
 })
 
 
+// ============================================================================
+// solbat-tree-bottomup-audit — 솔밧 트리 바텀업(L2→L1→L0) 영구룰 정합성 점검 (read-only)
+// 영구룰:
+//   1) 본인 daily = staking.amount × daily_rate × 150  (active staking 만)
+//   2) L1 referral = referee 본인 daily × 0.20  (L1 자신도 active staking 보유해야 함)
+//   3) L2 referral = referee 본인 daily × 0.10  (L2 자신도 active staking 보유해야 함)
+//   4) 휴일(토/일/공휴일/5/5어린이날) reward_date 불가
+//   5) staking 없으면 무조건 배당 0 (본인이든 referrer 든)
+// 점검: 5/4 ~ 5/18 평일 10일 × 회원 15명 매트릭스
+// 비교: expected (영구룰 산출) vs actual (daily_rewards/referral_rewards 원장 + transactions 미러)
+// 경로: GET /api/diag/solbat-tree-bottomup-audit?pw=ADMIN_PW
+// ============================================================================
+app.get('/api/diag/solbat-tree-bottomup-audit', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+
+  try {
+    const SOLBAT = 44
+    const L1_IDS = [45, 47, 48, 50, 52, 54, 89]
+    const L2_IDS = [46, 49, 73, 74, 76, 90, 93]
+    const ALL_IDS = [SOLBAT, ...L1_IDS, ...L2_IDS]
+    const ph = ALL_IDS.map(() => '?').join(',')
+
+    const WEEKDAYS = [
+      '2026-05-04','2026-05-06','2026-05-07','2026-05-08','2026-05-11',
+      '2026-05-12','2026-05-13','2026-05-14','2026-05-15','2026-05-18',
+    ]
+
+    // 트리 전원 정보
+    const userRows = (await c.env.DB.prepare(
+      `SELECT id, email, name, qkey_balance, referrer_id FROM users WHERE id IN (${ph})`
+    ).bind(...ALL_IDS).all()).results as any[]
+    const userMap: Record<number, any> = {}
+    for (const u of userRows) userMap[u.id] = u
+
+    // 트리 전원 staking
+    const stakingRows = (await c.env.DB.prepare(`
+      SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at
+      FROM staking WHERE user_id IN (${ph})
+    `).bind(...ALL_IDS).all()).results as any[]
+    const stakingByUser: Record<number, any[]> = {}
+    for (const uid of ALL_IDS) stakingByUser[uid] = []
+    for (const s of stakingRows) stakingByUser[s.user_id].push(s)
+
+    // 헬퍼: 회원 X 가 reward_date d 에 active staking 보유 (start_date 의 KST 날짜 <= d <= end_date 의 KST 날짜)
+    // ★ stakings 컬럼은 ISO datetime 문자열 (UTC). KST 변환 후 날짜만 비교 — 코드 36163 와 동일 로직 (date(start_date,'+9 hours'))
+    const isActiveOn = (uid: number, d: string): boolean => {
+      const list = stakingByUser[uid] || []
+      return list.some(s => {
+        if (s.reset_at) return false
+        if (s.status !== 'active') return false
+        if (!s.start_date || !s.end_date) return false
+        // YYYY-MM-DD 비교: ISO 문자열에서 +9 시간 후 날짜 추출
+        const sd = new Date(new Date(s.start_date).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+        const ed = new Date(new Date(s.end_date).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+        return sd <= d && d <= ed
+      })
+    }
+
+    // 헬퍼: 회원 X 가 reward_date d 에 받아야 할 본인 daily QKEY 합 (모든 active staking)
+    const expectedSelfDaily = (uid: number, d: string): { qkey: number, stakings: any[] } => {
+      const list = stakingByUser[uid] || []
+      const active = list.filter(s => {
+        if (s.reset_at || s.status !== 'active' || !s.start_date || !s.end_date) return false
+        const sd = new Date(new Date(s.start_date).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+        const ed = new Date(new Date(s.end_date).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+        return sd <= d && d <= ed
+      })
+      const list2 = active.map(s => ({
+        staking_id: s.id, amount: Number(s.amount), daily_rate: Number(s.daily_rate),
+        qkey: Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+      }))
+      return { qkey: list2.reduce((a, x) => a + x.qkey, 0), stakings: list2 }
+    }
+
+    // 실제 daily_rewards + tx 미러 join
+    const dailyRows = (await c.env.DB.prepare(`
+      SELECT dr.user_id, dr.reward_date, dr.id AS dr_id, dr.staking_id,
+             COALESCE(t.amount, 0) AS tx_qkey, t.id AS tx_id
+      FROM daily_rewards dr
+      LEFT JOIN transactions t ON t.ref_id = dr.id AND t.type = 'daily_qkey' AND t.user_id = dr.user_id
+      WHERE dr.user_id IN (${ph})
+        AND dr.reward_date IN (${WEEKDAYS.map(() => '?').join(',')})
+    `).bind(...ALL_IDS, ...WEEKDAYS).all()).results as any[]
+    // 회원-날짜 별 actual self_daily QKEY 합 + dr 행 목록
+    const actualSelfMap: Record<string, { qkey: number, dr_rows: any[] }> = {}
+    for (const r of dailyRows) {
+      const k = `${r.user_id}|${r.reward_date}`
+      if (!actualSelfMap[k]) actualSelfMap[k] = { qkey: 0, dr_rows: [] }
+      actualSelfMap[k].qkey += Number(r.tx_qkey) || 0
+      actualSelfMap[k].dr_rows.push({
+        dr_id: r.dr_id, staking_id: r.staking_id,
+        tx_id: r.tx_id, tx_qkey: Number(r.tx_qkey) || 0,
+      })
+    }
+
+    // 실제 referral_rewards (level=1, 2) — referrer 기준
+    const refRows = (await c.env.DB.prepare(`
+      SELECT rr.id AS rr_id, rr.referrer_id, rr.referee_id, rr.level,
+             rr.original_amount, rr.reward_amount, rr.reward_date, rr.staking_id
+      FROM referral_rewards rr
+      WHERE rr.referrer_id IN (${ph})
+        AND rr.reward_date IN (${WEEKDAYS.map(() => '?').join(',')})
+    `).bind(...ALL_IDS, ...WEEKDAYS).all()).results as any[]
+    // 키: referrer|date|level|referee|staking_id
+    const actualRefMap: Record<string, any[]> = {}
+    for (const r of refRows) {
+      const k = `${r.referrer_id}|${r.reward_date}|${r.level}|${r.referee_id}|${r.staking_id}`
+      if (!actualRefMap[k]) actualRefMap[k] = []
+      actualRefMap[k].push(r)
+    }
+
+    // ===== 바텀업 정산 (영구룰 그대로) =====
+    // 각 회원 × 각 reward_date 에 대해 expected 산출
+    //   Step 1) 회원 본인 daily 계산
+    //   Step 2) 그 회원이 referee 일 때, 자신의 referrer(L1/L2) 가 받아야 할 referral 계산
+    //           단, referrer 도 그 reward_date 에 active staking 보유해야 함
+
+    type ExpEntry = { source: 'self' | 'L1_from' | 'L2_from', referee?: number, staking_id?: number | null, qkey: number, ref_amount?: number }
+    // expectedByUserDate[uid|date] = { entries: [...], total_qkey }
+    const expectedByUserDate: Record<string, { entries: ExpEntry[], total_qkey: number }> = {}
+    const addExp = (uid: number, d: string, e: ExpEntry) => {
+      const k = `${uid}|${d}`
+      if (!expectedByUserDate[k]) expectedByUserDate[k] = { entries: [], total_qkey: 0 }
+      expectedByUserDate[k].entries.push(e)
+      expectedByUserDate[k].total_qkey += e.qkey
+    }
+
+    // ★ 영구룰: 모든 회원 (L0/L1/L2) 의 본인 daily 먼저, 그 다음 L1/L2 referral
+    //    바텀업 순서지만 계산은 회원의 daily 가 시작 → referee 의 referrer 에게 분배
+    for (const uid of ALL_IDS) {
+      const u = userMap[uid]
+      if (!u) continue
+      for (const d of WEEKDAYS) {
+        // 1) 본인 daily
+        const selfExp = expectedSelfDaily(uid, d)
+        for (const s of selfExp.stakings) {
+          addExp(uid, d, { source: 'self', staking_id: s.staking_id, qkey: s.qkey })
+        }
+
+        // 2) L1 referral: 이 회원의 referrer 가 트리 안에 있고, 그 referrer 가 active 면
+        const l1Id = u.referrer_id
+        if (l1Id && ALL_IDS.includes(l1Id) && selfExp.qkey > 0 && isActiveOn(l1Id, d)) {
+          // referee 의 각 staking 단위로 reward (코드는 staking_id 별 한 행)
+          for (const s of selfExp.stakings) {
+            const refAmt = Math.round(s.qkey * 0.20)
+            if (refAmt > 0) {
+              addExp(l1Id, d, { source: 'L1_from', referee: uid, staking_id: s.staking_id, qkey: refAmt, ref_amount: s.qkey })
+            }
+          }
+        }
+
+        // 3) L2 referral: L1 의 referrer (=L2) 도 트리 안 + active 면
+        if (l1Id) {
+          const l1User = userMap[l1Id]
+          const l2Id = l1User?.referrer_id
+          if (l2Id && ALL_IDS.includes(l2Id) && selfExp.qkey > 0 && isActiveOn(l2Id, d)) {
+            for (const s of selfExp.stakings) {
+              const refAmt = Math.round(s.qkey * 0.10)
+              if (refAmt > 0) {
+                addExp(l2Id, d, { source: 'L2_from', referee: uid, staking_id: s.staking_id, qkey: refAmt, ref_amount: s.qkey })
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ===== expected vs actual 매트릭스 =====
+    type Cell = {
+      expected_qkey: number,
+      actual_self_qkey: number,
+      actual_l1_qkey: number,
+      actual_l2_qkey: number,
+      actual_total: number,
+      diff: number,
+      expected_breakdown: ExpEntry[],
+      actual_dr_rows: any[],
+      actual_ref_rows: any[],
+      issues: string[],
+    }
+    const matrix: Record<number, Record<string, Cell>> = {}
+    for (const uid of ALL_IDS) {
+      matrix[uid] = {}
+      for (const d of WEEKDAYS) {
+        const k = `${uid}|${d}`
+        const exp = expectedByUserDate[k] || { entries: [], total_qkey: 0 }
+        const actSelf = actualSelfMap[k]?.qkey || 0
+        const actSelfRows = actualSelfMap[k]?.dr_rows || []
+        // actual referrals: refRows 에서 referrer_id=uid AND reward_date=d
+        const actRefRows = refRows.filter(r => r.referrer_id === uid && r.reward_date === d)
+        const actL1 = actRefRows.filter(r => r.level === 1).reduce((a, r) => a + Number(r.reward_amount), 0)
+        const actL2 = actRefRows.filter(r => r.level === 2).reduce((a, r) => a + Number(r.reward_amount), 0)
+        const actualTotal = actSelf + actL1 + actL2
+
+        const issues: string[] = []
+        // 비교: expected 의 source 별 합 vs actual 별 합
+        const expSelfSum = exp.entries.filter(e => e.source === 'self').reduce((a, e) => a + e.qkey, 0)
+        const expL1Sum = exp.entries.filter(e => e.source === 'L1_from').reduce((a, e) => a + e.qkey, 0)
+        const expL2Sum = exp.entries.filter(e => e.source === 'L2_from').reduce((a, e) => a + e.qkey, 0)
+        if (expSelfSum !== actSelf) issues.push(`self: exp=${expSelfSum} vs act=${actSelf} (diff=${actSelf - expSelfSum})`)
+        if (expL1Sum !== actL1) issues.push(`L1: exp=${expL1Sum} vs act=${actL1} (diff=${actL1 - expL1Sum})`)
+        if (expL2Sum !== actL2) issues.push(`L2: exp=${expL2Sum} vs act=${actL2} (diff=${actL2 - expL2Sum})`)
+
+        matrix[uid][d] = {
+          expected_qkey: exp.total_qkey,
+          actual_self_qkey: actSelf,
+          actual_l1_qkey: actL1,
+          actual_l2_qkey: actL2,
+          actual_total: actualTotal,
+          diff: actualTotal - exp.total_qkey,
+          expected_breakdown: exp.entries,
+          actual_dr_rows: actSelfRows,
+          actual_ref_rows: actRefRows,
+          issues,
+        }
+      }
+    }
+
+    // 회원별 요약
+    const perUserSummary: any[] = []
+    for (const uid of ALL_IDS) {
+      const u = userMap[uid] || { name: '?', email: '?' }
+      let totalExp = 0, totalAct = 0
+      const issueDays: any[] = []
+      for (const d of WEEKDAYS) {
+        const c2 = matrix[uid][d]
+        totalExp += c2.expected_qkey
+        totalAct += c2.actual_total
+        if (c2.issues.length > 0) {
+          issueDays.push({ date: d, diff: c2.diff, issues: c2.issues })
+        }
+      }
+      perUserSummary.push({
+        user_id: uid,
+        name: u.name,
+        email: u.email,
+        level: uid === SOLBAT ? 0 : (L1_IDS.includes(uid) ? 1 : 2),
+        qkey_balance: u.qkey_balance,
+        total_expected_qkey: totalExp,
+        total_actual_qkey: totalAct,
+        total_diff_qkey: totalAct - totalExp,
+        issue_days: issueDays,
+      })
+    }
+
+    // 평일별 그랜드 합계
+    const dailyTotals = WEEKDAYS.map(d => {
+      let expSum = 0, actSum = 0, issueCount = 0
+      for (const uid of ALL_IDS) {
+        const c2 = matrix[uid][d]
+        expSum += c2.expected_qkey
+        actSum += c2.actual_total
+        if (c2.issues.length > 0) issueCount++
+      }
+      return { reward_date: d, expected_total: expSum, actual_total: actSum, diff: actSum - expSum, users_with_issues: issueCount }
+    })
+
+    // 트리 그랜드 토탈
+    const grandTotal = {
+      total_expected_qkey: perUserSummary.reduce((a, u) => a + u.total_expected_qkey, 0),
+      total_actual_qkey: perUserSummary.reduce((a, u) => a + u.total_actual_qkey, 0),
+      total_diff_qkey: perUserSummary.reduce((a, u) => a + u.total_diff_qkey, 0),
+      users_with_issues: perUserSummary.filter(u => u.issue_days.length > 0).length,
+      users_clean: perUserSummary.filter(u => u.issue_days.length === 0).length,
+    }
+
+    return c.json({
+      mode: 'READ_ONLY',
+      rules: {
+        self_daily: 'staking.amount × daily_rate × 150 (active staking 만)',
+        l1_referral: 'referee 본인 daily × 0.20 (L1 자신도 active 필요)',
+        l2_referral: 'referee 본인 daily × 0.10 (L2 자신도 active 필요)',
+        holidays_excluded: ['5/5어린이날', '토요일', '일요일'],
+        no_staking_no_reward: '본인 또는 referrer staking 없으면 0',
+      },
+      checked_weekdays: WEEKDAYS,
+      grand_total: grandTotal,
+      daily_totals: dailyTotals,
+      per_user_summary: perUserSummary,
+      matrix,
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
