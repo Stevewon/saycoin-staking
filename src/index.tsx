@@ -61950,6 +61950,338 @@ app.get('/api/diag/solbat-tree-staking-coverage', async (c) => {
 
 
 // ============================================================================
+// solbat-fix-stage-B-preview — 5/4 + 솔밧 5/13, 5/14 누락 보충 dry-run + exec
+// 대상:
+//   1) 솔밧(44) 5/4: self daily 750 + L1(45,48,50,52,54 → 150×5=750) + L2(46,49 staking 2개 → 75×3=225) = 1,725
+//   2) 솔밧(44) 5/13, 5/14: dr_id=1438/1494 (이미 원장 존재, tx 미러 누락) → tx 미러만 INSERT + balance UPDATE = 750×2=1,500
+//   3) 김진심(50), 채성(52), 신운호(54), 박종범(46) 5/4: self daily 750 × 4 = 3,000
+//   ※ L1/L2 referral 도 영구룰 따라 자동 분배:
+//      - 50 (st#47, L1=44, L2=없음) → 솔밧 L1 +150
+//      - 52 (st#64, L1=44, L2=없음) → 솔밧 L1 +150
+//      - 54 (st#56, L1=44, L2=없음) → 솔밧 L1 +150
+//      - 46 (st#54, L1=49(트리내), L2=44) → 유정 L1 +150, 솔밧 L2 +75
+//      ★ 단, 위 1) 솔밧 5/4 expected breakdown 에 이미 이 분배가 포함되어 있음
+// 휴일 paid_date 처리:
+//   - 5/4(월) reward → 5/5(어린이날) 휴일 건너뛰고 5/6(수) paid
+//   - 5/13(수) reward → 이미 dr 존재(5/14 paid) → tx 미러만 추가, paid 그대로
+//   - 5/14(목) reward → 이미 dr 존재(5/15 paid) → tx 미러만 추가, paid 그대로
+// 마커: description '...solbat-stage-B-fix' 포함
+// DRY-RUN: GET /api/diag/solbat-fix-stage-B?pw=ADMIN_PW
+// EXEC:    GET /api/diag/solbat-fix-stage-B?pw=ADMIN_PW&confirm=STAGE_B_FIX_GO
+// ============================================================================
+app.get('/api/diag/solbat-fix-stage-B', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const isExec = c.req.query('confirm') === 'STAGE_B_FIX_GO'
+  const db = c.env.DB
+
+  try {
+    // ============== 1. 사전 검증 ==============
+    // 5/4 누락 회원 + staking 확인 (트리 안만)
+    // 5/13, 5/14 솔밧 GHOST_DR 확인
+    const PAID_5_4 = '2026-05-06'  // 5/4 reward → 5/5 어린이날 건너뛰고 5/6 paid
+    const SOLBAT = 44
+
+    // 1-A) 솔밧 5/13, 5/14 dr 행 + 기존 paid_date
+    const solbatGhostDr = (await db.prepare(`
+      SELECT id, user_id, staking_id, reward_date, paid_date, usdt_amount
+      FROM daily_rewards
+      WHERE user_id = ? AND reward_date IN ('2026-05-13','2026-05-14')
+    `).bind(SOLBAT).all()).results as any[]
+
+    // tx 미러 존재 여부 확인
+    const ghostDrCheck: any[] = []
+    for (const dr of solbatGhostDr) {
+      const tx = await db.prepare(`
+        SELECT id, amount FROM transactions WHERE ref_id = ? AND type = 'daily_qkey' AND user_id = ?
+      `).bind(dr.id, dr.user_id).first()
+      ghostDrCheck.push({
+        dr_id: dr.id, staking_id: dr.staking_id, reward_date: dr.reward_date, paid_date: dr.paid_date,
+        existing_tx: tx, needs_tx_insert: !tx,
+      })
+    }
+
+    // 1-B) 5/4 누락 대상 — 회원별 active staking 확인
+    //      (트리 안 회원 5/4 본인 daily 누락이 확인된 회원만 처리)
+    const TARGETS_5_4_SELF = [
+      { user_id: 44, name: '강인팔(솔밧)' },
+      { user_id: 50, name: '김진심' },
+      { user_id: 52, name: '채성' },
+      { user_id: 54, name: '신운호' },
+      { user_id: 46, name: '박종범' },
+    ]
+
+    // 각 회원 5/4 active staking — date(start,'+9 hours') <= '2026-05-04' <= date(end,'+9 hours')
+    const stakingPlan: any[] = []
+    for (const tgt of TARGETS_5_4_SELF) {
+      // 5/4 에 이미 dr 존재하면 SKIP
+      const existDr = await db.prepare(`
+        SELECT id, staking_id, paid_date FROM daily_rewards
+        WHERE user_id = ? AND reward_date = '2026-05-04'
+      `).bind(tgt.user_id).all()
+      const existDrList = (existDr.results || []) as any[]
+
+      const stk = await db.prepare(`
+        SELECT id, amount, daily_rate, start_date, end_date, status
+        FROM staking
+        WHERE user_id = ? AND status = 'active'
+          AND date(start_date, '+9 hours') <= '2026-05-04'
+          AND date(end_date,   '+9 hours') >= '2026-05-04'
+      `).bind(tgt.user_id).all()
+      const stkList = (stk.results || []) as any[]
+
+      const planRows = stkList.map(s => {
+        const dr_exists = existDrList.find(d => d.staking_id === s.id)
+        const qkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+        return {
+          staking_id: s.id, amount: s.amount, daily_rate: s.daily_rate,
+          usdt_amount: Math.round(Number(s.amount) * Number(s.daily_rate) * 100) / 100,
+          qkey, dr_exists, skip: !!dr_exists,
+        }
+      })
+      stakingPlan.push({ ...tgt, stakings: planRows })
+    }
+
+    // 1-C) 5/4 referral 분배 (L1, L2) 영구룰 그대로
+    //   - 본인 daily 가 발생하면 → referrer 가 active 이면 referral 발생
+    //   - 단, 5/4 에 이미 referral_rewards 가 존재하면 SKIP
+    const refPlan: any[] = []
+    for (const tgt of stakingPlan) {
+      for (const s of tgt.stakings) {
+        if (s.skip) continue
+        // L1: 자신의 referrer
+        const userRow = await db.prepare(`SELECT id, referrer_id FROM users WHERE id = ?`).bind(tgt.user_id).first() as any
+        const l1Id = userRow?.referrer_id
+        if (l1Id) {
+          const l1Active = await db.prepare(`
+            SELECT id FROM staking WHERE user_id = ? AND status='active'
+              AND date(start_date,'+9 hours') <= '2026-05-04'
+              AND date(end_date,  '+9 hours') >= '2026-05-04'
+            LIMIT 1
+          `).bind(l1Id).first()
+          if (l1Active) {
+            const existRr = await db.prepare(`
+              SELECT id FROM referral_rewards
+              WHERE referrer_id=? AND referee_id=? AND level=1 AND reward_date='2026-05-04'
+                AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+            `).bind(l1Id, tgt.user_id, s.staking_id, s.qkey).first()
+            const refAmt = Math.round(s.qkey * 0.20)
+            refPlan.push({
+              referrer_id: l1Id, referee_id: tgt.user_id, level: 1,
+              staking_id: s.staking_id, original_amount: s.qkey, reward_amount: refAmt,
+              already_exists: !!existRr, skip: !!existRr,
+            })
+
+            // L2: l1Id 의 referrer
+            const l1Row = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(l1Id).first() as any
+            const l2Id = l1Row?.referrer_id
+            if (l2Id) {
+              const l2Active = await db.prepare(`
+                SELECT id FROM staking WHERE user_id = ? AND status='active'
+                  AND date(start_date,'+9 hours') <= '2026-05-04'
+                  AND date(end_date,  '+9 hours') >= '2026-05-04'
+                LIMIT 1
+              `).bind(l2Id).first()
+              if (l2Active) {
+                const existRr2 = await db.prepare(`
+                  SELECT id FROM referral_rewards
+                  WHERE referrer_id=? AND referee_id=? AND level=2 AND reward_date='2026-05-04'
+                    AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+                `).bind(l2Id, tgt.user_id, s.staking_id, s.qkey).first()
+                const refAmt2 = Math.round(s.qkey * 0.10)
+                refPlan.push({
+                  referrer_id: l2Id, referee_id: tgt.user_id, level: 2,
+                  staking_id: s.staking_id, original_amount: s.qkey, reward_amount: refAmt2,
+                  already_exists: !!existRr2, skip: !!existRr2,
+                })
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ============== 2. balance delta 집계 ==============
+    const perUserDelta: Record<number, number> = {}
+    // 솔밧 GHOST_DR (5/13, 5/14)
+    let ghostQkey = 0
+    for (const g of ghostDrCheck) {
+      if (!g.needs_tx_insert) continue
+      // qkey 환산: staking 의 amount × daily_rate × 150
+      const stk = await db.prepare(`SELECT amount, daily_rate FROM staking WHERE id = ?`).bind(g.staking_id).first() as any
+      if (!stk) continue
+      const qkey = Math.round(Number(stk.amount) * Number(stk.daily_rate) * 150)
+      perUserDelta[SOLBAT] = (perUserDelta[SOLBAT] || 0) + qkey
+      ghostQkey += qkey
+      g.expected_qkey = qkey
+    }
+    // 5/4 self daily
+    let self54Qkey = 0
+    for (const tgt of stakingPlan) {
+      for (const s of tgt.stakings) {
+        if (s.skip) continue
+        perUserDelta[tgt.user_id] = (perUserDelta[tgt.user_id] || 0) + s.qkey
+        self54Qkey += s.qkey
+      }
+    }
+    // 5/4 referral
+    let refQkey = 0
+    for (const r of refPlan) {
+      if (r.skip) continue
+      perUserDelta[r.referrer_id] = (perUserDelta[r.referrer_id] || 0) + r.reward_amount
+      refQkey += r.reward_amount
+    }
+
+    // 현재 잔액 조회
+    const allUserIds = Object.keys(perUserDelta).map(Number)
+    let curMap: Record<number, any> = {}
+    if (allUserIds.length > 0) {
+      const phU = allUserIds.map(() => '?').join(',')
+      const rows = (await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id IN (${phU})`).bind(...allUserIds).all()).results as any[]
+      for (const u of rows) curMap[u.id] = u
+    }
+    const balanceMatrix = allUserIds.map(uid => ({
+      user_id: uid, name: curMap[uid]?.name || '?',
+      current: curMap[uid]?.qkey_balance || 0,
+      delta: perUserDelta[uid],
+      after: (curMap[uid]?.qkey_balance || 0) + perUserDelta[uid],
+    })).sort((a,b)=>a.user_id-b.user_id)
+
+    const summary = {
+      ghost_tx_inserts: ghostDrCheck.filter(g => g.needs_tx_insert).length,
+      ghost_tx_total_qkey: ghostQkey,
+      self_dr_inserts: stakingPlan.reduce((a, t) => a + t.stakings.filter((s: any) => !s.skip).length, 0),
+      self_dr_total_qkey: self54Qkey,
+      ref_rr_inserts: refPlan.filter(r => !r.skip).length,
+      ref_rr_total_qkey: refQkey,
+      total_qkey_supplemented: ghostQkey + self54Qkey + refQkey,
+      paid_date_5_4: PAID_5_4,
+    }
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        summary,
+        balance_matrix: balanceMatrix,
+        plan: {
+          ghost_dr_tx_inserts: ghostDrCheck,
+          self_daily_5_4_inserts: stakingPlan,
+          referral_5_4_inserts: refPlan,
+        },
+        hint: 'Add &confirm=STAGE_B_FIX_GO to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ============== 3. EXEC ==============
+    let inserted_tx = 0, inserted_dr = 0, inserted_rr = 0, updated_bal = 0
+    const errors: any[] = []
+
+    // 3-A) GHOST_DR (5/13, 5/14) — tx 미러만 INSERT + balance UPDATE
+    for (const g of ghostDrCheck) {
+      if (!g.needs_tx_insert) continue
+      try {
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+        `).bind(SOLBAT, g.expected_qkey, `일일 보상 (${g.reward_date}) [solbat-stage-B-fix ghost-tx]`, g.dr_id).run()
+        inserted_tx++
+      } catch (e: any) {
+        errors.push({ stage: 'ghost_tx', dr_id: g.dr_id, error: String(e?.message || e) })
+      }
+    }
+
+    // 3-B) 5/4 self daily — dr INSERT + tx 미러 INSERT
+    for (const tgt of stakingPlan) {
+      for (const s of tgt.stakings) {
+        if (s.skip) continue
+        try {
+          // dr INSERT
+          const drIns = await db.prepare(`
+            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+            VALUES (?, ?, ?, '2026-05-04', ?)
+          `).bind(tgt.user_id, s.staking_id, s.usdt_amount, PAID_5_4).run()
+          const drId = (drIns as any)?.meta?.last_row_id
+          inserted_dr++
+          // tx 미러 INSERT
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+          `).bind(tgt.user_id, s.qkey, `일일 보상 (2026-05-04) [solbat-stage-B-fix self-5-4]`, drId).run()
+          inserted_tx++
+        } catch (e: any) {
+          errors.push({ stage: 'self_5_4', user_id: tgt.user_id, staking_id: s.staking_id, error: String(e?.message || e) })
+        }
+      }
+    }
+
+    // 3-C) 5/4 referral — rr INSERT + tx 미러 INSERT
+    for (const r of refPlan) {
+      if (r.skip) continue
+      try {
+        const rrIns = await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+          VALUES (?, ?, ?, ?, ?, '2026-05-04', ?, ?)
+        `).bind(r.referrer_id, r.referee_id, r.level, r.original_amount, r.reward_amount, PAID_5_4, r.staking_id).run()
+        const rrId = (rrIns as any)?.meta?.last_row_id
+        inserted_rr++
+        const desc = r.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(r.referrer_id, r.reward_amount, `${desc} [solbat-stage-B-fix ref-5-4]`, rrId).run()
+        inserted_tx++
+      } catch (e: any) {
+        errors.push({ stage: 'ref_5_4', referrer: r.referrer_id, referee: r.referee_id, level: r.level, error: String(e?.message || e) })
+      }
+    }
+
+    // 3-D) qkey_balance UPDATE
+    for (const [uid, delta] of Object.entries(perUserDelta)) {
+      try {
+        const r = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, Number(uid)).run()
+        if ((r.meta?.changes || 0) > 0) updated_bal++
+      } catch (e: any) {
+        errors.push({ stage: 'balance_update', user_id: uid, delta, error: String(e?.message || e) })
+      }
+    }
+
+    // 사후 검증
+    const gb = await db.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS s FROM users`).first() as any
+    const gt = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE coin_type='QKEY'`).first() as any
+    const after: any[] = []
+    if (allUserIds.length > 0) {
+      const phU = allUserIds.map(() => '?').join(',')
+      const rows = (await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id IN (${phU})`).bind(...allUserIds).all()).results as any[]
+      for (const u of rows) {
+        const ts = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id=? AND coin_type='QKEY'`).bind(u.id).first() as any
+        after.push({ user_id: u.id, name: u.name, qkey_balance: u.qkey_balance, tx_sum: ts?.s, match: u.qkey_balance === ts?.s ? 'OK' : 'MISMATCH' })
+      }
+    }
+
+    return c.json({
+      mode: 'EXEC_DONE',
+      summary,
+      inserted: { transactions: inserted_tx, daily_rewards: inserted_dr, referral_rewards: inserted_rr },
+      balance_updated_users: updated_bal,
+      errors,
+      after_check: after.sort((a,b)=>a.user_id-b.user_id),
+      global: {
+        total_qkey_balance: gb?.s, total_qkey_tx_sum: gt?.s,
+        integrity: gb?.s === gt?.s ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+        diff: (gb?.s ?? 0) - (gt?.s ?? 0),
+      },
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================================
 // solbat-tree-bottomup-audit — 솔밧 트리 바텀업(L2→L1→L0) 영구룰 정합성 점검 (read-only)
 // 영구룰:
 //   1) 본인 daily = staking.amount × daily_rate × 150  (active staking 만)
