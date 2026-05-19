@@ -34736,13 +34736,251 @@ app.get('/api/diag/cron-h-plan-monitor', async (c) => {
       ],
       usage: {
         endpoint: 'GET /api/diag/cron-h-plan-monitor?password=<ADMIN_PW>&paid_date=2026-05-14',
-        call_when: '5/14 07:00 KST cron 실행 직후 (또는 has_more=false 워크플로 완료 후)',
+        call_when: 'KST 08:00 cron 실행 직후 (또는 has_more=false 워크플로 완료 후)',
         success_criteria: 'all_passed === true → 영구 룰 100% 준수 자동 cron 첫 가동 성공',
       },
     })
   } catch (error: any) {
     console.error('cron-h-plan-monitor error:', error)
     return c.json({ error: error?.message || String(error), code: error?.code }, 500)
+  }
+})
+
+// ============================================================================
+// cron-kst08-verify (2026-05-19): KST 08:00 cron 직후 종합 검증 (one-shot)
+// ============================================================================
+//   영구룰 #정규시각 (2026-05-19) 검증 포함:
+//     - 모든 신규 DR/RR/tx 의 created_at == KST 08:00 (= UTC prev-day 23:00:00 / 23:00:01)
+//     - cron 단일 실행 (daily_cron_lock 1행)
+//     - DR/L1/L2/tx 카운트 매칭
+//     - 이중지급 0건
+//   사용: GET /api/diag/cron-kst08-verify?key=<ADMIN_PW>
+//        (paid_date 미지정 시 오늘 KST 자동)
+app.get('/api/diag/cron-kst08-verify', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || c.req.query('password') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    const now = new Date()
+    const todayKst = kstDateStr(now)
+    const paidDate = c.req.query('paid_date') || todayKst
+
+    // KST 08:00 = UTC (paid_date - 1 day) 23:00:00
+    const prevDayKst = kstDateStr(new Date(new Date(paidDate + 'T00:00:00+09:00').getTime() - 24 * 60 * 60 * 1000))
+    const expectedDrCreatedAt = `${prevDayKst} 23:00:00`       // KST 08:00:00
+    const expectedRrCreatedAt = `${prevDayKst} 23:00:00`       // RR row 자체는 본 row
+    const expectedDailyTxCreatedAt = `${prevDayKst} 23:00:00`  // 본인 daily tx
+    const expectedRrTxCreatedAt = `${prevDayKst} 23:00:01`     // L1/L2 tx 는 1초 늦게
+
+    // ── A. daily_cron_lock 상태 ──
+    const lock = await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note, last_finished_at
+      FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(paidDate).first() as any
+    const lockExists = !!lock
+    const lockSource = lock?.source || null
+    const lockCronAuto = lockSource === 'cron_auto'
+
+    // ── B. DR / RR 카운트 + 합계 ──
+    const drAgg = await db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount), 0) AS sum_qkey
+      FROM daily_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+    const rrAgg = await db.prepare(`
+      SELECT COUNT(*) AS cnt,
+             SUM(CASE WHEN level=1 THEN 1 ELSE 0 END) AS l1_cnt,
+             SUM(CASE WHEN level=2 THEN 1 ELSE 0 END) AS l2_cnt,
+             COALESCE(SUM(CASE WHEN level=1 THEN reward_amount ELSE 0 END), 0) AS l1_sum,
+             COALESCE(SUM(CASE WHEN level=2 THEN reward_amount ELSE 0 END), 0) AS l2_sum
+      FROM referral_rewards WHERE paid_date = ?
+    `).bind(paidDate).first() as any
+
+    // ── C. DR 의 created_at 검증 (KST 08:00 = prev-day 23:00:00) ──
+    const drTimeAgg = await db.prepare(`
+      SELECT
+        SUM(CASE WHEN created_at = ? THEN 1 ELSE 0 END) AS exact_match,
+        SUM(CASE WHEN created_at != ? THEN 1 ELSE 0 END) AS mismatch,
+        COUNT(*) AS total
+      FROM daily_rewards WHERE paid_date = ?
+    `).bind(expectedDrCreatedAt, expectedDrCreatedAt, paidDate).first() as any
+    const drTimeMismatchSample = await db.prepare(`
+      SELECT id, user_id, paid_date, created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM daily_rewards
+      WHERE paid_date = ? AND created_at != ?
+      ORDER BY id ASC LIMIT 10
+    `).bind(paidDate, expectedDrCreatedAt).all()
+
+    // ── D. RR 의 created_at 검증 ──
+    const rrTimeAgg = await db.prepare(`
+      SELECT
+        SUM(CASE WHEN created_at = ? THEN 1 ELSE 0 END) AS exact_match,
+        SUM(CASE WHEN created_at != ? THEN 1 ELSE 0 END) AS mismatch,
+        COUNT(*) AS total
+      FROM referral_rewards WHERE paid_date = ?
+    `).bind(expectedRrCreatedAt, expectedRrCreatedAt, paidDate).first() as any
+    const rrTimeMismatchSample = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, paid_date, created_at,
+             datetime(created_at, '+9 hours') AS kst_at
+      FROM referral_rewards
+      WHERE paid_date = ? AND created_at != ?
+      ORDER BY id ASC LIMIT 10
+    `).bind(paidDate, expectedRrCreatedAt).all()
+
+    // ── E. daily_qkey tx created_at 검증 ──
+    const dailyTxTimeAgg = await db.prepare(`
+      SELECT
+        SUM(CASE WHEN t.created_at = ? THEN 1 ELSE 0 END) AS exact_match,
+        SUM(CASE WHEN t.created_at != ? THEN 1 ELSE 0 END) AS mismatch,
+        COUNT(*) AS total
+      FROM transactions t
+      INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+      WHERE t.type = 'daily_qkey' AND dr.paid_date = ?
+    `).bind(expectedDailyTxCreatedAt, expectedDailyTxCreatedAt, paidDate).first() as any
+    const dailyTxMismatchSample = await db.prepare(`
+      SELECT t.id, t.user_id, t.amount, t.created_at,
+             datetime(t.created_at, '+9 hours') AS kst_at,
+             dr.paid_date
+      FROM transactions t
+      INNER JOIN daily_rewards dr ON dr.id = t.ref_id
+      WHERE t.type = 'daily_qkey' AND dr.paid_date = ? AND t.created_at != ?
+      ORDER BY t.id ASC LIMIT 10
+    `).bind(paidDate, expectedDailyTxCreatedAt).all()
+
+    // ── F. referral_reward tx created_at 검증 (1초 늦은 23:00:01) ──
+    const rrTxTimeAgg = await db.prepare(`
+      SELECT
+        SUM(CASE WHEN t.created_at = ? THEN 1 ELSE 0 END) AS exact_match,
+        SUM(CASE WHEN t.created_at != ? THEN 1 ELSE 0 END) AS mismatch,
+        COUNT(*) AS total
+      FROM transactions t
+      INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+      WHERE t.type = 'referral_reward' AND rr.paid_date = ?
+    `).bind(expectedRrTxCreatedAt, expectedRrTxCreatedAt, paidDate).first() as any
+    const rrTxMismatchSample = await db.prepare(`
+      SELECT t.id, t.user_id, t.amount, t.created_at,
+             datetime(t.created_at, '+9 hours') AS kst_at,
+             rr.level, rr.paid_date
+      FROM transactions t
+      INNER JOIN referral_rewards rr ON rr.id = t.ref_id
+      WHERE t.type = 'referral_reward' AND rr.paid_date = ? AND t.created_at != ?
+      ORDER BY t.id ASC LIMIT 10
+    `).bind(paidDate, expectedRrTxCreatedAt).all()
+
+    // ── G. tx <-> ledger 카운트 매칭 ──
+    const drCnt = Number(drAgg?.cnt || 0)
+    const rrCnt = Number(rrAgg?.cnt || 0)
+    const dailyTxCnt = Number(dailyTxTimeAgg?.total || 0)
+    const rrTxCnt = Number(rrTxTimeAgg?.total || 0)
+    const drVsDailyTxMatch = drCnt === dailyTxCnt
+    const rrVsRrTxMatch = rrCnt === rrTxCnt
+
+    // ── H. 이중지급 검사 (5-tuple) ──
+    const drDup = await db.prepare(`
+      SELECT user_id, staking_id, reward_date, COUNT(*) AS cnt
+      FROM daily_rewards WHERE paid_date = ?
+      GROUP BY user_id, staking_id, reward_date
+      HAVING COUNT(*) > 1
+      LIMIT 10
+    `).bind(paidDate).all()
+    const rrDup = await db.prepare(`
+      SELECT referrer_id, referee_id, level, staking_id, reward_date, COUNT(*) AS cnt
+      FROM referral_rewards WHERE paid_date = ?
+      GROUP BY referrer_id, referee_id, level, staking_id, reward_date
+      HAVING COUNT(*) > 1
+      LIMIT 10
+    `).bind(paidDate).all()
+    const drDupCount = (drDup.results || []).length
+    const rrDupCount = (rrDup.results || []).length
+
+    // ── I. 종합 판정 ──
+    const drTimeOk = Number(drTimeAgg?.mismatch || 0) === 0 && Number(drTimeAgg?.total || 0) > 0
+    const rrTimeOk = Number(rrTimeAgg?.mismatch || 0) === 0
+    const dailyTxTimeOk = Number(dailyTxTimeAgg?.mismatch || 0) === 0 && Number(dailyTxTimeAgg?.total || 0) > 0
+    const rrTxTimeOk = Number(rrTxTimeAgg?.mismatch || 0) === 0
+    const noDup = drDupCount === 0 && rrDupCount === 0
+    const lockOk = lockExists && lockCronAuto
+
+    const allPassed = drTimeOk && rrTimeOk && dailyTxTimeOk && rrTxTimeOk && noDup && drVsDailyTxMatch && rrVsRrTxMatch && lockOk
+
+    return c.json({
+      ok: true,
+      paid_date: paidDate,
+      reward_date_expected: prevDayKst,
+      expected_created_at: {
+        dr: expectedDrCreatedAt,
+        rr: expectedRrCreatedAt,
+        daily_tx: expectedDailyTxCreatedAt,
+        rr_tx: expectedRrTxCreatedAt,
+        note: 'KST 08:00 (PERMANENT_RULE #regular-time 2026-05-19)',
+      },
+      A_lock: {
+        exists: lockExists,
+        source: lockSource,
+        is_cron_auto: lockCronAuto,
+        details: lock,
+        verdict: lockOk ? 'PASS (cron_auto lock 존재)' : 'FAIL',
+      },
+      B_counts: {
+        dr: drCnt,
+        dr_sum_qkey: Number(drAgg?.sum_qkey || 0),
+        rr_total: rrCnt,
+        rr_l1: Number(rrAgg?.l1_cnt || 0),
+        rr_l2: Number(rrAgg?.l2_cnt || 0),
+        rr_l1_sum_qkey: Number(rrAgg?.l1_sum || 0),
+        rr_l2_sum_qkey: Number(rrAgg?.l2_sum || 0),
+        daily_tx: dailyTxCnt,
+        rr_tx: rrTxCnt,
+      },
+      C_dr_time: {
+        total: Number(drTimeAgg?.total || 0),
+        exact_match: Number(drTimeAgg?.exact_match || 0),
+        mismatch: Number(drTimeAgg?.mismatch || 0),
+        mismatch_sample: drTimeMismatchSample.results || [],
+        verdict: drTimeOk ? 'PASS' : 'FAIL',
+      },
+      D_rr_time: {
+        total: Number(rrTimeAgg?.total || 0),
+        exact_match: Number(rrTimeAgg?.exact_match || 0),
+        mismatch: Number(rrTimeAgg?.mismatch || 0),
+        mismatch_sample: rrTimeMismatchSample.results || [],
+        verdict: rrTimeOk ? 'PASS' : 'FAIL',
+      },
+      E_daily_tx_time: {
+        total: Number(dailyTxTimeAgg?.total || 0),
+        exact_match: Number(dailyTxTimeAgg?.exact_match || 0),
+        mismatch: Number(dailyTxTimeAgg?.mismatch || 0),
+        mismatch_sample: dailyTxMismatchSample.results || [],
+        verdict: dailyTxTimeOk ? 'PASS' : 'FAIL',
+      },
+      F_rr_tx_time: {
+        total: Number(rrTxTimeAgg?.total || 0),
+        exact_match: Number(rrTxTimeAgg?.exact_match || 0),
+        mismatch: Number(rrTxTimeAgg?.mismatch || 0),
+        mismatch_sample: rrTxMismatchSample.results || [],
+        verdict: rrTxTimeOk ? 'PASS' : 'FAIL',
+      },
+      G_tx_ledger_match: {
+        dr_vs_daily_tx: drVsDailyTxMatch ? 'PASS' : `FAIL (dr=${drCnt}, daily_tx=${dailyTxCnt})`,
+        rr_vs_rr_tx: rrVsRrTxMatch ? 'PASS' : `FAIL (rr=${rrCnt}, rr_tx=${rrTxCnt})`,
+      },
+      H_dup_check: {
+        dr_dup_count: drDupCount,
+        dr_dup_sample: drDup.results || [],
+        rr_dup_count: rrDupCount,
+        rr_dup_sample: rrDup.results || [],
+        verdict: noDup ? 'PASS' : 'FAIL',
+      },
+      verdict: allPassed
+        ? 'ALL_PASSED: KST 08:00 cron 영구룰 완전 준수'
+        : 'FAILED: 위 verdict FAIL 항목 확인 필요',
+      all_passed: allPassed,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: error?.message || String(error), duration_ms: Date.now() - t0 }, 500)
   }
 })
 
