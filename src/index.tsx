@@ -55636,4 +55636,128 @@ app.get('/api/diag/check-user44-balance-after-516', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// fix-user44-balance-516 — user 44 balance -= 2475 직접 차감 (사장님 명시 결재 후 EXEC)
+// ════════════════════════════════════════════════════════════════════════
+// 배경: 5/16 TX 4건 (id 4450, 4451, 4458, 4462) 삭제는 완료됐으나
+//       timeout 발생으로 balance UPDATE 가 안 됨
+// 사장님 명시 결재 (2026-05-19): "고! 2,475 차감해" (옵션 ①)
+//
+// 가드:
+//   1) user_id = 44 만 (다른 user 절대 안 건드림)
+//   2) 차감액 = 정확히 2,475 (DRY-RUN 보고서와 100% 일치)
+//   3) 차감 전 balance = 24,375 (timeout 전 검증된 값) — 다르면 EXEC_BLOCKED
+//   4) confirm token = FIX_USER44_BALANCE_2475
+//   5) 차감 후 balance ≥ 0 검증
+//
+// EXEC: GET /api/diag/fix-user44-balance-516?key=ADMIN_PW&confirm=FIX_USER44_BALANCE_2475
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/fix-user44-balance-516', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_USER44_BALANCE_2475'
+    const db = c.env.DB
+
+    const USER_ID = 44
+    const DECREMENT = 2475
+    const EXPECTED_BEFORE = 24375
+    const EXPECTED_AFTER = 21900
+
+    // 현재 balance
+    const u = await db.prepare(`SELECT id, qkey_balance, name, email FROM users WHERE id=?`).bind(USER_ID).first() as any
+    const cur = Number(u?.qkey_balance || 0)
+
+    // 5/16 잔재 재검증 — 완전히 0건이어야 함 (DELETE 됐으니)
+    const dr516 = await db.prepare(`SELECT COUNT(*) as cnt FROM daily_rewards WHERE paid_date='2026-05-16'`).first() as any
+    const rr516 = await db.prepare(`SELECT COUNT(*) as cnt FROM referral_rewards WHERE paid_date='2026-05-16'`).first() as any
+    const tx516 = await db.prepare(`
+      SELECT COUNT(*) as cnt FROM transactions
+      WHERE user_id=44 AND coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward')
+        AND created_at >= '2026-05-15 23:00:00' AND created_at < '2026-05-16 23:00:00'
+    `).first() as any
+    const all516Clean = Number(dr516?.cnt || 0) === 0 && Number(rr516?.cnt || 0) === 0 && Number(tx516?.cnt || 0) === 0
+
+    const guardOk = cur === EXPECTED_BEFORE
+    const cleanOk = all516Clean
+    const afterOk = (cur - DECREMENT) >= 0
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        confirm_token_required: 'FIX_USER44_BALANCE_2475',
+        user: u,
+        plan: {
+          user_id: USER_ID,
+          decrement: DECREMENT,
+          expected_before: EXPECTED_BEFORE,
+          current_balance: cur,
+          expected_after: EXPECTED_AFTER,
+        },
+        guards: {
+          balance_match_expected: guardOk,
+          all_516_traces_zero: cleanOk,
+          tx_516_remaining: Number(tx516?.cnt || 0),
+          after_non_negative: afterOk,
+        },
+        will_execute: guardOk && cleanOk && afterOk,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC — 가드 fail 차단
+    if (!guardOk) {
+      return c.json({
+        ok: false,
+        mode: 'EXEC_BLOCKED',
+        reason: 'balance mismatch — refusing to modify',
+        current: cur,
+        expected_before: EXPECTED_BEFORE,
+      }, 400)
+    }
+    if (!cleanOk) {
+      return c.json({
+        ok: false,
+        mode: 'EXEC_BLOCKED',
+        reason: '5/16 traces still exist — DELETE first',
+        dr_516: Number(dr516?.cnt || 0),
+        rr_516: Number(rr516?.cnt || 0),
+        tx_516: Number(tx516?.cnt || 0),
+      }, 400)
+    }
+    if (!afterOk) {
+      return c.json({ ok: false, mode: 'EXEC_BLOCKED', reason: 'after balance < 0' }, 400)
+    }
+
+    // 명시적 다중 가드 UPDATE
+    const r = await db.prepare(`
+      UPDATE users
+      SET qkey_balance = qkey_balance - ?
+      WHERE id = ? AND qkey_balance = ?
+    `).bind(DECREMENT, USER_ID, EXPECTED_BEFORE).run()
+    const changes = (r as any)?.meta?.changes ?? 0
+
+    const after = await db.prepare(`SELECT id, qkey_balance FROM users WHERE id=?`).bind(USER_ID).first() as any
+    const afterVal = Number(after?.qkey_balance || 0)
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      updated_rows: changes,
+      before: cur,
+      after: afterVal,
+      expected_after: EXPECTED_AFTER,
+      match: afterVal === EXPECTED_AFTER,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
