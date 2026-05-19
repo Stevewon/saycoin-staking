@@ -56758,6 +56758,271 @@ app.get('/api/diag/scan-holiday-tx-double', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// purge-holiday-513-legacy — 휴일진입자 5/13 legacy daily_reward 잔재 제거
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "b를 발빠르게 처리하고"
+// 대상: tx_id IN (3303, 3305) (김주성 daily_reward 7350 + 이현우 daily_reward 750)
+// EXEC 시 confirm=PURGE_HOLIDAY_513_LEGACY 필요
+// DRY-RUN 은 confirm 없이 호출 가능
+// 작업:
+//   1) 대상 TX row 존재 검증 (id, user_id, type, amount, ref_id, kst date 일치)
+//   2) 각 user 의 qkey_balance 차감 (현재 balance - amount)
+//   3) transactions DELETE
+//   4) 사후 검증
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/purge-holiday-513-legacy', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const confirm = c.req.query('confirm') || ''
+  const isExec = confirm === 'PURGE_HOLIDAY_513_LEGACY'
+
+  try {
+    const db = c.env.DB
+    // 정확히 이 2건만 (id 고정 + type 가드 + ref_id 가드 + date 가드)
+    const TARGETS = [
+      { tx_id: 3303, user_id: 91, expected_type: 'daily_reward', expected_amount: 7350, expected_ref: 'bf_513_self_s96', expected_kst_date: '2026-05-13' },
+      { tx_id: 3305, user_id: 93, expected_type: 'daily_reward', expected_amount: 750,  expected_ref: 'bf_513_self_s98', expected_kst_date: '2026-05-13' },
+    ]
+
+    const preCheck: any[] = []
+    let totalAmount = 0
+    for (const t of TARGETS) {
+      const row = await db.prepare(`
+        SELECT id, user_id, type, amount, ref_id, description,
+               created_at,
+               date(created_at, '+9 hours') as kst_date,
+               time(created_at, '+9 hours') as kst_time
+        FROM transactions WHERE id = ?
+      `).bind(t.tx_id).first() as any
+
+      let ok = false
+      let reason = ''
+      if (!row) reason = 'NOT_FOUND'
+      else if (row.user_id !== t.user_id) reason = `USER_MISMATCH (got ${row.user_id})`
+      else if (row.type !== t.expected_type) reason = `TYPE_MISMATCH (got ${row.type})`
+      else if (Number(row.amount) !== t.expected_amount) reason = `AMOUNT_MISMATCH (got ${row.amount})`
+      else if (row.ref_id !== t.expected_ref) reason = `REF_MISMATCH (got ${row.ref_id})`
+      else if (row.kst_date !== t.expected_kst_date) reason = `DATE_MISMATCH (got ${row.kst_date})`
+      else { ok = true; reason = 'OK_READY_FOR_PURGE'; totalAmount += Number(row.amount) }
+
+      // user 현재 balance
+      const u = await db.prepare(`SELECT name, qkey_balance FROM users WHERE id = ?`).bind(t.user_id).first() as any
+
+      preCheck.push({
+        target: t,
+        actual_row: row,
+        check_ok: ok,
+        reason,
+        user_name: u?.name,
+        user_balance_before: u?.qkey_balance,
+        user_balance_after_purge: ok ? Number(u?.qkey_balance || 0) - Number(row?.amount || 0) : null,
+      })
+    }
+
+    const allOk = preCheck.every(p => p.check_ok)
+
+    if (!isExec) {
+      // DRY-RUN
+      return c.json({
+        mode: 'DRY_RUN',
+        confirm_hint: 'add &confirm=PURGE_HOLIDAY_513_LEGACY to execute',
+        all_targets_ok: allOk,
+        target_count: TARGETS.length,
+        total_amount_to_purge: totalAmount,
+        pre_check: preCheck,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ── EXEC ──────────────────────────────────────────────────────────────
+    if (!allOk) {
+      return c.json({
+        mode: 'EXEC_ABORTED',
+        reason: 'PRE_CHECK_FAILED',
+        pre_check: preCheck,
+      }, 400)
+    }
+
+    const execResults: any[] = []
+    for (const p of preCheck) {
+      const t = p.target
+      const amount = p.actual_row.amount
+
+      // 1) balance 차감
+      const balUpd = await db.prepare(
+        `UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`
+      ).bind(amount, t.user_id).run()
+
+      // 2) TX DELETE
+      const txDel = await db.prepare(
+        `DELETE FROM transactions WHERE id = ?`
+      ).bind(t.tx_id).run()
+
+      // 3) 사후 user balance
+      const after = await db.prepare(
+        `SELECT qkey_balance FROM users WHERE id = ?`
+      ).bind(t.user_id).first() as any
+
+      execResults.push({
+        tx_id: t.tx_id,
+        user_id: t.user_id,
+        amount_purged: amount,
+        balance_update_meta: balUpd.meta,
+        tx_delete_meta: txDel.meta,
+        balance_before: p.user_balance_before,
+        balance_after: after?.qkey_balance,
+      })
+    }
+
+    // 사후 검증: 대상 TX 가 모두 사라졌는지
+    const verifyRows = await db.prepare(`
+      SELECT id FROM transactions WHERE id IN (3303, 3305)
+    `).all()
+    const remaining = (verifyRows.results || []).length
+
+    return c.json({
+      mode: 'EXEC_DONE',
+      verdict: remaining === 0 ? 'PURGE_SUCCESS' : 'PURGE_INCOMPLETE',
+      remaining_count: remaining,
+      purged_count: preCheck.length - remaining,
+      total_amount_purged: totalAmount,
+      exec_results: execResults,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
+// scan-all-legacy-violation — 전체 user 영구룰 위반 TX type 전수조사 READ-ONLY
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 명령 (2026-05-19): "A를 처리하자!"
+// 영구룰 #영구가감: type 이 합법 6종 외 (특히 daily_reward, staking_reward, shop_*, _exec_*_marker)
+// 합법 6종: daily_qkey, referral_reward, direct_referral, admin_adjustment, swap_in, swap_out
+//
+// 분석:
+//   - 위반 type 별 row count + total amount
+//   - user 별 잔재 금액
+//   - KST date 별 분포
+//   - 각 row dump (purge 후보 list)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-all-legacy-violation', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  try {
+    const db = c.env.DB
+
+    const LEGAL_TYPES = ['daily_qkey', 'referral_reward', 'direct_referral', 'admin_adjustment', 'swap_in', 'swap_out']
+
+    // 위반 type 전체 (legal 6종 NOT IN)
+    const violationRows = await db.prepare(`
+      SELECT id, user_id, type, amount, ref_id, description, created_at,
+             date(created_at, '+9 hours') as kst_date,
+             time(created_at, '+9 hours') as kst_time
+      FROM transactions
+      WHERE type NOT IN ('daily_qkey','referral_reward','direct_referral','admin_adjustment','swap_in','swap_out')
+      ORDER BY user_id, kst_date, id
+    `).all()
+    const rows = (violationRows.results || []) as any[]
+
+    // user 이름 매핑 (chunk 50)
+    const userIds = Array.from(new Set(rows.map(r => r.user_id)))
+    const userNameMap = new Map<number, any>()
+    for (let i = 0; i < userIds.length; i += 50) {
+      const chunk = userIds.slice(i, i + 50)
+      const placeholders = chunk.map(() => '?').join(',')
+      const res = await db.prepare(
+        `SELECT id, name, qkey_balance FROM users WHERE id IN (${placeholders})`
+      ).bind(...chunk).all()
+      for (const u of (res.results || []) as any[]) userNameMap.set(u.id, u)
+    }
+
+    // type 별 집계
+    const byType: Record<string, any> = {}
+    for (const r of rows) {
+      if (!byType[r.type]) byType[r.type] = { count: 0, total_amount: 0, positive_count: 0, positive_amount: 0, negative_count: 0, negative_amount: 0 }
+      byType[r.type].count++
+      byType[r.type].total_amount += Number(r.amount)
+      if (Number(r.amount) > 0) {
+        byType[r.type].positive_count++
+        byType[r.type].positive_amount += Number(r.amount)
+      } else if (Number(r.amount) < 0) {
+        byType[r.type].negative_count++
+        byType[r.type].negative_amount += Number(r.amount)
+      }
+    }
+
+    // user 별 집계 (positive amount 만 가감 대상)
+    const byUser: Record<string, any> = {}
+    for (const r of rows) {
+      const u = userNameMap.get(r.user_id)
+      const key = String(r.user_id)
+      if (!byUser[key]) byUser[key] = {
+        user_id: r.user_id,
+        name: u?.name,
+        current_balance: u?.qkey_balance,
+        violation_count: 0,
+        total_amount: 0,
+        positive_amount: 0,  // 가감 대상 (잔액 증가시킨 위반)
+        negative_amount: 0,
+        types: new Set<string>(),
+        rows: [],
+      }
+      byUser[key].violation_count++
+      byUser[key].total_amount += Number(r.amount)
+      if (Number(r.amount) > 0) byUser[key].positive_amount += Number(r.amount)
+      else byUser[key].negative_amount += Number(r.amount)
+      byUser[key].types.add(r.type)
+      byUser[key].rows.push({
+        tx_id: r.id, type: r.type, amount: r.amount, ref_id: r.ref_id,
+        kst_date: r.kst_date, kst_time: r.kst_time, description: r.description,
+      })
+    }
+    // Set → Array 변환
+    for (const k of Object.keys(byUser)) {
+      byUser[k].types = Array.from(byUser[k].types)
+    }
+
+    // KST date 별 집계
+    const byDate: Record<string, any> = {}
+    for (const r of rows) {
+      const d = r.kst_date
+      if (!byDate[d]) byDate[d] = { count: 0, total_amount: 0, types: new Set<string>() }
+      byDate[d].count++
+      byDate[d].total_amount += Number(r.amount)
+      byDate[d].types.add(r.type)
+    }
+    for (const k of Object.keys(byDate)) byDate[k].types = Array.from(byDate[k].types)
+
+    const totalAmount = rows.reduce((s, r) => s + Number(r.amount), 0)
+    const totalPositive = rows.filter(r => Number(r.amount) > 0).reduce((s, r) => s + Number(r.amount), 0)
+
+    return c.json({
+      verdict: rows.length > 0 ? 'VIOLATION_FOUND' : 'CLEAN',
+      legal_types: LEGAL_TYPES,
+      summary: {
+        total_violation_rows: rows.length,
+        affected_users: Object.keys(byUser).length,
+        violation_types: Object.keys(byType).length,
+        total_amount: totalAmount,
+        total_positive_amount: totalPositive,   // 잔액에 더해진 위반 금액 (가감 대상)
+      },
+      by_type: byType,
+      by_date: byDate,
+      by_user: byUser,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // admin-page-mirror — 관리자 회원상세 화면이 호출하는 query 를 그대로 재현
 // ════════════════════════════════════════════════════════════════════════
 // 사장님 이미지 (2026-05-19): 이현우(93) 5/13 11:58 + 08:00 일일배당 750 두 건 표시
