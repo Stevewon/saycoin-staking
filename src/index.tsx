@@ -56508,8 +56508,9 @@ app.get('/api/diag/fix-519-tx-description', async (c) => {
     const db = c.env.DB
 
     const PAID = '2026-05-19'
-    const NEW_L1 = 'Level 1 추천 보상 (QKEY)'
-    const NEW_L2 = 'Level 2 추천 보상 (QKEY)'
+    // 다른 날(5/18 등) 정상 표기와 100% 동일하게 맞춤
+    const NEW_L1 = '추천 보너스 (Level 1)'
+    const NEW_L2 = '추천 보너스 (Level 2)'
 
     // 5/19 paid 의 RR L1/L2 ids 수집
     const rrL1 = await db.prepare(`
