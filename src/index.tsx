@@ -47834,6 +47834,137 @@ app.get('/api/diag/dup-prevention-precheck', async (c) => {
 })
 
 // ============================================================================
+// reward-date-status: 특정 reward_date 또는 paid_date 의 DR/RR/tx 현황 점검 (READ-ONLY)
+// 사장님 명령 2026-05-18 — "오늘자 지급이 어찌된거지?"
+// GET /api/diag/reward-date-status?key=ADMIN_PW&dates=2026-05-15,2026-05-18,2026-05-19
+// dates 미지정 시 최근 7일 자동 (오늘 KST 기준 -6일 ~ 오늘)
+// ============================================================================
+app.get('/api/diag/reward-date-status', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const db = c.env.DB
+  const t0 = Date.now()
+  try {
+    const datesParam = c.req.query('dates') || ''
+    let dates: string[] = []
+    if (datesParam) {
+      dates = datesParam.split(',').map(s => s.trim()).filter(Boolean)
+    } else {
+      // 기본: 최근 7일 (KST)
+      const nowKstMs = Date.now() + 9 * 3600 * 1000
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(nowKstMs - i * 86400000)
+        dates.push(d.toISOString().slice(0, 10))
+      }
+    }
+
+    const result: any[] = []
+    for (const d of dates) {
+      // by reward_date
+      const drR = await db.prepare(`
+        SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total_usdt,
+               COUNT(DISTINCT user_id) AS users
+        FROM daily_rewards WHERE reward_date = ?
+      `).bind(d).first() as any
+      const rrR = await db.prepare(`
+        SELECT COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total_qkey,
+               COUNT(DISTINCT referrer_id) AS users
+        FROM referral_rewards WHERE reward_date = ?
+      `).bind(d).first() as any
+      // by paid_date
+      const drP = await db.prepare(`
+        SELECT COUNT(*) AS cnt, COALESCE(SUM(usdt_amount),0) AS total_usdt,
+               COUNT(DISTINCT user_id) AS users,
+               GROUP_CONCAT(DISTINCT reward_date) AS reward_dates
+        FROM daily_rewards WHERE paid_date = ?
+      `).bind(d).first() as any
+      const rrP = await db.prepare(`
+        SELECT COUNT(*) AS cnt, COALESCE(SUM(reward_amount),0) AS total_qkey,
+               COUNT(DISTINCT referrer_id) AS users,
+               GROUP_CONCAT(DISTINCT reward_date) AS reward_dates
+        FROM referral_rewards WHERE paid_date = ?
+      `).bind(d).first() as any
+      // tx by KST date
+      const txKst = await db.prepare(`
+        SELECT type, COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total_amt,
+               COUNT(DISTINCT user_id) AS users,
+               MIN(datetime(created_at,'+9 hours')) AS first_kst,
+               MAX(datetime(created_at,'+9 hours')) AS last_kst
+        FROM transactions
+        WHERE LOWER(coin_type) = 'qkey'
+          AND date(created_at,'+9 hours') = ?
+          AND type IN ('daily_qkey','referral_reward')
+        GROUP BY type
+      `).bind(d).all()
+      const txRows = (txKst.results || []) as any[]
+      const txByType: Record<string, any> = {}
+      for (const r of txRows) {
+        txByType[String(r.type)] = {
+          cnt: Number(r.cnt || 0),
+          total_amt: Number(r.total_amt || 0),
+          users: Number(r.users || 0),
+          first_kst: r.first_kst,
+          last_kst: r.last_kst,
+        }
+      }
+      // daily_cron_lock
+      const lock = await db.prepare(`
+        SELECT lock_date, source, locked_at, locked_by, last_finished_at
+        FROM daily_cron_lock WHERE lock_date = ?
+      `).bind(d).first() as any
+
+      result.push({
+        date: d,
+        // reward_date 기준
+        by_reward_date: {
+          dr_count: Number(drR?.cnt || 0),
+          dr_total_usdt: Number(drR?.total_usdt || 0),
+          dr_users: Number(drR?.users || 0),
+          rr_count: Number(rrR?.cnt || 0),
+          rr_total_qkey: Number(rrR?.total_qkey || 0),
+          rr_users: Number(rrR?.users || 0),
+        },
+        // paid_date 기준
+        by_paid_date: {
+          dr_count: Number(drP?.cnt || 0),
+          dr_total_usdt: Number(drP?.total_usdt || 0),
+          dr_users: Number(drP?.users || 0),
+          dr_source_reward_dates: drP?.reward_dates || null,
+          rr_count: Number(rrP?.cnt || 0),
+          rr_total_qkey: Number(rrP?.total_qkey || 0),
+          rr_users: Number(rrP?.users || 0),
+          rr_source_reward_dates: rrP?.reward_dates || null,
+        },
+        // tx (KST date 기준)
+        tx_by_kst_date: txByType,
+        cron_lock: lock,
+      })
+    }
+
+    // active stakings (전체 + 5/18 이전 진입자)
+    const activeStakings = await db.prepare(`
+      SELECT COUNT(*) AS active_cnt,
+             COUNT(DISTINCT user_id) AS active_users,
+             COALESCE(SUM(amount),0) AS active_total_stake
+      FROM stakings
+      WHERE status = 'active'
+    `).first() as any
+
+    return c.json({
+      ok: true,
+      kst_now: new Date(Date.now() + 9 * 3600 * 1000).toISOString(),
+      utc_now: new Date().toISOString(),
+      dates_checked: dates,
+      active_stakings: activeStakings,
+      per_date: result,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
 // normalize-coin-type-qkey: 소문자 'qkey' → 'QKEY' 대문자 정규화
 // 영구룰 #중복지급금지 보강 — coin_type 대소문자 불일치로 인한 중복 검출 실패 방지
 // DRY-RUN: GET /api/diag/normalize-coin-type-qkey?key=ADMIN_PW
