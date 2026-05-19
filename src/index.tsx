@@ -34792,8 +34792,8 @@ app.get('/api/diag/user-ledger-replay', async (c) => {
     // withdrawals (active states)
     const wds = await db.prepare(`
       SELECT id, amount, status,
-             COALESCE(processed_at, requested_at, created_at) AS event_at,
-             datetime(COALESCE(processed_at, requested_at, created_at), '+9 hours') AS kst_at
+             COALESCE(processed_at, created_at) AS event_at,
+             datetime(COALESCE(processed_at, created_at), '+9 hours') AS kst_at
       FROM withdrawals
       WHERE user_id = ? AND coin_type = ?
         AND status IN ('approved','completed','processing','pending')
