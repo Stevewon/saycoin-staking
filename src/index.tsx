@@ -48051,6 +48051,371 @@ app.get('/api/diag/tx-time-distribution', async (c) => {
 })
 
 // ============================================================================
+// normalize-tx-time-kst-08: created_at 시각을 KST 08:00:00 으로 보정
+// 영구룰 #정규시각 (2026-05-19 변경): KST 08:00 통일, KST 15:15 폐기
+// 영구룰 #지상최고: 절대로 중복지급 없음 → 본 endpoint 는 UPDATE only, amount/balance 불변
+//
+// 대상: paid_date IN (지정 목록) 의 모든 DR/RR/tx
+//   - daily_rewards.created_at        := datetime(paid_date || ' 23:00:00') UTC = KST 08:00
+//   - referral_rewards.created_at     := datetime(paid_date || ' 23:00:00') UTC = KST 08:00
+//   - transactions.created_at         := DR/RR 의 ref_id 매핑 (daily_qkey, referral_reward)
+//                                        OR paid_date 기준 KST 날짜의 tx
+//
+// DRY-RUN: GET /api/diag/normalize-tx-time-kst-08?key=ADMIN_PW&paidDates=2026-05-07,2026-05-08,...
+// EXEC:    GET /api/diag/normalize-tx-time-kst-08?key=ADMIN_PW&paidDates=...&exec=true
+// ============================================================================
+app.get('/api/diag/normalize-tx-time-kst-08', async (c) => {
+  const key = c.req.query('key') || ''
+  if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+  const exec = c.req.query('exec') === 'true'
+  const paidDatesParam = c.req.query('paidDates') || ''
+  if (!paidDatesParam) return c.json({ error: 'paidDates required (예: 2026-05-07,2026-05-08,2026-05-11,...)' }, 400)
+  const paidDates = paidDatesParam.split(',').map(s => s.trim()).filter(Boolean)
+  if (paidDates.length === 0) return c.json({ error: 'paidDates empty' }, 400)
+  // 날짜 형식 검증
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/
+  for (const d of paidDates) {
+    if (!dateRe.test(d)) return c.json({ error: `invalid paidDate format: ${d}` }, 400)
+  }
+
+  const db = c.env.DB
+  const t0 = Date.now()
+  try {
+    // ── PRE-VERIFY: 전체 balance ↔ tx 정합 (변경 전 baseline)
+    const preAudit = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM users) AS users_total,
+        (SELECT COUNT(*) FROM users u
+         WHERE u.qkey_balance = COALESCE(
+           (SELECT SUM(t.amount) FROM transactions t
+            WHERE t.user_id = u.id AND LOWER(t.coin_type) = 'qkey'), 0)
+        ) AS matched_before
+    `).first() as any
+
+    // ── 영향 받을 row 집계 (DRY-RUN 정보)
+    const ph = paidDates.map(() => '?').join(',')
+
+    // DR target rows (현재 created_at 이 KST 08:00 아닌 것만)
+    const drTargets = await db.prepare(`
+      SELECT id, user_id, staking_id, paid_date,
+             datetime(created_at,'+9 hours') AS cur_kst,
+             usdt_amount
+      FROM daily_rewards
+      WHERE paid_date IN (${ph})
+        AND strftime('%H:%M:%S', created_at, '+9 hours') != '08:00:00'
+      ORDER BY paid_date, id
+    `).bind(...paidDates).all()
+    const drRows = (drTargets.results || []) as any[]
+
+    // RR target rows
+    const rrTargets = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, paid_date,
+             datetime(created_at,'+9 hours') AS cur_kst,
+             reward_amount
+      FROM referral_rewards
+      WHERE paid_date IN (${ph})
+        AND strftime('%H:%M:%S', created_at, '+9 hours') != '08:00:00'
+      ORDER BY paid_date, id
+    `).bind(...paidDates).all()
+    const rrRows = (rrTargets.results || []) as any[]
+
+    // tx targets: DR의 ref_id 매핑 (type='daily_qkey')
+    const drIds = drRows.map((r: any) => Number(r.id))
+    const drPaidDateMap = new Map<number, string>()
+    for (const r of drRows) drPaidDateMap.set(Number(r.id), String(r.paid_date))
+
+    // tx targets: RR의 ref_id 매핑 (type='referral_reward')
+    const rrIds = rrRows.map((r: any) => Number(r.id))
+    const rrPaidDateMap = new Map<number, string>()
+    for (const r of rrRows) rrPaidDateMap.set(Number(r.id), String(r.paid_date))
+
+    // tx 수집 (CHUNK)
+    const CHUNK = 80
+    const drTxRows: any[] = []
+    for (let i = 0; i < drIds.length; i += CHUNK) {
+      const chunk = drIds.slice(i, i + CHUNK)
+      const ph2 = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, ref_id,
+               datetime(created_at,'+9 hours') AS cur_kst
+        FROM transactions
+        WHERE type='daily_qkey' AND ref_id IN (${ph2})
+          AND strftime('%H:%M:%S', created_at, '+9 hours') != '08:00:00'
+      `).bind(...chunk).all()
+      drTxRows.push(...((r.results || []) as any[]))
+    }
+    const rrTxRows: any[] = []
+    for (let i = 0; i < rrIds.length; i += CHUNK) {
+      const chunk = rrIds.slice(i, i + CHUNK)
+      const ph2 = chunk.map(() => '?').join(',')
+      const r = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, ref_id,
+               datetime(created_at,'+9 hours') AS cur_kst
+        FROM transactions
+        WHERE type='referral_reward' AND ref_id IN (${ph2})
+          AND strftime('%H:%M:%S', created_at, '+9 hours') != '08:00:00'
+      `).bind(...chunk).all()
+      rrTxRows.push(...((r.results || []) as any[]))
+    }
+
+    // tx 중 ref_id 가 없는 daily_qkey/referral_reward 도 보정 대상 (NULL ref tx)
+    // 이런 tx 는 paid_date 기반 매칭 불가 → KST 날짜 = paidDates 일치하는 것만 대상
+    const nullRefTxRows = await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, ref_id,
+             date(created_at,'+9 hours') AS kst_date,
+             datetime(created_at,'+9 hours') AS cur_kst
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey'
+        AND type IN ('daily_qkey','referral_reward')
+        AND ref_id IS NULL
+        AND date(created_at,'+9 hours') IN (${ph})
+        AND strftime('%H:%M:%S', created_at, '+9 hours') != '08:00:00'
+    `).bind(...paidDates).all()
+    const nullRefRows = (nullRefTxRows.results || []) as any[]
+
+    // ── 중복 발생 가능성 사전 점검 (지상최고 명령)
+    // tx UPDATE 시 (user_id, type, ref_id, kst_date) 가 이미 KST 08:00 으로 있는 다른 tx 와
+    // 충돌하면 UNIQUE INDEX 가 막아주지만, 사장님 명령상 사전에 점검해 STOP
+    const collisionCheck: any[] = []
+    const tgtTxAll = [...drTxRows, ...rrTxRows]
+    for (const tx of tgtTxAll) {
+      const refId = tx.ref_id
+      if (refId == null) continue
+      // 같은 (user_id, type, ref_id) 가 이미 또 있는지 (UNIQUE INDEX 가 막아주지만 한번 더 확인)
+      const dup = await db.prepare(`
+        SELECT COUNT(*) AS cnt FROM transactions
+        WHERE user_id=? AND type=? AND ref_id=?
+      `).bind(Number(tx.user_id), String(tx.type), refId).first() as any
+      if (Number(dup?.cnt || 0) > 1) {
+        collisionCheck.push({
+          tx_id: tx.id, user_id: tx.user_id, type: tx.type, ref_id: refId,
+          existing_cnt: Number(dup.cnt)
+        })
+      }
+    }
+    if (collisionCheck.length > 0) {
+      return c.json({
+        ok: false,
+        BLOCKED: true,
+        reason: '🚨 지상최고 명령 — 중복 의심 STOP. 같은 (user_id, type, ref_id) 가 이미 2건 이상 존재.',
+        collisions: collisionCheck,
+        duration_ms: Date.now() - t0,
+      }, 423)
+    }
+
+    const totalDR = drRows.length
+    const totalRR = rrRows.length
+    const totalDrTx = drTxRows.length
+    const totalRrTx = rrTxRows.length
+    const totalNullRefTx = nullRefRows.length
+    const grandTotal = totalDR + totalRR + totalDrTx + totalRrTx + totalNullRefTx
+
+    if (!exec) {
+      // DRY-RUN: 보정 sample 보여주기
+      const sampleDR = drRows.slice(0, 10).map((r: any) => ({
+        id: Number(r.id), paid_date: r.paid_date, cur_kst: r.cur_kst,
+        target_kst: `${r.paid_date} 08:00:00`,
+      }))
+      const sampleRR = rrRows.slice(0, 10).map((r: any) => ({
+        id: Number(r.id), paid_date: r.paid_date, cur_kst: r.cur_kst,
+        target_kst: `${r.paid_date} 08:00:00`,
+      }))
+      const sampleDrTx = drTxRows.slice(0, 10).map((r: any) => ({
+        tx_id: Number(r.id), type: r.type, ref_id: r.ref_id, cur_kst: r.cur_kst,
+        target_paid_date: drPaidDateMap.get(Number(r.ref_id)) || '?'
+      }))
+      const sampleRrTx = rrTxRows.slice(0, 10).map((r: any) => ({
+        tx_id: Number(r.id), type: r.type, ref_id: r.ref_id, cur_kst: r.cur_kst,
+        target_paid_date: rrPaidDateMap.get(Number(r.ref_id)) || '?'
+      }))
+      const sampleNullRef = nullRefRows.slice(0, 10).map((r: any) => ({
+        tx_id: Number(r.id), type: r.type, kst_date: r.kst_date, cur_kst: r.cur_kst,
+      }))
+
+      // paid_date 별 카운트
+      const byPaidDate: Record<string, any> = {}
+      for (const d of paidDates) byPaidDate[d] = { dr: 0, rr: 0, dr_tx: 0, rr_tx: 0, null_ref_tx: 0 }
+      for (const r of drRows) byPaidDate[String(r.paid_date)].dr++
+      for (const r of rrRows) byPaidDate[String(r.paid_date)].rr++
+      for (const r of drTxRows) {
+        const pd = drPaidDateMap.get(Number(r.ref_id)) || '?'
+        if (byPaidDate[pd]) byPaidDate[pd].dr_tx++
+      }
+      for (const r of rrTxRows) {
+        const pd = rrPaidDateMap.get(Number(r.ref_id)) || '?'
+        if (byPaidDate[pd]) byPaidDate[pd].rr_tx++
+      }
+      for (const r of nullRefRows) {
+        const pd = String(r.kst_date)
+        if (byPaidDate[pd]) byPaidDate[pd].null_ref_tx++
+      }
+
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        target_paid_dates: paidDates,
+        summary: {
+          dr_count: totalDR,
+          rr_count: totalRR,
+          dr_tx_count: totalDrTx,
+          rr_tx_count: totalRrTx,
+          null_ref_tx_count: totalNullRefTx,
+          grand_total_updates: grandTotal,
+        },
+        by_paid_date: byPaidDate,
+        pre_audit: {
+          users_total: Number(preAudit?.users_total || 0),
+          matched_before: Number(preAudit?.matched_before || 0),
+        },
+        safety_check: {
+          collisions: collisionCheck.length,
+          verdict: '✅ 중복 의심 없음 — EXEC 안전'
+        },
+        sample_dr_first_10: sampleDR,
+        sample_rr_first_10: sampleRR,
+        sample_dr_tx_first_10: sampleDrTx,
+        sample_rr_tx_first_10: sampleRrTx,
+        sample_null_ref_tx_first_10: sampleNullRef,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ─────────────── EXEC ───────────────
+    // UPDATE only, amount/balance 절대 불변
+    const BATCH = 80
+    let drUpdated = 0, rrUpdated = 0, drTxUpdated = 0, rrTxUpdated = 0, nullRefUpdated = 0
+
+    // 1) daily_rewards.created_at := datetime(paid_date || ' 23:00:00')  -- UTC = KST 08:00
+    for (let i = 0; i < drRows.length; i += BATCH) {
+      const chunk = drRows.slice(i, i + BATCH)
+      const stmts = chunk.map((r: any) =>
+        db.prepare(`UPDATE daily_rewards SET created_at = datetime(?) WHERE id = ?`)
+          .bind(`${r.paid_date} 23:00:00`, Number(r.id))
+      )
+      if (stmts.length > 0) {
+        const res = await db.batch(stmts)
+        drUpdated += res.reduce((s: number, r: any) => s + (Number(r?.meta?.changes || 0)), 0)
+      }
+    }
+
+    // 2) referral_rewards.created_at
+    for (let i = 0; i < rrRows.length; i += BATCH) {
+      const chunk = rrRows.slice(i, i + BATCH)
+      const stmts = chunk.map((r: any) =>
+        db.prepare(`UPDATE referral_rewards SET created_at = datetime(?) WHERE id = ?`)
+          .bind(`${r.paid_date} 23:00:00`, Number(r.id))
+      )
+      if (stmts.length > 0) {
+        const res = await db.batch(stmts)
+        rrUpdated += res.reduce((s: number, r: any) => s + (Number(r?.meta?.changes || 0)), 0)
+      }
+    }
+
+    // 3) tx daily_qkey: ref_id 매핑된 것
+    for (let i = 0; i < drTxRows.length; i += BATCH) {
+      const chunk = drTxRows.slice(i, i + BATCH)
+      const stmts = chunk
+        .map((r: any) => {
+          const pd = drPaidDateMap.get(Number(r.ref_id))
+          if (!pd) return null
+          return db.prepare(`UPDATE transactions SET created_at = datetime(?) WHERE id = ?`)
+            .bind(`${pd} 23:00:00`, Number(r.id))
+        })
+        .filter((x: any) => x !== null) as any[]
+      if (stmts.length > 0) {
+        const res = await db.batch(stmts)
+        drTxUpdated += res.reduce((s: number, r: any) => s + (Number(r?.meta?.changes || 0)), 0)
+      }
+    }
+
+    // 4) tx referral_reward: ref_id 매핑된 것
+    for (let i = 0; i < rrTxRows.length; i += BATCH) {
+      const chunk = rrTxRows.slice(i, i + BATCH)
+      const stmts = chunk
+        .map((r: any) => {
+          const pd = rrPaidDateMap.get(Number(r.ref_id))
+          if (!pd) return null
+          return db.prepare(`UPDATE transactions SET created_at = datetime(?) WHERE id = ?`)
+            .bind(`${pd} 23:00:00`, Number(r.id))
+        })
+        .filter((x: any) => x !== null) as any[]
+      if (stmts.length > 0) {
+        const res = await db.batch(stmts)
+        rrTxUpdated += res.reduce((s: number, r: any) => s + (Number(r?.meta?.changes || 0)), 0)
+      }
+    }
+
+    // 5) tx with NULL ref_id: KST date 기준
+    for (let i = 0; i < nullRefRows.length; i += BATCH) {
+      const chunk = nullRefRows.slice(i, i + BATCH)
+      const stmts = chunk.map((r: any) =>
+        db.prepare(`UPDATE transactions SET created_at = datetime(?) WHERE id = ?`)
+          .bind(`${r.kst_date} 23:00:00`, Number(r.id))
+      )
+      if (stmts.length > 0) {
+        const res = await db.batch(stmts)
+        nullRefUpdated += res.reduce((s: number, r: any) => s + (Number(r?.meta?.changes || 0)), 0)
+      }
+    }
+
+    // ── POST-VERIFY: balance ↔ tx 정합 재확인 (지상최고 명령)
+    const postAudit = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM users) AS users_total,
+        (SELECT COUNT(*) FROM users u
+         WHERE u.qkey_balance = COALESCE(
+           (SELECT SUM(t.amount) FROM transactions t
+            WHERE t.user_id = u.id AND LOWER(t.coin_type) = 'qkey'), 0)
+        ) AS matched_after
+    `).first() as any
+
+    // 보정된 row 의 KST 08:00 verify
+    const verifyOffNorm = await db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM transactions
+      WHERE LOWER(coin_type) = 'qkey'
+        AND type IN ('daily_qkey','referral_reward')
+        AND date(created_at,'+9 hours') IN (${ph})
+        AND strftime('%H:%M:%S', created_at, '+9 hours') != '08:00:00'
+    `).bind(...paidDates).first() as any
+
+    const matchedBefore = Number(preAudit?.matched_before || 0)
+    const matchedAfter = Number(postAudit?.matched_after || 0)
+    const balanceConsistent = matchedAfter >= matchedBefore && matchedAfter === Number(preAudit?.users_total || 0)
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      target_paid_dates: paidDates,
+      updated: {
+        daily_rewards: drUpdated,
+        referral_rewards: rrUpdated,
+        tx_daily_qkey: drTxUpdated,
+        tx_referral_reward: rrTxUpdated,
+        tx_null_ref: nullRefUpdated,
+        grand_total: drUpdated + rrUpdated + drTxUpdated + rrTxUpdated + nullRefUpdated,
+      },
+      pre_audit: {
+        users_total: Number(preAudit?.users_total || 0),
+        matched_before: matchedBefore,
+      },
+      post_audit: {
+        users_total: Number(postAudit?.users_total || 0),
+        matched_after: matchedAfter,
+        balance_consistent: balanceConsistent,
+      },
+      verify_off_norm_left: Number(verifyOffNorm?.cnt || 0),
+      verdict: balanceConsistent && Number(verifyOffNorm?.cnt || 0) === 0
+        ? '✅ KST 08:00 보정 완료, balance↔tx 정합 유지'
+        : `🚨 검증 실패 (off_norm_left=${Number(verifyOffNorm?.cnt || 0)}, matched_after=${matchedAfter})`,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ============================================================================
 // normalize-coin-type-qkey: 소문자 'qkey' → 'QKEY' 대문자 정규화
 // 영구룰 #중복지급금지 보강 — coin_type 대소문자 불일치로 인한 중복 검출 실패 방지
 // DRY-RUN: GET /api/diag/normalize-coin-type-qkey?key=ADMIN_PW
