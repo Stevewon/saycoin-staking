@@ -63453,4 +63453,307 @@ app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
 })
 
 
+// ============================================================================
+// solbat-fix-stage-A2 — A 단계 EXEC 사후 v2 재검증에서 발견된 5/4 잔여 -1,050 보충
+// 원인: 외부 5명 (uid 53, 55, 57, 58, 59) 의 5/4 본인 daily 누락
+//       → cascade 로 주희(48) L2 -300, 유정(49) L1 -600 + L2 -150 = -1,050
+//
+// 처리 범위 (다른 날짜 / 다른 회원 절대 건들지 않음):
+//   ── 5/4 only ──
+//     1) 외부 5명의 5/4 active staking 전체 조회 (DB 동적 — staking_id 가드 없이도 안전)
+//     2) 각 (user_id, staking_id) 에 대해 본인 daily INSERT (이미 dr 있으면 SKIP)
+//     3) 본인 daily 마다 cascade L1/L2 (영구룰 그대로) — referrer 가 트리 내든 외든 동일 적용
+//
+// 이중지급 방지 가드 (stage-A 와 100% 동일):
+//   - dr INSERT 전: WHERE user_id=? AND reward_date=? AND staking_id=? 존재 시 SKIP
+//   - rr INSERT 전: WHERE referrer_id=? AND referee_id=? AND level=? AND reward_date=?
+//                     AND (staking_id=? OR (staking_id IS NULL AND original_amount=?)) 존재 시 SKIP
+//   - 처리 reward_date = ['2026-05-04'] 만
+// paid_date:
+//   - 5/4(월) reward → 5/5(어린이날) skip → 5/6(수) paid (영구룰)
+// 마커: description 에 'solbat-stage-A2-fix' 포함
+// DRY-RUN: GET /api/diag/solbat-fix-stage-A2?pw=ADMIN_PW
+// EXEC:    GET /api/diag/solbat-fix-stage-A2?pw=ADMIN_PW&confirm=STAGE_A2_FIX_GO
+// ============================================================================
+app.get('/api/diag/solbat-fix-stage-A2', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const isExec = c.req.query('confirm') === 'STAGE_A2_FIX_GO'
+  const db = c.env.DB
+
+  const REWARD_DATE = '2026-05-04'
+  const PAID_DATE   = '2026-05-06'  // 5/4 → 5/5 휴일 → 5/6 paid
+
+  // 외부 5명 (사후 v2 재검증에서 식별된 5/4 본인 daily 누락 회원)
+  const EXTERNAL_5_4_USERS = [53, 55, 57, 58, 59]
+
+  try {
+    // ============== 1) 외부 5명의 5/4 active staking 전체 조회 ==============
+    type StkRow = { id: number, user_id: number, name: string, amount: number, daily_rate: number,
+                    start_date: string, end_date: string, status: string, reset_at: string | null }
+    const externalStakings: StkRow[] = []
+    for (const uid of EXTERNAL_5_4_USERS) {
+      const rows = (await db.prepare(`
+        SELECT s.id, s.user_id, u.name, s.amount, s.daily_rate,
+               s.start_date, s.end_date, s.status, s.reset_at
+        FROM staking s JOIN users u ON s.user_id = u.id
+        WHERE s.user_id = ?
+          AND s.status = 'active'
+          AND s.reset_at IS NULL
+          AND date(s.start_date, '+9 hours') <= ?
+          AND date(s.end_date,   '+9 hours') >= ?
+        ORDER BY s.id
+      `).bind(uid, REWARD_DATE, REWARD_DATE).all()).results as any[]
+      for (const r of rows) externalStakings.push(r as StkRow)
+    }
+
+    // ============== 2) SELF daily INSERT plan (이중지급 가드 적용) ==============
+    type SelfPlan = { user_id: number, name: string, staking_id: number,
+                       reward_date: string, paid_date: string,
+                       amount: number, daily_rate: number,
+                       qkey: number, usdt_amount: number,
+                       already_dr: boolean, skip: boolean,
+                       start_date: string, end_date: string }
+    const selfPlans: SelfPlan[] = []
+
+    for (const stk of externalStakings) {
+      const existDr = await db.prepare(`
+        SELECT id FROM daily_rewards
+        WHERE user_id = ? AND reward_date = ? AND staking_id = ?
+      `).bind(stk.user_id, REWARD_DATE, stk.id).first()
+      const qkey = Math.round(Number(stk.amount) * Number(stk.daily_rate) * 150)
+      const usdt_amount = Math.round(Number(stk.amount) * Number(stk.daily_rate) * 100) / 100
+      selfPlans.push({
+        user_id: stk.user_id, name: stk.name, staking_id: stk.id,
+        reward_date: REWARD_DATE, paid_date: PAID_DATE,
+        amount: Number(stk.amount), daily_rate: Number(stk.daily_rate),
+        qkey, usdt_amount,
+        already_dr: !!existDr, skip: !!existDr,
+        start_date: stk.start_date, end_date: stk.end_date,
+      })
+    }
+
+    // ============== 3) REFERRAL cascade plan (영구룰 그대로 + 이중지급 가드) ==============
+    type RefPlan = {
+      referrer_id: number, referrer_name: string,
+      referee_id: number, referee_name: string,
+      level: 1 | 2,
+      staking_id: number, original_amount: number, reward_amount: number,
+      reward_date: string, paid_date: string,
+      already_rr: boolean, skip: boolean,
+    }
+    const refPlans: RefPlan[] = []
+
+    for (const sp of selfPlans) {
+      if (sp.skip) continue  // self 가 SKIP 이면 cascade 없음
+
+      // L1 — referee 의 referrer
+      const refereeUser = await db.prepare(`SELECT id, referrer_id FROM users WHERE id = ?`).bind(sp.user_id).first() as any
+      const l1Id = refereeUser?.referrer_id
+      if (!l1Id) continue
+
+      // L1 active 판정 (영구룰: L1 자신 active 필요)
+      const l1ActiveRow = await db.prepare(`
+        SELECT s.id, u.name FROM staking s JOIN users u ON s.user_id = u.id
+        WHERE s.user_id = ? AND s.status = 'active' AND s.reset_at IS NULL
+          AND date(s.start_date, '+9 hours') <= ?
+          AND date(s.end_date,   '+9 hours') >= ?
+        LIMIT 1
+      `).bind(l1Id, sp.reward_date, sp.reward_date).first() as any
+      if (!l1ActiveRow) continue  // L1 staking 없으면 cascade 전체 끊김
+
+      const refAmtL1 = Math.round(sp.qkey * 0.20)
+      const existRr1 = await db.prepare(`
+        SELECT id FROM referral_rewards
+        WHERE referrer_id=? AND referee_id=? AND level=1 AND reward_date=?
+          AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+      `).bind(l1Id, sp.user_id, sp.reward_date, sp.staking_id, sp.qkey).first()
+      refPlans.push({
+        referrer_id: l1Id, referrer_name: l1ActiveRow.name,
+        referee_id: sp.user_id, referee_name: sp.name,
+        level: 1,
+        staking_id: sp.staking_id, original_amount: sp.qkey, reward_amount: refAmtL1,
+        reward_date: sp.reward_date, paid_date: sp.paid_date,
+        already_rr: !!existRr1, skip: !!existRr1,
+      })
+
+      // L2 — L1 의 referrer
+      const l1User = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(l1Id).first() as any
+      const l2Id = l1User?.referrer_id
+      if (!l2Id) continue
+
+      const l2ActiveRow = await db.prepare(`
+        SELECT s.id, u.name FROM staking s JOIN users u ON s.user_id = u.id
+        WHERE s.user_id = ? AND s.status = 'active' AND s.reset_at IS NULL
+          AND date(s.start_date, '+9 hours') <= ?
+          AND date(s.end_date,   '+9 hours') >= ?
+        LIMIT 1
+      `).bind(l2Id, sp.reward_date, sp.reward_date).first() as any
+      if (!l2ActiveRow) continue
+
+      const refAmtL2 = Math.round(sp.qkey * 0.10)
+      const existRr2 = await db.prepare(`
+        SELECT id FROM referral_rewards
+        WHERE referrer_id=? AND referee_id=? AND level=2 AND reward_date=?
+          AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+      `).bind(l2Id, sp.user_id, sp.reward_date, sp.staking_id, sp.qkey).first()
+      refPlans.push({
+        referrer_id: l2Id, referrer_name: l2ActiveRow.name,
+        referee_id: sp.user_id, referee_name: sp.name,
+        level: 2,
+        staking_id: sp.staking_id, original_amount: sp.qkey, reward_amount: refAmtL2,
+        reward_date: sp.reward_date, paid_date: sp.paid_date,
+        already_rr: !!existRr2, skip: !!existRr2,
+      })
+    }
+
+    // ============== 4) balance delta 집계 ==============
+    const perUserDelta: Record<number, number> = {}
+    let selfSum = 0, refSum = 0
+    for (const sp of selfPlans) {
+      if (sp.skip) continue
+      perUserDelta[sp.user_id] = (perUserDelta[sp.user_id] || 0) + sp.qkey
+      selfSum += sp.qkey
+    }
+    for (const r of refPlans) {
+      if (r.skip) continue
+      perUserDelta[r.referrer_id] = (perUserDelta[r.referrer_id] || 0) + r.reward_amount
+      refSum += r.reward_amount
+    }
+
+    const allUserIds = Object.keys(perUserDelta).map(Number)
+    const curMap: Record<number, any> = {}
+    if (allUserIds.length > 0) {
+      const phU = allUserIds.map(() => '?').join(',')
+      const rows = (await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id IN (${phU})`).bind(...allUserIds).all()).results as any[]
+      for (const u of rows) curMap[u.id] = u
+    }
+    const balanceMatrix = allUserIds.map(uid => ({
+      user_id: uid, name: curMap[uid]?.name || '?',
+      current: curMap[uid]?.qkey_balance || 0,
+      delta: perUserDelta[uid],
+      after: (curMap[uid]?.qkey_balance || 0) + perUserDelta[uid],
+    })).sort((a,b)=>a.user_id-b.user_id)
+
+    const summary = {
+      external_users_checked: EXTERNAL_5_4_USERS,
+      external_active_stakings_5_4: externalStakings.length,
+      self_dr_inserts: selfPlans.filter(s => !s.skip).length,
+      self_dr_skipped: selfPlans.filter(s => s.skip).length,
+      self_total_qkey: selfSum,
+      ref_rr_inserts: refPlans.filter(r => !r.skip).length,
+      ref_rr_skipped: refPlans.filter(r => r.skip).length,
+      ref_total_qkey: refSum,
+      total_qkey_supplemented: selfSum + refSum,
+      paid_date_5_4: PAID_DATE,
+      processed_reward_dates_only: [REWARD_DATE],
+    }
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        summary,
+        external_stakings_5_4: externalStakings.map(s => ({
+          staking_id: s.id, user_id: s.user_id, name: s.name,
+          amount: s.amount, daily_rate: s.daily_rate,
+          start_date: s.start_date, end_date: s.end_date,
+          status: s.status, reset_at: s.reset_at,
+        })),
+        balance_matrix: balanceMatrix,
+        plan: { self_daily_inserts: selfPlans, referral_inserts: refPlans },
+        hint: 'Add &confirm=STAGE_A2_FIX_GO to execute',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ============== 5) EXEC ==============
+    let inserted_tx = 0, inserted_dr = 0, inserted_rr = 0, updated_bal = 0
+    const errors: any[] = []
+
+    // 5-A) self daily INSERT (dr + tx)
+    for (const sp of selfPlans) {
+      if (sp.skip) continue
+      try {
+        const drIns = await db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(sp.user_id, sp.staking_id, sp.usdt_amount, sp.reward_date, sp.paid_date).run()
+        const drId = (drIns as any)?.meta?.last_row_id
+        inserted_dr++
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+        `).bind(sp.user_id, sp.qkey, `일일 보상 (${sp.reward_date}) [solbat-stage-A2-fix self]`, drId).run()
+        inserted_tx++
+      } catch (e: any) {
+        errors.push({ stage: 'self', user_id: sp.user_id, staking_id: sp.staking_id, reward_date: sp.reward_date, error: String(e?.message || e) })
+      }
+    }
+
+    // 5-B) referral INSERT (rr + tx)
+    for (const r of refPlans) {
+      if (r.skip) continue
+      try {
+        const rrIns = await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(r.referrer_id, r.referee_id, r.level, r.original_amount, r.reward_amount, r.reward_date, r.paid_date, r.staking_id).run()
+        const rrId = (rrIns as any)?.meta?.last_row_id
+        inserted_rr++
+        const desc = r.level === 1 ? '추천 보너스 (Level 1)' : '추천 보너스 (Level 2)'
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(r.referrer_id, r.reward_amount, `${desc} [solbat-stage-A2-fix ref]`, rrId).run()
+        inserted_tx++
+      } catch (e: any) {
+        errors.push({ stage: 'ref', referrer: r.referrer_id, referee: r.referee_id, level: r.level, reward_date: r.reward_date, error: String(e?.message || e) })
+      }
+    }
+
+    // 5-C) qkey_balance UPDATE
+    for (const [uid, delta] of Object.entries(perUserDelta)) {
+      try {
+        const r = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(delta, Number(uid)).run()
+        if ((r.meta?.changes || 0) > 0) updated_bal++
+      } catch (e: any) {
+        errors.push({ stage: 'balance', user_id: uid, delta, error: String(e?.message || e) })
+      }
+    }
+
+    // 사후 검증
+    const gb = await db.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS s FROM users`).first() as any
+    const gt = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE coin_type='QKEY'`).first() as any
+    const after: any[] = []
+    if (allUserIds.length > 0) {
+      const phU = allUserIds.map(() => '?').join(',')
+      const rows = (await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id IN (${phU})`).bind(...allUserIds).all()).results as any[]
+      for (const u of rows) {
+        const ts = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id=? AND coin_type='QKEY'`).bind(u.id).first() as any
+        after.push({ user_id: u.id, name: u.name, qkey_balance: u.qkey_balance, tx_sum: ts?.s, match: u.qkey_balance === ts?.s ? 'OK' : 'MISMATCH' })
+      }
+    }
+
+    return c.json({
+      mode: 'EXEC_DONE',
+      summary,
+      inserted: { transactions: inserted_tx, daily_rewards: inserted_dr, referral_rewards: inserted_rr },
+      balance_updated_users: updated_bal,
+      errors,
+      after_check: after.sort((a,b)=>a.user_id-b.user_id),
+      global: {
+        total_qkey_balance: gb?.s, total_qkey_tx_sum: gt?.s,
+        integrity: gb?.s === gt?.s ? 'OK_BALANCE_EQ_TX_SUM' : 'MISMATCH',
+        diff: (gb?.s ?? 0) - (gt?.s ?? 0),
+      },
+      duration_ms: Date.now() - t0,
+    })
+
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
