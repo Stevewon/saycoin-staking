@@ -55537,4 +55537,103 @@ app.get('/api/diag/delete-516-all-traces', async (c) => {
 })
 
 
+// ════════════════════════════════════════════════════════════════════════
+// check-user44-balance-after-516 — user 44 balance recovery check (READ-ONLY + EXEC option)
+// ════════════════════════════════════════════════════════════════════════
+// 524 timeout 후 user 44 balance 가 차감되었는지 확인
+//   DELETE 는 4건 모두 완료됨 (re-scan 으로 검증)
+//   하지만 timeout 이 balance UPDATE 도중일 수 있음
+//
+// DRY-RUN: 현재 상태 보고
+// EXEC: confirm=FIX_USER44_516 → balance 가 아직 24,375 면 -2,475
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/check-user44-balance-after-516', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_USER44_516'
+    const db = c.env.DB
+
+    const u44 = await db.prepare(`SELECT id, qkey_balance, name, email FROM users WHERE id=44`).first() as any
+
+    // 영구룰 #관리자보정정당 검증: user 44 의 모든 QKEY TX 합 ≈ balance 여야 함
+    const totalIn = await db.prepare(`
+      SELECT COALESCE(SUM(amount),0) as t FROM transactions
+      WHERE user_id=44 AND coin_type='QKEY'
+        AND type IN ('daily_qkey','referral_reward','direct_referral')
+    `).first() as any
+
+    // QKEY 출금 합
+    const totalOut = await db.prepare(`
+      SELECT COALESCE(SUM(amount),0) as t FROM transactions
+      WHERE user_id=44 AND coin_type='QKEY'
+        AND type NOT IN ('daily_qkey','referral_reward','direct_referral')
+    `).first() as any
+
+    const balanceFromTx = Number(totalIn?.t || 0) - Number(totalOut?.t || 0)
+    const curBalance = Number(u44?.qkey_balance || 0)
+    const diff = curBalance - balanceFromTx
+
+    // diff 가 2,475 이면 5/16 분이 balance 에 남아있다는 뜻
+    const needsDecrement = Math.abs(diff - 2475) < 1
+    const alreadyCorrected = Math.abs(diff) < 1
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'READ_ONLY',
+        user: u44,
+        tx_sum_in: Number(totalIn?.t || 0),
+        tx_sum_out: Number(totalOut?.t || 0),
+        balance_from_tx: balanceFromTx,
+        current_balance: curBalance,
+        diff_balance_minus_tx: diff,
+        analysis: {
+          already_corrected: alreadyCorrected,
+          needs_decrement_2475: needsDecrement,
+          interpretation: alreadyCorrected
+            ? 'balance = sum(TX) — 5/16 차감 정상 완료 (timeout 무관)'
+            : needsDecrement
+            ? 'balance = sum(TX) + 2475 — 5/16 TX 삭제는 됐는데 balance UPDATE 가 안 됨, 차감 필요'
+            : 'diff 가 0 도 아니고 2475 도 아님 — 추가 조사 필요',
+        },
+        action: needsDecrement
+          ? 'GET /api/diag/check-user44-balance-after-516?key=ADMIN_PW&confirm=FIX_USER44_516'
+          : 'no action needed',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC: balance UPDATE
+    if (!needsDecrement) {
+      return c.json({
+        ok: false,
+        mode: 'EXEC_BLOCKED',
+        reason: 'diff is not 2475, refusing to modify',
+        current_diff: diff,
+      }, 400)
+    }
+
+    const r = await db.prepare(`UPDATE users SET qkey_balance = qkey_balance - 2475 WHERE id=44`).run()
+    const changes = (r as any)?.meta?.changes ?? 0
+    const u44After = await db.prepare(`SELECT id, qkey_balance FROM users WHERE id=44`).first() as any
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      updated: changes,
+      before: curBalance,
+      after: Number(u44After?.qkey_balance || 0),
+      expected_after: curBalance - 2475,
+      ok_check: Number(u44After?.qkey_balance || 0) === curBalance - 2475,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
