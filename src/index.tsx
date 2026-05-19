@@ -64137,4 +64137,92 @@ app.get('/api/diag/daily-payout-5-19', async (c) => {
 })
 
 
+// ============================================================================
+// lock-cron-today — 오늘 KST 날짜로 daily_cron_lock INSERT (자동 cron 차단)
+// 영구룰 #이중지급 절대 금지 / #수동 처리 우선 (2026-05-12 사장님 명령)
+//
+// 동작:
+//   - lock_date = 오늘 KST 날짜 (예: '2026-05-20')
+//   - source = 'manual_admin'
+//   - locked_by = 'admin-manual-payout' (사장님 수동 배당 명령)
+//   - note = 'STAGE-A2 + 5/19 payout EXEC — 자동 cron 차단'
+//   - 결과: 오늘(KST) 자동 cron 호출 시 423 Locked 차단됨
+//
+// 경로: GET /api/diag/lock-cron-today?pw=ADMIN_PW
+//       GET /api/diag/lock-cron-today?pw=ADMIN_PW&date=2026-05-20  (날짜 명시)
+// ============================================================================
+app.get('/api/diag/lock-cron-today', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const db = c.env.DB
+
+  // 명시 date 파라미터 우선, 없으면 오늘 KST
+  const dateParam = c.req.query('date')
+  const lockDate = dateParam || new Date(Date.now() + 9*3600*1000).toISOString().slice(0, 10)
+  const note = c.req.query('note') || `manual payout block (locked at ${new Date().toISOString()})`
+
+  try {
+    // 테이블 보장 (멱등)
+    try {
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS daily_cron_lock (
+          lock_date        TEXT PRIMARY KEY,
+          source           TEXT NOT NULL,
+          locked_at        TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+          locked_by        TEXT,
+          note             TEXT,
+          last_finished_at TEXT
+        )
+      `).run()
+    } catch(e) {}
+    try { await db.prepare(`ALTER TABLE daily_cron_lock ADD COLUMN last_finished_at TEXT`).run() } catch(e) {}
+
+    // 기존 lock 확인
+    const existing = await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(lockDate).first() as any
+
+    if (existing) {
+      return c.json({
+        mode: 'ALREADY_LOCKED',
+        lock_date: lockDate,
+        existing,
+        message: `${lockDate} 은 이미 [${existing.source}] 에 의해 ${existing.locked_at} 에 lock 됨`,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // 신규 lock INSERT
+    const ins = await db.prepare(`
+      INSERT INTO daily_cron_lock (lock_date, source, locked_by, note)
+      VALUES (?, ?, ?, ?)
+    `).bind(lockDate, 'manual_admin', 'admin-manual-payout', note).run()
+
+    // 확인 read
+    const inserted = await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+    `).bind(lockDate).first()
+
+    // 전체 lock 목록 (최근 7일)
+    const allLocks = (await db.prepare(`
+      SELECT lock_date, source, locked_at, locked_by, note, last_finished_at
+      FROM daily_cron_lock ORDER BY lock_date DESC LIMIT 14
+    `).all()).results
+
+    return c.json({
+      mode: 'LOCK_INSERTED',
+      lock_date: lockDate,
+      meta: { changes: ins.meta?.changes, last_row_id: ins.meta?.last_row_id },
+      inserted,
+      recent_locks: allLocks,
+      message: `${lockDate} manual_admin lock INSERT 완료 — 오늘 자동 cron 차단됨 (423 Locked 반환)`,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
