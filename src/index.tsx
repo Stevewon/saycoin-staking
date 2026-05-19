@@ -56810,9 +56810,10 @@ app.get('/api/diag/scan-user-full', async (c) => {
     const rrRows = (rrRowsResult.results || []) as any[]
 
     // ── 3) DR 전체 (user_id = user, paid_date 범위) ────────────────────────
+    // 영구룰: daily_rewards.usdt_amount 컬럼은 legacy 이름, 실제는 QKEY 값
     const drRowsResult = await c.env.DB.prepare(`
       SELECT id, user_id, staking_id, reward_date, paid_date,
-             usdt_amount as qkey_amount, qkey_amount as legacy_qkey_amount,
+             usdt_amount as qkey_amount,
              created_at,
              date(created_at, '+9 hours') as created_kst_date,
              time(created_at, '+9 hours') as created_kst_time
