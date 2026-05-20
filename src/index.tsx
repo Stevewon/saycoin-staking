@@ -66956,7 +66956,7 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
 
     const solbatStakings = await db.prepare(
       `SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at, created_at
-         FROM stakings WHERE user_id = 44 ORDER BY id`
+         FROM staking WHERE user_id = 44 ORDER BY id`
     ).all<any>()
 
     // 솔밧이 추천한 L1 referees (직접 자식)
@@ -66998,7 +66998,7 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
     // 솔밧 5/19 기대 vs 실제 (사장님 분노 원인 추적)
     const solbatMyStaking519 = await db.prepare(
       `SELECT id, amount, daily_rate, start_date, end_date, status, reset_at
-         FROM stakings
+         FROM staking
          WHERE user_id = 44
            AND date(start_date,'+9 hours') <= '2026-05-19'
            AND date(end_date,'+9 hours') >= '2026-05-19'
@@ -67028,7 +67028,7 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
               ROUND(s.amount * s.daily_rate * 150) AS expected_daily_qkey,
               ROUND(s.amount * s.daily_rate * 150 * 0.20) AS expected_l1_to_solbat
          FROM users u
-         JOIN stakings s ON s.user_id = u.id
+         JOIN staking s ON s.user_id = u.id
          WHERE u.referrer_id = 44
            AND date(s.start_date,'+9 hours') <= '2026-05-19'
            AND date(s.end_date,'+9 hours') >= '2026-05-19'
@@ -67044,7 +67044,7 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
               ROUND(s.amount * s.daily_rate * 150) AS expected_daily_qkey,
               ROUND(s.amount * s.daily_rate * 150 * 0.10) AS expected_l2_to_solbat
          FROM users u
-         JOIN stakings s ON s.user_id = u.id
+         JOIN staking s ON s.user_id = u.id
          WHERE u.referrer_id IN (SELECT id FROM users WHERE referrer_id = 44)
            AND date(s.start_date,'+9 hours') <= '2026-05-19'
            AND date(s.end_date,'+9 hours') >= '2026-05-19'
