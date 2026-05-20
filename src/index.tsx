@@ -64225,4 +64225,334 @@ app.get('/api/diag/lock-cron-today', async (c) => {
 })
 
 
+// ============================================================================
+// audit-5-19-full — 5/19 배당 전수조사 (전체 63명 회원 영구룰 바텀업 검증)
+//
+// 영구룰 (사장님 확정):
+//   - 본인 daily = staking.amount × daily_rate × 150 (active staking 마다)
+//     · active 판정: status='active' AND reset_at IS NULL
+//                    AND date(start_date,'+9h') <= 5/19 <= date(end_date,'+9h')
+//   - L1 referral = referee 본인 daily × 0.20 (L1 자신 5/19 active 필요)
+//   - L2 referral = referee 본인 daily × 0.10 (L2 자신 5/19 active 필요)
+//   - 본인/referrer staking 없으면 무조건 0
+//   - 휴일 무배당 (5/19 화 평일 OK)
+//
+// 검증 방식 (바텀업):
+//   1) 전체 staking 중 5/19 active 인 것 추출 → 각각 본인 daily 계산
+//   2) 각 본인 daily 마다 referee.referrer_id → L1, L1.referrer_id → L2 추적
+//   3) L1/L2 의 5/19 active 여부 검증 후 0.20 / 0.10 적용
+//   4) 회원별 expected_self / expected_l1 / expected_l2 합산
+//   5) DB 의 실제 dr/rr 에서 reward_date='2026-05-19' 인 actual 추출
+//   6) expected vs actual 비교 → diff 발생 식별
+//
+// 검증 정밀도:
+//   - 사장님 명령 "내 영구룰에 의한 바텀업 지급이 틀리다" 정밀 원인 추적
+//   - 회원별 / staking 별 / level 별 매트릭스
+//   - is_extra: actual 있지만 expected 없음 (잘못 지급)
+//   - is_missing: expected 있지만 actual 없음 (누락)
+//   - 정합 오차의 원인 (staking 활성 판정 / referrer 활성 판정 / 금액 계산) 식별
+//
+// 경로: GET /api/diag/audit-5-19-full?pw=ADMIN_PW
+// ============================================================================
+app.get('/api/diag/audit-5-19-full', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const db = c.env.DB
+
+  const REWARD_DATE = '2026-05-19'
+
+  try {
+    // ============== 1) 전체 회원 + 전체 staking 로드 ==============
+    const allUsers = (await db.prepare(`
+      SELECT id, name, referrer_id, qkey_balance FROM users ORDER BY id
+    `).all()).results as any[]
+    const userMap: Record<number, any> = {}
+    for (const u of allUsers) userMap[u.id] = u
+
+    const allStakings = (await db.prepare(`
+      SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at
+      FROM staking
+    `).all()).results as any[]
+
+    // 5/19 active staking 추출 (영구룰 정확히)
+    type ActiveStk = { staking_id: number, user_id: number, name: string,
+                       amount: number, daily_rate: number, qkey: number,
+                       start_kst: string, end_kst: string }
+    const activeStakings: ActiveStk[] = []
+    for (const s of allStakings) {
+      if (s.status !== 'active') continue
+      if (s.reset_at) continue
+      const sKst = new Date(new Date(s.start_date).getTime() + 9*3600*1000).toISOString().slice(0,10)
+      const eKst = new Date(new Date(s.end_date).getTime() + 9*3600*1000).toISOString().slice(0,10)
+      if (!(sKst <= REWARD_DATE && REWARD_DATE <= eKst)) continue
+      const qkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+      activeStakings.push({
+        staking_id: s.id, user_id: s.user_id,
+        name: userMap[s.user_id]?.name || '?',
+        amount: Number(s.amount), daily_rate: Number(s.daily_rate),
+        qkey,
+        start_kst: sKst, end_kst: eKst,
+      })
+    }
+    // 회원별 active 여부 셋
+    const isActiveOn5_19: Set<number> = new Set(activeStakings.map(s => s.user_id))
+
+    // ============== 2) expected 계산 (바텀업 영구룰) ==============
+    // 회원별 / staking 별 / level 별 expected row
+    type ExpRow = {
+      to_user_id: number, to_name: string,
+      level: 0 | 1 | 2,            // 0=self, 1=L1, 2=L2
+      referee_user_id: number | null,
+      referee_name: string | null,
+      staking_id: number,
+      original_amount: number,     // referee 본인 daily (level=0 이면 자기 본인)
+      reward_amount: number,       // 실제 받을 QKEY
+    }
+    const expected: ExpRow[] = []
+
+    for (const s of activeStakings) {
+      // self
+      expected.push({
+        to_user_id: s.user_id, to_name: s.name, level: 0,
+        referee_user_id: null, referee_name: null,
+        staking_id: s.staking_id,
+        original_amount: s.qkey,
+        reward_amount: s.qkey,
+      })
+
+      // L1 — referee 의 referrer (referee = s.user_id, referrer = users[s.user_id].referrer_id)
+      const refereeUser = userMap[s.user_id]
+      const l1Id = refereeUser?.referrer_id
+      if (l1Id && isActiveOn5_19.has(l1Id)) {
+        expected.push({
+          to_user_id: l1Id, to_name: userMap[l1Id]?.name || '?',
+          level: 1,
+          referee_user_id: s.user_id, referee_name: s.name,
+          staking_id: s.staking_id,
+          original_amount: s.qkey,
+          reward_amount: Math.round(s.qkey * 0.20),
+        })
+        // L2 — L1 의 referrer
+        const l1User = userMap[l1Id]
+        const l2Id = l1User?.referrer_id
+        if (l2Id && isActiveOn5_19.has(l2Id)) {
+          expected.push({
+            to_user_id: l2Id, to_name: userMap[l2Id]?.name || '?',
+            level: 2,
+            referee_user_id: s.user_id, referee_name: s.name,
+            staking_id: s.staking_id,
+            original_amount: s.qkey,
+            reward_amount: Math.round(s.qkey * 0.10),
+          })
+        }
+      }
+    }
+
+    // ============== 3) actual 추출 (DB 의 5/19 reward_date 인 dr/rr) ==============
+    const actDr = (await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date
+      FROM daily_rewards WHERE reward_date = ?
+    `).bind(REWARD_DATE).all()).results as any[]
+
+    const actRr = (await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             reward_date, paid_date, staking_id
+      FROM referral_rewards WHERE reward_date = ?
+    `).bind(REWARD_DATE).all()).results as any[]
+
+    // actual TX (description 마커로 식별)
+    const actTx = (await db.prepare(`
+      SELECT id, user_id, type, amount, description, ref_id
+      FROM transactions
+      WHERE coin_type='QKEY'
+        AND (description LIKE '%2026-05-19%' OR description LIKE '%daily-payout-5-19%')
+    `).all()).results as any[]
+
+    // actual self qkey = dr.usdt_amount × 150
+    type ActRow = {
+      to_user_id: number, level: 0 | 1 | 2,
+      referee_user_id: number | null,
+      staking_id: number | null,
+      original_amount: number | null,
+      reward_amount: number,
+      dr_or_rr_id: number,
+    }
+    const actual: ActRow[] = []
+    for (const dr of actDr) {
+      const qkey = Math.round(Number(dr.usdt_amount) * 150)
+      actual.push({
+        to_user_id: dr.user_id, level: 0,
+        referee_user_id: null, staking_id: dr.staking_id,
+        original_amount: qkey, reward_amount: qkey,
+        dr_or_rr_id: dr.id,
+      })
+    }
+    for (const rr of actRr) {
+      actual.push({
+        to_user_id: rr.referrer_id, level: rr.level,
+        referee_user_id: rr.referee_id, staking_id: rr.staking_id,
+        original_amount: rr.original_amount, reward_amount: rr.reward_amount,
+        dr_or_rr_id: rr.id,
+      })
+    }
+
+    // ============== 4) 매트릭스 비교 — key = `${to_user_id}|${level}|${referee_user_id||0}|${staking_id||0}` ==============
+    const keyOfExp = (e: ExpRow) => `${e.to_user_id}|${e.level}|${e.referee_user_id || 0}|${e.staking_id || 0}`
+    const keyOfAct = (a: ActRow) => `${a.to_user_id}|${a.level}|${a.referee_user_id || 0}|${a.staking_id || 0}`
+
+    const expMap: Record<string, ExpRow> = {}
+    for (const e of expected) expMap[keyOfExp(e)] = e
+    const actMap: Record<string, ActRow[]> = {}
+    for (const a of actual) {
+      const k = keyOfAct(a)
+      if (!actMap[k]) actMap[k] = []
+      actMap[k].push(a)
+    }
+
+    type CmpRow = {
+      key: string,
+      to_user_id: number, to_name: string,
+      level: 0 | 1 | 2,
+      referee_user_id: number | null, referee_name: string | null,
+      staking_id: number | null,
+      expected_amount: number,
+      actual_amount: number,
+      actual_count: number,    // 같은 key 의 actual row 수 (>=2 이면 이중지급!)
+      diff: number,            // actual - expected
+      status: string,
+    }
+    const cmpRows: CmpRow[] = []
+
+    const allKeys = new Set([...Object.keys(expMap), ...Object.keys(actMap)])
+    for (const k of allKeys) {
+      const e = expMap[k]
+      const aList = actMap[k] || []
+      const expAmt = e?.reward_amount || 0
+      const actAmt = aList.reduce((sum, a) => sum + a.reward_amount, 0)
+      let status = 'OK'
+      if (!e && aList.length > 0) status = 'EXTRA_NO_EXPECTED'        // 지급 됐지만 영구룰상 expected 0
+      else if (e && aList.length === 0) status = 'MISSING_NOT_PAID'   // 지급해야 하는데 안 들어감
+      else if (e && aList.length > 1) status = 'DUPLICATE_PAID'       // 이중지급
+      else if (e && actAmt !== expAmt) status = 'AMOUNT_MISMATCH'     // 금액 다름
+
+      const ref = e || (aList[0] ? {
+        to_user_id: aList[0].to_user_id,
+        to_name: userMap[aList[0].to_user_id]?.name || '?',
+        level: aList[0].level,
+        referee_user_id: aList[0].referee_user_id,
+        referee_name: aList[0].referee_user_id ? (userMap[aList[0].referee_user_id]?.name || '?') : null,
+        staking_id: aList[0].staking_id,
+      } : null)
+      cmpRows.push({
+        key: k,
+        to_user_id: ref?.to_user_id || 0,
+        to_name: ref?.to_name || '?',
+        level: ref?.level as any || 0,
+        referee_user_id: ref?.referee_user_id || null,
+        referee_name: ref?.referee_name || null,
+        staking_id: ref?.staking_id || null,
+        expected_amount: expAmt,
+        actual_amount: actAmt,
+        actual_count: aList.length,
+        diff: actAmt - expAmt,
+        status,
+      })
+    }
+
+    // ============== 5) 회원별 summary ==============
+    type UserSum = {
+      user_id: number, name: string,
+      exp_self: number, act_self: number, diff_self: number,
+      exp_l1: number, act_l1: number, diff_l1: number,
+      exp_l2: number, act_l2: number, diff_l2: number,
+      total_expected: number, total_actual: number, total_diff: number,
+      issues: string[],
+    }
+    const sumMap: Record<number, UserSum> = {}
+    const ensure = (uid: number): UserSum => {
+      if (!sumMap[uid]) sumMap[uid] = {
+        user_id: uid, name: userMap[uid]?.name || '?',
+        exp_self: 0, act_self: 0, diff_self: 0,
+        exp_l1: 0, act_l1: 0, diff_l1: 0,
+        exp_l2: 0, act_l2: 0, diff_l2: 0,
+        total_expected: 0, total_actual: 0, total_diff: 0,
+        issues: [],
+      }
+      return sumMap[uid]
+    }
+    for (const e of expected) {
+      const s = ensure(e.to_user_id)
+      if (e.level === 0) s.exp_self += e.reward_amount
+      else if (e.level === 1) s.exp_l1 += e.reward_amount
+      else if (e.level === 2) s.exp_l2 += e.reward_amount
+    }
+    for (const a of actual) {
+      const s = ensure(a.to_user_id)
+      if (a.level === 0) s.act_self += a.reward_amount
+      else if (a.level === 1) s.act_l1 += a.reward_amount
+      else if (a.level === 2) s.act_l2 += a.reward_amount
+    }
+    for (const s of Object.values(sumMap)) {
+      s.diff_self = s.act_self - s.exp_self
+      s.diff_l1   = s.act_l1   - s.exp_l1
+      s.diff_l2   = s.act_l2   - s.exp_l2
+      s.total_expected = s.exp_self + s.exp_l1 + s.exp_l2
+      s.total_actual   = s.act_self + s.act_l1 + s.act_l2
+      s.total_diff     = s.total_actual - s.total_expected
+    }
+    // issues 추가
+    for (const r of cmpRows) {
+      if (r.status === 'OK') continue
+      const s = ensure(r.to_user_id)
+      s.issues.push(`L${r.level} st#${r.staking_id} from=${r.referee_user_id || 'self'} ${r.status} exp=${r.expected_amount} act=${r.actual_amount}`)
+    }
+    const userSummary = Object.values(sumMap).sort((a,b) => a.user_id - b.user_id)
+    const issueUsers = userSummary.filter(u => u.total_diff !== 0 || u.issues.length > 0)
+
+    // ============== 6) grand totals ==============
+    const expSelfSum = expected.filter(e => e.level === 0).reduce((s,e) => s + e.reward_amount, 0)
+    const expL1Sum   = expected.filter(e => e.level === 1).reduce((s,e) => s + e.reward_amount, 0)
+    const expL2Sum   = expected.filter(e => e.level === 2).reduce((s,e) => s + e.reward_amount, 0)
+    const actSelfSum = actual.filter(a => a.level === 0).reduce((s,a) => s + a.reward_amount, 0)
+    const actL1Sum   = actual.filter(a => a.level === 1).reduce((s,a) => s + a.reward_amount, 0)
+    const actL2Sum   = actual.filter(a => a.level === 2).reduce((s,a) => s + a.reward_amount, 0)
+
+    return c.json({
+      mode: 'AUDIT_5_19_FULL',
+      reward_date: REWARD_DATE,
+      counts: {
+        active_stakings_on_5_19: activeStakings.length,
+        active_users_on_5_19: isActiveOn5_19.size,
+        expected_rows: expected.length,
+        actual_rows_dr: actDr.length,
+        actual_rows_rr: actRr.length,
+        actual_rows_tx_with_marker: actTx.length,
+        cmp_rows: cmpRows.length,
+      },
+      grand_totals: {
+        expected: { self: expSelfSum, l1: expL1Sum, l2: expL2Sum, total: expSelfSum + expL1Sum + expL2Sum },
+        actual:   { self: actSelfSum, l1: actL1Sum, l2: actL2Sum, total: actSelfSum + actL1Sum + actL2Sum },
+        diff:     {
+          self: actSelfSum - expSelfSum,
+          l1: actL1Sum - expL1Sum,
+          l2: actL2Sum - expL2Sum,
+          total: (actSelfSum + actL1Sum + actL2Sum) - (expSelfSum + expL1Sum + expL2Sum),
+        },
+      },
+      issues: {
+        cmp_rows_not_ok: cmpRows.filter(r => r.status !== 'OK'),
+        users_with_diff: issueUsers,
+      },
+      active_stakings: activeStakings,
+      cmp_matrix_all: cmpRows.sort((a,b) => a.to_user_id - b.to_user_id || a.level - b.level || (a.staking_id || 0) - (b.staking_id || 0)),
+      user_summary_all: userSummary,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
