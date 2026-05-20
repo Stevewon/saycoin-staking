@@ -66145,6 +66145,113 @@ app.get('/api/diag/find-ininshil2', async (c) => {
 
 
 // ============================================================
+// 🔴 /api/diag/audit-ininshil2-deep
+// 이인실2 (76) 의 5/4 / 5/19 reward_date 의 중복 가능성 정밀 분석
+// ============================================================
+app.get('/api/diag/audit-ininshil2-deep', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw')
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    const UID = 76
+
+    // 이인실2 의 모든 rr (받은 추천금)
+    const rrAll = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, staking_id, reward_date, paid_date, created_at
+      FROM referral_rewards
+      WHERE referrer_id = ?
+      ORDER BY reward_date, level, id
+    `).bind(UID).all()
+
+    // reward_date 별 분포
+    const byDate = await db.prepare(`
+      SELECT reward_date,
+             COUNT(*) as cnt,
+             SUM(reward_amount) as sum_amt,
+             GROUP_CONCAT(level || ':' || reward_amount || ':' || staking_id || ':' || referee_id) as detail
+      FROM referral_rewards
+      WHERE referrer_id = ?
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).bind(UID).all()
+
+    // 5/4 reward_date 의 모든 rr (76 이 referrer)
+    const rr_5_4 = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, staking_id, reward_date, created_at
+      FROM referral_rewards
+      WHERE referrer_id = ? AND reward_date = '2026-05-04'
+    `).bind(UID).all()
+
+    // 5/4 동일 referee/level 의 rr 중복 체크
+    const rr_5_4_dup = await db.prepare(`
+      SELECT referee_id, level,
+             COUNT(*) as cnt,
+             GROUP_CONCAT(id) as ids,
+             GROUP_CONCAT(staking_id) as sids,
+             GROUP_CONCAT(reward_amount) as amts,
+             GROUP_CONCAT(created_at) as ts
+      FROM referral_rewards
+      WHERE referrer_id = ? AND reward_date = '2026-05-04'
+      GROUP BY referee_id, level
+      HAVING COUNT(*) >= 2
+    `).bind(UID).all()
+
+    // 이인실2 의 5/4 reward_date 의 본인 dr (있나?)
+    const dr_5_4 = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards
+      WHERE user_id = ? AND reward_date = '2026-05-04'
+    `).bind(UID).all()
+
+    // 5/4 에 본인 daily TX
+    const tx_5_4_self = await db.prepare(`
+      SELECT id, type, coin_type, amount, description, ref_id, created_at,
+             datetime(created_at, '+9 hours') as kst_time
+      FROM transactions
+      WHERE user_id = ?
+        AND type = 'daily_qkey'
+        AND description LIKE '%2026-05-04%'
+      ORDER BY created_at
+    `).bind(UID).all()
+
+    // 모든 TX 받은 것 (전체 history)
+    const txAll = await db.prepare(`
+      SELECT id, type, coin_type, amount, description, ref_id, created_at,
+             datetime(created_at, '+9 hours') as kst_time
+      FROM transactions
+      WHERE user_id = ?
+      ORDER BY created_at, id
+    `).bind(UID).all()
+
+    // 이인실2 의 staking_id=73 의 본인 dr 전수 (5/5 ~ 5/19)
+    const dr_history = await db.prepare(`
+      SELECT id, reward_date, usdt_amount, staking_id, paid_date, created_at
+      FROM daily_rewards
+      WHERE user_id = ?
+      ORDER BY reward_date, id
+    `).bind(UID).all()
+
+    return c.json({
+      ok: true,
+      user_id: UID,
+      by_reward_date: byDate.results,
+      rr_5_4: rr_5_4.results,
+      rr_5_4_dup_by_referee_level: rr_5_4_dup.results,
+      dr_5_4_self: dr_5_4.results,
+      tx_5_4_self_daily_qkey: tx_5_4_self.results,
+      dr_history_all: dr_history.results,
+      tx_all_count: (txAll.results as any[])?.length || 0,
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================
 // 🔴 /api/diag/remove-5-19-duplicates
 // 5/19 reward_date 의 dr / rr / tx 중복 행 제거.
 // 정책: (user_id, staking_id) / (referrer_id, referee_id, level, staking_id) 기준
