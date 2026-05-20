@@ -66145,6 +66145,28 @@ app.get('/api/diag/find-ininshil2', async (c) => {
 
 
 // ============================================================
+// 🔴 /api/diag/lookup-rr
+// rr id 들을 직접 조회
+// ============================================================
+app.get('/api/diag/lookup-rr', async (c) => {
+  try {
+    const pw = c.req.query('pw')
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const idsStr = c.req.query('ids') || ''
+    const ids = idsStr.split(',').map(x => Number(x.trim())).filter(x => x > 0)
+    if (ids.length === 0) return c.json({ error: 'no ids' })
+    const db = c.env.DB
+    const rows = await db.prepare(`
+      SELECT * FROM referral_rewards WHERE id IN (${ids.join(',')})
+    `).all()
+    return c.json({ ok: true, rows: rows.results })
+  } catch (e: any) {
+    return c.json({ error: String(e?.message || e) }, 500)
+  }
+})
+
+
+// ============================================================
 // 🔴 /api/diag/audit-ininshil2-deep
 // 이인실2 (76) 의 5/4 / 5/19 reward_date 의 중복 가능성 정밀 분석
 // ============================================================
