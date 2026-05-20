@@ -66822,4 +66822,336 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/audit-5-20-dup-and-solbat
+// ----------------------------------------------------------------------------
+// 사장님 명령 (2026-05-20 fix-tx-created-at EXEC 직후):
+//   "20일자 사용자내역에 그럼 중복지급 비슷하게도 안보이는지 반드시 확인한후에
+//    솔밧(solbat)의 현황을 전수조사하고 왜 부족하게 찍혔는지 확인하라!"
+//
+// PART 1: 5/20 KST 사용자내역 중복 의심 검증
+//   - 모든 회원의 5/20 KST 날짜에 표시되는 TX 전수
+//   - 같은 user, 같은 type, 같은 reward_date 가 2건 이상이면 중복 의심
+//   - 같은 user, 같은 type 이 5/20 에 여러 번 찍히면 알림 (다른 reward_date 라도)
+//
+// PART 2: solbat (user_id=44) 전수조사
+//   - users 정보, stakings, referees, daily_rewards 전부, referral_rewards 전부,
+//     transactions 전부, 5/19 기대 vs 실제
+//
+// query: pw=ADMIN_PW (required)
+// ============================================================================
+app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // ========================================================================
+    // PART 1: 5/20 KST 중복 의심 검증
+    // ========================================================================
+    // 1-A) 5/20 KST 에 표시되는 모든 daily_qkey / referral_reward TX
+    //      (사용자 화면 기준 = date(created_at, '+9 hours') = '2026-05-20')
+    const tx5_20 = await db.prepare(
+      `SELECT t.id, t.user_id, u.name, t.type, t.amount, t.ref_id,
+              t.created_at AS tx_utc,
+              datetime(t.created_at,'+9 hours') AS tx_kst,
+              t.description
+         FROM transactions t
+         LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.type IN ('daily_qkey','referral_reward')
+          AND date(t.created_at,'+9 hours') = '2026-05-20'
+        ORDER BY t.user_id, t.type, t.id`
+    ).all<any>()
+
+    // 1-B) 5/20 KST 에 같은 (user_id, type) 가 2건 이상인 경우 (중복 의심)
+    const dupSameType = await db.prepare(
+      `SELECT t.user_id, u.name, t.type, COUNT(*) AS cnt,
+              GROUP_CONCAT(t.id) AS tx_ids,
+              GROUP_CONCAT(t.ref_id) AS ref_ids,
+              GROUP_CONCAT(t.amount) AS amounts,
+              GROUP_CONCAT(t.description, '|') AS descs
+         FROM transactions t
+         LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.type IN ('daily_qkey','referral_reward')
+          AND date(t.created_at,'+9 hours') = '2026-05-20'
+        GROUP BY t.user_id, t.type
+        HAVING COUNT(*) > 1
+        ORDER BY t.user_id`
+    ).all<any>()
+
+    // 1-C) 5/20 KST 에 같은 (user_id, type, ref_id) 가 2건 이상 → 실제 중복지급
+    const dupSameRef = await db.prepare(
+      `SELECT t.user_id, u.name, t.type, t.ref_id, COUNT(*) AS cnt,
+              GROUP_CONCAT(t.id) AS tx_ids,
+              GROUP_CONCAT(t.amount) AS amounts
+         FROM transactions t
+         LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.type IN ('daily_qkey','referral_reward')
+          AND date(t.created_at,'+9 hours') = '2026-05-20'
+        GROUP BY t.user_id, t.type, t.ref_id
+        HAVING COUNT(*) > 1
+        ORDER BY t.user_id`
+    ).all<any>()
+
+    // 1-D) 5/20 KST 에 다른 reward_date 의 TX 가 섞여 있는지 (정분 사례 검증)
+    const dailyByDateOn520 = await db.prepare(
+      `SELECT t.user_id, u.name, dr.reward_date, COUNT(*) AS cnt,
+              GROUP_CONCAT(t.id) AS tx_ids
+         FROM transactions t
+         LEFT JOIN users u ON u.id = t.user_id
+         JOIN daily_rewards dr ON CAST(t.ref_id AS INTEGER) = dr.id
+        WHERE t.type='daily_qkey'
+          AND date(t.created_at,'+9 hours') = '2026-05-20'
+        GROUP BY t.user_id, dr.reward_date
+        ORDER BY t.user_id, dr.reward_date`
+    ).all<any>()
+    const referralByDateOn520 = await db.prepare(
+      `SELECT t.user_id, u.name, rr.reward_date, COUNT(*) AS cnt,
+              GROUP_CONCAT(t.id) AS tx_ids
+         FROM transactions t
+         LEFT JOIN users u ON u.id = t.user_id
+         JOIN referral_rewards rr ON CAST(t.ref_id AS INTEGER) = rr.id
+        WHERE t.type='referral_reward'
+          AND date(t.created_at,'+9 hours') = '2026-05-20'
+        GROUP BY t.user_id, rr.reward_date
+        ORDER BY t.user_id, rr.reward_date`
+    ).all<any>()
+
+    // 1-E) 5/20 KST 에 reward_date 가 5/19 가 아닌 dr/rr 매칭 TX (오염)
+    const dailyNon519On520 = await db.prepare(
+      `SELECT t.id AS tx_id, t.user_id, u.name, t.ref_id, t.amount,
+              dr.reward_date,
+              datetime(t.created_at,'+9 hours') AS kst,
+              t.description
+         FROM transactions t
+         LEFT JOIN users u ON u.id = t.user_id
+         JOIN daily_rewards dr ON CAST(t.ref_id AS INTEGER) = dr.id
+        WHERE t.type='daily_qkey'
+          AND date(t.created_at,'+9 hours') = '2026-05-20'
+          AND dr.reward_date != '2026-05-19'
+        ORDER BY dr.reward_date, t.user_id`
+    ).all<any>()
+    const referralNon519On520 = await db.prepare(
+      `SELECT t.id AS tx_id, t.user_id, u.name, t.ref_id, t.amount,
+              rr.reward_date,
+              datetime(t.created_at,'+9 hours') AS kst,
+              t.description
+         FROM transactions t
+         LEFT JOIN users u ON u.id = t.user_id
+         JOIN referral_rewards rr ON CAST(t.ref_id AS INTEGER) = rr.id
+        WHERE t.type='referral_reward'
+          AND date(t.created_at,'+9 hours') = '2026-05-20'
+          AND rr.reward_date != '2026-05-19'
+        ORDER BY rr.reward_date, t.user_id`
+    ).all<any>()
+
+    // ========================================================================
+    // PART 2: solbat (user_id=44) 전수조사
+    // ========================================================================
+    const solbatUser = await db.prepare(
+      `SELECT id, name, email, referrer_id, qkey_balance, role, created_at
+         FROM users WHERE id = 44`
+    ).first<any>()
+
+    const solbatStakings = await db.prepare(
+      `SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at, created_at
+         FROM stakings WHERE user_id = 44 ORDER BY id`
+    ).all<any>()
+
+    // 솔밧이 추천한 L1 referees (직접 자식)
+    const solbatReferees = await db.prepare(
+      `SELECT u.id, u.name, u.email, u.referrer_id, u.qkey_balance, u.created_at
+         FROM users u WHERE u.referrer_id = 44 ORDER BY u.id`
+    ).all<any>()
+
+    // 솔밧의 L2 referees (자식의 자식)
+    const solbatL2 = await db.prepare(
+      `SELECT u.id, u.name, u.email, u.referrer_id, u.qkey_balance
+         FROM users u
+         WHERE u.referrer_id IN (SELECT id FROM users WHERE referrer_id = 44)
+         ORDER BY u.id`
+    ).all<any>()
+
+    // 솔밧 daily_rewards 전체
+    const solbatDR = await db.prepare(
+      `SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+         FROM daily_rewards WHERE user_id = 44 ORDER BY reward_date, id`
+    ).all<any>()
+
+    // 솔밧 referral_rewards 전체 (받은 것)
+    const solbatRR = await db.prepare(
+      `SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+              reward_date, paid_date, staking_id, created_at
+         FROM referral_rewards WHERE referrer_id = 44 ORDER BY reward_date, level, id`
+    ).all<any>()
+
+    // 솔밧 transactions 전체
+    const solbatTX = await db.prepare(
+      `SELECT id, type, amount, ref_id,
+              created_at AS utc,
+              datetime(created_at,'+9 hours') AS kst,
+              description
+         FROM transactions WHERE user_id = 44 ORDER BY created_at, id`
+    ).all<any>()
+
+    // 솔밧 5/19 기대 vs 실제 (사장님 분노 원인 추적)
+    const solbatMyStaking519 = await db.prepare(
+      `SELECT id, amount, daily_rate, start_date, end_date, status, reset_at
+         FROM stakings
+         WHERE user_id = 44
+           AND date(start_date,'+9 hours') <= '2026-05-19'
+           AND date(end_date,'+9 hours') >= '2026-05-19'
+           AND status = 'active'
+           AND (reset_at IS NULL OR date(reset_at,'+9 hours') > '2026-05-19')`
+    ).all<any>()
+
+    // 5/19 reward 솔밧 자기 daily_rewards / 매칭 TX
+    const solbatSelf519 = await db.prepare(
+      `SELECT id, staking_id, usdt_amount, reward_date, paid_date, created_at
+         FROM daily_rewards
+         WHERE user_id = 44 AND reward_date = '2026-05-19'`
+    ).all<any>()
+
+    // 5/19 reward 솔밧이 받은 referral_rewards
+    const solbatRef519 = await db.prepare(
+      `SELECT id, referee_id, level, original_amount, reward_amount, reward_date, staking_id
+         FROM referral_rewards
+         WHERE referrer_id = 44 AND reward_date = '2026-05-19'
+         ORDER BY level, referee_id`
+    ).all<any>()
+
+    // 5/19 KST 에 active referees (솔밧 직접 추천 = L1 후보)
+    const solbatRefereesActive519 = await db.prepare(
+      `SELECT u.id AS user_id, u.name,
+              s.id AS staking_id, s.amount, s.daily_rate, s.start_date, s.end_date, s.status, s.reset_at,
+              ROUND(s.amount * s.daily_rate * 150) AS expected_daily_qkey,
+              ROUND(s.amount * s.daily_rate * 150 * 0.20) AS expected_l1_to_solbat
+         FROM users u
+         JOIN stakings s ON s.user_id = u.id
+         WHERE u.referrer_id = 44
+           AND date(s.start_date,'+9 hours') <= '2026-05-19'
+           AND date(s.end_date,'+9 hours') >= '2026-05-19'
+           AND s.status = 'active'
+           AND (s.reset_at IS NULL OR date(s.reset_at,'+9 hours') > '2026-05-19')
+         ORDER BY u.id, s.id`
+    ).all<any>()
+
+    // 5/19 KST 에 active L2 referees
+    const solbatL2Active519 = await db.prepare(
+      `SELECT u.id AS user_id, u.name, u.referrer_id AS l1_user_id,
+              s.id AS staking_id, s.amount, s.daily_rate, s.start_date, s.end_date, s.status, s.reset_at,
+              ROUND(s.amount * s.daily_rate * 150) AS expected_daily_qkey,
+              ROUND(s.amount * s.daily_rate * 150 * 0.10) AS expected_l2_to_solbat
+         FROM users u
+         JOIN stakings s ON s.user_id = u.id
+         WHERE u.referrer_id IN (SELECT id FROM users WHERE referrer_id = 44)
+           AND date(s.start_date,'+9 hours') <= '2026-05-19'
+           AND date(s.end_date,'+9 hours') >= '2026-05-19'
+           AND s.status = 'active'
+           AND (s.reset_at IS NULL OR date(s.reset_at,'+9 hours') > '2026-05-19')
+         ORDER BY u.id, s.id`
+    ).all<any>()
+
+    // Solbat balance vs TX sum
+    const solbatTxSum = await db.prepare(
+      `SELECT COALESCE(SUM(amount),0) AS tx_sum
+         FROM transactions WHERE user_id = 44`
+    ).first<any>()
+
+    // ========================================================================
+    // PART 3: 솔밧 5/19 기대 vs 실제 정합성 계산
+    // ========================================================================
+    const dr519List = (solbatSelf519.results || [])
+    const rr519List = (solbatRef519.results || [])
+    const refereesActive = (solbatRefereesActive519.results || [])
+    const l2Active = (solbatL2Active519.results || [])
+
+    const expectedSelf519 = dr519List.reduce((a:number,r:any)=>a+Number(r.usdt_amount||0),0)
+    const expectedL1Sum = refereesActive.reduce((a:number,r:any)=>a+Number(r.expected_l1_to_solbat||0),0)
+    const expectedL2Sum = l2Active.reduce((a:number,r:any)=>a+Number(r.expected_l2_to_solbat||0),0)
+
+    const actualL1 = rr519List.filter((r:any)=>r.level===1).reduce((a:number,r:any)=>a+Number(r.reward_amount||0),0)
+    const actualL2 = rr519List.filter((r:any)=>r.level===2).reduce((a:number,r:any)=>a+Number(r.reward_amount||0),0)
+
+    return c.json({
+      ok: true,
+      run_at_kst: new Date(Date.now()+9*3600*1000).toISOString(),
+
+      // ====================================================================
+      // PART 1: 5/20 KST 중복 의심 검증
+      // ====================================================================
+      part1_5_20_dup_check: {
+        total_tx_on_5_20_kst: tx5_20.results?.length || 0,
+        critical_same_user_same_type_same_ref_count: dupSameRef.results?.length || 0,
+        critical_same_user_same_type_same_ref_list: dupSameRef.results || [],
+        warning_same_user_same_type_multi_count: dupSameType.results?.length || 0,
+        warning_same_user_same_type_multi_list: dupSameType.results || [],
+        daily_distribution_by_reward_date: dailyByDateOn520.results || [],
+        referral_distribution_by_reward_date: referralByDateOn520.results || [],
+        daily_non_5_19_on_5_20_count: dailyNon519On520.results?.length || 0,
+        daily_non_5_19_on_5_20_list: dailyNon519On520.results || [],
+        referral_non_5_19_on_5_20_count: referralNon519On520.results?.length || 0,
+        referral_non_5_19_on_5_20_list: referralNon519On520.results || [],
+        sample_tx_on_5_20_first_40: (tx5_20.results || []).slice(0, 40)
+      },
+
+      // ====================================================================
+      // PART 2: solbat (44) 전수
+      // ====================================================================
+      part2_solbat: {
+        user: solbatUser,
+        balance: solbatUser?.qkey_balance,
+        tx_sum: solbatTxSum?.tx_sum,
+        balance_match: Number(solbatUser?.qkey_balance||0) === Number(solbatTxSum?.tx_sum||0),
+        stakings: solbatStakings.results || [],
+        referees_L1: solbatReferees.results || [],
+        referees_L2: solbatL2.results || [],
+        daily_rewards_all: solbatDR.results || [],
+        referral_rewards_all: solbatRR.results || [],
+        transactions_all: solbatTX.results || [],
+        daily_rewards_count: (solbatDR.results || []).length,
+        referral_rewards_count: (solbatRR.results || []).length,
+        transactions_count: (solbatTX.results || []).length
+      },
+
+      // ====================================================================
+      // PART 3: solbat 5/19 기대 vs 실제 (부족 원인 추적)
+      // ====================================================================
+      part3_solbat_5_19_expected_vs_actual: {
+        my_active_stakings_on_5_19: solbatMyStaking519.results || [],
+        active_L1_referees_on_5_19: refereesActive,
+        active_L2_referees_on_5_19: l2Active,
+        // 기대값
+        expected: {
+          self_daily: expectedSelf519,   // dr 가 이미 있는 경우 그 합
+          l1_referral: expectedL1Sum,
+          l2_referral: expectedL2Sum,
+          total: expectedSelf519 + expectedL1Sum + expectedL2Sum
+        },
+        // 실제 dr/rr 값
+        actual_dr_5_19: dr519List,
+        actual_rr_5_19: rr519List,
+        actual: {
+          self_daily: dr519List.reduce((a:number,r:any)=>a+Number(r.usdt_amount||0),0),
+          l1_referral: actualL1,
+          l2_referral: actualL2,
+          total: dr519List.reduce((a:number,r:any)=>a+Number(r.usdt_amount||0),0) + actualL1 + actualL2
+        },
+        // diff
+        diff: {
+          self_daily: expectedSelf519 - dr519List.reduce((a:number,r:any)=>a+Number(r.usdt_amount||0),0),
+          l1_referral: expectedL1Sum - actualL1,
+          l2_referral: expectedL2Sum - actualL2
+        }
+      },
+
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
