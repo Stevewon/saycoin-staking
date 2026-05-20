@@ -65635,12 +65635,12 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
     // 1) 5/20 KST 에 일일 배당 15000 받은 회원 식별
     //    KST = UTC+9. 5/20 KST 00:00 ~ 5/20 KST 23:59 → UTC 5/19 15:00 ~ 5/20 14:59
     const dailyRcv = await db.prepare(`
-      SELECT t.id as tx_id, t.user_id, u.name as user_name, t.amount, t.currency,
-             t.description, t.reference_id, t.created_at,
+      SELECT t.id as tx_id, t.user_id, u.name as user_name, t.amount, t.coin_type,
+             t.description, t.ref_id, t.created_at,
              datetime(t.created_at, '+9 hours') as kst_time
       FROM transactions t LEFT JOIN users u ON t.user_id = u.id
       WHERE t.type = 'daily_qkey'
-        AND t.currency = 'QKEY'
+        AND t.coin_type = 'QKEY'
         AND t.amount = 15000
         AND date(t.created_at, '+9 hours') = '2026-05-20'
       ORDER BY t.created_at, t.user_id
@@ -65649,11 +65649,11 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
     // 2) 5/20 KST 에 L1=3000 받은 회원
     const l1_3000 = await db.prepare(`
       SELECT t.id as tx_id, t.user_id, u.name as user_name, t.amount,
-             t.description, t.reference_id, t.created_at,
+             t.description, t.ref_id, t.created_at,
              datetime(t.created_at, '+9 hours') as kst_time
       FROM transactions t LEFT JOIN users u ON t.user_id = u.id
       WHERE t.type = 'referral_reward'
-        AND t.currency = 'QKEY'
+        AND t.coin_type = 'QKEY'
         AND t.amount = 3000
         AND t.description LIKE '%Level 1%'
         AND date(t.created_at, '+9 hours') = '2026-05-20'
@@ -65663,11 +65663,11 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
     // 3) 5/20 KST 에 L2=630 받은 회원
     const l2_630 = await db.prepare(`
       SELECT t.id as tx_id, t.user_id, u.name as user_name, t.amount,
-             t.description, t.reference_id, t.created_at,
+             t.description, t.ref_id, t.created_at,
              datetime(t.created_at, '+9 hours') as kst_time
       FROM transactions t LEFT JOIN users u ON t.user_id = u.id
       WHERE t.type = 'referral_reward'
-        AND t.currency = 'QKEY'
+        AND t.coin_type = 'QKEY'
         AND t.amount = 630
         AND t.description LIKE '%Level 2%'
         AND date(t.created_at, '+9 hours') = '2026-05-20'
@@ -65684,7 +65684,7 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
              GROUP_CONCAT(datetime(created_at, '+9 hours'), ' | ') as kst_times
       FROM transactions
       WHERE type = 'referral_reward'
-        AND currency = 'QKEY'
+        AND coin_type = 'QKEY'
         AND amount = 3000
         AND description LIKE '%Level 1%'
         AND date(created_at, '+9 hours') = '2026-05-20'
@@ -65702,7 +65702,7 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
              GROUP_CONCAT(datetime(created_at, '+9 hours'), ' | ') as kst_times
       FROM transactions
       WHERE type = 'referral_reward'
-        AND currency = 'QKEY'
+        AND coin_type = 'QKEY'
         AND amount = 630
         AND description LIKE '%Level 2%'
         AND date(created_at, '+9 hours') = '2026-05-20'
@@ -65720,7 +65720,7 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
       FROM transactions t1
       LEFT JOIN users u ON t1.user_id = u.id
       WHERE t1.type = 'referral_reward'
-        AND t1.currency = 'QKEY'
+        AND t1.coin_type = 'QKEY'
         AND t1.amount = 3000
         AND t1.description LIKE '%Level 1%'
         AND date(t1.created_at, '+9 hours') = '2026-05-20'
@@ -65764,9 +65764,62 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
       ORDER BY reward_date
     `).all()
 
+    // 10) 🔴 '이인실2' 회원 정밀 조사
+    const ininshil2User = await db.prepare(`
+      SELECT id, name, email, referrer_id, qkey_balance, usdt_balance, status
+      FROM users WHERE name LIKE '%이인실2%' OR name = '이인실2'
+    `).all()
+
+    const ininshil2Id = (ininshil2User.results as any[])?.[0]?.id
+
+    const ininshil2AllTx5_20 = ininshil2Id ? await db.prepare(`
+      SELECT t.id as tx_id, t.user_id, t.type, t.coin_type, t.amount,
+             t.description, t.ref_id, t.created_at,
+             datetime(t.created_at, '+9 hours') as kst_time
+      FROM transactions t
+      WHERE t.user_id = ?
+        AND date(t.created_at, '+9 hours') = '2026-05-20'
+      ORDER BY t.created_at, t.id
+    `).bind(ininshil2Id).all() : null
+
+    const ininshil2AllDr = ininshil2Id ? await db.prepare(`
+      SELECT id, user_id, reward_date, usdt_amount, staking_id, description, created_at
+      FROM daily_rewards
+      WHERE user_id = ?
+      ORDER BY reward_date, id
+    `).bind(ininshil2Id).all() : null
+
+    const ininshil2AllRr = ininshil2Id ? await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, reward_date, qkey_amount,
+             original_amount, staking_id, description, created_at
+      FROM referral_rewards
+      WHERE referrer_id = ?
+      ORDER BY reward_date, id
+    `).bind(ininshil2Id).all() : null
+
+    // staking 정보
+    const ininshil2Staking = ininshil2Id ? await db.prepare(`
+      SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at
+      FROM staking WHERE user_id = ?
+      ORDER BY id
+    `).bind(ininshil2Id).all() : null
+
+    // referee 들 (이인실2 가 referrer 인 회원들)
+    const ininshil2Referees = ininshil2Id ? await db.prepare(`
+      SELECT id, name, referrer_id, status
+      FROM users WHERE referrer_id = ?
+    `).bind(ininshil2Id).all() : null
+
     return c.json({
       ok: true,
       timestamp_kst: new Date(Date.now() + 9*3600*1000).toISOString().replace('T',' ').substring(0,19),
+
+      step10_ininshil2_user: ininshil2User.results,
+      step10_ininshil2_all_tx_5_20: ininshil2AllTx5_20?.results,
+      step10_ininshil2_all_dr_history: ininshil2AllDr?.results,
+      step10_ininshil2_all_rr_received: ininshil2AllRr?.results,
+      step10_ininshil2_staking: ininshil2Staking?.results,
+      step10_ininshil2_referees: ininshil2Referees?.results,
 
       step1_daily_15000_recipients_5_20: {
         count: (dailyRcv.results as any[])?.length || 0,
