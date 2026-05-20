@@ -66024,7 +66024,7 @@ app.get('/api/diag/inspect-referee-stakings', async (c) => {
     const sids = [45, 49, 53, 61, 62, 65, 72, 77]
 
     const users = await db.prepare(`
-      SELECT id, name, referrer_id, status, qkey_balance, usdt_balance
+      SELECT id, name, referrer_id, qkey_balance, usdt_balance
       FROM users WHERE id IN (${refs.join(',')})
     `).all()
 
