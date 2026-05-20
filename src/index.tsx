@@ -66823,6 +66823,138 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
 
 
 // ============================================================================
+// /api/diag/audit-solbat-deep
+// ----------------------------------------------------------------------------
+// 솔밧 5/19 KST 08:00 cron TX (ref_id 1908, 3647 ~ 3746) 가 매칭되는 dr/rr 의
+// reward_date 를 추적해서 이중지급인지 확인
+// ============================================================================
+app.get('/api/diag/audit-solbat-deep', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // 솔밧 모든 TX 의 ref_id 매칭 dr/rr (full join)
+    const txDailyMatch = await db.prepare(
+      `SELECT t.id AS tx_id, t.amount, t.ref_id, t.description,
+              datetime(t.created_at,'+9 hours') AS kst,
+              dr.id AS dr_id, dr.reward_date AS dr_reward_date, dr.usdt_amount AS dr_amt, dr.staking_id
+         FROM transactions t
+         LEFT JOIN daily_rewards dr ON CAST(t.ref_id AS INTEGER) = dr.id
+        WHERE t.user_id = 44 AND t.type='daily_qkey'
+        ORDER BY t.created_at, t.id`
+    ).all<any>()
+
+    const txRefMatch = await db.prepare(
+      `SELECT t.id AS tx_id, t.amount, t.ref_id, t.description,
+              datetime(t.created_at,'+9 hours') AS kst,
+              rr.id AS rr_id, rr.reward_date AS rr_reward_date, rr.level, rr.original_amount, rr.reward_amount, rr.referee_id
+         FROM transactions t
+         LEFT JOIN referral_rewards rr ON CAST(t.ref_id AS INTEGER) = rr.id
+        WHERE t.user_id = 44 AND t.type='referral_reward'
+        ORDER BY t.created_at, t.id`
+    ).all<any>()
+
+    // 솔밧 모든 dr/rr (reward_date 별 그룹)
+    const allDr = await db.prepare(
+      `SELECT id, staking_id, usdt_amount, reward_date, paid_date, created_at
+         FROM daily_rewards WHERE user_id=44 ORDER BY reward_date, id`
+    ).all<any>()
+    const allRr = await db.prepare(
+      `SELECT id, referee_id, level, original_amount, reward_amount, reward_date, staking_id
+         FROM referral_rewards WHERE referrer_id=44 ORDER BY reward_date, level, id`
+    ).all<any>()
+
+    // dr/rr 의 reward_date 별 sum
+    const drByDate = await db.prepare(
+      `SELECT reward_date, COUNT(*) AS cnt, SUM(usdt_amount) AS sum_qkey
+         FROM daily_rewards WHERE user_id=44 GROUP BY reward_date ORDER BY reward_date`
+    ).all<any>()
+    const rrByDate = await db.prepare(
+      `SELECT reward_date, COUNT(*) AS cnt, SUM(reward_amount) AS sum_qkey
+         FROM referral_rewards WHERE referrer_id=44 GROUP BY reward_date ORDER BY reward_date`
+    ).all<any>()
+
+    // TX 매칭 + dr/rr reward_date 별 sum
+    const txDailyByDate: Record<string, {cnt:number, sum:number}> = {}
+    for (const r of (txDailyMatch.results || [])) {
+      const k = r.dr_reward_date || 'NULL'
+      if (!txDailyByDate[k]) txDailyByDate[k] = {cnt:0, sum:0}
+      txDailyByDate[k].cnt++
+      txDailyByDate[k].sum += Number(r.amount || 0)
+    }
+    const txRefByDate: Record<string, {cnt:number, sum:number}> = {}
+    for (const r of (txRefMatch.results || [])) {
+      const k = r.rr_reward_date || 'NULL'
+      if (!txRefByDate[k]) txRefByDate[k] = {cnt:0, sum:0}
+      txRefByDate[k].cnt++
+      txRefByDate[k].sum += Number(r.amount || 0)
+    }
+
+    // 같은 reward_date 에 TX 가 dr/rr 갯수보다 많은 경우 = 이중지급
+    const dailyDups: any[] = []
+    for (const d of (drByDate.results || [])) {
+      const txCnt = txDailyByDate[d.reward_date]?.cnt || 0
+      const txSum = txDailyByDate[d.reward_date]?.sum || 0
+      if (txCnt > d.cnt || txSum > d.sum_qkey) {
+        dailyDups.push({
+          reward_date: d.reward_date,
+          dr_count: d.cnt,
+          dr_sum: d.sum_qkey,
+          tx_count: txCnt,
+          tx_sum: txSum,
+          excess_tx: txCnt - d.cnt,
+          excess_sum: txSum - d.sum_qkey
+        })
+      }
+    }
+    const refDups: any[] = []
+    for (const r of (rrByDate.results || [])) {
+      const txCnt = txRefByDate[r.reward_date]?.cnt || 0
+      const txSum = txRefByDate[r.reward_date]?.sum || 0
+      if (txCnt > r.cnt || txSum > r.sum_qkey) {
+        refDups.push({
+          reward_date: r.reward_date,
+          rr_count: r.cnt,
+          rr_sum: r.sum_qkey,
+          tx_count: txCnt,
+          tx_sum: txSum,
+          excess_tx: txCnt - r.cnt,
+          excess_sum: txSum - r.sum_qkey
+        })
+      }
+    }
+
+    // 솔밧 잔액 vs tx_sum
+    const u = await db.prepare(`SELECT id, name, qkey_balance FROM users WHERE id=44`).first<any>()
+    const txSum = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE user_id=44`).first<any>()
+
+    return c.json({
+      ok: true,
+      user: u,
+      balance: u?.qkey_balance,
+      tx_sum: txSum?.s,
+      diff_tx_minus_balance: Number(txSum?.s || 0) - Number(u?.qkey_balance || 0),
+      dr_count: (allDr.results || []).length,
+      rr_count: (allRr.results || []).length,
+      dr_by_reward_date: drByDate.results || [],
+      rr_by_reward_date: rrByDate.results || [],
+      tx_daily_by_dr_reward_date: txDailyByDate,
+      tx_ref_by_rr_reward_date: txRefByDate,
+      daily_dup_alerts: dailyDups,
+      referral_dup_alerts: refDups,
+      tx_daily_with_dr_full: txDailyMatch.results || [],
+      tx_ref_with_rr_full: txRefMatch.results || [],
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================================
 // /api/diag/audit-5-20-dup-and-solbat
 // ----------------------------------------------------------------------------
 // 사장님 명령 (2026-05-20 fix-tx-created-at EXEC 직후):
