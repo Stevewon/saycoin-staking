@@ -68453,4 +68453,49 @@ app.get('/api/diag/audit-referral-completeness', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/inspect-rr-and-tx
+// ----------------------------------------------------------------------------
+// rr_id 들의 상세 + 그 referrer 의 그 날짜 거래내역 전수 조회
+// ============================================================================
+app.get('/api/diag/inspect-rr-and-tx', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    const idsParam = c.req.query('ids') || ''
+    const ids = idsParam.split(',').map(s => Number(s.trim())).filter(n => !isNaN(n) && n > 0)
+    if (ids.length === 0) return c.json({ error: 'ids required' }, 400)
+
+    const ph = ids.map(() => '?').join(',')
+    const rrs = await db.prepare(
+      `SELECT * FROM referral_rewards WHERE id IN (${ph})`
+    ).bind(...ids).all<any>()
+
+    const refRows = rrs.results || []
+    const refIds = refRows.map((r: any) => Number(r.id))
+    const txs = refIds.length > 0
+      ? (await db.prepare(
+          `SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+             FROM transactions
+            WHERE CAST(ref_id AS INTEGER) IN (${refIds.map(() => '?').join(',')})`
+        ).bind(...refIds).all<any>()).results || []
+      : []
+
+    return c.json({
+      ok: true,
+      rr_count: refRows.length,
+      rr: refRows,
+      tx_count: txs.length,
+      tx: txs,
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error) }, 500)
+  }
+})
+
+
 export default app
