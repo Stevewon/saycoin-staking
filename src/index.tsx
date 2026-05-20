@@ -68762,8 +68762,14 @@ app.get('/api/diag/fix-l12-createdat-by-user', async (c) => {
       `t.coin_type = 'QKEY'`,
       `t.user_id = ?`,
       `rr.level IN (1, 2)`,
-      // ★ created_at 이 영구룰 정답값과 다른 경우만
-      `t.created_at != (date(rr.paid_date, '-1 day') || ' 23:00:00')`
+      // ★ 영구룰 #정규시각 정답값 (PERMANENT_RULES.md L255-256):
+      //   - DR  : paid_date 전일 23:00:00 UTC
+      //   - RR tx: paid_date 전일 23:00:01 UTC (RR tx 는 1초 늦게)
+      // → 둘 다 정답으로 인정 (정규 cron이 :00:00 으로 박은 분도 허용)
+      `t.created_at NOT IN (
+         date(rr.paid_date, '-1 day') || ' 23:00:00',
+         date(rr.paid_date, '-1 day') || ' 23:00:01'
+       )`
     ]
     const bindParams: any[] = [userId]
     if (paidDate) {
@@ -68784,7 +68790,8 @@ app.get('/api/diag/fix-l12-createdat-by-user', async (c) => {
         rr.level AS rr_level,
         rr.reward_date AS rr_reward_date,
         rr.paid_date AS rr_paid_date,
-        (date(rr.paid_date, '-1 day') || ' 23:00:00') AS correct_created_at
+        -- ★ 영구룰 #정규시각: RR tx 정답값 = paid_date 전일 23:00:01 UTC
+        (date(rr.paid_date, '-1 day') || ' 23:00:01') AS correct_created_at
       FROM transactions t
       INNER JOIN referral_rewards rr
         ON CAST(t.ref_id AS INTEGER) = rr.id
