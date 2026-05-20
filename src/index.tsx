@@ -68701,4 +68701,211 @@ app.get('/api/diag/fix-missing-l12-tx-all', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/fix-l12-createdat-by-user
+// ----------------------------------------------------------------------------
+// 🚨 영구룰 #정규시각 위반 보정 (CRITICAL)
+//
+// 배경:
+//   commit 4fcf5fd (fix-missing-l12-tx-all) 가 L1/L2 누락 TX 를 보강할 때
+//   created_at = reward_date + ' 14:00:00' UTC 로 박았음 → 영구룰 #정규시각 위반
+//
+// 영구룰 #정규시각 (PERMANENT_RULES.md L233-275):
+//   created_at = paid_date 의 KST 08:00 = UTC 23:00 of (paid_date - 1)
+//   예: paid_date='2026-05-18' → created_at='2026-05-17 23:00:00' (UTC)
+//
+// 처리 방식:
+//   - 대상: transactions where
+//       user_id = ? (필수, 사장님 명령으로 솔밧만 우선)
+//       type = 'referral_reward'
+//       coin_type = 'QKEY'
+//       CAST(ref_id AS INTEGER) IN (rr.id)
+//       AND rr.paid_date = ? (선택, 미지정 시 전체 잘못된 것 다 잡음)
+//       AND tx.created_at != 영구룰 정답값
+//   - JOIN referral_rewards 로 paid_date 가져와서 정확한 created_at 계산
+//   - UPDATE 만, INSERT/DELETE/금액 변경 일체 없음
+//   - 잔액 변동 0
+//
+// confirm token: FIX_L12_CREATEDAT_BY_USER_GO
+// ============================================================================
+app.get('/api/diag/fix-l12-createdat-by-user', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+
+    const userIdStr = c.req.query('user_id') || ''
+    if (!userIdStr) return c.json({ error: 'user_id required (사장님 명령: 솔밧만 우선)' }, 400)
+    const userId = Number(userIdStr)
+    if (!Number.isFinite(userId) || userId <= 0) return c.json({ error: 'invalid user_id' }, 400)
+
+    const paidDate = c.req.query('paid_date') || '' // 선택 (e.g. '2026-05-18')
+    const confirm = c.req.query('confirm') || ''
+    const exec = (confirm === 'FIX_L12_CREATEDAT_BY_USER_GO')
+    const db = c.env.DB
+
+    // STEP 0: snapshot before
+    const balBefore = await db.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS total FROM users`).first<any>()
+    const txCountBefore = await db.prepare(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='referral_reward'`).first<any>()
+    const txSumBefore = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions`).first<any>()
+    const userBefore = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    // STEP 1: 대상 식별
+    // referral_reward TX 중 매칭 rr 의 (paid_date - 1) || ' 23:00:00' UTC 와 created_at 이 다른 행
+    //
+    // ★ 영구룰 #정규시각 정답값:
+    //   correct_created_at = date(rr.paid_date, '-1 day') || ' 23:00:00'
+    //
+    // rr 의 level IN (1, 2) 만 대상 (L0 별도)
+    const whereClauses: string[] = [
+      `t.type = 'referral_reward'`,
+      `t.coin_type = 'QKEY'`,
+      `t.user_id = ?`,
+      `rr.level IN (1, 2)`,
+      // ★ created_at 이 영구룰 정답값과 다른 경우만
+      `t.created_at != (date(rr.paid_date, '-1 day') || ' 23:00:00')`
+    ]
+    const bindParams: any[] = [userId]
+    if (paidDate) {
+      whereClauses.push(`rr.paid_date = ?`)
+      bindParams.push(paidDate)
+    }
+    const whereSql = whereClauses.join(' AND ')
+
+    const targetSql = `
+      SELECT
+        t.id AS tx_id,
+        t.user_id,
+        t.amount,
+        t.description,
+        t.ref_id,
+        t.created_at AS old_created_at,
+        rr.id AS rr_id,
+        rr.level AS rr_level,
+        rr.reward_date AS rr_reward_date,
+        rr.paid_date AS rr_paid_date,
+        (date(rr.paid_date, '-1 day') || ' 23:00:00') AS correct_created_at
+      FROM transactions t
+      INNER JOIN referral_rewards rr
+        ON CAST(t.ref_id AS INTEGER) = rr.id
+      WHERE ${whereSql}
+      ORDER BY t.id
+    `
+    const targets = await db.prepare(targetSql).bind(...bindParams).all<any>()
+    const targetList = targets.results || []
+
+    // 집계
+    const totalAmount = targetList.reduce((a: number, b: any) => a + Number(b.amount || 0), 0)
+    const byPaidDate: Record<string, { count: number, amount: number }> = {}
+    for (const r of targetList) {
+      const k = String(r.rr_paid_date)
+      if (!byPaidDate[k]) byPaidDate[k] = { count: 0, amount: 0 }
+      byPaidDate[k].count++
+      byPaidDate[k].amount += Number(r.amount || 0)
+    }
+
+    const summary = {
+      user_id: userId,
+      user_name: userBefore?.name || '',
+      user_email: userBefore?.email || '',
+      filter_paid_date: paidDate || '(all)',
+      total_target_tx: targetList.length,
+      total_amount_unchanged: totalAmount,
+      by_paid_date: byPaidDate
+    }
+
+    // STEP 2: EXEC
+    let execResult: any = null
+    if (exec) {
+      const errors: string[] = []
+      let updated = 0
+      let skipped = 0
+
+      for (const r of targetList) {
+        try {
+          // 정확한 created_at 으로 UPDATE (영구룰 #정규시각)
+          const correctUtc = String(r.correct_created_at)
+          const upd = await db.prepare(`
+            UPDATE transactions
+               SET created_at = ?
+             WHERE id = ?
+               AND type = 'referral_reward'
+               AND coin_type = 'QKEY'
+               AND user_id = ?
+               AND created_at != ?
+          `).bind(correctUtc, Number(r.tx_id), userId, correctUtc).run()
+
+          if ((upd as any)?.meta?.changes > 0) updated++
+          else skipped++
+        } catch (e: any) {
+          errors.push(`tx ${r.tx_id}: ${String(e?.message || e)}`)
+        }
+      }
+
+      execResult = {
+        tx_updated: updated,
+        tx_skipped: skipped,
+        errors_count: errors.length,
+        errors_first_10: errors.slice(0, 10)
+      }
+    }
+
+    // STEP 3: snapshot after + post verify
+    const balAfter = await db.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS total FROM users`).first<any>()
+    const txCountAfter = await db.prepare(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='referral_reward'`).first<any>()
+    const txSumAfter = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions`).first<any>()
+    const userAfter = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    let postVerify: any = null
+    if (exec) {
+      // 같은 조건으로 재조회 — 남은 위반 건수
+      const remaining = await db.prepare(targetSql).bind(...bindParams).all<any>()
+      postVerify = {
+        remaining_violations: (remaining.results || []).length,
+        balance_unchanged: Number(balAfter?.total || 0) === Number(balBefore?.total || 0),
+        tx_count_unchanged: Number(txCountAfter?.cnt || 0) === Number(txCountBefore?.cnt || 0),
+        tx_sum_unchanged: Number(txSumAfter?.total || 0) === Number(txSumBefore?.total || 0),
+        user_balance_unchanged: Number(userAfter?.qkey_balance || 0) === Number(userBefore?.qkey_balance || 0)
+      }
+    }
+
+    return c.json({
+      ok: true,
+      mode: exec ? 'EXEC' : 'DRY_RUN',
+      confirm_required: 'FIX_L12_CREATEDAT_BY_USER_GO',
+      permanent_rule: '#정규시각 — created_at = paid_date 전일 23:00:00 UTC (= KST 08:00)',
+      summary,
+      snapshot: {
+        balance_before: balBefore?.total,
+        balance_after: balAfter?.total,
+        balance_delta: Number(balAfter?.total || 0) - Number(balBefore?.total || 0),
+        tx_referral_count_before: txCountBefore?.cnt,
+        tx_referral_count_after: txCountAfter?.cnt,
+        tx_referral_count_delta: Number(txCountAfter?.cnt || 0) - Number(txCountBefore?.cnt || 0),
+        tx_sum_before: txSumBefore?.total,
+        tx_sum_after: txSumAfter?.total,
+        tx_sum_delta: Number(txSumAfter?.total || 0) - Number(txSumBefore?.total || 0),
+        user_balance_before: userBefore?.qkey_balance,
+        user_balance_after: userAfter?.qkey_balance
+      },
+      target_preview_first_30: targetList.slice(0, 30).map((r: any) => ({
+        tx_id: r.tx_id,
+        rr_id: r.rr_id,
+        level: r.rr_level,
+        amount: r.amount,
+        reward_date: r.rr_reward_date,
+        paid_date: r.rr_paid_date,
+        old_created_at_utc: r.old_created_at,
+        new_created_at_utc: r.correct_created_at
+      })),
+      exec_result: execResult,
+      post_verify: postVerify,
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
