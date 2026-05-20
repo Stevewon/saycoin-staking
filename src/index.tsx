@@ -66569,18 +66569,24 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
 
 
 // ============================================================================
-// /api/diag/fix-tx-created-at-permanent-rule
+// /api/diag/fix-tx-created-at-permanent-rule (OPTION B — 사장님 명령 5/20)
 // ----------------------------------------------------------------------------
-// 영구룰: transactions.created_at = (관련 dr/rr 의 reward_date) || ' 23:00:00 (KST)'
+// 영구룰: 보충/소급 TX 의 created_at = 해당 reward_date 23:00:00 KST (UTC 14:00)
 //        보충/소급 작업도 원본 reward_date 에 찍어야 함 (오늘 날짜 금지)
 //
-// 식별 로직:
-//   1) type='daily_qkey' AND ref_id 가 daily_rewards.id 와 매칭
-//      -> dr.reward_date 와 date(t.created_at,'+9 hours') 비교
-//   2) type='referral_reward' AND ref_id 가 referral_rewards.id 와 매칭
-//      -> rr.reward_date 와 date(t.created_at,'+9 hours') 비교
-//   3) 불일치 TX 만 정정: created_at = reward_date || ' 14:00:00'
-//      (DB 는 UTC 저장이므로 KST 23:00 = UTC 14:00. SQLite 는 timezone-naive 저장)
+// 사장님 명령 (2026-05-20):
+//   "19일 확정분은 어제 19일처럼 오늘 20일에 찍어주고 나머지는 각 해당날짜에 찍어주면 되는거야!"
+//   → 5/19 reward 의 TX 는 5/20 KST 08:00 에 찍힌 그대로 유지 (정상 cron 패턴)
+//   → 5/19 이외 reward 의 보충/소급 TX 는 모두 reward_date 23:00 KST 로 정정
+//
+// 식별 로직 (OPTION B — 마커 기반 + 5/19 제외):
+//   1) description 에 보충/소급 마커 포함:
+//      - %solbat-stage% (A/A2/B fix 시리즈)
+//      - %daily-payout-5-19-fix-reset% (5/19 누락 24명 재보충 — 그런데 reward_date=5/19라 제외 됨)
+//      - (daily-payout-5-19 자체는 5/19 reward 이므로 제외)
+//   2) AND reward_date != '2026-05-19'  (5/19 확정분은 어제 패턴대로 5/20 표시 유지)
+//   3) AND date(t.created_at,'+9 hours') != reward_date  (이미 정상이면 건너뜀)
+//   4) 정답 created_at = reward_date || ' 14:00:00' (UTC, KST 23:00)
 //
 // 잔액/금액/dr/rr/users 절대 안 건드림. created_at 컬럼만 UPDATE.
 //
@@ -66595,6 +66601,17 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
     const exec = (confirm === 'FIX_TX_CREATED_AT_GO')
     const db = c.env.DB
 
+    // Marker filter for backfill/retroactive TX (OPTION B)
+    // Excludes regular cron TX (which has no marker).
+    const MARKER_FILTER = `(
+      t.description LIKE '%solbat-stage%'
+      OR t.description LIKE '%daily-payout-5-19%'
+      OR t.description LIKE '%daily-payout-5-19-fix-reset%'
+      OR t.description LIKE '%-fix%'
+    )`
+    // Exclude 5/19 reward_date (사장님 명령: 5/19 확정분은 5/20 표시 유지)
+    const EXCLUDE_DATE = `'2026-05-19'`
+
     // ------------------------------------------------------------------------
     // STEP 1: snapshot before (balance + tx sum)
     // ------------------------------------------------------------------------
@@ -66608,10 +66625,10 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
     ).first<any>()
 
     // ------------------------------------------------------------------------
-    // STEP 2: identify daily_qkey TX with mismatched created_at
+    // STEP 2: identify daily_qkey backfill TX with mismatched created_at
     //         (DB stores UTC; KST = UTC+9; reward_date is KST date)
-    //         expected_created_at_utc = reward_date - 9h + 23h = reward_date 14:00:00 UTC
-    //         compare: date(t.created_at,'+9 hours') vs dr.reward_date
+    //         expected_created_at_utc = reward_date 14:00:00 UTC (=KST 23:00)
+    //         OPTION B filter: marker AND reward_date != '2026-05-19'
     // ------------------------------------------------------------------------
     const dailyMismatch = await db.prepare(
       `SELECT t.id AS tx_id, t.user_id, t.ref_id, t.amount,
@@ -66623,12 +66640,14 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
          FROM transactions t
          JOIN daily_rewards dr ON CAST(t.ref_id AS INTEGER) = dr.id
         WHERE t.type = 'daily_qkey'
+          AND ${MARKER_FILTER}
+          AND dr.reward_date != ${EXCLUDE_DATE}
           AND dr.reward_date != date(t.created_at,'+9 hours')
         ORDER BY dr.reward_date, t.user_id, t.id`
     ).all<any>()
 
     // ------------------------------------------------------------------------
-    // STEP 3: identify referral_reward TX with mismatched created_at
+    // STEP 3: identify referral_reward backfill TX with mismatched created_at
     // ------------------------------------------------------------------------
     const referralMismatch = await db.prepare(
       `SELECT t.id AS tx_id, t.user_id, t.ref_id, t.amount,
@@ -66640,6 +66659,8 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
          FROM transactions t
          JOIN referral_rewards rr ON CAST(t.ref_id AS INTEGER) = rr.id
         WHERE t.type = 'referral_reward'
+          AND ${MARKER_FILTER}
+          AND rr.reward_date != ${EXCLUDE_DATE}
           AND rr.reward_date != date(t.created_at,'+9 hours')
         ORDER BY rr.reward_date, t.user_id, t.id`
     ).all<any>()
@@ -66725,13 +66746,19 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
       `SELECT COUNT(*) AS n
          FROM transactions t
          JOIN daily_rewards dr ON CAST(t.ref_id AS INTEGER) = dr.id
-        WHERE t.type='daily_qkey' AND dr.reward_date != date(t.created_at,'+9 hours')`
+        WHERE t.type='daily_qkey'
+          AND ${MARKER_FILTER}
+          AND dr.reward_date != ${EXCLUDE_DATE}
+          AND dr.reward_date != date(t.created_at,'+9 hours')`
     ).first<any>()
     const remainingReferral = await db.prepare(
       `SELECT COUNT(*) AS n
          FROM transactions t
          JOIN referral_rewards rr ON CAST(t.ref_id AS INTEGER) = rr.id
-        WHERE t.type='referral_reward' AND rr.reward_date != date(t.created_at,'+9 hours')`
+        WHERE t.type='referral_reward'
+          AND ${MARKER_FILTER}
+          AND rr.reward_date != ${EXCLUDE_DATE}
+          AND rr.reward_date != date(t.created_at,'+9 hours')`
     ).first<any>()
 
     // jeongbun (user 84) after

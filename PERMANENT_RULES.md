@@ -1,8 +1,46 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-19 (★ 영구룰 #지상최고 + #정규시각 KST 08:00 + #관리자보정정당 + #위반type가감 + #이중구조절대금지 + #익일처리코드영구반영 (D 명령) — 사장님 직접 명령)
+**최종 업데이트**: 2026-05-20 (★ 영구룰 #보충TX_created_at = 해당reward_date_고정 — 사장님 직접 명령 / 정분(84) 사례)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
+
+---
+
+## 🔴 영구룰 #보충TX_created_at (2026-05-20 신규 — 사장님 분노)
+
+> **보충/소급 TX 의 `transactions.created_at` 은 반드시 해당 `reward_date` 23:00:00 KST (= UTC 14:00:00) 에 찍을 것. 다른 날짜에 절대로 찍지 말 것.**
+
+### 배경
+- 정분(84) 5/20 사용자 화면에 5/6 reward 보충 2건 + 5/19 reward 보충 2건 = **4건이 5/20 에 표시** → 사장님 격노
+- 사용자 입장에서는 "오늘 4건 들어왔다" 로 보임 → 이중지급 의심
+- DB 정합성만 OK 이고 사용자 화면이 어긋나면 무의미
+
+### 절대 원칙
+1. ❌ 보충/소급 INSERT 시 `created_at = CURRENT_TIMESTAMP` 사용 **절대 금지**
+2. ✅ 반드시 `created_at = reward_date || ' 14:00:00'` (UTC, KST 23:00) 명시 바인딩
+3. ✅ "어제와 똑같이 찍어라" = 어제 cron 패턴 (`reward_date 다음날 08:00 KST` = `reward_date 23:00 UTC`)
+4. ❌ 마커는 `description` 에 남기되, `created_at` 은 절대 마커 실행 시각으로 찍지 말 것
+5. ✅ 정상 cron 정규 지급은 기존 KST 다음날 08:00 패턴 유지 (이건 보충이 아님)
+
+### 코드 패턴 (필수)
+```typescript
+// ❌ 금지 (영구룰 위반)
+INSERT INTO transactions (..., created_at) VALUES (..., CURRENT_TIMESTAMP)
+
+// ✅ 필수 (보충/소급)
+INSERT INTO transactions (..., created_at)
+VALUES (..., ?)  // bind: rewardDate + ' 14:00:00'  (UTC = KST 23:00)
+```
+
+### 적용 대상 endpoint (전체)
+- 모든 `/api/diag/daily-payout-*` 보충/재실행 endpoint
+- 모든 `/api/diag/*-fix*` 보충 endpoint (solbat-stage-*, fix-reset 등)
+- 향후 추가될 모든 backfill/recalc endpoint
+
+### 위반 시
+- 즉시 작업 중단
+- created_at 정정 endpoint 작성 → DRY-RUN → 사장님 결재 → EXEC
+- 사장님께 사과 + 재발 방지 보고
 
 ---
 
