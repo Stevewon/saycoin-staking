@@ -66065,6 +66065,86 @@ app.get('/api/diag/inspect-referee-stakings', async (c) => {
 
 
 // ============================================================
+// 🔴 /api/diag/find-ininshil2
+// '이인실2' 회원의 모든 데이터 추출
+// ============================================================
+app.get('/api/diag/find-ininshil2', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw')
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+
+    // 이름에 '이인실' 들어가는 모든 회원
+    const matches = await db.prepare(`
+      SELECT id, name, email, referrer_id, qkey_balance, usdt_balance
+      FROM users WHERE name LIKE '%이인실%'
+      ORDER BY id
+    `).all()
+
+    const result: any = { users: matches.results, per_user: [] }
+
+    for (const u of (matches.results as any[])) {
+      const uid = u.id
+      const stk = await db.prepare(`
+        SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at,
+               date(start_date, '+9 hours') as start_kst,
+               date(end_date, '+9 hours') as end_kst
+        FROM staking WHERE user_id = ?
+        ORDER BY id
+      `).bind(uid).all()
+
+      const tx520 = await db.prepare(`
+        SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at,
+               datetime(created_at, '+9 hours') as kst_time
+        FROM transactions
+        WHERE user_id = ?
+          AND date(created_at, '+9 hours') = '2026-05-20'
+        ORDER BY created_at, id
+      `).bind(uid).all()
+
+      const dr519 = await db.prepare(`
+        SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+        FROM daily_rewards
+        WHERE user_id = ? AND reward_date = '2026-05-19'
+        ORDER BY id
+      `).bind(uid).all()
+
+      const rrReceived = await db.prepare(`
+        SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, staking_id, reward_date, created_at
+        FROM referral_rewards
+        WHERE referrer_id = ? AND reward_date = '2026-05-19'
+        ORDER BY id
+      `).bind(uid).all()
+
+      const txAllRr = await db.prepare(`
+        SELECT id, type, coin_type, amount, description, ref_id, created_at,
+               datetime(created_at, '+9 hours') as kst_time
+        FROM transactions
+        WHERE user_id = ?
+          AND type = 'referral_reward'
+        ORDER BY created_at, id
+      `).bind(uid).all()
+
+      result.per_user.push({
+        user: u,
+        stakings: stk.results,
+        tx_5_20: tx520.results,
+        dr_5_19: dr519.results,
+        rr_5_19_as_referrer: rrReceived.results,
+        all_referral_reward_tx: txAllRr.results
+      })
+    }
+
+    return c.json({ ok: true, ...result, duration_ms: Date.now() - t0 })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================
 // 🔴 /api/diag/remove-5-19-duplicates
 // 5/19 reward_date 의 dr / rr / tx 중복 행 제거.
 // 정책: (user_id, staking_id) / (referrer_id, referee_id, level, staking_id) 기준
