@@ -67922,4 +67922,236 @@ app.get('/api/diag/audit-user-referral-detail', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/fix-missing-tx-5-14-15-18
+// ----------------------------------------------------------------------------
+// 사장님 결재: (A) 옵션 — TX 109건만 보충 (잔액 영향 0)
+//
+// 배경:
+//   audit-missing-referral-5-14-15-18 결과:
+//     - referral_rewards 누락 0건 ✅ (rr 는 모두 정상, qkey_balance 이미 += 됨)
+//     - transactions 누락 109건 🔴 (5/14:55 + 5/15:52 + 5/18:2)
+//     - 총 누락 금액 74,475 QKEY (잔액에는 이미 반영됨)
+//
+// 처리:
+//   각 누락 rr 마다 transactions INSERT
+//     type = 'referral_reward'
+//     user_id = rr.referrer_id
+//     coin_type = 'QKEY'
+//     amount = rr.reward_amount
+//     description = '추천 보너스 (Level N)' (N = rr.level)
+//     ref_id = rr.id
+//     created_at = rr.reward_date || ' 14:00:00'  ★ 영구룰 #보충TX_created_at
+//                  (= UTC 14:00 = KST 23:00 of reward_date)
+//
+//   ★ users.qkey_balance UPDATE 금지! (이미 cron 에서 += 됨, 재증가 시 이중지급)
+//
+// 안전장치:
+//   - 영구룰 #이중지급 절대 금지 — INSERT 전 EXISTS 가드
+//     (type='referral_reward' AND ref_id=rr.id 이미 있으면 SKIP)
+//   - 영구룰 #보충TX_created_at — created_at 절대 CURRENT_TIMESTAMP 금지
+//
+// confirm token: FIX_MISSING_TX_5_14_15_18_GO
+// ============================================================================
+app.get('/api/diag/fix-missing-tx-5-14-15-18', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const exec = (confirm === 'FIX_MISSING_TX_5_14_15_18_GO')
+    const db = c.env.DB
+
+    const TARGET_DATES = ['2026-05-14', '2026-05-15', '2026-05-18']
+
+    // snapshot before
+    const balBefore = await db.prepare(
+      `SELECT COALESCE(SUM(qkey_balance),0) AS total FROM users`
+    ).first<any>()
+    const txCountBefore = await db.prepare(
+      `SELECT COUNT(*) AS cnt FROM transactions WHERE type='referral_reward'`
+    ).first<any>()
+    const txSumBefore = await db.prepare(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM transactions`
+    ).first<any>()
+
+    // STEP 1: 누락 TX 식별 — referral_rewards 중 ref_id 매칭 TX 없는 것 (대상 날짜만)
+    const ph = TARGET_DATES.map(() => '?').join(',')
+    const rrAll = await db.prepare(`
+      SELECT id, referrer_id, referee_id, staking_id, level, original_amount, reward_amount, reward_date, paid_date, created_at
+        FROM referral_rewards
+       WHERE reward_date IN (${ph})
+       ORDER BY reward_date, id
+    `).bind(...TARGET_DATES).all<any>()
+    const rrList = rrAll.results || []
+
+    // 매칭 TX 있는 rr.id set (단일 쿼리)
+    const rrIds = rrList.map((r: any) => Number(r.id))
+    const txByRefId = new Set<number>()
+    if (rrIds.length > 0) {
+      for (let i = 0; i < rrIds.length; i += 100) {
+        const chunk = rrIds.slice(i, i + 100)
+        const cph = chunk.map(() => '?').join(',')
+        const txRows = await db.prepare(
+          `SELECT CAST(ref_id AS INTEGER) AS rid FROM transactions
+            WHERE type='referral_reward' AND CAST(ref_id AS INTEGER) IN (${cph})`
+        ).bind(...chunk).all<any>()
+        for (const r of (txRows.results || [])) txByRefId.add(Number(r.rid))
+      }
+    }
+
+    // missing list
+    const missingList: any[] = []
+    for (const rr of rrList) {
+      if (!txByRefId.has(Number(rr.id))) {
+        missingList.push(rr)
+      }
+    }
+
+    // by-date / by-referrer 집계
+    const byDate: Record<string, number> = {}
+    const byReferrer: Record<number, { count: number, amount: number, dates: Set<string> }> = {}
+    for (const m of missingList) {
+      const d = String(m.reward_date)
+      byDate[d] = (byDate[d] || 0) + 1
+      const rid = Number(m.referrer_id)
+      if (!byReferrer[rid]) byReferrer[rid] = { count: 0, amount: 0, dates: new Set() }
+      byReferrer[rid].count++
+      byReferrer[rid].amount += Number(m.reward_amount || 0)
+      byReferrer[rid].dates.add(d)
+    }
+
+    // 회원 이름
+    const referrerIds = Object.keys(byReferrer).map(Number)
+    const userNames: Record<number, string> = {}
+    if (referrerIds.length > 0) {
+      const uph = referrerIds.map(() => '?').join(',')
+      const us = await db.prepare(
+        `SELECT id, name FROM users WHERE id IN (${uph})`
+      ).bind(...referrerIds).all<any>()
+      for (const u of (us.results || [])) userNames[Number(u.id)] = String(u.name || '')
+    }
+
+    const summary = {
+      target_dates: TARGET_DATES,
+      total_rr_in_dates: rrList.length,
+      total_missing_tx: missingList.length,
+      total_missing_amount: missingList.reduce((a, b) => a + Number(b.reward_amount || 0), 0),
+      affected_referrer_count: referrerIds.length,
+      by_date: byDate,
+      by_referrer: referrerIds.map(rid => ({
+        user_id: rid,
+        name: userNames[rid] || '',
+        count: byReferrer[rid].count,
+        amount: byReferrer[rid].amount,
+        dates: Array.from(byReferrer[rid].dates).sort()
+      })).sort((a, b) => b.amount - a.amount)
+    }
+
+    // STEP 2: EXEC
+    let execResult: any = null
+    if (exec) {
+      const errors: string[] = []
+      let txInserted = 0
+      let txSkipped = 0  // 가드에 걸려 SKIP
+
+      for (const rr of missingList) {
+        try {
+          // ★ 영구룰 #이중지급 절대 금지 — INSERT 전 가드 (race condition 대비)
+          const existsRow = await db.prepare(`
+            SELECT id FROM transactions
+            WHERE type='referral_reward' AND CAST(ref_id AS INTEGER) = ?
+            LIMIT 1
+          `).bind(Number(rr.id)).first<any>()
+          if (existsRow) {
+            txSkipped++
+            continue
+          }
+
+          // ★ 영구룰 #보충TX_created_at — created_at = reward_date 14:00:00 UTC (= KST 23:00)
+          const createdAtUtc = String(rr.reward_date) + ' 14:00:00'
+          const desc = `추천 보너스 (Level ${rr.level})`
+
+          const r = await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+            VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+          `).bind(
+            Number(rr.referrer_id),
+            Number(rr.reward_amount),
+            desc,
+            Number(rr.id),
+            createdAtUtc
+          ).run()
+
+          if ((r as any)?.meta?.changes > 0) txInserted++
+        } catch (e: any) {
+          errors.push(`rr ${rr.id}: ${String(e?.message || e)}`)
+        }
+      }
+
+      execResult = {
+        tx_inserted: txInserted,
+        tx_skipped_by_guard: txSkipped,
+        errors_count: errors.length,
+        errors_first_10: errors.slice(0, 10)
+      }
+    }
+
+    // snapshot after
+    const balAfter = await db.prepare(
+      `SELECT COALESCE(SUM(qkey_balance),0) AS total FROM users`
+    ).first<any>()
+    const txCountAfter = await db.prepare(
+      `SELECT COUNT(*) AS cnt FROM transactions WHERE type='referral_reward'`
+    ).first<any>()
+    const txSumAfter = await db.prepare(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM transactions`
+    ).first<any>()
+
+    // post verify: missing TX 재계산
+    let postMissing: number | null = null
+    if (exec) {
+      // 단일 쿼리 재검산
+      const txByRefIdPost = new Set<number>()
+      for (let i = 0; i < rrIds.length; i += 100) {
+        const chunk = rrIds.slice(i, i + 100)
+        const cph = chunk.map(() => '?').join(',')
+        const txRows = await db.prepare(
+          `SELECT CAST(ref_id AS INTEGER) AS rid FROM transactions
+            WHERE type='referral_reward' AND CAST(ref_id AS INTEGER) IN (${cph})`
+        ).bind(...chunk).all<any>()
+        for (const r of (txRows.results || [])) txByRefIdPost.add(Number(r.rid))
+      }
+      postMissing = rrList.filter((r: any) => !txByRefIdPost.has(Number(r.id))).length
+    }
+
+    return c.json({
+      ok: true,
+      mode: exec ? 'EXEC' : 'DRY_RUN',
+      confirm_required: 'FIX_MISSING_TX_5_14_15_18_GO',
+      summary,
+      snapshot: {
+        balance_before: balBefore?.total,
+        balance_after: balAfter?.total,
+        balance_delta: Number(balAfter?.total || 0) - Number(balBefore?.total || 0),
+        tx_referral_count_before: txCountBefore?.cnt,
+        tx_referral_count_after: txCountAfter?.cnt,
+        tx_referral_count_delta: Number(txCountAfter?.cnt || 0) - Number(txCountBefore?.cnt || 0),
+        tx_sum_before: txSumBefore?.total,
+        tx_sum_after: txSumAfter?.total,
+        tx_sum_delta: Number(txSumAfter?.total || 0) - Number(txSumBefore?.total || 0)
+      },
+      exec_result: execResult,
+      post_verify: {
+        remaining_missing_tx: postMissing
+      },
+      missing_preview_first_20: missingList.slice(0, 20),
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
