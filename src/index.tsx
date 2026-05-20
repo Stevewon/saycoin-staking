@@ -65617,4 +65617,207 @@ app.get('/api/diag/daily-payout-5-19-fix-reset', async (c) => {
 })
 
 
+// ============================================================
+// 🔴 /api/diag/find-duplicate-suspect
+// 캡처: 같은 회원의 5/20 거래내역에 L1=3000, L2=630 추천 보너스가
+// 06:44 [solbat-st...] 와 07:12 [daily-pa...] 두 번 표시됨.
+// 일일 배당 +15000 도 07:12 에 있음.
+// → 이 회원 식별 + 06:44 / 07:12 의 정확한 마커와 reward_date 확인.
+// ============================================================
+app.get('/api/diag/find-duplicate-suspect', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw')
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+
+    // 1) 5/20 KST 에 일일 배당 15000 받은 회원 식별
+    //    KST = UTC+9. 5/20 KST 00:00 ~ 5/20 KST 23:59 → UTC 5/19 15:00 ~ 5/20 14:59
+    const dailyRcv = await db.prepare(`
+      SELECT t.id as tx_id, t.user_id, u.name as user_name, t.amount, t.currency,
+             t.description, t.reference_id, t.created_at,
+             datetime(t.created_at, '+9 hours') as kst_time
+      FROM transactions t LEFT JOIN users u ON t.user_id = u.id
+      WHERE t.type = 'daily_qkey'
+        AND t.currency = 'QKEY'
+        AND t.amount = 15000
+        AND date(t.created_at, '+9 hours') = '2026-05-20'
+      ORDER BY t.created_at, t.user_id
+    `).all()
+
+    // 2) 5/20 KST 에 L1=3000 받은 회원
+    const l1_3000 = await db.prepare(`
+      SELECT t.id as tx_id, t.user_id, u.name as user_name, t.amount,
+             t.description, t.reference_id, t.created_at,
+             datetime(t.created_at, '+9 hours') as kst_time
+      FROM transactions t LEFT JOIN users u ON t.user_id = u.id
+      WHERE t.type = 'referral_reward'
+        AND t.currency = 'QKEY'
+        AND t.amount = 3000
+        AND t.description LIKE '%Level 1%'
+        AND date(t.created_at, '+9 hours') = '2026-05-20'
+      ORDER BY t.user_id, t.created_at
+    `).all()
+
+    // 3) 5/20 KST 에 L2=630 받은 회원
+    const l2_630 = await db.prepare(`
+      SELECT t.id as tx_id, t.user_id, u.name as user_name, t.amount,
+             t.description, t.reference_id, t.created_at,
+             datetime(t.created_at, '+9 hours') as kst_time
+      FROM transactions t LEFT JOIN users u ON t.user_id = u.id
+      WHERE t.type = 'referral_reward'
+        AND t.currency = 'QKEY'
+        AND t.amount = 630
+        AND t.description LIKE '%Level 2%'
+        AND date(t.created_at, '+9 hours') = '2026-05-20'
+      ORDER BY t.user_id, t.created_at
+    `).all()
+
+    // 4) ⭐ 핵심: 같은 (user_id, amount, type, level) 조합이 5/20 에 2회 이상 등장한 것
+    const duplicates = await db.prepare(`
+      SELECT user_id,
+             COUNT(*) as cnt,
+             GROUP_CONCAT(id) as tx_ids,
+             GROUP_CONCAT(amount) as amts,
+             GROUP_CONCAT(SUBSTR(description, 1, 80), ' || ') as descs,
+             GROUP_CONCAT(datetime(created_at, '+9 hours'), ' | ') as kst_times
+      FROM transactions
+      WHERE type = 'referral_reward'
+        AND currency = 'QKEY'
+        AND amount = 3000
+        AND description LIKE '%Level 1%'
+        AND date(created_at, '+9 hours') = '2026-05-20'
+      GROUP BY user_id
+      HAVING COUNT(*) >= 2
+      ORDER BY cnt DESC, user_id
+    `).all()
+
+    const duplicates_l2 = await db.prepare(`
+      SELECT user_id,
+             COUNT(*) as cnt,
+             GROUP_CONCAT(id) as tx_ids,
+             GROUP_CONCAT(amount) as amts,
+             GROUP_CONCAT(SUBSTR(description, 1, 80), ' || ') as descs,
+             GROUP_CONCAT(datetime(created_at, '+9 hours'), ' | ') as kst_times
+      FROM transactions
+      WHERE type = 'referral_reward'
+        AND currency = 'QKEY'
+        AND amount = 630
+        AND description LIKE '%Level 2%'
+        AND date(created_at, '+9 hours') = '2026-05-20'
+      GROUP BY user_id
+      HAVING COUNT(*) >= 2
+      ORDER BY cnt DESC, user_id
+    `).all()
+
+    // 5) ⭐ 동시 의심: 같은 회원이 L1=3000 과 L2=630 둘 다 받았고 + daily=15000 도 받은 케이스
+    const suspectUsers = await db.prepare(`
+      SELECT t1.user_id, u.name as user_name,
+             COUNT(DISTINCT t1.id) as l1_3000_cnt,
+             GROUP_CONCAT(DISTINCT t1.id) as l1_tx_ids,
+             GROUP_CONCAT(DISTINCT SUBSTR(t1.description, 1, 60), ' || ') as l1_descs
+      FROM transactions t1
+      LEFT JOIN users u ON t1.user_id = u.id
+      WHERE t1.type = 'referral_reward'
+        AND t1.currency = 'QKEY'
+        AND t1.amount = 3000
+        AND t1.description LIKE '%Level 1%'
+        AND date(t1.created_at, '+9 hours') = '2026-05-20'
+      GROUP BY t1.user_id
+      ORDER BY l1_3000_cnt DESC, t1.user_id
+    `).all()
+
+    // 6) 'solbat' 마커 가 description 에 들어간 5/20 TX 전수
+    const solbatTx = await db.prepare(`
+      SELECT t.id, t.user_id, u.name as user_name, t.type, t.amount, t.currency,
+             t.description, t.reference_id, t.created_at,
+             datetime(t.created_at, '+9 hours') as kst_time
+      FROM transactions t LEFT JOIN users u ON t.user_id = u.id
+      WHERE t.description LIKE '%solbat%'
+        AND date(t.created_at, '+9 hours') = '2026-05-20'
+      ORDER BY t.user_id, t.created_at
+    `).all()
+
+    // 7) referral_reward 전체에서 description 에 solbat 포함된 것 (날짜 무관) — 마커가 진짜 있는지
+    const solbatTxAll = await db.prepare(`
+      SELECT COUNT(*) as cnt
+      FROM transactions
+      WHERE description LIKE '%solbat%' AND type = 'referral_reward'
+    `).first()
+
+    // 8) daily_rewards 에서 description 에 solbat 포함 (reward_date 별 분포)
+    const solbatDr = await db.prepare(`
+      SELECT reward_date, COUNT(*) as cnt
+      FROM daily_rewards
+      WHERE description LIKE '%solbat%'
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).all()
+
+    // 9) referral_rewards 에서 description 에 solbat 포함 (reward_date 별)
+    const solbatRr = await db.prepare(`
+      SELECT reward_date, COUNT(*) as cnt
+      FROM referral_rewards
+      WHERE description LIKE '%solbat%'
+      GROUP BY reward_date
+      ORDER BY reward_date
+    `).all()
+
+    return c.json({
+      ok: true,
+      timestamp_kst: new Date(Date.now() + 9*3600*1000).toISOString().replace('T',' ').substring(0,19),
+
+      step1_daily_15000_recipients_5_20: {
+        count: (dailyRcv.results as any[])?.length || 0,
+        rows: dailyRcv.results
+      },
+
+      step2_l1_3000_recipients_5_20: {
+        count: (l1_3000.results as any[])?.length || 0,
+        rows: l1_3000.results
+      },
+
+      step3_l2_630_recipients_5_20: {
+        count: (l2_630.results as any[])?.length || 0,
+        rows: l2_630.results
+      },
+
+      step4_users_with_2plus_l1_3000_on_5_20: {
+        count: (duplicates.results as any[])?.length || 0,
+        rows: duplicates.results
+      },
+
+      step4b_users_with_2plus_l2_630_on_5_20: {
+        count: (duplicates_l2.results as any[])?.length || 0,
+        rows: duplicates_l2.results
+      },
+
+      step5_l1_3000_per_user_aggregated: {
+        rows: suspectUsers.results
+      },
+
+      step6_solbat_marker_tx_on_5_20: {
+        count: (solbatTx.results as any[])?.length || 0,
+        rows: solbatTx.results
+      },
+
+      step7_solbat_referral_reward_all_tx_count: solbatTxAll,
+
+      step8_solbat_marker_dr_by_reward_date: {
+        rows: solbatDr.results
+      },
+
+      step9_solbat_marker_rr_by_reward_date: {
+        rows: solbatRr.results
+      },
+
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
