@@ -68154,4 +68154,303 @@ app.get('/api/diag/fix-missing-tx-5-14-15-18', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/audit-referral-completeness
+// ----------------------------------------------------------------------------
+// 사장님 명령 (2026-05-20):
+//   "솔밧(44) 의 경우에 4, 6, 7, 8일자, 18일자 모두 일부 누락이 있다!
+//    무조건 솔밧의 1대는 1050 2대는 1950 이어야 하는데 누락이 있어!!!!
+//    왜 내 영구룰을 자꾸 어기지? 전수 조사하고 이와 유사한 사람들 다 찾아내!"
+//
+// 진단:
+//   특정 회원의 특정 reward_date 에서 expected rr (L1+L2 모두) vs actual rr 비교
+//   - expected = active referee staking 모두 × (L1=20%, L2=10%)
+//   - actual = referral_rewards 테이블의 그 referrer 의 그 reward_date row
+//   - missing = expected 에 있는데 actual 에 없는 것 (전수조사)
+//
+// 기간:
+//   전체 활동 기간 (2026-05-04 ~ 2026-05-19, 평일만 — 휴일 무배당 룰)
+//
+// 출력:
+//   - by_user: 회원별 누락 (rr 누락 + TX 누락 분리)
+//   - by_date: 날짜별 통계
+//   - solbat_focus: 솔밧(44) 상세
+//
+// read-only audit. EXEC 별도 endpoint.
+// ============================================================================
+app.get('/api/diag/audit-referral-completeness', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    // 기본: 5/4 ~ 5/19 평일 (휴일 제외). param 으로 단일 날짜만 처리 가능
+    const dateParam = c.req.query('date') || ''
+    const ALL_DATES = [
+      '2026-05-04', // 월
+      '2026-05-05', // 화
+      '2026-05-06', // 수
+      '2026-05-07', // 목
+      '2026-05-08', // 금
+      // 5/9 토, 5/10 일 — 휴일 제외
+      '2026-05-11', // 월
+      '2026-05-12', // 화
+      '2026-05-13', // 수
+      '2026-05-14', // 목
+      '2026-05-15', // 금
+      // 5/16 토, 5/17 일 — 휴일 제외
+      '2026-05-18', // 월
+      '2026-05-19'  // 화
+    ]
+    const TARGET_DATES = dateParam ? [dateParam] : ALL_DATES
+
+    // ★ 최적화: users 메모리 로드
+    const allUsers = await db.prepare(`SELECT id, name, referrer_id FROM users`).all<any>()
+    const userMap = new Map<number, { id: number, name: string, referrer_id: number | null }>()
+    for (const u of (allUsers.results || [])) {
+      userMap.set(Number(u.id), { id: Number(u.id), name: u.name || '', referrer_id: u.referrer_id != null ? Number(u.referrer_id) : null })
+    }
+
+    type Expected = {
+      reward_date: string
+      referrer_id: number
+      referee_id: number
+      staking_id: number
+      level: number
+      original_amount: number
+      reward_amount: number
+    }
+
+    // 결과 구조
+    const byDate: Record<string, {
+      active_staking: number
+      expected_total: number
+      expected_L1: number
+      expected_L2: number
+      actual_total: number
+      missing_rr: number
+      missing_tx: number
+    }> = {}
+
+    // 회원별 누락 집계: { referrer_id: { rr_missing: Expected[], tx_missing: any[] } }
+    const byUser: Record<number, {
+      user_id: number
+      name: string
+      rr_missing: Expected[]
+      tx_missing: any[]
+      rr_missing_amount: number
+      tx_missing_amount: number
+      affected_dates: Set<string>
+    }> = {}
+
+    const ensureUser = (rid: number) => {
+      if (!byUser[rid]) {
+        byUser[rid] = {
+          user_id: rid,
+          name: userMap.get(rid)?.name || '',
+          rr_missing: [],
+          tx_missing: [],
+          rr_missing_amount: 0,
+          tx_missing_amount: 0,
+          affected_dates: new Set()
+        }
+      }
+      return byUser[rid]
+    }
+
+    for (const REWARD_DATE of TARGET_DATES) {
+      // STEP 1: active staking on date
+      const activeStakings = await db.prepare(`
+        SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate
+          FROM staking s
+         WHERE s.status = 'active'
+           AND date(s.start_date, '+9 hours') <= ?
+           AND date(s.end_date,   '+9 hours') >= ?
+         ORDER BY s.id
+      `).bind(REWARD_DATE, REWARD_DATE).all<any>()
+      const stakingList = activeStakings.results || []
+
+      const activeUserIds = new Set<number>()
+      for (const stk of stakingList) activeUserIds.add(Number(stk.user_id))
+
+      // STEP 2: expected rr (전수)
+      const expectedRr: Expected[] = []
+      for (const stk of stakingList) {
+        const refereeId = Number(stk.user_id)
+        const stakingId = Number(stk.staking_id)
+        const amount = Number(stk.amount || 0)
+        const dailyRate = Number(stk.daily_rate || 0)
+        const qkeyAmount = Math.round(amount * dailyRate * 150)
+        if (qkeyAmount <= 0) continue
+
+        const refereeUser = userMap.get(refereeId)
+        const l1Id = refereeUser?.referrer_id ?? null
+        if (!l1Id) continue
+
+        if (activeUserIds.has(l1Id)) {
+          expectedRr.push({
+            reward_date: REWARD_DATE,
+            referrer_id: l1Id,
+            referee_id: refereeId,
+            staking_id: stakingId,
+            level: 1,
+            original_amount: qkeyAmount,
+            reward_amount: Math.round(qkeyAmount * 0.20)
+          })
+
+          const l1User = userMap.get(l1Id)
+          const l2Id = l1User?.referrer_id ?? null
+          if (l2Id && activeUserIds.has(l2Id)) {
+            expectedRr.push({
+              reward_date: REWARD_DATE,
+              referrer_id: l2Id,
+              referee_id: refereeId,
+              staking_id: stakingId,
+              level: 2,
+              original_amount: qkeyAmount,
+              reward_amount: Math.round(qkeyAmount * 0.10)
+            })
+          }
+        }
+      }
+
+      // STEP 3: actual rr on date
+      const actualRr = await db.prepare(`
+        SELECT id, referrer_id, referee_id, staking_id, level, original_amount, reward_amount, reward_date, paid_date, created_at
+          FROM referral_rewards
+         WHERE reward_date = ?
+      `).bind(REWARD_DATE).all<any>()
+      const actualList = actualRr.results || []
+
+      // STEP 4: missing rr 검출
+      const missingRrThisDate: Expected[] = []
+      for (const exp of expectedRr) {
+        const match = actualList.find((a: any) =>
+          Number(a.referrer_id) === exp.referrer_id &&
+          Number(a.referee_id) === exp.referee_id &&
+          Number(a.level) === exp.level &&
+          (
+            (a.staking_id != null && Number(a.staking_id) === exp.staking_id)
+            ||
+            (a.staking_id == null && Number(a.original_amount) === exp.original_amount)
+          )
+        )
+        if (!match) missingRrThisDate.push(exp)
+      }
+
+      // STEP 5: missing TX 검출 (actual rr 중 TX 없는 것)
+      const actualRrIds = actualList.map((r: any) => Number(r.id))
+      const txByRefId = new Set<number>()
+      if (actualRrIds.length > 0) {
+        for (let i = 0; i < actualRrIds.length; i += 100) {
+          const chunk = actualRrIds.slice(i, i + 100)
+          const ph = chunk.map(() => '?').join(',')
+          const txRows = await db.prepare(
+            `SELECT CAST(ref_id AS INTEGER) AS rid FROM transactions
+              WHERE type='referral_reward' AND CAST(ref_id AS INTEGER) IN (${ph})`
+          ).bind(...chunk).all<any>()
+          for (const r of (txRows.results || [])) txByRefId.add(Number(r.rid))
+        }
+      }
+      const missingTxThisDate: any[] = []
+      for (const rr of actualList) {
+        if (!txByRefId.has(Number(rr.id))) {
+          missingTxThisDate.push({
+            rr_id: rr.id,
+            referrer_id: rr.referrer_id,
+            referee_id: rr.referee_id,
+            level: rr.level,
+            reward_amount: rr.reward_amount,
+            reward_date: rr.reward_date,
+            staking_id: rr.staking_id,
+            original_amount: rr.original_amount
+          })
+        }
+      }
+
+      // 집계
+      byDate[REWARD_DATE] = {
+        active_staking: stakingList.length,
+        expected_total: expectedRr.length,
+        expected_L1: expectedRr.filter(e => e.level === 1).length,
+        expected_L2: expectedRr.filter(e => e.level === 2).length,
+        actual_total: actualList.length,
+        missing_rr: missingRrThisDate.length,
+        missing_tx: missingTxThisDate.length
+      }
+
+      for (const m of missingRrThisDate) {
+        const u = ensureUser(m.referrer_id)
+        u.rr_missing.push(m)
+        u.rr_missing_amount += m.reward_amount
+        u.affected_dates.add(REWARD_DATE)
+      }
+      for (const t of missingTxThisDate) {
+        const u = ensureUser(Number(t.referrer_id))
+        u.tx_missing.push(t)
+        u.tx_missing_amount += Number(t.reward_amount || 0)
+        u.affected_dates.add(REWARD_DATE)
+      }
+    }
+
+    // 회원별 결과 sort
+    const userResults = Object.values(byUser)
+      .map(u => ({
+        user_id: u.user_id,
+        name: u.name,
+        rr_missing_count: u.rr_missing.length,
+        rr_missing_amount: u.rr_missing_amount,
+        tx_missing_count: u.tx_missing.length,
+        tx_missing_amount: u.tx_missing_amount,
+        affected_dates: Array.from(u.affected_dates).sort(),
+        rr_missing: u.rr_missing,
+        tx_missing: u.tx_missing
+      }))
+      .sort((a, b) => (b.rr_missing_amount + b.tx_missing_amount) - (a.rr_missing_amount + a.tx_missing_amount))
+
+    // 솔밧(44) focus
+    const solbatFocus = byUser[44] ? {
+      user_id: 44,
+      name: byUser[44].name,
+      rr_missing_count: byUser[44].rr_missing.length,
+      rr_missing_amount: byUser[44].rr_missing_amount,
+      tx_missing_count: byUser[44].tx_missing.length,
+      tx_missing_amount: byUser[44].tx_missing_amount,
+      affected_dates: Array.from(byUser[44].affected_dates).sort(),
+      rr_missing_detail: byUser[44].rr_missing,
+      tx_missing_detail: byUser[44].tx_missing
+    } : { user_id: 44, name: '강인팔', note: '누락 없음 (이번 audit 범위)' }
+
+    // 전체 합계
+    let totalMissingRr = 0, totalMissingTx = 0, totalMissingRrAmt = 0, totalMissingTxAmt = 0
+    for (const u of Object.values(byUser)) {
+      totalMissingRr += u.rr_missing.length
+      totalMissingTx += u.tx_missing.length
+      totalMissingRrAmt += u.rr_missing_amount
+      totalMissingTxAmt += u.tx_missing_amount
+    }
+
+    return c.json({
+      ok: true,
+      target_dates: TARGET_DATES,
+      summary: {
+        total_dates_audited: TARGET_DATES.length,
+        total_missing_rr_count: totalMissingRr,
+        total_missing_rr_amount: totalMissingRrAmt,
+        total_missing_tx_count: totalMissingTx,
+        total_missing_tx_amount: totalMissingTxAmt,
+        affected_user_count: Object.keys(byUser).length
+      },
+      by_date: byDate,
+      by_user: userResults,
+      solbat_focus: solbatFocus,
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
