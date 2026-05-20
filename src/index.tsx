@@ -64772,7 +64772,6 @@ app.get('/api/diag/fix-usdt-amount-permanent-rule', async (c) => {
         dr.staking_id,
         dr.reward_date,
         dr.usdt_amount AS current_value,
-        dr.description,
         s.amount AS staking_amount,
         s.daily_rate AS daily_rate,
         ROUND(s.amount * s.daily_rate * 150, 6) AS corrected_qkey
@@ -64816,7 +64815,6 @@ app.get('/api/diag/fix-usdt-amount-permanent-rule', async (c) => {
           daily_rate: Number(r.daily_rate),
           current_wrong: cur,
           corrected_qkey: correct,
-          description: r.description,
         })
       } else {
         suspicious.push({
