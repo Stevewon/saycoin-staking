@@ -68702,6 +68702,275 @@ app.get('/api/diag/fix-missing-l12-tx-all', async (c) => {
 
 
 // ============================================================================
+// /api/diag/solbat-bottomup-backfill
+// ----------------------------------------------------------------------------
+// 🚨 영구룰 #바텀업정산 — 솔밧(user_id=44) 5/6~5/20 paid_date 누락분 일괄 INSERT
+//
+// 사장님 결재 (2026-05-20):
+//   - 솔밧 트리: B 본인 + L1 7명 + L2 7명 (각 staking 1건씩 fully active)
+//   - 11 paid_date 각각에 정확히 3,750 QKEY (B 750 + L1 1050 + L2 1950)
+//   - 총 165건 = 11일 × 15건 (B 1 + L1 7 + L2 7) = 41,250 QKEY
+//
+// 영구룰 #정규시각: created_at = paid_date 전일 23:00:00 UTC (B,L1,L2 동일)
+// 영구룰 #익일처리: 평일발생 → 다음영업일 paid, 토/일/공휴일 발생 없음
+// 영구룰 #중복지급금지: EXISTS 가드 (user_id, level, referee_id, referee_staking_id, reward_date)
+// 영구룰 #이중구조절대금지: dr/rr ↔ tx atomic batch
+// ============================================================================
+app.get('/api/diag/solbat-bottomup-backfill', async (c) => {
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+
+    const dryRun = c.req.query('dry_run') === 'true' || !c.req.query('confirm')
+    const confirm = c.req.query('confirm') || ''
+    if (!dryRun && confirm !== 'SOLBAT_BOTTOMUP_BACKFILL_GO') {
+      return c.json({ error: 'confirm token required: SOLBAT_BOTTOMUP_BACKFILL_GO' }, 400)
+    }
+
+    const db = c.env.DB
+    const SOLBAT = 44
+    const SOLBAT_STK = 46  // 솔밧 본인 staking
+
+    // ===== 영구룰 #바텀업 결재 데이터 (사장님 OK 2026-05-20) =====
+    // 11 paid_date × (B 1건 + L1 7건 + L2 7건) = 165 entries
+    // user 76 staking#73 = amount=10000 rate=0.01 → daily=15000, L2 보상=1500
+    // 그 외 모두 amount=1000 rate=0.005 → daily=750, L1=150, L2=75
+
+    // L1 트리: (referee_id, referee_staking_id, referee_daily, l1_amount)
+    const L1_TREE = [
+      { uid: 45, sid: 53, daily: 750, l1: 150 },
+      { uid: 47, sid: 47, daily: 750, l1: 150 },
+      { uid: 48, sid: 48, daily: 750, l1: 150 },
+      { uid: 50, sid: 47, daily: 750, l1: 150 },  // 주의: user50 staking 확인 필요
+      { uid: 52, sid: 64, daily: 750, l1: 150 },
+      { uid: 54, sid: 56, daily: 750, l1: 150 },
+      { uid: 89, sid: 92, daily: 750, l1: 150 },
+    ]
+    // L2 트리
+    const L2_TREE = [
+      { uid: 46, sid: 54, daily: 750, l2: 75 },
+      { uid: 49, sid: 49, daily: 750, l2: 75 },
+      { uid: 73, sid: 71, daily: 750, l2: 75 },
+      { uid: 74, sid: 0, daily: 750, l2: 75 },   // user74: staking 미확인 — 사장님 결재상 7건 가정
+      { uid: 76, sid: 73, daily: 15000, l2: 1500 },  // ★ rate=0.01 amount=10000
+      { uid: 90, sid: 93, daily: 750, l2: 75 },
+      { uid: 93, sid: 98, daily: 750, l2: 75 },
+    ]
+    // 11 paid_date 매트릭스
+    const SCHEDULE = [
+      { reward_date: '2026-05-04', paid_date: '2026-05-06' },
+      { reward_date: '2026-05-06', paid_date: '2026-05-07' },
+      { reward_date: '2026-05-07', paid_date: '2026-05-08' },
+      { reward_date: '2026-05-08', paid_date: '2026-05-11' },
+      { reward_date: '2026-05-11', paid_date: '2026-05-12' },
+      { reward_date: '2026-05-12', paid_date: '2026-05-13' },
+      { reward_date: '2026-05-13', paid_date: '2026-05-14' },
+      { reward_date: '2026-05-14', paid_date: '2026-05-15' },
+      { reward_date: '2026-05-15', paid_date: '2026-05-18' },
+      { reward_date: '2026-05-18', paid_date: '2026-05-19' },
+      { reward_date: '2026-05-19', paid_date: '2026-05-20' },
+    ]
+
+    // L1 staking_id 정확히 가져오기 (DB 조회)
+    const stkRows = await db.prepare(`
+      SELECT id, user_id, amount, daily_rate FROM staking
+      WHERE user_id IN (45,47,48,50,52,54,89,46,49,73,74,76,90,93)
+        AND status = 'active'
+      ORDER BY id ASC
+    `).all()
+    const stkByUser: Record<number, any[]> = {}
+    for (const r of stkRows.results as any[]) {
+      if (!stkByUser[r.user_id]) stkByUser[r.user_id] = []
+      stkByUser[r.user_id].push(r)
+    }
+
+    // 솔밧 본인 staking 검증
+    const sbStk = await db.prepare(`SELECT id, amount, daily_rate FROM staking WHERE id=? AND user_id=?`).bind(SOLBAT_STK, SOLBAT).first()
+    if (!sbStk) return c.json({ error: 'Solbat staking#46 not found' }, 404)
+    const sbDaily = Math.round(Number(sbStk.amount) * Number(sbStk.daily_rate) * 150)
+
+    // ===== EXISTS 가드: 이미 존재하는 (level, referee_staking_id, reward_date) 스킵 =====
+    type Plan = {
+      kind: 'B' | 'L1' | 'L2',
+      reward_date: string, paid_date: string, created_at_utc: string,
+      referee_id?: number, referee_staking_id?: number,
+      amount: number, original_amount: number, level: number,
+      description: string
+    }
+    const plan: Plan[] = []
+    const skipped: any[] = []
+
+    function createdAtUtc(paidDate: string): string {
+      // KST paid_date 08:00 = UTC (paid_date - 1) 23:00:00
+      const d = new Date(paidDate + 'T08:00:00+09:00')
+      return d.toISOString().slice(0, 19).replace('T', ' ')
+    }
+
+    for (const s of SCHEDULE) {
+      const cAt = createdAtUtc(s.paid_date)
+
+      // --- B 본인 daily ---
+      const sbExist = await db.prepare(`
+        SELECT id FROM daily_rewards
+        WHERE user_id=? AND staking_id=? AND reward_date=?
+      `).bind(SOLBAT, SOLBAT_STK, s.reward_date).first()
+      if (sbExist) {
+        skipped.push({ kind: 'B', reward_date: s.reward_date, reason: 'dr exists', id: sbExist.id })
+      } else {
+        plan.push({
+          kind: 'B', reward_date: s.reward_date, paid_date: s.paid_date,
+          created_at_utc: cAt, amount: sbDaily, original_amount: sbDaily, level: -1,
+          referee_staking_id: SOLBAT_STK,
+          description: `일일 보상 (${s.reward_date})`
+        })
+      }
+
+      // --- L1 ---
+      for (const ref of L1_TREE) {
+        // staking_id 가져오기
+        const sList = stkByUser[ref.uid] || []
+        // 첫 번째 active staking 사용
+        const refStk = sList[0]
+        if (!refStk) {
+          skipped.push({ kind: 'L1', referee_id: ref.uid, reward_date: s.reward_date, reason: 'no active staking' })
+          continue
+        }
+        const refDaily = Math.round(Number(refStk.amount) * Number(refStk.daily_rate) * 150)
+        const l1Amt = Math.round(refDaily * 0.20)
+        const exist = await db.prepare(`
+          SELECT id FROM referral_rewards
+          WHERE referrer_id=? AND referee_id=? AND staking_id=? AND reward_date=? AND level=1
+        `).bind(SOLBAT, ref.uid, refStk.id, s.reward_date).first()
+        if (exist) {
+          skipped.push({ kind: 'L1', referee_id: ref.uid, reward_date: s.reward_date, reason: 'rr exists', id: exist.id })
+        } else {
+          plan.push({
+            kind: 'L1', reward_date: s.reward_date, paid_date: s.paid_date,
+            created_at_utc: cAt, referee_id: ref.uid, referee_staking_id: refStk.id,
+            amount: l1Amt, original_amount: refDaily, level: 1,
+            description: `Level 1 referral bonus (${refDaily} QKEY x 20%, accrued ${s.reward_date} paid ${s.paid_date})`
+          })
+        }
+      }
+
+      // --- L2 ---
+      for (const ref of L2_TREE) {
+        const sList = stkByUser[ref.uid] || []
+        const refStk = sList[0]
+        if (!refStk) {
+          skipped.push({ kind: 'L2', referee_id: ref.uid, reward_date: s.reward_date, reason: 'no active staking' })
+          continue
+        }
+        const refDaily = Math.round(Number(refStk.amount) * Number(refStk.daily_rate) * 150)
+        const l2Amt = Math.round(refDaily * 0.10)
+        const exist = await db.prepare(`
+          SELECT id FROM referral_rewards
+          WHERE referrer_id=? AND referee_id=? AND staking_id=? AND reward_date=? AND level=2
+        `).bind(SOLBAT, ref.uid, refStk.id, s.reward_date).first()
+        if (exist) {
+          skipped.push({ kind: 'L2', referee_id: ref.uid, reward_date: s.reward_date, reason: 'rr exists', id: exist.id })
+        } else {
+          plan.push({
+            kind: 'L2', reward_date: s.reward_date, paid_date: s.paid_date,
+            created_at_utc: cAt, referee_id: ref.uid, referee_staking_id: refStk.id,
+            amount: l2Amt, original_amount: refDaily, level: 2,
+            description: `Level 2 referral bonus (${refDaily} QKEY x 10%, accrued ${s.reward_date} paid ${s.paid_date})`
+          })
+        }
+      }
+    }
+
+    const totalAmount = plan.reduce((s, p) => s + p.amount, 0)
+    const byPaidDate: Record<string, { B: number, L1: number, L2: number, total: number, count: number }> = {}
+    for (const p of plan) {
+      const pd = p.paid_date
+      if (!byPaidDate[pd]) byPaidDate[pd] = { B: 0, L1: 0, L2: 0, total: 0, count: 0 }
+      if (p.kind === 'B') byPaidDate[pd].B += p.amount
+      if (p.kind === 'L1') byPaidDate[pd].L1 += p.amount
+      if (p.kind === 'L2') byPaidDate[pd].L2 += p.amount
+      byPaidDate[pd].total += p.amount
+      byPaidDate[pd].count += 1
+    }
+
+    const userBefore = await db.prepare(`SELECT qkey_balance FROM users WHERE id=?`).bind(SOLBAT).first() as any
+
+    if (dryRun) {
+      return c.json({
+        success: true, mode: 'DRY_RUN',
+        user_id: SOLBAT,
+        balance_before: Number(userBefore?.qkey_balance || 0),
+        balance_after_expected: Number(userBefore?.qkey_balance || 0) + totalAmount,
+        plan_count: plan.length,
+        skipped_count: skipped.length,
+        total_amount_qkey: totalAmount,
+        by_paid_date: byPaidDate,
+        plan_sample: plan.slice(0, 20),
+        skipped_sample: skipped.slice(0, 20),
+        confirm_token: 'SOLBAT_BOTTOMUP_BACKFILL_GO'
+      })
+    }
+
+    // ===== EXEC: atomic batch =====
+    const stmts: any[] = []
+    for (const p of plan) {
+      if (p.kind === 'B') {
+        // daily_rewards INSERT
+        stmts.push(db.prepare(`
+          INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(SOLBAT, SOLBAT_STK, p.amount, p.reward_date, p.paid_date, p.created_at_utc))
+        // transactions INSERT (ref_id = NULL — POST-INSERT 에서 채울 수도 있으나 dr는 직접 ref 없음)
+        stmts.push(db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, created_at)
+          VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?)
+        `).bind(SOLBAT, p.amount, p.description, p.created_at_utc))
+      } else {
+        // referral_rewards INSERT
+        stmts.push(db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, staking_id, level, original_amount, reward_amount, reward_date, paid_date, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(SOLBAT, p.referee_id, p.referee_staking_id, p.level, p.original_amount, p.amount, p.reward_date, p.paid_date, p.created_at_utc))
+        // transactions INSERT
+        stmts.push(db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, created_at)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?)
+        `).bind(SOLBAT, p.amount, p.description, p.created_at_utc))
+      }
+    }
+    // 잔액 UPDATE
+    stmts.push(db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(totalAmount, SOLBAT))
+
+    const batchResults = await db.batch(stmts)
+
+    // POST-VERIFY
+    const userAfter = await db.prepare(`SELECT qkey_balance FROM users WHERE id=?`).bind(SOLBAT).first() as any
+    const drAfter = await db.prepare(`SELECT COUNT(*) as cnt, COALESCE(SUM(usdt_amount),0) as sum FROM daily_rewards WHERE user_id=?`).bind(SOLBAT).first() as any
+    const rrAfter = await db.prepare(`SELECT COUNT(*) as cnt, COALESCE(SUM(reward_amount),0) as sum FROM referral_rewards WHERE referrer_id=?`).bind(SOLBAT).first() as any
+    const txAfter = await db.prepare(`SELECT COUNT(*) as cnt, COALESCE(SUM(amount),0) as sum FROM transactions WHERE user_id=? AND type IN ('daily_qkey','referral_reward')`).bind(SOLBAT).first() as any
+
+    return c.json({
+      success: true, mode: 'EXEC',
+      user_id: SOLBAT,
+      balance_before: Number(userBefore?.qkey_balance || 0),
+      balance_after: Number(userAfter?.qkey_balance || 0),
+      balance_delta: Number(userAfter?.qkey_balance || 0) - Number(userBefore?.qkey_balance || 0),
+      expected_delta: totalAmount,
+      delta_match: (Number(userAfter?.qkey_balance || 0) - Number(userBefore?.qkey_balance || 0)) === totalAmount,
+      inserted_count: plan.length,
+      skipped_count: skipped.length,
+      batch_results_count: batchResults.length,
+      dr_total: drAfter,
+      rr_total: rrAfter,
+      tx_total: txAfter,
+      by_paid_date: byPaidDate
+    })
+  } catch (err: any) {
+    return c.json({ error: 'internal_error', message: String(err?.message || err), stack: String(err?.stack || '') }, 500)
+  }
+})
+
+
+// ============================================================================
 // /api/diag/fix-l12-createdat-by-user
 // ----------------------------------------------------------------------------
 // 🚨 영구룰 #정규시각 위반 보정 (CRITICAL)
