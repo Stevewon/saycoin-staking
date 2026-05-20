@@ -65091,4 +65091,244 @@ app.get('/api/diag/fix-bangsh-balance', async (c) => {
 })
 
 
+// ============================================================================
+// 🔴 /api/diag/fix-bangsh-swap-tx
+// 방승훈 (uid=33) 5/20 실제 swap TX 누락 보충 (옵션 B)
+//
+// 사실관계 (사장님 확인):
+//   방승훈은 5/20 오늘 정상적으로 QKEY → USDT swap 실행
+//   - QKEY 12,000 → USDT 80 (환율 1 USDT = 150 QKEY)
+//   - 잔액 UPDATE 정상: qkey 12000→0, usdt 120→200
+//   - 하지만 transactions 테이블에 swap TX 2건 INSERT 누락 (swap API 버그)
+//
+// 제가 한 잘못된 fix (fix-bangsh-balance 옵션 A):
+//   사용자 실제 swap 을 무효처리 → 사장님 의도와 정반대
+//   현재 잔액: qkey=12000, usdt=120 (사용자 swap 전 상태로 잘못 복구됨)
+//
+// 올바른 수정 (옵션 B):
+//   1) 잔액 원복: qkey 12000→0, usdt 120→200 (사용자 실제 swap 결과)
+//   2) 누락 TX 2건 INSERT:
+//      - swap_out: coin=QKEY amount=-12000
+//      - swap_in:  coin=USDT amount=+80
+//   3) 정합성: TX sum 도 balance 와 일치 (영구룰 OK)
+//
+// DRY-RUN: GET ?pw=...
+// EXEC:    GET ?pw=...&confirm=FIX_BANGSH_SWAP_GO
+// ============================================================================
+app.get('/api/diag/fix-bangsh-swap-tx', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') {
+      return c.json({ error: 'unauthorized' }, 401)
+    }
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_BANGSH_SWAP_GO'
+
+    const DB = c.env.DB
+    const UID = 33
+
+    // 1) 현재 user row
+    const user = await DB.prepare(
+      `SELECT id, name, email, qkey_balance, usdt_balance FROM users WHERE id = ?`
+    ).bind(UID).first<any>()
+    if (!user) return c.json({ error: 'user not found' }, 404)
+
+    const currentQkey = Number(user.qkey_balance ?? 0)
+    const currentUsdt = Number(user.usdt_balance ?? 0)
+
+    // 2) Swap 파라미터 (사용자 실제 swap 결과 기준)
+    const SWAP_QKEY_OUT = 12000   // QKEY 차감
+    const SWAP_USDT_IN = 80       // USDT 입금
+    // 환율 검증
+    const RATE = 150
+    const rateOk = (SWAP_QKEY_OUT / SWAP_USDT_IN) === RATE
+
+    // 3) 목표 잔액 (사용자 swap 후 상태)
+    const targetQkey = 0
+    const targetUsdt = 200
+
+    // 4) 누락 TX 확인 — 이미 5/20 swap TX 있는지 중복 가드
+    const existing5_20Swap = await DB.prepare(
+      `SELECT id, type, coin_type, amount, description, created_at
+       FROM transactions
+       WHERE user_id = ?
+         AND (type LIKE 'swap%')
+         AND (
+           description LIKE '%bangsh-swap-fix%'
+           OR (description LIKE '%12,000 QKEY%' AND description LIKE '%80 USDT%')
+         )`
+    ).bind(UID).all<any>()
+    const dupCount = (existing5_20Swap.results || []).length
+
+    // 5) TX sum 계산 (영구룰 검증)
+    const qkeySum = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'QKEY'`
+    ).bind(UID).first<{ s: number }>()
+    const usdtSum = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'USDT'`
+    ).bind(UID).first<{ s: number }>()
+    const qkeySumCurrent = Number(qkeySum?.s ?? 0)
+    const usdtSumCurrent = Number(usdtSum?.s ?? 0)
+
+    // KST timestamp
+    const nowMs = Date.now()
+    const kstIso = new Date(nowMs + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)
+    const refId = `bangsh_5_20_swap_${nowMs}`
+    const desc = `QKEY → USDT swap (12,000 QKEY → 80 USDT) [bangsh-swap-fix-5-20 보충]`
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        target_user: { id: UID, name: user.name, email: user.email },
+        current_state: {
+          qkey_balance: currentQkey,
+          usdt_balance: currentUsdt,
+          qkey_tx_sum: qkeySumCurrent,
+          usdt_tx_sum: usdtSumCurrent,
+          balance_vs_tx_diff_qkey: currentQkey - qkeySumCurrent,
+          balance_vs_tx_diff_usdt: currentUsdt - usdtSumCurrent,
+        },
+        actual_user_swap_5_20: {
+          qkey_out: SWAP_QKEY_OUT,
+          usdt_in: SWAP_USDT_IN,
+          rate: RATE,
+          rate_check: rateOk,
+        },
+        planned_actions: {
+          step1_revert_balance: {
+            from: { qkey: currentQkey, usdt: currentUsdt },
+            to: { qkey: targetQkey, usdt: targetUsdt },
+            note: '사용자 실제 swap 결과로 잔액 원복 (제가 잘못한 fix-bangsh-balance 되돌림)',
+          },
+          step2_insert_tx_swap_out: {
+            user_id: UID,
+            type: 'swap_out',
+            coin_type: 'QKEY',
+            amount: -SWAP_QKEY_OUT,
+            description: desc,
+            ref_id: refId,
+            created_at_kst: kstIso,
+          },
+          step3_insert_tx_swap_in: {
+            user_id: UID,
+            type: 'swap_in',
+            coin_type: 'USDT',
+            amount: SWAP_USDT_IN,
+            description: desc,
+            ref_id: refId,
+            created_at_kst: kstIso,
+          },
+        },
+        duplicate_guard: {
+          existing_bangsh_swap_fix_rows: dupCount,
+          existing_rows: existing5_20Swap.results || [],
+          will_skip: dupCount > 0,
+        },
+        expected_after: {
+          qkey_balance: targetQkey,
+          usdt_balance: targetUsdt,
+          qkey_tx_sum: qkeySumCurrent - SWAP_QKEY_OUT,
+          usdt_tx_sum: usdtSumCurrent + SWAP_USDT_IN,
+          integrity_qkey_ok: (qkeySumCurrent - SWAP_QKEY_OUT) === targetQkey,
+          integrity_usdt_ok: (usdtSumCurrent + SWAP_USDT_IN) === targetUsdt,
+        },
+        principle: '영구룰: 사용자 실제 swap 보존 + TX sum = balance 정합 회복',
+        next_step: 'to EXEC: append &confirm=FIX_BANGSH_SWAP_GO',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ===== EXEC =====
+    if (dupCount > 0) {
+      return c.json({
+        mode: 'EXEC_SKIPPED',
+        reason: 'duplicate guard — bangsh-swap-fix 마커 이미 존재',
+        existing_rows: existing5_20Swap.results,
+      })
+    }
+
+    // Step 1: 잔액 원복 (사용자 실제 swap 후 상태)
+    const updRes = await DB.prepare(
+      `UPDATE users SET qkey_balance = ?, usdt_balance = ? WHERE id = ?`
+    ).bind(targetQkey, targetUsdt, UID).run()
+
+    // Step 2: swap_out TX INSERT (QKEY -12000)
+    const txOut = await DB.prepare(
+      `INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+       VALUES (?, 'swap_out', 'QKEY', ?, ?, ?, ?)`
+    ).bind(UID, -SWAP_QKEY_OUT, desc, refId, kstIso).run()
+
+    // Step 3: swap_in TX INSERT (USDT +80)
+    const txIn = await DB.prepare(
+      `INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+       VALUES (?, 'swap_in', 'USDT', ?, ?, ?, ?)`
+    ).bind(UID, SWAP_USDT_IN, desc, refId, kstIso).run()
+
+    // 사후 검증
+    const verify = await DB.prepare(
+      `SELECT id, name, qkey_balance, usdt_balance FROM users WHERE id = ?`
+    ).bind(UID).first<any>()
+    const qkeySumAfter = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'QKEY'`
+    ).bind(UID).first<{ s: number }>()
+    const usdtSumAfter = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'USDT'`
+    ).bind(UID).first<{ s: number }>()
+
+    const balQkeyAfter = Number(verify?.qkey_balance ?? 0)
+    const balUsdtAfter = Number(verify?.usdt_balance ?? 0)
+    const txQkeyAfter = Number(qkeySumAfter?.s ?? 0)
+    const txUsdtAfter = Number(usdtSumAfter?.s ?? 0)
+
+    // 글로벌 정합성
+    const totalBal = await DB.prepare(
+      `SELECT COALESCE(SUM(qkey_balance), 0) AS s FROM users`
+    ).first<{ s: number }>()
+    const totalTx = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE coin_type = 'QKEY'`
+    ).first<{ s: number }>()
+
+    return c.json({
+      mode: 'EXEC',
+      executed_at_kst: kstIso + '+09:00',
+      target_user: { id: UID, name: user.name, email: user.email },
+      step1_balance_revert: {
+        before: { qkey: currentQkey, usdt: currentUsdt },
+        after: { qkey: balQkeyAfter, usdt: balUsdtAfter },
+        changes: (updRes as any)?.meta?.changes ?? null,
+      },
+      step2_insert_swap_out: {
+        last_row_id: (txOut as any)?.meta?.last_row_id ?? null,
+        coin: 'QKEY', amount: -SWAP_QKEY_OUT, ref_id: refId,
+      },
+      step3_insert_swap_in: {
+        last_row_id: (txIn as any)?.meta?.last_row_id ?? null,
+        coin: 'USDT', amount: SWAP_USDT_IN, ref_id: refId,
+      },
+      bangsh_integrity_after: {
+        qkey_balance: balQkeyAfter,
+        qkey_tx_sum: txQkeyAfter,
+        qkey_diff: balQkeyAfter - txQkeyAfter,
+        qkey_ok: balQkeyAfter === txQkeyAfter,
+        usdt_balance: balUsdtAfter,
+        usdt_tx_sum: txUsdtAfter,
+        usdt_diff: balUsdtAfter - txUsdtAfter,
+        usdt_ok: balUsdtAfter === txUsdtAfter,
+      },
+      global_integrity_after: {
+        total_qkey_balance: Number(totalBal?.s ?? 0),
+        total_qkey_tx_sum: Number(totalTx?.s ?? 0),
+        diff: Number(totalBal?.s ?? 0) - Number(totalTx?.s ?? 0),
+        ok: Math.abs(Number(totalBal?.s ?? 0) - Number(totalTx?.s ?? 0)) < 0.01,
+      },
+      note: '사용자 실제 5/20 swap 보존 + TX 보충 + 영구룰 (balance = TX sum) 정합 회복',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
