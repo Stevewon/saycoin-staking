@@ -66568,4 +66568,231 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/fix-tx-created-at-permanent-rule
+// ----------------------------------------------------------------------------
+// 영구룰: transactions.created_at = (관련 dr/rr 의 reward_date) || ' 23:00:00 (KST)'
+//        보충/소급 작업도 원본 reward_date 에 찍어야 함 (오늘 날짜 금지)
+//
+// 식별 로직:
+//   1) type='daily_qkey' AND ref_id 가 daily_rewards.id 와 매칭
+//      -> dr.reward_date 와 date(t.created_at,'+9 hours') 비교
+//   2) type='referral_reward' AND ref_id 가 referral_rewards.id 와 매칭
+//      -> rr.reward_date 와 date(t.created_at,'+9 hours') 비교
+//   3) 불일치 TX 만 정정: created_at = reward_date || ' 14:00:00'
+//      (DB 는 UTC 저장이므로 KST 23:00 = UTC 14:00. SQLite 는 timezone-naive 저장)
+//
+// 잔액/금액/dr/rr/users 절대 안 건드림. created_at 컬럼만 UPDATE.
+//
+// query: pw=ADMIN_PW (required), confirm=FIX_TX_CREATED_AT_GO (optional, EXEC)
+// ============================================================================
+app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const exec = (confirm === 'FIX_TX_CREATED_AT_GO')
+    const db = c.env.DB
+
+    // ------------------------------------------------------------------------
+    // STEP 1: snapshot before (balance + tx sum)
+    // ------------------------------------------------------------------------
+    const balBefore = await db.prepare(
+      `SELECT COALESCE(SUM(qkey_balance),0) AS total_qkey_balance FROM users`
+    ).first<any>()
+    const txSumBefore = await db.prepare(
+      `SELECT COALESCE(SUM(CASE WHEN amount IS NOT NULL THEN amount ELSE 0 END),0) AS total_qkey_tx_sum
+         FROM transactions
+         WHERE type IN ('daily_qkey','referral_reward','swap','withdrawal','deposit','adjustment')`
+    ).first<any>()
+
+    // ------------------------------------------------------------------------
+    // STEP 2: identify daily_qkey TX with mismatched created_at
+    //         (DB stores UTC; KST = UTC+9; reward_date is KST date)
+    //         expected_created_at_utc = reward_date - 9h + 23h = reward_date 14:00:00 UTC
+    //         compare: date(t.created_at,'+9 hours') vs dr.reward_date
+    // ------------------------------------------------------------------------
+    const dailyMismatch = await db.prepare(
+      `SELECT t.id AS tx_id, t.user_id, t.ref_id, t.amount,
+              t.created_at AS tx_created_at_utc,
+              date(t.created_at,'+9 hours') AS tx_kst_date,
+              dr.reward_date AS expected_kst_date,
+              dr.reward_date || ' 14:00:00' AS new_created_at_utc,
+              t.description
+         FROM transactions t
+         JOIN daily_rewards dr ON CAST(t.ref_id AS INTEGER) = dr.id
+        WHERE t.type = 'daily_qkey'
+          AND dr.reward_date != date(t.created_at,'+9 hours')
+        ORDER BY dr.reward_date, t.user_id, t.id`
+    ).all<any>()
+
+    // ------------------------------------------------------------------------
+    // STEP 3: identify referral_reward TX with mismatched created_at
+    // ------------------------------------------------------------------------
+    const referralMismatch = await db.prepare(
+      `SELECT t.id AS tx_id, t.user_id, t.ref_id, t.amount,
+              t.created_at AS tx_created_at_utc,
+              date(t.created_at,'+9 hours') AS tx_kst_date,
+              rr.reward_date AS expected_kst_date,
+              rr.reward_date || ' 14:00:00' AS new_created_at_utc,
+              t.description
+         FROM transactions t
+         JOIN referral_rewards rr ON CAST(t.ref_id AS INTEGER) = rr.id
+        WHERE t.type = 'referral_reward'
+          AND rr.reward_date != date(t.created_at,'+9 hours')
+        ORDER BY rr.reward_date, t.user_id, t.id`
+    ).all<any>()
+
+    const dailyRows = dailyMismatch.results || []
+    const referralRows = referralMismatch.results || []
+    const totalTargets = dailyRows.length + referralRows.length
+
+    // sample 30 of each for visibility
+    const dailySample = dailyRows.slice(0, 30)
+    const referralSample = referralRows.slice(0, 30)
+
+    // distribution by expected_kst_date
+    const byDateDaily: Record<string, number> = {}
+    for (const r of dailyRows) {
+      const k = r.expected_kst_date
+      byDateDaily[k] = (byDateDaily[k] || 0) + 1
+    }
+    const byDateReferral: Record<string, number> = {}
+    for (const r of referralRows) {
+      const k = r.expected_kst_date
+      byDateReferral[k] = (byDateReferral[k] || 0) + 1
+    }
+
+    // jeongbun (user 84) specific check
+    const jeongbunBefore = await db.prepare(
+      `SELECT t.id, t.type, t.amount, t.ref_id,
+              t.created_at AS utc,
+              datetime(t.created_at,'+9 hours') AS kst,
+              date(t.created_at,'+9 hours') AS kst_date,
+              t.description
+         FROM transactions t
+         WHERE t.user_id = 84
+         ORDER BY t.created_at DESC
+         LIMIT 20`
+    ).all<any>()
+
+    // ------------------------------------------------------------------------
+    // STEP 4: EXEC (only when confirm=FIX_TX_CREATED_AT_GO)
+    // ------------------------------------------------------------------------
+    let updatedDaily = 0
+    let updatedReferral = 0
+    const errors: string[] = []
+
+    if (exec) {
+      // daily_qkey UPDATE
+      for (const r of dailyRows) {
+        try {
+          const res = await db.prepare(
+            `UPDATE transactions SET created_at = ? WHERE id = ? AND type = 'daily_qkey'`
+          ).bind(r.new_created_at_utc, r.tx_id).run()
+          if ((res as any)?.meta?.changes && (res as any).meta.changes > 0) updatedDaily++
+        } catch (e: any) {
+          errors.push(`daily tx_id=${r.tx_id}: ${String(e?.message || e)}`)
+        }
+      }
+      // referral_reward UPDATE
+      for (const r of referralRows) {
+        try {
+          const res = await db.prepare(
+            `UPDATE transactions SET created_at = ? WHERE id = ? AND type = 'referral_reward'`
+          ).bind(r.new_created_at_utc, r.tx_id).run()
+          if ((res as any)?.meta?.changes && (res as any).meta.changes > 0) updatedReferral++
+        } catch (e: any) {
+          errors.push(`referral tx_id=${r.tx_id}: ${String(e?.message || e)}`)
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // STEP 5: verify after (balance + tx sum unchanged; mismatch count = 0)
+    // ------------------------------------------------------------------------
+    const balAfter = await db.prepare(
+      `SELECT COALESCE(SUM(qkey_balance),0) AS total_qkey_balance FROM users`
+    ).first<any>()
+    const txSumAfter = await db.prepare(
+      `SELECT COALESCE(SUM(CASE WHEN amount IS NOT NULL THEN amount ELSE 0 END),0) AS total_qkey_tx_sum
+         FROM transactions
+         WHERE type IN ('daily_qkey','referral_reward','swap','withdrawal','deposit','adjustment')`
+    ).first<any>()
+
+    const remainingDaily = await db.prepare(
+      `SELECT COUNT(*) AS n
+         FROM transactions t
+         JOIN daily_rewards dr ON CAST(t.ref_id AS INTEGER) = dr.id
+        WHERE t.type='daily_qkey' AND dr.reward_date != date(t.created_at,'+9 hours')`
+    ).first<any>()
+    const remainingReferral = await db.prepare(
+      `SELECT COUNT(*) AS n
+         FROM transactions t
+         JOIN referral_rewards rr ON CAST(t.ref_id AS INTEGER) = rr.id
+        WHERE t.type='referral_reward' AND rr.reward_date != date(t.created_at,'+9 hours')`
+    ).first<any>()
+
+    // jeongbun (user 84) after
+    const jeongbunAfter = await db.prepare(
+      `SELECT t.id, t.type, t.amount, t.ref_id,
+              t.created_at AS utc,
+              datetime(t.created_at,'+9 hours') AS kst,
+              date(t.created_at,'+9 hours') AS kst_date,
+              t.description
+         FROM transactions t
+         WHERE t.user_id = 84
+         ORDER BY t.created_at DESC
+         LIMIT 20`
+    ).all<any>()
+
+    return c.json({
+      ok: true,
+      mode: exec ? 'EXEC' : 'DRY_RUN',
+      confirm_required: 'FIX_TX_CREATED_AT_GO',
+      permanent_rule: 'transactions.created_at MUST equal (dr/rr.reward_date) 23:00:00 KST = reward_date 14:00:00 UTC',
+      targets: {
+        daily_qkey_mismatch_count: dailyRows.length,
+        referral_reward_mismatch_count: referralRows.length,
+        total: totalTargets
+      },
+      distribution: {
+        daily_by_expected_date: byDateDaily,
+        referral_by_expected_date: byDateReferral
+      },
+      sample: {
+        daily_first_30: dailySample,
+        referral_first_30: referralSample
+      },
+      exec_result: exec ? {
+        updated_daily: updatedDaily,
+        updated_referral: updatedReferral,
+        total_updated: updatedDaily + updatedReferral,
+        errors
+      } : null,
+      balance_check: {
+        balance_before: balBefore?.total_qkey_balance,
+        balance_after: balAfter?.total_qkey_balance,
+        tx_sum_before: txSumBefore?.total_qkey_tx_sum,
+        tx_sum_after: txSumAfter?.total_qkey_tx_sum,
+        balance_delta: Number(balAfter?.total_qkey_balance || 0) - Number(balBefore?.total_qkey_balance || 0),
+        tx_sum_delta: Number(txSumAfter?.total_qkey_tx_sum || 0) - Number(txSumBefore?.total_qkey_tx_sum || 0)
+      },
+      post_verify: {
+        remaining_daily_mismatch: remainingDaily?.n,
+        remaining_referral_mismatch: remainingReferral?.n
+      },
+      jeongbun_84: {
+        before_top20: jeongbunBefore.results || [],
+        after_top20: jeongbunAfter.results || []
+      },
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
