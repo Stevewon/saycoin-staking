@@ -66010,6 +66010,61 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
 
 
 // ============================================================
+// 🔴 /api/diag/inspect-referee-stakings
+// referee 42/45/49/58 의 staking 상태 + 5/19 dr 행 확인
+// ============================================================
+app.get('/api/diag/inspect-referee-stakings', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw')
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+
+    const db = c.env.DB
+    const refs = [42, 45, 49, 58]
+    const sids = [45, 49, 53, 61, 62, 65, 72, 77]
+
+    const users = await db.prepare(`
+      SELECT id, name, referrer_id, status, qkey_balance, usdt_balance
+      FROM users WHERE id IN (${refs.join(',')})
+    `).all()
+
+    const stakings = await db.prepare(`
+      SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at,
+             date(start_date, '+9 hours') as start_kst,
+             date(end_date, '+9 hours') as end_kst
+      FROM staking WHERE id IN (${sids.join(',')}) OR user_id IN (${refs.join(',')})
+      ORDER BY user_id, id
+    `).all()
+
+    const drRows = await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards
+      WHERE reward_date = '2026-05-19' AND user_id IN (${refs.join(',')})
+      ORDER BY user_id, staking_id
+    `).all()
+
+    const rrRows = await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, staking_id, reward_date, created_at
+      FROM referral_rewards
+      WHERE reward_date = '2026-05-19' AND referee_id IN (${refs.join(',')})
+      ORDER BY referee_id, level, staking_id
+    `).all()
+
+    return c.json({
+      ok: true,
+      users: users.results,
+      stakings: stakings.results,
+      dr_for_referees_5_19: drRows.results,
+      rr_for_referees_5_19: rrRows.results,
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================
 // 🔴 /api/diag/remove-5-19-duplicates
 // 5/19 reward_date 의 dr / rr / tx 중복 행 제거.
 // 정책: (user_id, staking_id) / (referrer_id, referee_id, level, staking_id) 기준
