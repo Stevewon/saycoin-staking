@@ -64722,4 +64722,242 @@ app.get('/api/diag/audit-user-5-19', async (c) => {
 })
 
 
+// ============================================================================
+// 🔴 /api/diag/fix-usdt-amount-permanent-rule
+// 영구룰 위반 정정: daily_rewards.usdt_amount 컬럼에 USDT 환산값 넣은 51건을
+// QKEY 값으로 정정 (사장님 영구룰: 모든 계산은 쿠키/QKEY 단위)
+//
+// 영구룰 (사장님 패턴):
+//   본인 daily QKEY = staking.amount × staking.daily_rate × 150
+//   L1 referral QKEY = referee 본인 daily × 0.20
+//   L2 referral QKEY = referee 본인 daily × 0.10
+//   daily_rewards.usdt_amount 컬럼에는 ★QKEY 값★ 을 저장 (legacy column name)
+//
+// 정정 대상 식별:
+//   reward_date IN ('2026-05-04','2026-05-06','2026-05-19') AND usdt_amount < 100
+//   (USDT 값은 모두 100 미만: 5, 35, 100 등 — 단 100 은 경계라 < 100 로 안전 필터)
+//   ※ 실제 USDT 값 패턴 분석: 5, 15, 21, 30, 35, 42, 50, 70, 100, 150
+//      → 100 미만/이상이 섞여있으므로 더 안전한 방법 사용:
+//   동적 비교: dr.usdt_amount < (st.amount × st.daily_rate × 150) × 0.5
+//   = dr.usdt_amount 가 정답(QKEY)의 절반보다 작으면 USDT 값으로 판정
+//   (USDT 값은 정답QKEY 의 1/150, QKEY 값이면 정확히 일치)
+//
+// 정정 로직:
+//   corrected_qkey = staking.amount × staking.daily_rate × 150
+//   UPDATE daily_rewards SET usdt_amount = corrected_qkey WHERE id = ?
+//
+// 🔴 잔액 (qkey_balance) / 거래내역 (transactions) 절대 안 건드림 (이미 정확)
+//
+// DRY-RUN: GET ?pw=...
+// EXEC:    GET ?pw=...&confirm=FIX_USDT_AMOUNT_GO
+// ============================================================================
+app.get('/api/diag/fix-usdt-amount-permanent-rule', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') {
+      return c.json({ error: 'unauthorized' }, 401)
+    }
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_USDT_AMOUNT_GO'
+
+    const DB = c.env.DB
+
+    // 1) 정정 대상 식별: 5/4, 5/6, 5/19 의 self reward 중 usdt_amount 가 QKEY 값이 아닌 것
+    //    JOIN staking 으로 정답 QKEY 계산
+    const candidates = await DB.prepare(`
+      SELECT
+        dr.id AS dr_id,
+        dr.user_id,
+        dr.staking_id,
+        dr.reward_date,
+        dr.usdt_amount AS current_value,
+        dr.description,
+        s.amount AS staking_amount,
+        s.daily_rate AS daily_rate,
+        ROUND(s.amount * s.daily_rate * 150, 6) AS corrected_qkey
+      FROM daily_rewards dr
+      INNER JOIN staking s ON s.id = dr.staking_id
+      WHERE dr.reward_date IN ('2026-05-04', '2026-05-06', '2026-05-19')
+      ORDER BY dr.id ASC
+    `).all<any>()
+
+    const allRows = candidates.results || []
+
+    // 영구룰 정답 (QKEY) 과 현재값 비교
+    // - 정답과 일치하면 영구룰 준수 (skip)
+    // - 정답의 1/150 정도면 USDT 값 (정정 대상)
+    // - 그 외는 의심 케이스 (별도 보고)
+    const toFix: any[] = []
+    const alreadyCorrect: any[] = []
+    const suspicious: any[] = []
+
+    for (const r of allRows) {
+      const cur = Number(r.current_value)
+      const correct = Number(r.corrected_qkey)
+      const diff = Math.abs(cur - correct)
+      const usdtPattern = Math.abs(cur - correct / 150)
+
+      if (diff < 0.01) {
+        alreadyCorrect.push({
+          dr_id: r.dr_id,
+          user_id: r.user_id,
+          reward_date: r.reward_date,
+          current: cur,
+          correct_qkey: correct,
+        })
+      } else if (usdtPattern < 0.01) {
+        toFix.push({
+          dr_id: r.dr_id,
+          user_id: r.user_id,
+          staking_id: r.staking_id,
+          reward_date: r.reward_date,
+          staking_amount: Number(r.staking_amount),
+          daily_rate: Number(r.daily_rate),
+          current_wrong: cur,
+          corrected_qkey: correct,
+          description: r.description,
+        })
+      } else {
+        suspicious.push({
+          dr_id: r.dr_id,
+          user_id: r.user_id,
+          reward_date: r.reward_date,
+          current: cur,
+          correct_qkey: correct,
+          ratio: cur / correct,
+        })
+      }
+    }
+
+    // 정정 전 합계
+    const sumCurrentWrong = toFix.reduce((s, x) => s + x.current_wrong, 0)
+    const sumCorrectedQkey = toFix.reduce((s, x) => s + x.corrected_qkey, 0)
+    const deltaUsdtAmountSum = sumCorrectedQkey - sumCurrentWrong
+
+    // 날짜별 분포
+    const byDate: Record<string, number> = {}
+    for (const x of toFix) {
+      byDate[x.reward_date] = (byDate[x.reward_date] || 0) + 1
+    }
+
+    // QKEY 값 분포
+    const byQkey: Record<string, number> = {}
+    for (const x of toFix) {
+      const k = String(x.corrected_qkey)
+      byQkey[k] = (byQkey[k] || 0) + 1
+    }
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        permanent_rule: 'daily_rewards.usdt_amount column stores QKEY value (NOT USDT)',
+        formula: 'corrected_qkey = staking.amount × staking.daily_rate × 150',
+        target_dates: ['2026-05-04', '2026-05-06', '2026-05-19'],
+        scan_results: {
+          total_scanned: allRows.length,
+          to_fix_count: toFix.length,
+          already_correct_count: alreadyCorrect.length,
+          suspicious_count: suspicious.length,
+        },
+        to_fix_summary: {
+          by_date: byDate,
+          by_corrected_qkey_value: byQkey,
+          sum_current_wrong: Math.round(sumCurrentWrong * 100) / 100,
+          sum_corrected_qkey: sumCorrectedQkey,
+          delta_usdt_amount_column: deltaUsdtAmountSum,
+          note: '★ 잔액(qkey_balance)/거래내역(transactions) 절대 안 건드림 — 이미 영구룰대로 정확',
+        },
+        to_fix_preview: toFix.slice(0, 60),
+        suspicious_rows: suspicious,
+        next_step: `to EXEC: append &confirm=FIX_USDT_AMOUNT_GO`,
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ===== EXEC =====
+    const updateResults: any[] = []
+    const errors: any[] = []
+
+    for (const row of toFix) {
+      try {
+        const res = await DB.prepare(`
+          UPDATE daily_rewards
+          SET usdt_amount = ?
+          WHERE id = ?
+        `).bind(row.corrected_qkey, row.dr_id).run()
+
+        updateResults.push({
+          dr_id: row.dr_id,
+          user_id: row.user_id,
+          reward_date: row.reward_date,
+          from: row.current_wrong,
+          to: row.corrected_qkey,
+          changes: (res as any)?.meta?.changes ?? null,
+        })
+      } catch (e: any) {
+        errors.push({ dr_id: row.dr_id, error: String(e?.message || e) })
+      }
+    }
+
+    // 사후 검증: 같은 SELECT 다시 실행해서 모두 영구룰 일치 확인
+    const verify = await DB.prepare(`
+      SELECT
+        dr.id AS dr_id,
+        dr.reward_date,
+        dr.usdt_amount AS current_value,
+        ROUND(s.amount * s.daily_rate * 150, 6) AS correct_qkey
+      FROM daily_rewards dr
+      INNER JOIN staking s ON s.id = dr.staking_id
+      WHERE dr.reward_date IN ('2026-05-04', '2026-05-06', '2026-05-19')
+    `).all<any>()
+
+    const verifyRows = verify.results || []
+    const stillMismatch: any[] = []
+    for (const v of verifyRows) {
+      if (Math.abs(Number(v.current_value) - Number(v.correct_qkey)) >= 0.01) {
+        stillMismatch.push(v)
+      }
+    }
+
+    // 잔액/TX 변화 없음 검증
+    const totalBalanceAfter = await DB.prepare(
+      `SELECT COALESCE(SUM(qkey_balance), 0) AS total FROM users`
+    ).first<{ total: number }>()
+    const totalTxAfter = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM transactions`
+    ).first<{ total: number }>()
+
+    return c.json({
+      mode: 'EXEC',
+      executed_at_kst: new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('Z', '+09:00'),
+      permanent_rule: 'daily_rewards.usdt_amount = staking.amount × daily_rate × 150 (QKEY)',
+      stats: {
+        targeted: toFix.length,
+        updated: updateResults.length,
+        errors: errors.length,
+        sum_corrected_qkey: sumCorrectedQkey,
+        delta_usdt_amount_column: deltaUsdtAmountSum,
+      },
+      verification: {
+        rows_rechecked: verifyRows.length,
+        still_mismatch_count: stillMismatch.length,
+        still_mismatch_rows: stillMismatch.slice(0, 20),
+        ok: stillMismatch.length === 0,
+      },
+      balance_tx_unchanged: {
+        total_qkey_balance: Number(totalBalanceAfter?.total ?? 0),
+        total_qkey_tx_sum: Number(totalTxAfter?.total ?? 0),
+        note: '★ 잔액/TX 는 이 endpoint 에서 절대 안 건드림 — 이전 상태 그대로',
+      },
+      updates: updateResults.slice(0, 60),
+      errors,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
