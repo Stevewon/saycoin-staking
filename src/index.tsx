@@ -65893,8 +65893,7 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
       SELECT user_id, staking_id, COUNT(*) as cnt,
              GROUP_CONCAT(id) as dr_ids,
              GROUP_CONCAT(usdt_amount) as amts,
-             GROUP_CONCAT(SUBSTR(COALESCE(description,''), 1, 80), ' || ') as descs,
-             GROUP_CONCAT(created_at, ' | ') as created_ats
+             GROUP_CONCAT(created_at) as created_ats
       FROM daily_rewards
       WHERE reward_date = ?
       GROUP BY user_id, staking_id
@@ -65906,9 +65905,8 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
     const rrDup = await db.prepare(`
       SELECT referrer_id, referee_id, level, staking_id, COUNT(*) as cnt,
              GROUP_CONCAT(id) as rr_ids,
-             GROUP_CONCAT(qkey_amount) as amts,
-             GROUP_CONCAT(SUBSTR(COALESCE(description,''), 1, 80), ' || ') as descs,
-             GROUP_CONCAT(created_at, ' | ') as created_ats
+             GROUP_CONCAT(reward_amount) as amts,
+             GROUP_CONCAT(created_at) as created_ats
       FROM referral_rewards
       WHERE reward_date = ?
       GROUP BY referrer_id, referee_id, level, staking_id
@@ -65921,9 +65919,8 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
       SELECT referrer_id, referee_id, level, original_amount, COUNT(*) as cnt,
              GROUP_CONCAT(id) as rr_ids,
              GROUP_CONCAT(staking_id) as staking_ids,
-             GROUP_CONCAT(qkey_amount) as amts,
-             GROUP_CONCAT(SUBSTR(COALESCE(description,''), 1, 80), ' || ') as descs,
-             GROUP_CONCAT(created_at, ' | ') as created_ats
+             GROUP_CONCAT(reward_amount) as amts,
+             GROUP_CONCAT(created_at) as created_ats
       FROM referral_rewards
       WHERE reward_date = ?
       GROUP BY referrer_id, referee_id, level, original_amount
@@ -65931,33 +65928,36 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
       ORDER BY referrer_id, referee_id, level
     `).bind(RD).all()
 
-    // 4) marker 분포 확인
+    // 4) marker 분포 확인 — dr/rr 에는 description 컬럼 없음. transactions 만 검사
+    //    대신 5/19 의 created_at 시간대로 1차/2차 EXEC 분리 가능
+    //    1차 EXEC (이전 세션): created_at 시각 X
+    //    2차 EXEC (오늘 fix-reset): 2026-05-20T04:01 UTC = 2026-05-20T13:01 KST
     const drMarker = await db.prepare(`
       SELECT
         CASE
-          WHEN description LIKE '%daily-payout-5-19-fix-reset%' THEN 'fix-reset'
-          WHEN description LIKE '%daily-payout-5-19%' THEN 'first-run'
-          WHEN description LIKE '%solbat%' THEN 'solbat'
+          WHEN datetime(created_at) >= '2026-05-20T04:00:00' AND datetime(created_at) < '2026-05-20T04:10:00' THEN 'fix-reset-5-20-1301-KST'
+          WHEN datetime(created_at) < '2026-05-20T04:00:00' THEN 'first-run'
           ELSE 'other'
-        END as marker,
-        COUNT(*) as cnt
+        END as bucket,
+        COUNT(*) as cnt,
+        MIN(created_at) as min_t, MAX(created_at) as max_t
       FROM daily_rewards
       WHERE reward_date = ?
-      GROUP BY marker
+      GROUP BY bucket
     `).bind(RD).all()
 
     const rrMarker = await db.prepare(`
       SELECT
         CASE
-          WHEN description LIKE '%daily-payout-5-19-fix-reset%' THEN 'fix-reset'
-          WHEN description LIKE '%daily-payout-5-19%' THEN 'first-run'
-          WHEN description LIKE '%solbat%' THEN 'solbat'
+          WHEN datetime(created_at) >= '2026-05-20T04:00:00' AND datetime(created_at) < '2026-05-20T04:10:00' THEN 'fix-reset-5-20-1301-KST'
+          WHEN datetime(created_at) < '2026-05-20T04:00:00' THEN 'first-run'
           ELSE 'other'
-        END as marker,
-        COUNT(*) as cnt
+        END as bucket,
+        COUNT(*) as cnt,
+        MIN(created_at) as min_t, MAX(created_at) as max_t
       FROM referral_rewards
       WHERE reward_date = ?
-      GROUP BY marker
+      GROUP BY bucket
     `).bind(RD).all()
 
     // 5) transactions 5/20 의 daily-payout 마커별
@@ -65980,7 +65980,7 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
 
     // 6) total dr / rr 5/19 합계
     const drTotal = await db.prepare(`SELECT COUNT(*) as cnt, SUM(usdt_amount) as sum FROM daily_rewards WHERE reward_date = ?`).bind(RD).first()
-    const rrTotal = await db.prepare(`SELECT COUNT(*) as cnt, SUM(qkey_amount) as sum FROM referral_rewards WHERE reward_date = ?`).bind(RD).first()
+    const rrTotal = await db.prepare(`SELECT COUNT(*) as cnt, SUM(reward_amount) as sum FROM referral_rewards WHERE reward_date = ?`).bind(RD).first()
 
     return c.json({
       ok: true,
@@ -66046,21 +66046,21 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
       HAVING COUNT(*) >= 2
     `).bind(RD).all()
 
-    const drToRemove: { id: number, user_id: number, staking_id: number, amount: number, description: string }[] = []
+    const drToRemove: { id: number, user_id: number, staking_id: number, amount: number, created_at: string }[] = []
 
     for (const g of (drDupGroups.results as any[])) {
       const allIds = String(g.all_ids).split(',').map(Number)
       const keepId = Number(g.keep_id)
       const removeIds = allIds.filter(i => i !== keepId)
       for (const rid of removeIds) {
-        const row = await db.prepare(`SELECT id, user_id, staking_id, usdt_amount, description FROM daily_rewards WHERE id = ?`).bind(rid).first() as any
+        const row = await db.prepare(`SELECT id, user_id, staking_id, usdt_amount, created_at FROM daily_rewards WHERE id = ?`).bind(rid).first() as any
         if (row) {
           drToRemove.push({
             id: row.id,
             user_id: row.user_id,
             staking_id: row.staking_id,
             amount: Number(row.usdt_amount), // QKEY 값 (영구룰)
-            description: String(row.description || '')
+            created_at: String(row.created_at)
           })
         }
       }
@@ -66080,14 +66080,14 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
       HAVING COUNT(*) >= 2
     `).bind(RD).all()
 
-    const rrToRemove: { id: number, referrer_id: number, referee_id: number, level: number, staking_id: number | null, amount: number, description: string }[] = []
+    const rrToRemove: { id: number, referrer_id: number, referee_id: number, level: number, staking_id: number | null, amount: number, created_at: string }[] = []
 
     for (const g of (rrDupGroups.results as any[])) {
       const allIds = String(g.all_ids).split(',').map(Number)
       const keepId = Number(g.keep_id)
       const removeIds = allIds.filter(i => i !== keepId)
       for (const rid of removeIds) {
-        const row = await db.prepare(`SELECT id, referrer_id, referee_id, level, staking_id, qkey_amount, description FROM referral_rewards WHERE id = ?`).bind(rid).first() as any
+        const row = await db.prepare(`SELECT id, referrer_id, referee_id, level, staking_id, reward_amount, created_at FROM referral_rewards WHERE id = ?`).bind(rid).first() as any
         if (row) {
           rrToRemove.push({
             id: row.id,
@@ -66095,8 +66095,8 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
             referee_id: row.referee_id,
             level: row.level,
             staking_id: row.staking_id,
-            amount: Number(row.qkey_amount),
-            description: String(row.description || '')
+            amount: Number(row.reward_amount),
+            created_at: String(row.created_at)
           })
         }
       }
@@ -66121,7 +66121,7 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
       const removeIds = allIds.filter(i => i !== keepId)
       for (const rid of removeIds) {
         if (rrToRemove.find(x => x.id === rid)) continue // 이미 위 staking_id 키에서 잡혔으면 skip
-        const row = await db.prepare(`SELECT id, referrer_id, referee_id, level, staking_id, qkey_amount, description FROM referral_rewards WHERE id = ?`).bind(rid).first() as any
+        const row = await db.prepare(`SELECT id, referrer_id, referee_id, level, staking_id, reward_amount, created_at FROM referral_rewards WHERE id = ?`).bind(rid).first() as any
         if (row) {
           rrToRemove.push({
             id: row.id,
@@ -66129,8 +66129,8 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
             referee_id: row.referee_id,
             level: row.level,
             staking_id: row.staking_id,
-            amount: Number(row.qkey_amount),
-            description: String(row.description || '')
+            amount: Number(row.reward_amount),
+            created_at: String(row.created_at)
           })
         }
       }
