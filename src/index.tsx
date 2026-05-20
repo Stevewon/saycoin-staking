@@ -67455,11 +67455,14 @@ app.get('/api/diag/detect-and-remove-5-19-dup', async (c) => {
 
     // affected users 정보
     const affectedUserIds = Object.keys(balanceDeduct).map(Number)
-    const affectedUsers = affectedUserIds.length > 0
-      ? (await db.prepare(
-          `SELECT id, name, qkey_balance FROM users WHERE id IN (${affectedUserIds.map(() => '?').join(',')})`
-        ).bind(...affectedUserIds).all<any>()).results || []
-      : []
+    let affectedUsersResults: any[] = []
+    if (affectedUserIds.length > 0) {
+      const placeholders = affectedUserIds.map(() => '?').join(',')
+      const r = await db.prepare(
+        `SELECT id, name, qkey_balance FROM users WHERE id IN (${placeholders})`
+      ).bind(...affectedUserIds).all<any>()
+      affectedUsersResults = r.results || []
+    }
 
     // ========================================================================
     // STEP 5: EXEC (only when confirm=REMOVE_5_19_DUP_GO)
@@ -67566,7 +67569,7 @@ app.get('/api/diag/detect-and-remove-5-19-dup', async (c) => {
         rr_first_15: rrToRemove.slice(0, 15),
         tx_first_30: txToRemove.slice(0, 30)
       },
-      affected_users,
+      affected_users: affectedUsersResults,
       exec_result: execResult,
       duration_ms: Date.now() - t0
     })
