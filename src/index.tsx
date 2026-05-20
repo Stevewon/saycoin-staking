@@ -67835,4 +67835,91 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/audit-user-referral-detail
+// ----------------------------------------------------------------------------
+// 특정 user 의 referral_rewards + 매칭 transactions 상세 조회 (특정 날짜들)
+// 사장님이 신운호(54) 같은 케이스 더 깊이 확인할 때 사용
+// ============================================================================
+app.get('/api/diag/audit-user-referral-detail', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+
+    const userId = Number(c.req.query('user_id') || '54')
+    const datesParam = c.req.query('dates') || '2026-05-14,2026-05-15,2026-05-18'
+    const DATES = datesParam.split(',').map(s => s.trim()).filter(Boolean)
+
+    const result: Record<string, any> = {}
+
+    for (const d of DATES) {
+      // rr where referrer_id = userId
+      const rrs = await db.prepare(`
+        SELECT id, referrer_id, referee_id, staking_id, level, original_amount, reward_amount, reward_date, paid_date, created_at
+          FROM referral_rewards
+         WHERE referrer_id = ? AND reward_date = ?
+         ORDER BY id
+      `).bind(userId, d).all<any>()
+
+      const rrList = rrs.results || []
+
+      // 매칭 TX
+      const rrIds = rrList.map((r: any) => Number(r.id))
+      const txMap = new Map<number, any>()
+      if (rrIds.length > 0) {
+        const ph = rrIds.map(() => '?').join(',')
+        const txRows = await db.prepare(
+          `SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+             FROM transactions
+            WHERE type='referral_reward' AND CAST(ref_id AS INTEGER) IN (${ph})`
+        ).bind(...rrIds).all<any>()
+        for (const t of (txRows.results || [])) {
+          txMap.set(Number(t.ref_id), t)
+        }
+      }
+
+      // 화면 표시용: 그 날짜 KST 에 보이는 TX (created_at +9hours 의 date 가 d 와 일치하거나 d+1)
+      // 신운호 캡처 기준: 화면 표시 = date(created_at,'+9 hours') 가 paid_date
+      // (reward_date 의 다음 영업일)
+      const screenTxs = await db.prepare(`
+        SELECT id, user_id, type, amount, description, ref_id, created_at,
+               date(created_at, '+9 hours') AS kst_date
+          FROM transactions
+         WHERE user_id = ? AND type = 'referral_reward'
+           AND date(created_at, '+9 hours') = ?
+         ORDER BY id
+      `).bind(userId, d).all<any>()
+
+      result[d] = {
+        rr_count: rrList.length,
+        rr_list: rrList.map((r: any) => ({
+          id: r.id, referee_id: r.referee_id, level: r.level, staking_id: r.staking_id,
+          original_amount: r.original_amount, reward_amount: r.reward_amount,
+          reward_date: r.reward_date, paid_date: r.paid_date, created_at: r.created_at,
+          has_tx: txMap.has(Number(r.id)),
+          tx: txMap.get(Number(r.id)) || null
+        })),
+        screen_tx_count_on_kst_date: (screenTxs.results || []).length,
+        screen_tx: screenTxs.results || []
+      }
+    }
+
+    // user 정보
+    const u = await db.prepare(`SELECT id, name, email, qkey_balance, referrer_id FROM users WHERE id = ?`).bind(userId).first<any>()
+
+    return c.json({
+      ok: true,
+      user: u,
+      dates: DATES,
+      detail: result,
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
