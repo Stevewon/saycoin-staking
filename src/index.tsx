@@ -67286,4 +67286,294 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
 })
 
 
+// ============================================================================
+// /api/diag/detect-and-remove-5-19-dup
+// ----------------------------------------------------------------------------
+// 사장님 명령 (2026-05-20 ULTIMATE RAGE):
+//   "어제 19일 페이드된 거에 오늘 20일 페이드를 각 계정마다 1회씩만 더해서 찍으라고!"
+//
+// 진단:
+//   5/19 reward_date 에 대해 두 번 지급된 회원/staking 검출:
+//     (1) 정규 cron (5/19 08:00 KST) — 정상
+//     (2) /api/diag/daily-payout-5-19 보충 (5/20 07:12 KST) — 사장님이 누락자 보충하라고 명령해서
+//                                                              만들었지만 누락 판단 오류로
+//                                                              정규 cron 으로 받은 회원도 또 받음
+//
+// 식별 로직:
+//   ① daily_rewards 에서 같은 (user_id, staking_id, reward_date='2026-05-19') 가 2건 이상
+//   ② referral_rewards 에서 같은 (referrer_id, referee_id, staking_id, level, reward_date='2026-05-19') 가 2건 이상
+//
+// 제거 정책 (사장님 명령: "각 계정마다 1회씩만"):
+//   - 2건 중 더 늦은 created_at (= daily-payout-5-19 보충분) 을 제거
+//   - 매칭 TX 도 함께 제거
+//   - users.qkey_balance 에서 해당 금액만큼 차감
+//
+// DRY_RUN 우선, confirm=REMOVE_5_19_DUP_GO 시 EXEC
+// ============================================================================
+app.get('/api/diag/detect-and-remove-5-19-dup', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const exec = (confirm === 'REMOVE_5_19_DUP_GO')
+    const db = c.env.DB
+
+    // ========================================================================
+    // STEP 0: snapshot before
+    // ========================================================================
+    const balBefore = await db.prepare(
+      `SELECT COALESCE(SUM(qkey_balance),0) AS total FROM users`
+    ).first<any>()
+    const txSumBefore = await db.prepare(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM transactions`
+    ).first<any>()
+    const drCountBefore = await db.prepare(
+      `SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date='2026-05-19'`
+    ).first<any>()
+    const rrCountBefore = await db.prepare(
+      `SELECT COUNT(*) AS cnt FROM referral_rewards WHERE reward_date='2026-05-19'`
+    ).first<any>()
+
+    // ========================================================================
+    // STEP 1: daily_rewards 중복 (5/19) 검출
+    // ========================================================================
+    const dailyDupGroups = await db.prepare(
+      `SELECT user_id, staking_id, reward_date, COUNT(*) AS cnt,
+              GROUP_CONCAT(id) AS dr_ids,
+              GROUP_CONCAT(usdt_amount) AS amounts,
+              GROUP_CONCAT(created_at) AS created_ats
+         FROM daily_rewards
+        WHERE reward_date = '2026-05-19'
+        GROUP BY user_id, staking_id, reward_date
+        HAVING COUNT(*) > 1
+        ORDER BY user_id, staking_id`
+    ).all<any>()
+
+    // ========================================================================
+    // STEP 2: referral_rewards 중복 (5/19) 검출
+    // ========================================================================
+    const refDupGroups = await db.prepare(
+      `SELECT referrer_id, referee_id, staking_id, level, reward_date, COUNT(*) AS cnt,
+              GROUP_CONCAT(id) AS rr_ids,
+              GROUP_CONCAT(reward_amount) AS amounts,
+              GROUP_CONCAT(created_at) AS created_ats
+         FROM referral_rewards
+        WHERE reward_date = '2026-05-19'
+        GROUP BY referrer_id, referee_id, staking_id, level, reward_date
+        HAVING COUNT(*) > 1
+        ORDER BY referrer_id, level, referee_id`
+    ).all<any>()
+
+    // ========================================================================
+    // STEP 3: 제거 대상 식별 (각 그룹에서 더 늦은 created_at 선택)
+    //         dr_to_remove[] = {dr_id, user_id, staking_id, amount}
+    //         rr_to_remove[] = {rr_id, referrer_id, referee_id, level, amount}
+    //         tx_to_remove[] = {tx_id, user_id, amount, type, ref_id}
+    // ========================================================================
+    const drToRemove: any[] = []
+    for (const g of (dailyDupGroups.results || [])) {
+      const ids = String(g.dr_ids).split(',').map((x: string) => Number(x.trim()))
+      const cas = String(g.created_ats).split(',').map((x: string) => x.trim())
+      // pick the one with LATER created_at (= the backfill insert)
+      let maxIdx = 0
+      for (let i = 1; i < cas.length; i++) {
+        if (cas[i] > cas[maxIdx]) maxIdx = i
+      }
+      const drId = ids[maxIdx]
+      // get full dr
+      const dr = await db.prepare(
+        `SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+           FROM daily_rewards WHERE id = ?`
+      ).bind(drId).first<any>()
+      if (dr) drToRemove.push(dr)
+    }
+
+    const rrToRemove: any[] = []
+    for (const g of (refDupGroups.results || [])) {
+      const ids = String(g.rr_ids).split(',').map((x: string) => Number(x.trim()))
+      const cas = String(g.created_ats).split(',').map((x: string) => x.trim())
+      let maxIdx = 0
+      for (let i = 1; i < cas.length; i++) {
+        if (cas[i] > cas[maxIdx]) maxIdx = i
+      }
+      const rrId = ids[maxIdx]
+      const rr = await db.prepare(
+        `SELECT id, referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at
+           FROM referral_rewards WHERE id = ?`
+      ).bind(rrId).first<any>()
+      if (rr) rrToRemove.push(rr)
+    }
+
+    // ========================================================================
+    // STEP 4: 매칭 TX 식별 (제거 대상 dr/rr 의 id 로)
+    // ========================================================================
+    const txToRemove: any[] = []
+
+    for (const dr of drToRemove) {
+      const tx = await db.prepare(
+        `SELECT id, user_id, type, amount, ref_id, description, created_at
+           FROM transactions
+           WHERE type = 'daily_qkey'
+             AND CAST(ref_id AS INTEGER) = ?
+             AND user_id = ?`
+      ).bind(dr.id, dr.user_id).all<any>()
+      for (const t of (tx.results || [])) {
+        txToRemove.push({ ...t, _source: 'daily', _dr_id: dr.id, _amount_to_deduct: t.amount })
+      }
+    }
+    for (const rr of rrToRemove) {
+      const tx = await db.prepare(
+        `SELECT id, user_id, type, amount, ref_id, description, created_at
+           FROM transactions
+           WHERE type = 'referral_reward'
+             AND CAST(ref_id AS INTEGER) = ?
+             AND user_id = ?`
+      ).bind(rr.id, rr.referrer_id).all<any>()
+      for (const t of (tx.results || [])) {
+        txToRemove.push({ ...t, _source: 'referral', _rr_id: rr.id, _amount_to_deduct: t.amount })
+      }
+    }
+
+    // user 별 차감 금액 집계
+    const balanceDeduct: Record<number, number> = {}
+    for (const tx of txToRemove) {
+      const uid = Number(tx.user_id)
+      balanceDeduct[uid] = (balanceDeduct[uid] || 0) + Number(tx.amount || 0)
+    }
+
+    const summary = {
+      daily_dup_group_count: (dailyDupGroups.results || []).length,
+      referral_dup_group_count: (refDupGroups.results || []).length,
+      dr_to_remove_count: drToRemove.length,
+      rr_to_remove_count: rrToRemove.length,
+      tx_to_remove_count: txToRemove.length,
+      tx_total_amount: txToRemove.reduce((a, b) => a + Number(b.amount || 0), 0),
+      affected_users: Object.keys(balanceDeduct).length,
+      balance_deduct_per_user: balanceDeduct
+    }
+
+    // affected users 정보
+    const affectedUserIds = Object.keys(balanceDeduct).map(Number)
+    const affectedUsers = affectedUserIds.length > 0
+      ? (await db.prepare(
+          `SELECT id, name, qkey_balance FROM users WHERE id IN (${affectedUserIds.map(() => '?').join(',')})`
+        ).bind(...affectedUserIds).all<any>()).results || []
+      : []
+
+    // ========================================================================
+    // STEP 5: EXEC (only when confirm=REMOVE_5_19_DUP_GO)
+    // ========================================================================
+    let execResult: any = null
+    if (exec) {
+      const errors: string[] = []
+      let drDeleted = 0, rrDeleted = 0, txDeleted = 0, balUpdated = 0
+
+      // 5-A) Delete TX
+      for (const tx of txToRemove) {
+        try {
+          const r = await db.prepare(`DELETE FROM transactions WHERE id = ?`).bind(tx.id).run()
+          if ((r as any)?.meta?.changes > 0) txDeleted++
+        } catch (e: any) {
+          errors.push(`tx ${tx.id}: ${String(e?.message || e)}`)
+        }
+      }
+
+      // 5-B) Delete dr
+      for (const dr of drToRemove) {
+        try {
+          const r = await db.prepare(`DELETE FROM daily_rewards WHERE id = ?`).bind(dr.id).run()
+          if ((r as any)?.meta?.changes > 0) drDeleted++
+        } catch (e: any) {
+          errors.push(`dr ${dr.id}: ${String(e?.message || e)}`)
+        }
+      }
+
+      // 5-C) Delete rr
+      for (const rr of rrToRemove) {
+        try {
+          const r = await db.prepare(`DELETE FROM referral_rewards WHERE id = ?`).bind(rr.id).run()
+          if ((r as any)?.meta?.changes > 0) rrDeleted++
+        } catch (e: any) {
+          errors.push(`rr ${rr.id}: ${String(e?.message || e)}`)
+        }
+      }
+
+      // 5-D) Deduct user balances
+      for (const [uidStr, amt] of Object.entries(balanceDeduct)) {
+        try {
+          const r = await db.prepare(
+            `UPDATE users SET qkey_balance = qkey_balance - ? WHERE id = ?`
+          ).bind(amt, Number(uidStr)).run()
+          if ((r as any)?.meta?.changes > 0) balUpdated++
+        } catch (e: any) {
+          errors.push(`user ${uidStr}: ${String(e?.message || e)}`)
+        }
+      }
+
+      execResult = { tx_deleted: txDeleted, dr_deleted: drDeleted, rr_deleted: rrDeleted, balance_updated_users: balUpdated, errors }
+    }
+
+    // ========================================================================
+    // STEP 6: post-check
+    // ========================================================================
+    const balAfter = await db.prepare(`SELECT COALESCE(SUM(qkey_balance),0) AS total FROM users`).first<any>()
+    const txSumAfter = await db.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions`).first<any>()
+    const drCountAfter = await db.prepare(`SELECT COUNT(*) AS cnt FROM daily_rewards WHERE reward_date='2026-05-19'`).first<any>()
+    const rrCountAfter = await db.prepare(`SELECT COUNT(*) AS cnt FROM referral_rewards WHERE reward_date='2026-05-19'`).first<any>()
+
+    // re-check remaining dups
+    const remainDailyDup = await db.prepare(
+      `SELECT COUNT(*) AS n FROM (
+        SELECT user_id, staking_id FROM daily_rewards
+         WHERE reward_date='2026-05-19'
+         GROUP BY user_id, staking_id HAVING COUNT(*) > 1)`
+    ).first<any>()
+    const remainRefDup = await db.prepare(
+      `SELECT COUNT(*) AS n FROM (
+        SELECT referrer_id, referee_id, staking_id, level FROM referral_rewards
+         WHERE reward_date='2026-05-19'
+         GROUP BY referrer_id, referee_id, staking_id, level HAVING COUNT(*) > 1)`
+    ).first<any>()
+
+    return c.json({
+      ok: true,
+      mode: exec ? 'EXEC' : 'DRY_RUN',
+      confirm_required: 'REMOVE_5_19_DUP_GO',
+      summary,
+      snapshot: {
+        balance_before: balBefore?.total,
+        balance_after: balAfter?.total,
+        balance_delta: Number(balAfter?.total || 0) - Number(balBefore?.total || 0),
+        tx_sum_before: txSumBefore?.total,
+        tx_sum_after: txSumAfter?.total,
+        tx_sum_delta: Number(txSumAfter?.total || 0) - Number(txSumBefore?.total || 0),
+        dr_5_19_count_before: drCountBefore?.cnt,
+        dr_5_19_count_after: drCountAfter?.cnt,
+        rr_5_19_count_before: rrCountBefore?.cnt,
+        rr_5_19_count_after: rrCountAfter?.cnt
+      },
+      post_verify: {
+        remaining_daily_dup_groups: remainDailyDup?.n,
+        remaining_ref_dup_groups: remainRefDup?.n
+      },
+      dup_groups: {
+        daily_first_30: (dailyDupGroups.results || []).slice(0, 30),
+        referral_first_30: (refDupGroups.results || []).slice(0, 30)
+      },
+      to_remove_preview: {
+        dr_first_15: drToRemove.slice(0, 15),
+        rr_first_15: rrToRemove.slice(0, 15),
+        tx_first_30: txToRemove.slice(0, 30)
+      },
+      affected_users,
+      exec_result: execResult,
+      duration_ms: Date.now() - t0
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
