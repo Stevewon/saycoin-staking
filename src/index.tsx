@@ -64555,4 +64555,171 @@ app.get('/api/diag/audit-5-19-full', async (c) => {
 })
 
 
+// ============================================================================
+// audit-user-5-19 — 특정 회원의 5/19 배당 raw 전수 (dr, rr, tx 전부)
+// 사장님 명령: "솔밧(solbat)의 경우 난리가 아님" → 솔밧 5/19 정밀 추적
+//
+// 출력:
+//   - target user 정보
+//   - 5/19 reward_date 인 dr/rr 전체 (그 회원이 받은 것)
+//   - 5/19 reward 관련 tx 전체 (description LIKE '%2026-05-19%' OR ref_id=dr.id/rr.id)
+//   - expected breakdown (영구룰 바텀업)
+//   - 중복 식별 (같은 (referee, staking_id, level) 의 rr 가 여러 개)
+//
+// 경로: GET /api/diag/audit-user-5-19?pw=ADMIN_PW&uid=44
+// ============================================================================
+app.get('/api/diag/audit-user-5-19', async (c) => {
+  const t0 = Date.now()
+  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
+  const db = c.env.DB
+
+  const uid = Number(c.req.query('uid') || 44)
+  const REWARD_DATE = '2026-05-19'
+
+  try {
+    const user = await db.prepare(`SELECT id, name, email, referrer_id, qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+
+    // (1) 본인의 5/19 dr
+    const drs = (await db.prepare(`
+      SELECT id, user_id, staking_id, usdt_amount, reward_date, paid_date, created_at
+      FROM daily_rewards
+      WHERE user_id = ? AND reward_date = ?
+      ORDER BY id
+    `).bind(uid, REWARD_DATE).all()).results
+
+    // (2) 본인이 받은 5/19 rr (referrer_id = uid)
+    const rrs = (await db.prepare(`
+      SELECT id, referrer_id, referee_id, level, original_amount, reward_amount,
+             reward_date, paid_date, staking_id, created_at
+      FROM referral_rewards
+      WHERE referrer_id = ? AND reward_date = ?
+      ORDER BY id
+    `).bind(uid, REWARD_DATE).all()).results
+
+    // (3) 본인의 5/19 관련 tx (description 키워드 + ref_id 매칭)
+    const txByDesc = (await db.prepare(`
+      SELECT id, user_id, type, coin_type, amount, description, ref_id, created_at
+      FROM transactions
+      WHERE user_id = ? AND coin_type='QKEY'
+        AND (description LIKE '%2026-05-19%' OR description LIKE '%daily-payout-5-19%')
+      ORDER BY id
+    `).bind(uid).all()).results
+
+    // (4) 본인 5/19 active staking 으로부터 expected (영구룰)
+    const myStakings = (await db.prepare(`
+      SELECT id, user_id, amount, daily_rate, start_date, end_date, status, reset_at
+      FROM staking
+      WHERE user_id = ?
+        AND status = 'active' AND reset_at IS NULL
+        AND date(start_date, '+9 hours') <= ?
+        AND date(end_date,   '+9 hours') >= ?
+    `).bind(uid, REWARD_DATE, REWARD_DATE).all()).results as any[]
+
+    type Exp = { source: string, referee_user_id?: number, referee_name?: string,
+                  staking_id: number, level: 0 | 1 | 2,
+                  original_amount: number, reward_amount: number }
+    const expected: Exp[] = []
+
+    // self
+    for (const s of myStakings) {
+      const qkey = Math.round(Number(s.amount) * Number(s.daily_rate) * 150)
+      expected.push({ source: 'self', staking_id: s.id, level: 0,
+                       original_amount: qkey, reward_amount: qkey })
+    }
+
+    // 내가 L1 받을 수 있는 referee 들 (referrer_id = uid AND referee 가 5/19 active staking 보유)
+    if (myStakings.length > 0) {
+      const l1Referees = (await db.prepare(`
+        SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, u.name
+        FROM staking s JOIN users u ON s.user_id = u.id
+        WHERE u.referrer_id = ?
+          AND s.status='active' AND s.reset_at IS NULL
+          AND date(s.start_date, '+9 hours') <= ?
+          AND date(s.end_date,   '+9 hours') >= ?
+      `).bind(uid, REWARD_DATE, REWARD_DATE).all()).results as any[]
+      for (const r of l1Referees) {
+        const refQkey = Math.round(Number(r.amount) * Number(r.daily_rate) * 150)
+        expected.push({ source: 'L1_from', referee_user_id: r.user_id, referee_name: r.name,
+                         staking_id: r.staking_id, level: 1,
+                         original_amount: refQkey, reward_amount: Math.round(refQkey * 0.20) })
+      }
+
+      // L2 받을 수 있는 referee 들 (referee 의 referrer 의 referrer = uid)
+      const l2Referees = (await db.prepare(`
+        SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, u.name, u.referrer_id AS l1Id
+        FROM staking s JOIN users u ON s.user_id = u.id
+        JOIN users u2 ON u.referrer_id = u2.id
+        WHERE u2.referrer_id = ?
+          AND s.status='active' AND s.reset_at IS NULL
+          AND date(s.start_date, '+9 hours') <= ?
+          AND date(s.end_date,   '+9 hours') >= ?
+      `).bind(uid, REWARD_DATE, REWARD_DATE).all()).results as any[]
+      for (const r of l2Referees) {
+        const refQkey = Math.round(Number(r.amount) * Number(r.daily_rate) * 150)
+        expected.push({ source: 'L2_from', referee_user_id: r.user_id, referee_name: r.name,
+                         staking_id: r.staking_id, level: 2,
+                         original_amount: refQkey, reward_amount: Math.round(refQkey * 0.10) })
+      }
+    }
+
+    // 중복 식별 (같은 (referee_id, level, staking_id) 가 여러 번 들어왔는지)
+    const rrKeyMap: Record<string, any[]> = {}
+    for (const r of rrs as any[]) {
+      const k = `${r.referee_id}|L${r.level}|st${r.staking_id || 0}|amt${r.original_amount}`
+      if (!rrKeyMap[k]) rrKeyMap[k] = []
+      rrKeyMap[k].push(r)
+    }
+    const dupRrKeys = Object.entries(rrKeyMap).filter(([_, arr]) => arr.length > 1)
+
+    const drKeyMap: Record<string, any[]> = {}
+    for (const r of drs as any[]) {
+      const k = `st${r.staking_id || 0}`
+      if (!drKeyMap[k]) drKeyMap[k] = []
+      drKeyMap[k].push(r)
+    }
+    const dupDrKeys = Object.entries(drKeyMap).filter(([_, arr]) => arr.length > 1)
+
+    // actual totals
+    const actSelf = (drs as any[]).reduce((s, r) => s + Math.round(Number(r.usdt_amount) * 150), 0)
+    const actL1 = (rrs as any[]).filter(r => r.level === 1).reduce((s, r) => s + Number(r.reward_amount), 0)
+    const actL2 = (rrs as any[]).filter(r => r.level === 2).reduce((s, r) => s + Number(r.reward_amount), 0)
+    const actTx = (txByDesc as any[]).reduce((s, r) => s + Number(r.amount), 0)
+
+    const expSelf = expected.filter(e => e.level === 0).reduce((s, e) => s + e.reward_amount, 0)
+    const expL1   = expected.filter(e => e.level === 1).reduce((s, e) => s + e.reward_amount, 0)
+    const expL2   = expected.filter(e => e.level === 2).reduce((s, e) => s + e.reward_amount, 0)
+
+    return c.json({
+      mode: 'AUDIT_USER_5_19',
+      reward_date: REWARD_DATE,
+      user,
+      my_active_stakings_on_5_19: myStakings,
+      expected_breakdown: expected,
+      actual_dr: drs,
+      actual_rr: rrs,
+      actual_tx_by_desc: txByDesc,
+      totals: {
+        expected: { self: expSelf, l1: expL1, l2: expL2, total: expSelf + expL1 + expL2 },
+        actual:   { self: actSelf, l1: actL1, l2: actL2, dr_count: drs.length, rr_count: rrs.length,
+                    tx_amount_sum: actTx, tx_count: txByDesc.length,
+                    rr_l1_count: (rrs as any[]).filter(r => r.level === 1).length,
+                    rr_l2_count: (rrs as any[]).filter(r => r.level === 2).length },
+        diff: {
+          self: actSelf - expSelf, l1: actL1 - expL1, l2: actL2 - expL2,
+          total: (actSelf + actL1 + actL2) - (expSelf + expL1 + expL2),
+        },
+      },
+      duplicates: {
+        dr_duplicates: dupDrKeys.map(([k, arr]) => ({ key: k, count: arr.length, rows: arr })),
+        rr_duplicates: dupRrKeys.map(([k, arr]) => ({ key: k, count: arr.length, rows: arr })),
+      },
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
