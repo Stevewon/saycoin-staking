@@ -66950,7 +66950,7 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
     // PART 2: solbat (user_id=44) 전수조사
     // ========================================================================
     const solbatUser = await db.prepare(
-      `SELECT id, name, email, referrer_id, qkey_balance, role, created_at
+      `SELECT id, name, email, referrer_id, qkey_balance, created_at
          FROM users WHERE id = 44`
     ).first<any>()
 
