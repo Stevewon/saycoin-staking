@@ -64958,4 +64958,137 @@ app.get('/api/diag/fix-usdt-amount-permanent-rule', async (c) => {
 })
 
 
+// ============================================================================
+// 🔴 /api/diag/fix-bangsh-balance (uid=33 방승훈 잔액 정합성 복구)
+//
+// 정밀 조사 결과:
+//   - users.qkey_balance = 0
+//   - QKEY TX sum       = 12,000
+//   - users.usdt_balance = 200
+//   - USDT TX sum       = 120
+//   - diff: QKEY -12,000 / USDT +80 (1 USDT = 150 QKEY 환율 정확히 매칭)
+//   - 결론: TX 기록 없이 잔액만 변경된 비정상 swap 발생 (swap API 의 TX INSERT 누락 버그)
+//
+// 영구룰: balance = SUM(transactions) (TX 로 추적되지 않는 잔액 변동은 무효)
+//
+// 수정 방안 (옵션 A — 영구룰 정통):
+//   UPDATE users SET qkey_balance = 12000, usdt_balance = 120 WHERE id = 33
+//   → swap 미기록분 무효처리, 잔액을 TX sum 과 일치시킴
+//
+// 🔴 TX 절대 안 건드림 (transactions 그대로 유지)
+//
+// DRY-RUN: GET ?pw=...
+// EXEC:    GET ?pw=...&confirm=FIX_BANGSH_GO
+// ============================================================================
+app.get('/api/diag/fix-bangsh-balance', async (c) => {
+  const t0 = Date.now()
+  try {
+    const pw = c.req.query('pw') || ''
+    if (pw !== 'Qta@2026!Sec#Admin') {
+      return c.json({ error: 'unauthorized' }, 401)
+    }
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_BANGSH_GO'
+
+    const DB = c.env.DB
+    const UID = 33
+
+    // 1) 현재 user row
+    const user = await DB.prepare(
+      `SELECT id, name, email, qkey_balance, usdt_balance FROM users WHERE id = ?`
+    ).bind(UID).first<any>()
+    if (!user) return c.json({ error: 'user not found' }, 404)
+
+    // 2) TX 합계 (영구룰: balance = SUM(transactions per coin_type))
+    const qkeySum = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'QKEY'`
+    ).bind(UID).first<{ s: number }>()
+    const usdtSum = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE user_id = ? AND coin_type = 'USDT'`
+    ).bind(UID).first<{ s: number }>()
+
+    const targetQkey = Number(qkeySum?.s ?? 0)
+    const targetUsdt = Number(usdtSum?.s ?? 0)
+    const currentQkey = Number(user.qkey_balance ?? 0)
+    const currentUsdt = Number(user.usdt_balance ?? 0)
+    const deltaQkey = targetQkey - currentQkey
+    const deltaUsdt = targetUsdt - currentUsdt
+
+    // 3) 미기록 swap 의심 증거: 환율 매칭 (1 USDT = 150 QKEY)
+    const swapEvidence = {
+      qkey_missing: -deltaQkey,            // 12000
+      usdt_missing: deltaUsdt,             // -80? we expect +80
+      ratio_check_150: Math.abs((-deltaQkey) / 150 - (-deltaUsdt)) < 0.01,
+      note: '1 USDT = 150 QKEY 환율로 미기록 swap 흔적 확인',
+    }
+
+    if (!isExec) {
+      return c.json({
+        mode: 'DRY_RUN',
+        target_user: { id: UID, name: user.name, email: user.email },
+        before: {
+          qkey_balance: currentQkey,
+          usdt_balance: currentUsdt,
+        },
+        tx_sums: {
+          qkey: targetQkey,
+          usdt: targetUsdt,
+        },
+        proposed_after: {
+          qkey_balance: targetQkey,
+          usdt_balance: targetUsdt,
+        },
+        deltas: {
+          qkey: deltaQkey,
+          usdt: deltaUsdt,
+        },
+        swap_evidence: swapEvidence,
+        action: 'UPDATE users SET qkey_balance=?, usdt_balance=? WHERE id=33',
+        principle: '영구룰: balance = SUM(transactions). TX 미기록 swap 무효처리',
+        next_step: 'to EXEC: append &confirm=FIX_BANGSH_GO',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // ===== EXEC =====
+    const updateRes = await DB.prepare(
+      `UPDATE users SET qkey_balance = ?, usdt_balance = ? WHERE id = ?`
+    ).bind(targetQkey, targetUsdt, UID).run()
+
+    // 사후 검증
+    const verify = await DB.prepare(
+      `SELECT id, name, qkey_balance, usdt_balance FROM users WHERE id = ?`
+    ).bind(UID).first<any>()
+
+    // 전체 정합성 재확인
+    const totalBal = await DB.prepare(
+      `SELECT COALESCE(SUM(qkey_balance), 0) AS s FROM users`
+    ).first<{ s: number }>()
+    const totalTx = await DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE coin_type = 'QKEY'`
+    ).first<{ s: number }>()
+
+    return c.json({
+      mode: 'EXEC',
+      executed_at_kst: new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('Z', '+09:00'),
+      target_user: { id: UID, name: user.name, email: user.email },
+      before: { qkey_balance: currentQkey, usdt_balance: currentUsdt },
+      after: { qkey_balance: Number(verify?.qkey_balance ?? 0), usdt_balance: Number(verify?.usdt_balance ?? 0) },
+      deltas: { qkey: deltaQkey, usdt: deltaUsdt },
+      changes: (updateRes as any)?.meta?.changes ?? null,
+      global_integrity_after: {
+        total_qkey_balance: Number(totalBal?.s ?? 0),
+        total_qkey_tx_sum: Number(totalTx?.s ?? 0),
+        diff: Number(totalBal?.s ?? 0) - Number(totalTx?.s ?? 0),
+        ok: Math.abs(Number(totalBal?.s ?? 0) - Number(totalTx?.s ?? 0)) < 0.01,
+      },
+      note: 'TX 절대 안 건드림 (transactions 그대로). users.qkey_balance/usdt_balance 컬럼만 TX sum 과 일치시킴',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error: any) {
+    return c.json({ error: String(error?.message || error), stack: error?.stack, duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 export default app
