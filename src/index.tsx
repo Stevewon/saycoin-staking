@@ -67615,7 +67615,10 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
     if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
-    const TARGET_DATES = ['2026-05-14', '2026-05-15', '2026-05-18']
+    // 단일 날짜만 처리 (Worker timeout 회피) — 미지정 시 전부
+    const dateParam = c.req.query('date') || ''
+    const ALL_DATES = ['2026-05-14', '2026-05-15', '2026-05-18']
+    const TARGET_DATES = dateParam && ALL_DATES.includes(dateParam) ? [dateParam] : ALL_DATES
 
     // expected rr struct
     type Expected = {
@@ -67628,26 +67631,30 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
       reward_amount: number    // L1=20%, L2=10%
     }
 
+    // ★ 최적화: 모든 users (id, referrer_id) 한번에 로드 → 메모리 룩업
+    const allUsers = await db.prepare(`SELECT id, name, referrer_id FROM users`).all<any>()
+    const userMap = new Map<number, { id: number, name: string, referrer_id: number | null }>()
+    for (const u of (allUsers.results || [])) {
+      userMap.set(Number(u.id), { id: Number(u.id), name: u.name || '', referrer_id: u.referrer_id != null ? Number(u.referrer_id) : null })
+    }
+
     const byDate: Record<string, {
       active_staking_count: number
       expected_l1_count: number
       expected_l2_count: number
       actual_rr_count: number
       missing_rr: Expected[]
-      missing_tx: any[]  // {rr_id, referrer_id, referee_id, level, reward_amount, reward_date}
+      missing_tx: any[]
     }> = {}
 
     const allMissingRr: Expected[] = []
     const allMissingTx: any[] = []
 
     for (const REWARD_DATE of TARGET_DATES) {
-      // STEP 1: 해당 날짜 active 였던 모든 staking
+      // STEP 1: 해당 날짜 active 였던 모든 staking (단일 쿼리)
       const activeStakings = await db.prepare(`
-        SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.start_date, s.end_date,
-               s.status, s.reset_at,
-               u.referrer_id AS l1_id
+        SELECT s.id AS staking_id, s.user_id, s.amount, s.daily_rate, s.start_date, s.end_date
           FROM staking s
-          JOIN users u ON u.id = s.user_id
          WHERE s.status = 'active'
            AND date(s.start_date, '+9 hours') <= ?
            AND date(s.end_date,   '+9 hours') >= ?
@@ -67656,7 +67663,13 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
 
       const stakingList = activeStakings.results || []
 
-      // STEP 2: expected rr 생성
+      // ★ 최적화: 해당 날짜에 active 인 user_id set 을 한 번에 계산 (메모리)
+      const activeUserIds = new Set<number>()
+      for (const stk of stakingList) {
+        activeUserIds.add(Number(stk.user_id))
+      }
+
+      // STEP 2: expected rr 생성 (메모리 룩업만)
       const expectedRr: Expected[] = []
       for (const stk of stakingList) {
         const refereeId = Number(stk.user_id)
@@ -67666,20 +67679,12 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
         const qkeyAmount = Math.round(amount * dailyRate * 150)
         if (qkeyAmount <= 0) continue
 
-        const l1Id = stk.l1_id ? Number(stk.l1_id) : null
+        const refereeUser = userMap.get(refereeId)
+        const l1Id = refereeUser?.referrer_id ?? null
         if (!l1Id) continue
 
-        // L1 active 확인
-        const l1Active = await db.prepare(`
-          SELECT id FROM staking
-          WHERE user_id = ?
-            AND status = 'active'
-            AND date(start_date, '+9 hours') <= ?
-            AND date(end_date,   '+9 hours') >= ?
-          LIMIT 1
-        `).bind(l1Id, REWARD_DATE, REWARD_DATE).first<any>()
-
-        if (l1Active) {
+        // L1 active 여부: activeUserIds set 으로 즉시 판정
+        if (activeUserIds.has(l1Id)) {
           expectedRr.push({
             reward_date: REWARD_DATE,
             referrer_id: l1Id,
@@ -67690,29 +67695,19 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
             reward_amount: Math.round(qkeyAmount * 0.20)
           })
 
-          // L2 확인 (L1 의 referrer)
-          const l1Row = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(l1Id).first<any>()
-          const l2Id = l1Row?.referrer_id ? Number(l1Row.referrer_id) : null
-          if (l2Id) {
-            const l2Active = await db.prepare(`
-              SELECT id FROM staking
-              WHERE user_id = ?
-                AND status = 'active'
-                AND date(start_date, '+9 hours') <= ?
-                AND date(end_date,   '+9 hours') >= ?
-              LIMIT 1
-            `).bind(l2Id, REWARD_DATE, REWARD_DATE).first<any>()
-            if (l2Active) {
-              expectedRr.push({
-                reward_date: REWARD_DATE,
-                referrer_id: l2Id,
-                referee_id: refereeId,
-                staking_id: stakingId,
-                level: 2,
-                original_amount: qkeyAmount,
-                reward_amount: Math.round(qkeyAmount * 0.10)
-              })
-            }
+          // L2: L1 의 referrer 가 또 activeUserIds 에 있는지
+          const l1User = userMap.get(l1Id)
+          const l2Id = l1User?.referrer_id ?? null
+          if (l2Id && activeUserIds.has(l2Id)) {
+            expectedRr.push({
+              reward_date: REWARD_DATE,
+              referrer_id: l2Id,
+              referee_id: refereeId,
+              staking_id: stakingId,
+              level: 2,
+              original_amount: qkeyAmount,
+              reward_amount: Math.round(qkeyAmount * 0.10)
+            })
           }
         }
       }
@@ -67733,27 +67728,33 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
           Number(a.referee_id) === exp.referee_id &&
           Number(a.level) === exp.level &&
           (
-            // staking_id 명시 매칭
             (a.staking_id != null && Number(a.staking_id) === exp.staking_id)
             ||
-            // legacy NULL staking_id: original_amount 같으면 매칭
             (a.staking_id == null && Number(a.original_amount) === exp.original_amount)
           )
         )
         if (!match) missingRr.push(exp)
       }
 
-      // STEP 5: 매칭 TX 누락 체크 (actual rr 중 TX 없는 것)
+      // STEP 5: 매칭 TX 누락 체크 — 단일 쿼리로 일괄 조회
+      const actualRrIds = actualList.map((r: any) => Number(r.id))
+      const txByRefId = new Set<number>()
+      if (actualRrIds.length > 0) {
+        // chunk 100 (D1 placeholder 제한 회피)
+        for (let i = 0; i < actualRrIds.length; i += 100) {
+          const chunk = actualRrIds.slice(i, i + 100)
+          const ph = chunk.map(() => '?').join(',')
+          const txRows = await db.prepare(
+            `SELECT CAST(ref_id AS INTEGER) AS rid FROM transactions
+              WHERE type='referral_reward' AND CAST(ref_id AS INTEGER) IN (${ph})`
+          ).bind(...chunk).all<any>()
+          for (const r of (txRows.results || [])) txByRefId.add(Number(r.rid))
+        }
+      }
+
       const missingTxList: any[] = []
       for (const rr of actualList) {
-        const tx = await db.prepare(`
-          SELECT id FROM transactions
-          WHERE type = 'referral_reward'
-            AND CAST(ref_id AS INTEGER) = ?
-            AND user_id = ?
-          LIMIT 1
-        `).bind(Number(rr.id), Number(rr.referrer_id)).first<any>()
-        if (!tx) {
+        if (!txByRefId.has(Number(rr.id))) {
           missingTxList.push({
             rr_id: rr.id,
             referrer_id: rr.referrer_id,
@@ -67807,8 +67808,8 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
       user_id: 54,
       missing_per_date: TARGET_DATES.map(d => ({
         date: d,
-        missing_count: byDate[d].missing_rr.filter(m => m.referrer_id === 54).length,
-        missing_detail: byDate[d].missing_rr.filter(m => m.referrer_id === 54)
+        missing_count: (byDate[d]?.missing_rr || []).filter(m => m.referrer_id === 54).length,
+        missing_detail: (byDate[d]?.missing_rr || []).filter(m => m.referrer_id === 54)
       }))
     }
 
