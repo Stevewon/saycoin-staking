@@ -65714,9 +65714,9 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
     // 5) ⭐ 동시 의심: 같은 회원이 L1=3000 과 L2=630 둘 다 받았고 + daily=15000 도 받은 케이스
     const suspectUsers = await db.prepare(`
       SELECT t1.user_id, u.name as user_name,
-             COUNT(DISTINCT t1.id) as l1_3000_cnt,
-             GROUP_CONCAT(DISTINCT t1.id) as l1_tx_ids,
-             GROUP_CONCAT(DISTINCT SUBSTR(t1.description, 1, 60), ' || ') as l1_descs
+             COUNT(t1.id) as l1_3000_cnt,
+             GROUP_CONCAT(t1.id) as l1_tx_ids,
+             GROUP_CONCAT(SUBSTR(t1.description, 1, 60)) as l1_descs
       FROM transactions t1
       LEFT JOIN users u ON t1.user_id = u.id
       WHERE t1.type = 'referral_reward'
