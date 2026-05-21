@@ -4229,6 +4229,134 @@ app.get('/api/admin/member-rewards', async (c) => {
       ORDER BY total_reward DESC
     `).all()
 
+    // ===== 영구룰 #cap200정책 — staking별 CAP % 계산 (READ-ONLY) =====
+    // 1) 모든 staking 조회 (active/completed/capped 모두 포함, FIFO 정렬: user_id ASC, start_date ASC)
+    const allStakings = await db.prepare(`
+      SELECT id, user_id, amount, status, start_date
+      FROM staking
+      WHERE status IN ('active','completed','capped')
+      ORDER BY user_id ASC, start_date ASC, id ASC
+    `).all()
+
+    // 2) 모든 4종 cap 대상 transactions 조회 (created_at ASC for FIFO 시뮬레이션)
+    //    4종: daily_qkey, referral_reward, direct_referral
+    //    제외: staking_reward, admin_adjustment, swap_*, withdrawal*
+    const allCapTxs = await db.prepare(`
+      SELECT user_id, type, amount, created_at, id
+      FROM transactions
+      WHERE coin_type = 'QKEY'
+        AND type IN ('daily_qkey', 'referral_reward', 'direct_referral')
+      ORDER BY user_id ASC, created_at ASC, id ASC
+    `).all()
+
+    // 3) user_id별로 stakings/txs 그룹화 후 FIFO 분배 시뮬레이션
+    const stakingsByUser: Record<number, any[]> = {}
+    for (const s of (allStakings.results || []) as any[]) {
+      const uid = Number(s.user_id)
+      if (!stakingsByUser[uid]) stakingsByUser[uid] = []
+      stakingsByUser[uid].push({
+        id: Number(s.id),
+        amount: Number(s.amount),
+        status: String(s.status),
+        start_date: String(s.start_date),
+        cap_target: Number(s.amount) * 300,  // 영구룰 #cap200정책: amount × 300
+        baseline: Number(s.amount) * 150,     // 100% 기준점
+        paid_total: 0,
+        capped: false,
+      })
+    }
+
+    const txsByUser: Record<number, any[]> = {}
+    for (const tx of (allCapTxs.results || []) as any[]) {
+      const uid = Number(tx.user_id)
+      if (!txsByUser[uid]) txsByUser[uid] = []
+      txsByUser[uid].push({
+        type: String(tx.type),
+        amount: Number(tx.amount),
+        created_at: String(tx.created_at),
+        id: Number(tx.id),
+      })
+    }
+
+    // 4) 각 user의 stakings에 FIFO로 paid_total 분배
+    const stakingCapsByUser: Record<number, any[]> = {}
+    for (const uid of Object.keys(stakingsByUser)) {
+      const uidNum = Number(uid)
+      const stks = stakingsByUser[uidNum]  // 이미 start_date ASC 정렬됨
+      const txs = txsByUser[uidNum] || []
+
+      for (const ev of txs) {
+        // ev.created_at의 날짜 부분 (UTC raw, KST 변환 안함 — staking.start_date와 동일 기준)
+        const paidDate = ev.created_at.substring(0, 10)
+        let remaining = ev.amount
+        // 활성(start_date ≤ paid_date) + 미-cap staking 중 가장 오래된 것에 분배
+        while (remaining > 0) {
+          let target: any = null
+          for (const s of stks) {
+            if (s.start_date.substring(0, 10) > paidDate) continue
+            if (s.capped) continue
+            target = s
+            break
+          }
+          if (!target) {
+            // 모든 staking capped: 영구룰 위반 가능성, 그러나 표시 단계에서는
+            // 마지막 staking에 overflow 기록 (DB는 변경 안함)
+            if (stks.length > 0) stks[stks.length - 1].paid_total += remaining
+            remaining = 0
+            break
+          }
+          const available = target.cap_target - target.paid_total
+          if (remaining <= available) {
+            target.paid_total += remaining
+            if (target.paid_total >= target.cap_target) target.capped = true
+            remaining = 0
+          } else {
+            // Case B: 1회만 초과 허용 + capped
+            target.paid_total += remaining
+            target.capped = true
+            remaining = 0
+          }
+        }
+      }
+
+      stakingCapsByUser[uidNum] = stks.map(s => {
+        const cap_pct = s.baseline > 0 ? (s.paid_total / s.baseline * 100) : 0
+        return {
+          staking_id: s.id,
+          amount: s.amount,
+          status: s.status,
+          start_date: s.start_date,
+          baseline: s.baseline,
+          cap_target: s.cap_target,
+          paid_total: s.paid_total,
+          cap_pct: Math.round(cap_pct * 100) / 100,  // 소수 2자리
+          capped: s.capped,
+        }
+      })
+    }
+
+    // 5) members에 staking_caps 필드 추가
+    const enrichedMembers = ((memberRewards.results || []) as any[]).map(m => {
+      const uid = Number(m.id)
+      const caps = stakingCapsByUser[uid] || []
+      // user 전체 합계 (참고용)
+      const total_baseline = caps.reduce((sum, c) => sum + c.baseline, 0)
+      const total_cap_target = caps.reduce((sum, c) => sum + c.cap_target, 0)
+      const total_paid_for_cap = caps.reduce((sum, c) => sum + c.paid_total, 0)
+      const user_cap_pct = total_baseline > 0 ? Math.round(total_paid_for_cap / total_baseline * 100 * 100) / 100 : 0
+      return {
+        ...m,
+        staking_caps: caps,
+        cap_summary: {
+          total_baseline,
+          total_cap_target,
+          total_paid_for_cap,
+          user_cap_pct,
+          any_capped: caps.some(c => c.capped),
+        }
+      }
+    })
+
     // 전체 합계
     const totals = await db.prepare(`
       SELECT 
@@ -4243,7 +4371,7 @@ app.get('/api/admin/member-rewards', async (c) => {
 
     return c.json({
       success: true,
-      members: memberRewards.results,
+      members: enrichedMembers,
       totals: {
         totalDailyQkey: totals?.total_daily_qkey || 0,
         totalReferralQkey: referralTotals?.total_referral_qkey || 0,
@@ -25245,15 +25373,17 @@ app.get('/admin/dashboard', (c) => {
                                 <tr>
                                     <th class="px-2 py-2 text-left" data-i18n="admin.col_email_short">이메일</th>
                                     <th class="px-2 py-2 text-left" data-i18n="admin.col_name_short">이름</th>
+                                    <th class="px-2 py-2 text-center">스테이킹</th>
                                     <th class="px-2 py-2 text-right" data-i18n="admin.col_investment">투자금액</th>
                                     <th class="px-2 py-2 text-right" data-i18n="admin.col_daily_reward">일일배당</th>
                                     <th class="px-2 py-2 text-right" data-i18n="admin.col_referral_reward">추천보상</th>
                                     <th class="px-2 py-2 text-right" data-i18n="admin.col_total_reward">총수당</th>
+                                    <th class="px-2 py-2 text-center" title="영구룰 #cap200정책: paid_total ÷ (amount×150) × 100">CAP %</th>
                                     <th class="px-2 py-2 text-center" data-i18n="admin.col_qkey_balance">QKEY잔액</th>
                                 </tr>
                             </thead>
                             <tbody id="memberRewardsTableBody" class="divide-y divide-gray-200">
-                                <tr><td colspan="7" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
+                                <tr><td colspan="9" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -27083,24 +27213,83 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // 영구룰 #cap200정책 — CAP % 색상 임계값 (200% scale)
+            // 0~100% 회색, 100~160% 노랑, 160~199% 주황, 200%+ 빨강 CAPPED
+            function capPctColorClass(pct) {
+                if (pct >= 200) return 'text-red-700 font-bold bg-red-50';
+                if (pct >= 160) return 'text-orange-600 font-bold bg-orange-50';
+                if (pct >= 100) return 'text-yellow-700 font-bold bg-yellow-50';
+                return 'text-gray-500';
+            }
+            function capPctBadge(pct, capped) {
+                var cls = capPctColorClass(pct);
+                var label = pct.toFixed(2) + '%';
+                if (capped || pct >= 200) label += ' 🔴';
+                return '<span class="px-2 py-0.5 rounded ' + cls + '">' + label + '</span>';
+            }
+
             function renderMemberRewards(members) {
                 var tbody = document.getElementById('memberRewardsTableBody');
                 if (members.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_data') + '</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_data') + '</td></tr>';
                     return;
                 }
-                tbody.innerHTML = members.map(function(m) {
-                    var total = (m.daily_reward_total || 0) + (m.referral_reward_total || 0);
-                    return '<tr class="hover:bg-gray-50 cursor-pointer" onclick="showDownlineSales(' + m.id + ')">' +
-                        '<td class="px-2 py-2 text-xs">' + esc(m.email) + '</td>' +
-                        '<td class="px-2 py-2 font-medium text-sm">' + esc(m.name) + '</td>' +
-                        '<td class="px-2 py-2 text-right text-sm">$' + (m.staking_amount || 0).toLocaleString() + '</td>' +
-                        '<td class="px-2 py-2 text-right text-yellow-600 font-bold">' + Math.round(m.daily_reward_total || 0).toLocaleString() + '</td>' +
-                        '<td class="px-2 py-2 text-right text-blue-600 font-bold">' + Math.round(m.referral_reward_total || 0).toLocaleString() + '</td>' +
-                        '<td class="px-2 py-2 text-right text-green-600 font-bold">' + Math.round(total).toLocaleString() + '</td>' +
-                        '<td class="px-2 py-2 text-center">' + (m.qkey_balance || 0).toLocaleString() + '</td>' +
-                    '</tr>';
-                }).join('');
+                var rows = [];
+                members.forEach(function(m) {
+                    var totalReward = (m.daily_reward_total || 0) + (m.referral_reward_total || 0);
+                    var caps = m.staking_caps || [];
+                    var userCapPct = (m.cap_summary && m.cap_summary.user_cap_pct) || 0;
+                    var anyCapped = (m.cap_summary && m.cap_summary.any_capped) || false;
+
+                    if (caps.length === 0) {
+                        // staking 없음 → 기존 1행 (CAP 컬럼 "-")
+                        rows.push(
+                            '<tr class="hover:bg-gray-50 cursor-pointer" onclick="showDownlineSales(' + m.id + ')">' +
+                            '<td class="px-2 py-2 text-xs">' + esc(m.email) + '</td>' +
+                            '<td class="px-2 py-2 font-medium text-sm">' + esc(m.name) + '</td>' +
+                            '<td class="px-2 py-2 text-center text-xs text-gray-400">-</td>' +
+                            '<td class="px-2 py-2 text-right text-sm">$' + (m.staking_amount || 0).toLocaleString() + '</td>' +
+                            '<td class="px-2 py-2 text-right text-yellow-600 font-bold">' + Math.round(m.daily_reward_total || 0).toLocaleString() + '</td>' +
+                            '<td class="px-2 py-2 text-right text-blue-600 font-bold">' + Math.round(m.referral_reward_total || 0).toLocaleString() + '</td>' +
+                            '<td class="px-2 py-2 text-right text-green-600 font-bold">' + Math.round(totalReward).toLocaleString() + '</td>' +
+                            '<td class="px-2 py-2 text-center text-xs text-gray-400">-</td>' +
+                            '<td class="px-2 py-2 text-center">' + (m.qkey_balance || 0).toLocaleString() + '</td>' +
+                            '</tr>'
+                        );
+                    } else {
+                        // staking별 행 분리 (영구룰 #스테이킹별독립)
+                        // 첫 행에 rowspan으로 좌측 공통 정보 표시
+                        caps.forEach(function(cap, idx) {
+                            var sid = cap.staking_id;
+                            var amount = cap.amount || 0;
+                            var capPct = cap.cap_pct || 0;
+                            var stakingCell = '#' + sid + '<br><span class="text-[10px] text-gray-400">' + (cap.start_date || '').substring(0,10) + '</span>';
+                            var amountCell = '$' + amount.toLocaleString() + '<br><span class="text-[10px] text-gray-400">paid ' + Math.round(cap.paid_total || 0).toLocaleString() + '</span>';
+                            var capCell = capPctBadge(capPct, cap.capped);
+
+                            var row = '<tr class="hover:bg-gray-50 cursor-pointer" onclick="showDownlineSales(' + m.id + ')">';
+                            if (idx === 0) {
+                                row += '<td class="px-2 py-2 text-xs align-top" rowspan="' + caps.length + '">' + esc(m.email) + '</td>';
+                                row += '<td class="px-2 py-2 font-medium text-sm align-top" rowspan="' + caps.length + '">' + esc(m.name) + '</td>';
+                            }
+                            row += '<td class="px-2 py-2 text-center text-xs">' + stakingCell + '</td>';
+                            row += '<td class="px-2 py-2 text-right text-sm">' + amountCell + '</td>';
+                            // daily/referral/total/qkey_balance 는 user 합계 (첫 행에 rowspan)
+                            if (idx === 0) {
+                                row += '<td class="px-2 py-2 text-right text-yellow-600 font-bold align-top" rowspan="' + caps.length + '">' + Math.round(m.daily_reward_total || 0).toLocaleString() + '</td>';
+                                row += '<td class="px-2 py-2 text-right text-blue-600 font-bold align-top" rowspan="' + caps.length + '">' + Math.round(m.referral_reward_total || 0).toLocaleString() + '</td>';
+                                row += '<td class="px-2 py-2 text-right text-green-600 font-bold align-top" rowspan="' + caps.length + '">' + Math.round(totalReward).toLocaleString() + '</td>';
+                            }
+                            row += '<td class="px-2 py-2 text-center text-xs">' + capCell + '</td>';
+                            if (idx === 0) {
+                                row += '<td class="px-2 py-2 text-center align-top" rowspan="' + caps.length + '">' + (m.qkey_balance || 0).toLocaleString() + '</td>';
+                            }
+                            row += '</tr>';
+                            rows.push(row);
+                        });
+                    }
+                });
+                tbody.innerHTML = rows.join('');
             }
 
             function filterMemberRewards() {
