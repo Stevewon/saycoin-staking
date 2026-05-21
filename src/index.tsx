@@ -7833,6 +7833,111 @@ app.get('/api/staking/progress/:userId', async (c) => {
   }
 })
 
+// ★★★ 영구룰 #cap200정책 8️⃣ — staking별 cap audit (per-staking 분리 검증) ★★★
+//   영구룰 2️⃣ Staking별 완전 독립 적용: paid_total을 FIFO(진입날짜 ASC)로 staking에 분배
+//   영구룰 3️⃣ 분자 4종: daily_qkey + referral_reward(L1+L2) + direct_referral
+//   사용 예: GET /api/admin/diag/cap200-per-staking?user_id=42
+//          GET /api/admin/diag/cap200-per-staking          (전체 사용자)
+app.get('/api/admin/diag/cap200-per-staking', async (c) => {
+  try {
+    const db = c.env.DB
+    const USD_TO_QKEY = 150
+    const userIdParam = c.req.query('user_id') || ''
+    const onlyUser = userIdParam ? parseInt(userIdParam) : null
+
+    // 1. 대상 사용자 목록 (스테이크 있는 사람)
+    const usersSql = onlyUser
+      ? `SELECT id, email FROM users WHERE id = ?`
+      : `SELECT DISTINCT u.id, u.email FROM users u
+         INNER JOIN staking s ON s.user_id = u.id
+         WHERE s.status IN ('active','completed','capped')
+         ORDER BY u.id ASC`
+    const usersRes = onlyUser
+      ? await db.prepare(usersSql).bind(onlyUser).all()
+      : await db.prepare(usersSql).all()
+
+    const results: any[] = []
+
+    for (const u of usersRes.results as any[]) {
+      const uid = u.id
+      // 2. 사용자 staking 목록 (진입일 ASC = FIFO)
+      const stakingsRes = await db.prepare(`
+        SELECT id, amount, start_date, end_date, status, daily_rate
+        FROM staking
+        WHERE user_id = ? AND status IN ('active','completed','capped')
+        ORDER BY date(start_date, '+9 hours') ASC, id ASC
+      `).bind(uid).all()
+      const stakings = stakingsRes.results as any[]
+      if (stakings.length === 0) continue
+
+      // 3. paid_total 분자 4종 (cap 계산에 들어가는 4종) 전체 합계
+      const paidRow = await db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM transactions
+        WHERE user_id = ? AND coin_type = 'QKEY'
+          AND type IN ('daily_qkey','referral_reward','direct_referral')
+      `).bind(uid).first() as any
+      let paidPool = Number(paidRow?.total || 0)
+
+      // 4. FIFO 분배 — 각 staking에 cap_target(=amount×300)까지 채우고 남으면 다음 staking으로
+      const perStaking: any[] = []
+      for (const s of stakings) {
+        const amount = Number(s.amount)
+        const capTarget = amount * 2 * USD_TO_QKEY  // 200% target = amount × 300
+        const baseline = amount * USD_TO_QKEY        // 100% baseline = amount × 150
+        // 이 staking이 받을 수 있는 최대
+        const fill = Math.min(paidPool, capTarget)
+        paidPool -= fill
+        const pct = capTarget > 0 ? (fill / baseline * 100) : 0  // 100% scale로 표시 (영구룰 1)
+        const status_cap = fill >= capTarget ? 'CAPPED' : (fill >= baseline ? '100%+' : 'active')
+        perStaking.push({
+          staking_id: s.id,
+          amount_usd: amount,
+          start_date_kst: String(s.start_date).slice(0,10),
+          end_date_kst: String(s.end_date).slice(0,10),
+          status_db: s.status,
+          baseline_qkey: baseline,           // 100% = amount × 150
+          cap_target_qkey: capTarget,        // 200% = amount × 300
+          paid_qkey_assigned: fill,          // FIFO 분배된 paid
+          remaining_to_cap_qkey: Math.max(0, capTarget - fill),
+          cap_pct_100scale: Math.round(pct * 100) / 100,    // 100% scale
+          cap_pct_200scale: Math.round(fill / capTarget * 100 * 100) / 100,
+          cap_status: status_cap,
+          can_receive_payment: fill < capTarget  // 내일 cron이 이 staking에 지급할 수 있는지
+        })
+      }
+
+      const totalPaid = Number(paidRow?.total || 0)
+      const totalCapTarget = stakings.reduce((sum, s) => sum + Number(s.amount) * 2 * USD_TO_QKEY, 0)
+      const leftoverPool = paidPool  // 모든 staking을 채우고도 남은 paid (영구룰 위반 신호)
+
+      results.push({
+        user_id: uid,
+        email: u.email,
+        stakings_count: stakings.length,
+        total_paid_qkey: totalPaid,
+        total_cap_target_qkey: totalCapTarget,
+        leftover_after_fifo: leftoverPool,    // > 0 이면 모든 staking cap 도달 + 초과지급 의심
+        warning: leftoverPool > 0 ? '⚠️ 모든 staking CAPPED 이후 추가 지급 감지' : null,
+        any_capped: perStaking.some(s => s.cap_status === 'CAPPED'),
+        any_under_100: perStaking.some(s => s.cap_pct_100scale < 100),
+        stakings: perStaking
+      })
+    }
+
+    return c.json({
+      success: true,
+      rule_refs: ['#cap200정책 2️⃣ (staking별 독립)', '#cap200정책 3️⃣ (분자 4종)', '#cap200정책 4️⃣ Case A/B/C'],
+      fifo_method: 'paid_total을 진입일 ASC 순으로 각 staking의 cap_target(=amount×300)까지 채움',
+      total_users: results.length,
+      results
+    })
+  } catch (error) {
+    console.error('cap200-per-staking error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ★ 어드민 200% Cap 진단 — 53명 전체 진행률 일람 ★
 app.get('/api/admin/diag/staking-progress', async (c) => {
   try {
