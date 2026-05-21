@@ -22432,16 +22432,19 @@ app.get('/dashboard', (c) => {
                     <!-- 추천 보상 통계 -->
                     <div class="grid grid-cols-3 gap-2 sm:gap-4 mb-4 sm:mb-6">
                         <div class="bg-blue-50 rounded-lg p-3 sm:p-4 border border-blue-200">
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.level1_referral"><span data-i18n="dash.level1_referral">Level 1 Referrals</span></p>
-                            <p class="text-lg sm:text-2xl font-bold text-blue-600" id="level1Count">0</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1"><span data-i18n="dash.level1_referral">Level 1 Referrals</span></p>
+                            <p class="text-lg sm:text-2xl font-bold text-blue-600"><span id="level1Count">0</span><span class="text-xs sm:text-sm font-normal text-gray-500 ml-1">명</span></p>
+                            <p class="text-xs sm:text-sm text-blue-700 font-semibold mt-1"><i class="fas fa-coins text-[10px] mr-0.5"></i><span id="level1Rewards">0</span> QKEY</p>
                         </div>
                         <div class="bg-purple-50 rounded-lg p-3 sm:p-4 border border-purple-200">
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.level2_referral"><span data-i18n="dash.level2_referral">Level 2 Referrals</span></p>
-                            <p class="text-lg sm:text-2xl font-bold text-purple-600" id="level2Count">0</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1"><span data-i18n="dash.level2_referral">Level 2 Referrals</span></p>
+                            <p class="text-lg sm:text-2xl font-bold text-purple-600"><span id="level2Count">0</span><span class="text-xs sm:text-sm font-normal text-gray-500 ml-1">명</span></p>
+                            <p class="text-xs sm:text-sm text-purple-700 font-semibold mt-1"><i class="fas fa-coins text-[10px] mr-0.5"></i><span id="level2Rewards">0</span> QKEY</p>
                         </div>
                         <div class="bg-green-50 rounded-lg p-3 sm:p-4 border border-green-200">
                             <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="dash.total_rewards">총 추천 보상</p>
                             <p class="text-lg sm:text-2xl font-bold text-green-600" id="totalRewards">0 QKEY</p>
+                            <p class="text-[10px] sm:text-xs text-green-700 mt-1">L1 + L2 합계</p>
                         </div>
                     </div>
 
@@ -24414,6 +24417,11 @@ app.get('/dashboard', (c) => {
                         document.getElementById('level1Count').textContent = stats.level1Count;
                         document.getElementById('level2Count').textContent = stats.level2Count;
                         document.getElementById('totalRewards').textContent = Math.round(stats.totalRewards).toLocaleString() + ' QKEY';
+                        // L1/L2 배당액 표시 (인원수와 같은 카드 내)
+                        var l1RewardsEl = document.getElementById('level1Rewards');
+                        var l2RewardsEl = document.getElementById('level2Rewards');
+                        if (l1RewardsEl) l1RewardsEl.textContent = Math.round(stats.level1Rewards || 0).toLocaleString();
+                        if (l2RewardsEl) l2RewardsEl.textContent = Math.round(stats.level2Rewards || 0).toLocaleString();
                         
                         // 1단계 / <span data-i18n="dash.level2_referral">Level 2 Referrals</span> 목록 렌더링
                         renderLevel1List(level1);
@@ -24588,6 +24596,11 @@ app.get('/dashboard', (c) => {
                         // 총 추천 보상 (상단 카드) 업데이트
                         var totalRewardsEl = document.getElementById('totalRewards');
                         if (totalRewardsEl) totalRewardsEl.textContent = Math.round(stats.grandTotal).toLocaleString() + ' QKEY';
+                        // L1/L2 배당액 (상단 카드 안의 배당액) 동기화
+                        var l1RewardsEl2 = document.getElementById('level1Rewards');
+                        var l2RewardsEl2 = document.getElementById('level2Rewards');
+                        if (l1RewardsEl2) l1RewardsEl2.textContent = Math.round(stats.level1Total || 0).toLocaleString();
+                        if (l2RewardsEl2) l2RewardsEl2.textContent = Math.round(stats.level2Total || 0).toLocaleString();
                         
                         // 테이블 렌더링
                         var tableBody = document.getElementById('rewards-table-body');
