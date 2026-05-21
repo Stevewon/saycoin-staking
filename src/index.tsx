@@ -7767,10 +7767,14 @@ app.post('/api/diag/exec-may11-phase4-safe', async (c) => {
 
 
 // ★ 200% Cap 진행률 조회 API (사용자/UI용) ★
-//   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)을
+//   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward + direct_referral)을
 //   사용자 진입금액 합계 × 2 × 150 (target) 과 비교한 진행률 반환.
 //   단계 (사장님 정책 2026-05-10 수정):
 //     <100% green / 100~150% orange / 150~200% red / >=200% capped
+//   ★ 영구룰 #cap200정책 (2026-05-21) — 분자 4종:
+//     daily_qkey + referral_reward(L1+L2) + direct_referral(L0)
+//     → 기존 SQL 은 direct_referral(L0) 가 누락되어 솔밧 등 직판 큰 회원의 % 가
+//        과소표시(예: 솔밧 17.25% 실제 94.50%) 되던 표시 버그 수정. DB/잔액 영향 0.
 app.get('/api/staking/progress/:userId', async (c) => {
   try {
     const db = c.env.DB
@@ -7786,11 +7790,12 @@ app.get('/api/staking/progress/:userId', async (c) => {
     `).bind(userId).first() as any
     const stakeTotal = Number(stakeRow?.total || 0)
 
+    // ★ 영구룰 #cap200정책 3️⃣ — 분자 4종 (daily_qkey + L1 + L2 + L0 direct_referral)
     const paidRow = await db.prepare(`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM transactions
       WHERE user_id = ? AND coin_type = 'QKEY'
-        AND type IN ('daily_qkey', 'referral_reward')
+        AND type IN ('daily_qkey', 'referral_reward', 'direct_referral')
     `).bind(userId).first() as any
     const paidTotal = Number(paidRow?.total || 0)
 
@@ -7834,6 +7839,7 @@ app.get('/api/admin/diag/staking-progress', async (c) => {
     const db = c.env.DB
     const USD_TO_QKEY = 150
 
+    // ★ 영구룰 #cap200정책 3️⃣ — 분자 4종 (daily_qkey + L1 + L2 + L0 direct_referral)
     const rows = await db.prepare(`
       SELECT
         u.id as user_id,
@@ -7841,7 +7847,7 @@ app.get('/api/admin/diag/staking-progress', async (c) => {
         COALESCE(SUM(CASE WHEN s.status IN ('active','completed','capped') THEN s.amount ELSE 0 END), 0) as stake_total,
         (SELECT COALESCE(SUM(amount), 0) FROM transactions
           WHERE user_id = u.id AND coin_type = 'QKEY'
-            AND type IN ('daily_qkey','referral_reward')) as paid_total
+            AND type IN ('daily_qkey','referral_reward','direct_referral')) as paid_total
       FROM users u
       LEFT JOIN staking s ON s.user_id = u.id
       GROUP BY u.id
