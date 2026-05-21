@@ -642,6 +642,15 @@ cap_pct = paid_total ÷ (staking.amount × 150) × 100
 - L1/L2 matching은 **receiver 의 staking_id 단위로 cap 체크**
 - staking#N이 capped → 그 staking에 들어가는 L1/L2 matching만 중단
 - 같은 user의 다른 staking#M은 계속 L1/L2 matching 진행
+- ★ **FIFO reflow (사장님 직접 정의 2026-05-22)**: 매칭이 들어왔을 때
+  receiver의 staking#N이 capped면, 그 매칭은 **소멸하지 않고** receiver의
+  **다른 capped 안 된 staking으로 FIFO(진입일 ASC) 순서로 흘러 들어감**.
+  - 매칭 금액은 sender staking 기준 (downline 진입금액 비례 분할 X)
+  - 빅뱅공 예시: #45 capped + #77 active 일 때, 솔밧→빅뱅공 L1 매칭은
+    전액 #77로 들어감 ("하부 배당은 1천달러 기준 아니고 그대로 다 받음")
+- ★ **sender capped 시 자동 차단**: capped staking에서 본인 daily가 0이면
+  그 staking이 trigger하는 L1/L2 매칭도 자동으로 0 (계산식상 자동)
+  - 빅뱅공 예시: #45 본인 daily=0 → #45 → 큰빛 L1=0, #45 → top9900 L2=0
 
 ### 7️⃣ Admin 대시보드 표시 규칙
 
