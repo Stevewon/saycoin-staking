@@ -573,3 +573,91 @@ D1 SQLite 가 SQL 레벨에서 `UNIQUE constraint failed` 로 즉시 차단.
 **영구룰**:
 - 이 UNIQUE INDEX 2개는 절대 DROP 하지 않는다.
 - 새 cron / 백필 / 보정 코드 작성 시 반드시 ref_id 를 명시한다 (NULL ref_id 는 인덱스 검사 제외).
+
+---
+
+## 🔒 영구룰 #cap200정책 (2026-05-21 신규 — 사장님 직접 정의)
+
+**배경**: 빅뱅공(user_id=42) audit 중 cap 로직이 코드 2곳에서 불일치 발견.
+사장님이 직접 cap 정책의 모든 조항을 명시하여 영구 확정.
+
+### 1️⃣ CAP % 계산 공식
+
+```
+산정기준 (100%) = staking.amount × 150       ← 진입 시점 가상 산정 QKEY
+cap_target (200%) = staking.amount × 300     ← CAPPED 도달점 (= 산정기준 × 2)
+
+cap_pct = paid_total ÷ (staking.amount × 150) × 100
+       = paid_total ÷ 산정기준 × 100
+```
+
+**예시**: $1,000 staking
+- 산정기준 = 150,000 QKEY (100%)
+- cap_target = 300,000 QKEY (200% = CAPPED)
+- paid 150,000 받음 → 100%
+- paid 300,000 받음 → 200% (CAPPED, 더 이상 INSERT 금지)
+
+### 2️⃣ ★ Staking별 완전 독립 (영구룰 #스테이킹별독립 적용)
+
+- 같은 user_id라도 **staking_id 마다 cap_pct 별개 계산**
+- 같은 계정에 5/3 $1,000 + 5/6 $1,000 진입 시 → 2개 staking 별도 cap 적용
+- paid_total은 **FIFO (진입날짜 ASC)** 로 staking에 분배
+- 한 staking이 CAPPED 되어도 다른 staking은 계속 진행
+
+### 3️⃣ paid_total 분자 = 4종 (per-staking 기준)
+
+```
+✅ INCLUDED (cap 계산에 포함):
+  - daily_qkey         (본인 B)
+  - referral_reward L1
+  - referral_reward L2
+  - direct_referral    (L0 즉시쿠키)
+
+❌ EXCLUDED (cap 계산에서 제외):
+  - staking_reward     (welcome bonus)
+  - admin_adjustment
+  - swap
+  - withdrawal
+```
+
+### 4️⃣ INSERT 정책 (Case A/B/C)
+
+| Case | 조건 | 처리 |
+|------|------|------|
+| **A** | paid + new < cap_target | ✅ INSERT 허용 (정상) |
+| **B** | paid + new ≥ cap_target (처음 초과) | ✅ **그 1회만** INSERT 허용 + staking.status='capped' |
+| **C** | paid ≥ cap_target (이미 capped) | ❌ INSERT **절대 금지** |
+
+→ 결과적으로 paid_total은 cap_target을 **딱 1회만 살짝 초과** 할 수 있음 (Case B)
+
+### 5️⃣ 출금 한도 ↔ paid_total 분리
+
+- transactions의 `paid_total`은 Case B로 cap_target을 살짝 초과 표시 가능
+- 그러나 **출금 한도 = cap_target (영구 고정)**
+- 사용자가 출금 가능한 최대 QKEY = `staking.amount × 300` (per-staking)
+- 초과 표시된 부분은 출금 불가 (한도 기준 cap_target)
+
+### 6️⃣ (referrer, referee, staking_id) 3-tuple 독립
+
+- L1/L2 matching은 **receiver 의 staking_id 단위로 cap 체크**
+- staking#N이 capped → 그 staking에 들어가는 L1/L2 matching만 중단
+- 같은 user의 다른 staking#M은 계속 L1/L2 matching 진행
+
+### 7️⃣ Admin 대시보드 표시 규칙
+
+- **회원수당 탭** 에서 **staking별 행 분리**로 표시 (영구룰 #스테이킹별독립 적용)
+- CAP % 컬럼 색상 (200% scale):
+  - `0~100%`   🔘 회색 (안전)
+  - `100~160%` 🟡 노랑 (절반 넘음)
+  - `160~199%` 🟠 주황 (CAP 근접)
+  - `200%+`    🔴 빨강 CAPPED
+
+### 8️⃣ 위반 감지 / 검증
+
+- `/api/diag/cap200-audit-all` (예정) — 모든 staking에 대해 cap_pct 계산
+- 200% 초과 staking 발견 시 → 즉시 사장님 보고 + 정정 작업
+- 신규 cron / INSERT 코드 작성 시 반드시 본 영구룰 준수 확인
+
+---
+
+**이 영구룰은 사장님 직접 정의 (2026-05-21) — 절대 변경/삭제 금지.**
