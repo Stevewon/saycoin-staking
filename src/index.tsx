@@ -5034,45 +5034,159 @@ app.post('/api/rewards/daily', async (c) => {
     // 환율: 1 USD = 1,500 KRW, 1 QKEY = 10 KRW → 1 USD = 150 QKEY
     const USD_TO_QKEY = 150
 
-    // ★ 사장님 룰 (2026-05-07) — 200% cap 정책 (B안 사용자 단위 총 합산) ★
-    //   사용자가 받은 모든 QKEY 수당 총합(daily_qkey + referral_reward)이
-    //   사용자가 넣은 진입금액 합계 × 2 × 150(USD→QKEY) 도달 시
-    //   해당 사용자의 모든 신규 수당(본인 daily + 받을 매칭) INSERT 차단.
-    //   출금 무관, 잔액 변동 무관 — 누적 수령액만 추적.
-    async function isUserCapped(userId: number): Promise<{ capped: boolean, paidTotal: number, target: number, percent: number }> {
-      // user_stake_total: active+completed+capped 의 stake amount 합계
-      const stakeRow = await db.prepare(`
-        SELECT COALESCE(SUM(amount), 0) as total
-        FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
-      `).bind(userId).first() as any
-      const stakeTotal = Number(stakeRow?.total || 0)
-      if (stakeTotal <= 0) return { capped: false, paidTotal: 0, target: 0, percent: 0 }
+    // ★★★ 영구룰 #cap200정책 (2026-05-21 사장님 직접 정의) ★★★
+    //   ① 분자 4종 = daily_qkey + referral_reward(L1+L2) + direct_referral(L0)
+    //   ② Staking별 완전 독립: paid_total을 FIFO(진입일 ASC)로 staking에 분배
+    //   ⑥ L1/L2 매칭은 receiver의 staking_id 단위로 cap 체크
+    //
+    // 구현: 인메모리 상태(stakingStateCache)로 cron 실행 중 fill 누적 추적
+    //       매 staking 별 (cap_target까지 남은 fill) 잔여를 추적 → 다른 staking 영향 X
+    //
+    // stakingStateCache: Map<userId, { totalPaid, stakings: [{id, amount, capTarget, fill, capped, status_db}] }>
+    type StakingState = {
+      id: number
+      amount: number
+      capTarget: number   // amount × 300
+      fill: number        // FIFO 분배된 paid
+      capped: boolean     // fill >= capTarget
+      status_db: string   // DB의 status (active/capped/completed)
+      start_date_kst: string
+    }
+    type UserCapState = {
+      userId: number
+      totalPaid: number   // 분자 4종 합계 (캐시 직전 DB 값)
+      stakings: StakingState[]   // 진입일 ASC
+    }
+    const stakingStateCache = new Map<number, UserCapState>()
 
-      // user_paid_total: daily_qkey + referral_reward 의 amount 합계 (positive)
+    async function loadUserCapState(userId: number): Promise<UserCapState> {
+      const cached = stakingStateCache.get(userId)
+      if (cached) return cached
+
+      // 사용자 staking 목록 (진입일 ASC = FIFO)
+      const stakingRows = await db.prepare(`
+        SELECT id, amount, status, start_date,
+               date(start_date, '+9 hours') as start_date_kst
+        FROM staking
+        WHERE user_id = ? AND status IN ('active','completed','capped')
+        ORDER BY date(start_date, '+9 hours') ASC, id ASC
+      `).bind(userId).all()
+
+      // ★ 영구룰 #cap200정책 3️⃣ 분자 4종 ★ (direct_referral 반드시 포함)
       const paidRow = await db.prepare(`
         SELECT COALESCE(SUM(amount), 0) as total
         FROM transactions
         WHERE user_id = ? AND coin_type = 'QKEY'
-          AND type IN ('daily_qkey', 'referral_reward')
+          AND type IN ('daily_qkey','referral_reward','direct_referral')
       `).bind(userId).first() as any
-      const paidTotal = Number(paidRow?.total || 0)
-      const target = stakeTotal * 2 * USD_TO_QKEY
-      const percent = target > 0 ? (paidTotal / target * 100) : 0
-      return { capped: paidTotal >= target, paidTotal, target, percent }
+      let pool = Number(paidRow?.total || 0)
+
+      // FIFO 분배: 진입일 빠른 staking부터 cap_target까지 채움
+      const stakings: StakingState[] = []
+      for (const r of stakingRows.results as any[]) {
+        const amount = Number(r.amount)
+        const capTarget = amount * 2 * USD_TO_QKEY
+        const fill = Math.min(pool, capTarget)
+        pool -= fill
+        stakings.push({
+          id: Number(r.id),
+          amount,
+          capTarget,
+          fill,
+          capped: fill >= capTarget,
+          status_db: String(r.status || 'active'),
+          start_date_kst: String(r.start_date_kst || '')
+        })
+      }
+
+      const state: UserCapState = {
+        userId,
+        totalPaid: Number(paidRow?.total || 0),
+        stakings
+      }
+      stakingStateCache.set(userId, state)
+      return state
+    }
+
+    // ★ 영구룰 #cap200정책 2️⃣ — 특정 staking이 capped인지 (FIFO 분배 후)
+    async function isStakingCapped(userId: number, stakingId: number): Promise<{
+      capped: boolean, fill: number, capTarget: number, remaining: number, state: UserCapState
+    }> {
+      const state = await loadUserCapState(userId)
+      const s = state.stakings.find(x => x.id === stakingId)
+      if (!s) {
+        // staking 없음 — 안전상 capped로 간주
+        return { capped: true, fill: 0, capTarget: 0, remaining: 0, state }
+      }
+      return {
+        capped: s.capped,
+        fill: s.fill,
+        capTarget: s.capTarget,
+        remaining: Math.max(0, s.capTarget - s.fill),
+        state
+      }
+    }
+
+    // ★ 영구룰 #cap200정책 2️⃣/6️⃣ — 추가 paid 발생 시 FIFO로 가장 빠른 미충전 staking에 채움
+    //   반환: { acceptedAmount, targetStakingId } — acceptedAmount는 잔여 cap에 의해 줄어들 수 있음
+    function applyPaidIncrementFIFO(state: UserCapState, requestedAmount: number): {
+      accepted: number, targetStakingId: number | null
+    } {
+      if (requestedAmount <= 0) return { accepted: 0, targetStakingId: null }
+      // 진입일 ASC 순으로 가장 먼저 fill < capTarget 인 staking 찾기
+      for (const s of state.stakings) {
+        if (s.fill >= s.capTarget) continue
+        const room = s.capTarget - s.fill
+        const accept = Math.min(requestedAmount, room)
+        if (accept <= 0) continue
+        // 인메모리 fill 업데이트
+        s.fill += accept
+        if (s.fill >= s.capTarget) s.capped = true
+        state.totalPaid += accept
+        return { accepted: accept, targetStakingId: s.id }
+      }
+      // 모든 staking이 capped — 추가 지급 불가
+      return { accepted: 0, targetStakingId: null }
+    }
+
+    // ★ 영구룰 #cap200정책 2️⃣ — 특정 staking이 본인 daily 지급을 받을 수 있는 잔여 계산
+    //   본인 채굴은 staking이 1:1 매핑 — 해당 staking이 capped면 다른 staking으로 이전 X (영구룰 2️⃣)
+    function applyOwnDailyToStaking(state: UserCapState, stakingId: number, requestedAmount: number): number {
+      const s = state.stakings.find(x => x.id === stakingId)
+      if (!s) return 0
+      if (s.fill >= s.capTarget) return 0
+      const room = s.capTarget - s.fill
+      const accept = Math.min(requestedAmount, room)
+      s.fill += accept
+      if (s.fill >= s.capTarget) s.capped = true
+      state.totalPaid += accept
+      return accept
+    }
+
+    // (호환용 wrapper — 기존 isUserCapped 호출부에서 user 전체 합산 cap 체크용)
+    //   영구룰 2️⃣ 위반 — 절대 본인 채굴 cap 체크용으로 쓰면 안 됨.
+    //   ※ 유일하게 안전한 용도: "사용자의 모든 staking이 다 capped인지" 확인 (사전 skip)
+    async function isUserAllStakingsCapped(userId: number): Promise<{ allCapped: boolean, state: UserCapState }> {
+      const state = await loadUserCapState(userId)
+      if (state.stakings.length === 0) return { allCapped: false, state }
+      return { allCapped: state.stakings.every(s => s.capped), state }
     }
 
     for (const staking of activeStakings.results) {
       try {
         const periodDays = staking.period_days || (staking.period_months * 30)
 
-        // ★ 200% cap 사전 체크 ★ — 사용자가 이미 cap 도달이면 본인 daily 전체 skip
-        const capState = await isUserCapped(staking.user_id as number)
-        if (capState.capped) {
+        // ★★★ 영구룰 #cap200정책 2️⃣ — 본 staking 단위 cap 사전 체크 ★★★
+        //   기존: user 단위 합산 → staking별 독립 위반
+        //   변경: 이 staking 만 FIFO 분배 후 fill >= capTarget 이면 본인 daily skip
+        //         다른 staking 은 계속 진행 (영구룰 2️⃣)
+        const stkCapPre = await isStakingCapped(staking.user_id as number, staking.staking_id as number)
+        if (stkCapPre.capped) {
           cappedSkipCount++
           if (!cappedUsers.includes(staking.user_id as number)) cappedUsers.push(staking.user_id as number)
-          // 자동으로 staking.status='capped' 표시 (해당 user 의 모든 active staking)
+          // ★ 영구룰 2️⃣ — 이 staking 만 capped 표시 (다른 active staking 영향 X)
           try {
-            await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(staking.user_id).run()
+            await db.prepare(`UPDATE staking SET status='capped' WHERE id=? AND status='active'`).bind(staking.staking_id).run()
           } catch(e) {}
           continue
         }
@@ -5133,29 +5247,33 @@ app.post('/api/rewards/daily', async (c) => {
           const usdAmount = staking.amount * dailyRate
           let qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
 
-          // ★ 200% cap 부분 지급 체크 (B안) ★
-          //   accrual loop 내에서 매 영업일마다 누적이 cap 에 닿는지 재계산
-          //   cap 도달 시 정확한 잔여분만 지급하고 staking.status='capped' 처리 후 종료
-          const capCheck = await isUserCapped(staking.user_id as number)
-          if (capCheck.capped) {
-            // 이미 cap 도달 — 본인 daily 더 이상 지급 X
+          // ★★★ 영구룰 #cap200정책 2️⃣ — 본 staking 도중 cap 재확인 ★★★
+          //   기존: user 단위 합산 → staking별 독립 위반
+          //   변경: 이 staking 자체의 fill ≥ capTarget 인지 검사
+          //         부분지급(Case B) 시: room = capTarget - fill 만큼만 지급
+          //         capped 시: 이 staking 만 status='capped', 다른 staking은 계속 (영구룰 2️⃣)
+          const stkCapNow = await isStakingCapped(staking.user_id as number, staking.staking_id as number)
+          if (stkCapNow.capped) {
             cappedSkipCount++
             if (!cappedUsers.includes(staking.user_id as number)) cappedUsers.push(staking.user_id as number)
-            try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(staking.user_id).run() } catch(e) {}
+            try { await db.prepare(`UPDATE staking SET status='capped' WHERE id=? AND status='active'`).bind(staking.staking_id).run() } catch(e) {}
             break
           }
-          // 잔여 한도 = target - paidTotal
-          const remaining = capCheck.target - capCheck.paidTotal
-          if (qkeyAmount > remaining) {
-            // 부분 지급으로 cap 정확히 맞춤
-            qkeyAmount = Math.max(0, Math.floor(remaining))
+          // 부분 지급 (Case B) — 이 staking 잔여만큼만
+          const stkRoom = stkCapNow.remaining
+          if (qkeyAmount > stkRoom) {
+            qkeyAmount = Math.max(0, Math.floor(stkRoom))
             if (qkeyAmount <= 0) {
               cappedSkipCount++
               if (!cappedUsers.includes(staking.user_id as number)) cappedUsers.push(staking.user_id as number)
-              try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(staking.user_id).run() } catch(e) {}
+              try { await db.prepare(`UPDATE staking SET status='capped' WHERE id=? AND status='active'`).bind(staking.staking_id).run() } catch(e) {}
               break
             }
           }
+          // ★ 인메모리 cap state 업데이트 (다음 iteration이 정확한 fill 보도록) ★
+          //   영구룰 2️⃣ — 본인 daily는 자기 staking으로만 (FIFO 이전 금지)
+          const _appliedOwn = applyOwnDailyToStaking(stkCapNow.state, staking.staking_id as number, qkeyAmount)
+          // _appliedOwn 은 qkeyAmount 와 동일해야 함 (위에서 잔여만큼만 잘랐기 때문)
 
           // [본인 배당 지급]
           //   reward_date = accrualDate (해당 평일)
@@ -5225,15 +5343,17 @@ app.post('/api/rewards/daily', async (c) => {
                 if (l1Exists.count === 0) {
                   let level1Reward = Math.round(qkeyAmount * 0.20)
 
-                  // ★ 200% cap 체크 (B안) — L1 받는 사람 cap 도달 시 부분 지급 또는 차단 ★
-                  const l1Cap = await isUserCapped(level1Referrer.referrer_id as number)
-                  if (l1Cap.capped) {
-                    // L1 추천인 이미 cap → 매칭 수당 0건
-                    try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(level1Referrer.referrer_id).run() } catch(e) {}
+                  // ★★★ 영구룰 #cap200정책 2️⃣/6️⃣ — L1 receiver(referrer)의 staking 단위 cap 체크 ★★★
+                  //   기존: user 단위 합산 → 영구룰 위반
+                  //   변경: receiver의 모든 staking을 FIFO 순회, 가장 빠른 미충전 staking으로 분배
+                  //         모든 staking이 capped면 0건
+                  const l1State = await loadUserCapState(level1Referrer.referrer_id as number)
+                  const l1Apply = applyPaidIncrementFIFO(l1State, level1Reward)
+                  if (l1Apply.accepted === 0) {
+                    // L1 추천인 모든 staking이 capped → 매칭 수당 0건
                     if (!cappedUsers.includes(level1Referrer.referrer_id as number)) cappedUsers.push(level1Referrer.referrer_id as number)
                   } else {
-                    const l1Remaining = l1Cap.target - l1Cap.paidTotal
-                    if (level1Reward > l1Remaining) level1Reward = Math.max(0, Math.floor(l1Remaining))
+                    level1Reward = l1Apply.accepted
                     if (level1Reward > 0) {
                       await db.prepare(`
                         UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
@@ -5247,6 +5367,12 @@ app.post('/api/rewards/daily', async (c) => {
                         VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
                       `).bind(level1Referrer.referrer_id, staking.user_id, qkeyAmount, level1Reward, accrualDate, accrualPaidDate, staking.staking_id, accrualDailyCreatedAtUtc).run()
                       const rrL1Id = (rrL1Ins as any)?.meta?.last_row_id ?? null
+
+                      // ★ 영구룰 2️⃣ — L1 receiver의 채워진 staking을 정확히 capped로 표시 (한 건이라도 capped 됐다면)
+                      const justCappedL1 = l1State.stakings.find(s => s.id === l1Apply.targetStakingId && s.capped)
+                      if (justCappedL1) {
+                        try { await db.prepare(`UPDATE staking SET status='capped' WHERE id=? AND status='active'`).bind(justCappedL1.id).run() } catch(e) {}
+                      }
 
                       // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
                       const l1TxExists2 = await db.prepare(`
@@ -5296,14 +5422,13 @@ app.post('/api/rewards/daily', async (c) => {
                     if (l2Exists.count === 0) {
                       let level2Reward = Math.round(qkeyAmount * 0.10)
 
-                      // ★ 200% cap 체크 (B안) — L2 받는 사람 cap 도달 시 부분 지급 또는 차단 ★
-                      const l2Cap = await isUserCapped(level2Referrer.referrer_id as number)
-                      if (l2Cap.capped) {
-                        try { await db.prepare(`UPDATE staking SET status='capped' WHERE user_id=? AND status='active'`).bind(level2Referrer.referrer_id).run() } catch(e) {}
+                      // ★★★ 영구룰 #cap200정책 2️⃣/6️⃣ — L2 receiver의 staking 단위 cap 체크 ★★★
+                      const l2State = await loadUserCapState(level2Referrer.referrer_id as number)
+                      const l2Apply = applyPaidIncrementFIFO(l2State, level2Reward)
+                      if (l2Apply.accepted === 0) {
                         if (!cappedUsers.includes(level2Referrer.referrer_id as number)) cappedUsers.push(level2Referrer.referrer_id as number)
                       } else {
-                        const l2Remaining = l2Cap.target - l2Cap.paidTotal
-                        if (level2Reward > l2Remaining) level2Reward = Math.max(0, Math.floor(l2Remaining))
+                        level2Reward = l2Apply.accepted
                         if (level2Reward > 0) {
                           await db.prepare(`
                             UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
@@ -5317,6 +5442,12 @@ app.post('/api/rewards/daily', async (c) => {
                             VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?)
                           `).bind(level2Referrer.referrer_id, staking.user_id, qkeyAmount, level2Reward, accrualDate, accrualPaidDate, staking.staking_id, accrualDailyCreatedAtUtc).run()
                           const rrL2Id = (rrL2Ins as any)?.meta?.last_row_id ?? null
+
+                          // ★ 영구룰 2️⃣ — L2 receiver의 채워진 staking을 정확히 capped로 표시
+                          const justCappedL2 = l2State.stakings.find(s => s.id === l2Apply.targetStakingId && s.capped)
+                          if (justCappedL2) {
+                            try { await db.prepare(`UPDATE staking SET status='capped' WHERE id=? AND status='active'`).bind(justCappedL2.id).run() } catch(e) {}
+                          }
 
                           // EXISTS 가드 (ref_id 1:1) — 동일 referral_rewards.id 에 대응하는 transactions 행이 이미 있으면 차단
                           const l2TxExists2 = await db.prepare(`
@@ -8064,23 +8195,28 @@ app.get('/api/admin/daily-preview', async (c) => {
       ORDER BY s.user_id ASC, s.id ASC
     `).bind(yesterdayKst, yesterdayKst).all()
 
-    // 사용자별 dry-run 누적 (실제 cron 의 isUserCapped 와 동일하게 simulatedPaid 추적)
-    // userId → { email, stake_total, paid_total (real db), simulated_paid (preview 누적), daily, l1, l2, total, capped, capStage }
+    // ★★★ 영구룰 #cap200정책 (2026-05-21) 적용된 dry-run ★★★
+    //   ① 분자 4종 = daily_qkey + referral_reward + direct_referral
+    //   ② Staking별 완전 독립 (FIFO 진입일 ASC)
+    //   ⑥ L1/L2 매칭은 receiver의 staking_id 단위로 cap 체크
+    type SimStaking = {
+      id: number, amount: number, capTarget: number, fill: number,
+      capped: boolean, start_date_kst: string, status_db: string
+    }
     type PreviewUserState = {
       user_id: number,
       email: string | null,
       stake_total: number,
-      paid_total_real: number,  // DB 현재 누적
-      target: number,
-      remaining_initial: number,
-      simulated_paid: number,    // dry-run 동안 누적 (cap 판정용)
+      paid_total_real: number,   // DB 현재 누적 (분자 4종)
+      target: number,            // = stake_total × 300 (전체 합산용 표시)
+      stakings: SimStaking[],    // FIFO 분배 적용된 in-memory state
       daily_qkey: number,
       l1_qkey: number,
       l2_qkey: number,
       total_qkey: number,
       cap_hit_during: boolean,
-      capped_initial: boolean,
-      stakings_processed: { staking_id: number, accrual_dates: string[], amount: number, daily_rate: number, per_day_qkey: number }[]
+      all_capped_initial: boolean,
+      stakings_processed: { staking_id: number, accrual_dates: string[], amount: number, daily_rate: number, per_day_qkey: number, capped_during_loop: boolean }[]
     }
     const userMap = new Map<number, PreviewUserState>()
     const capSkipUsers: number[] = []
@@ -8088,46 +8224,95 @@ app.get('/api/admin/daily-preview', async (c) => {
     async function getOrInitUser(userId: number): Promise<PreviewUserState> {
       let u = userMap.get(userId)
       if (u) return u
-      const stakeRow = await db.prepare(`
-        SELECT COALESCE(SUM(amount), 0) as total
-        FROM staking WHERE user_id = ? AND status IN ('active','completed','capped')
-      `).bind(userId).first() as any
+      // 분자 4종 (direct_referral 포함) ★ 영구룰 3️⃣ ★
       const paidRow = await db.prepare(`
         SELECT COALESCE(SUM(amount), 0) as total
         FROM transactions
         WHERE user_id = ? AND coin_type = 'QKEY'
-          AND type IN ('daily_qkey', 'referral_reward')
+          AND type IN ('daily_qkey','referral_reward','direct_referral')
       `).bind(userId).first() as any
       const emailRow = await db.prepare(`SELECT email FROM users WHERE id = ?`).bind(userId).first() as any
-      const stake_total = Number(stakeRow?.total || 0)
+
+      // 사용자 staking 진입일 ASC = FIFO
+      const stkRows = await db.prepare(`
+        SELECT id, amount, status,
+               date(start_date, '+9 hours') as start_date_kst
+        FROM staking
+        WHERE user_id = ? AND status IN ('active','completed','capped')
+        ORDER BY date(start_date, '+9 hours') ASC, id ASC
+      `).bind(userId).all()
+
       const paid_total_real = Number(paidRow?.total || 0)
+      let pool = paid_total_real
+      const stakings: SimStaking[] = []
+      let stake_total = 0
+      for (const r of stkRows.results as any[]) {
+        const amount = Number(r.amount)
+        stake_total += amount
+        const capTarget = amount * 2 * USD_TO_QKEY
+        const fill = Math.min(pool, capTarget)
+        pool -= fill
+        stakings.push({
+          id: Number(r.id), amount, capTarget, fill,
+          capped: fill >= capTarget,
+          start_date_kst: String(r.start_date_kst || ''),
+          status_db: String(r.status || 'active')
+        })
+      }
       const target = stake_total * 2 * USD_TO_QKEY
-      const remaining_initial = Math.max(0, target - paid_total_real)
-      const capped_initial = stake_total > 0 && paid_total_real >= target
+      const all_capped_initial = stakings.length > 0 && stakings.every(s => s.capped)
       u = {
         user_id: userId,
         email: emailRow?.email || null,
         stake_total,
         paid_total_real,
         target,
-        remaining_initial,
-        simulated_paid: paid_total_real,
+        stakings,
         daily_qkey: 0,
         l1_qkey: 0,
         l2_qkey: 0,
         total_qkey: 0,
         cap_hit_during: false,
-        capped_initial,
+        all_capped_initial,
         stakings_processed: []
       }
       userMap.set(userId, u)
       return u
     }
 
+    // 영구룰 2️⃣ — 본인 daily: 자기 staking 으로만 (FIFO 이전 금지)
+    function simApplyOwnDaily(state: PreviewUserState, stakingId: number, requested: number): number {
+      const s = state.stakings.find(x => x.id === stakingId)
+      if (!s) return 0
+      if (s.capped) return 0
+      const room = s.capTarget - s.fill
+      const accept = Math.min(requested, room)
+      s.fill += accept
+      if (s.fill >= s.capTarget) s.capped = true
+      return accept
+    }
+
+    // 영구룰 2️⃣/6️⃣ — L1/L2 매칭: receiver의 FIFO 첫 미충전 staking으로
+    function simApplyReferralFIFO(state: PreviewUserState, requested: number): { accepted: number, targetStakingId: number | null } {
+      if (requested <= 0) return { accepted: 0, targetStakingId: null }
+      for (const s of state.stakings) {
+        if (s.capped) continue
+        const room = s.capTarget - s.fill
+        const accept = Math.min(requested, room)
+        if (accept <= 0) continue
+        s.fill += accept
+        if (s.fill >= s.capTarget) s.capped = true
+        return { accepted: accept, targetStakingId: s.id }
+      }
+      return { accepted: 0, targetStakingId: null }
+    }
+
     // ===== dry-run 메인 루프 (실제 cron 과 동일 흐름) =====
     for (const staking of activeStakings.results as any[]) {
       const ownerState = await getOrInitUser(staking.user_id as number)
-      if (ownerState.capped_initial) {
+      // 사전 staking-level cap check
+      const ownStk = ownerState.stakings.find(s => s.id === Number(staking.staking_id))
+      if (!ownStk || ownStk.capped) {
         if (!capSkipUsers.includes(staking.user_id as number)) capSkipUsers.push(staking.user_id as number)
         continue
       }
@@ -8143,31 +8328,34 @@ app.get('/api/admin/daily-preview', async (c) => {
       const stakingDailyRate = staking.daily_rate || getDailyRate(staking.amount as number)
       const stakingProcessed: string[] = []
       let perDayQkey = Math.round((staking.amount as number) * stakingDailyRate * USD_TO_QKEY)
+      let cappedDuringLoop = false
 
       for (const accrualDate of accrualDates) {
         const currentRewardedCount = (staking.rewarded_count as number) + stakingProcessed.length
         if (currentRewardedCount >= periodDays) break
 
-        // 본인 cap 재확인 (cron 의 isUserCapped 와 동일 — simulated_paid 사용)
-        if (ownerState.simulated_paid >= ownerState.target) {
+        // ★ 영구룰 2️⃣ — 이 staking 단독 cap check
+        if (ownStk.capped) {
           ownerState.cap_hit_during = true
+          cappedDuringLoop = true
           if (!capSkipUsers.includes(ownerState.user_id)) capSkipUsers.push(ownerState.user_id)
           break
         }
         let qkeyAmount = perDayQkey
-        const remaining = ownerState.target - ownerState.simulated_paid
-        if (qkeyAmount > remaining) qkeyAmount = Math.max(0, Math.floor(remaining))
+        const room = ownStk.capTarget - ownStk.fill
+        if (qkeyAmount > room) qkeyAmount = Math.max(0, Math.floor(room))
         if (qkeyAmount <= 0) {
           ownerState.cap_hit_during = true
+          cappedDuringLoop = true
           if (!capSkipUsers.includes(ownerState.user_id)) capSkipUsers.push(ownerState.user_id)
           break
         }
 
-        ownerState.daily_qkey += qkeyAmount
-        ownerState.simulated_paid += qkeyAmount
+        const applied = simApplyOwnDaily(ownerState, ownStk.id, qkeyAmount)
+        ownerState.daily_qkey += applied
         stakingProcessed.push(accrualDate)
 
-        // L1 매칭 (20%)
+        // L1 매칭 (20%) — receiver staking 단위 FIFO
         const lvl1 = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(staking.user_id).first() as any
         if (lvl1 && lvl1.referrer_id) {
           const l1Active = await db.prepare(`
@@ -8179,19 +8367,15 @@ app.get('/api/admin/daily-preview', async (c) => {
           `).bind(lvl1.referrer_id, accrualDate, accrualDate).first()
           if (l1Active) {
             const l1State = await getOrInitUser(lvl1.referrer_id as number)
-            if (!l1State.capped_initial && l1State.simulated_paid < l1State.target) {
-              let l1Reward = Math.round(qkeyAmount * 0.20)
-              const l1Rem = l1State.target - l1State.simulated_paid
-              if (l1Reward > l1Rem) l1Reward = Math.max(0, Math.floor(l1Rem))
-              if (l1Reward > 0) {
-                l1State.l1_qkey += l1Reward
-                l1State.simulated_paid += l1Reward
-              }
+            const l1Req = Math.round(applied * 0.20)
+            const l1Res = simApplyReferralFIFO(l1State, l1Req)
+            if (l1Res.accepted > 0) {
+              l1State.l1_qkey += l1Res.accepted
             } else {
               if (!capSkipUsers.includes(lvl1.referrer_id as number)) capSkipUsers.push(lvl1.referrer_id as number)
             }
 
-            // L2 매칭 (10%)
+            // L2 매칭 (10%) — 동일
             const lvl2 = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(lvl1.referrer_id).first() as any
             if (lvl2 && lvl2.referrer_id) {
               const l2Active = await db.prepare(`
@@ -8203,14 +8387,10 @@ app.get('/api/admin/daily-preview', async (c) => {
               `).bind(lvl2.referrer_id, accrualDate, accrualDate).first()
               if (l2Active) {
                 const l2State = await getOrInitUser(lvl2.referrer_id as number)
-                if (!l2State.capped_initial && l2State.simulated_paid < l2State.target) {
-                  let l2Reward = Math.round(qkeyAmount * 0.10)
-                  const l2Rem = l2State.target - l2State.simulated_paid
-                  if (l2Reward > l2Rem) l2Reward = Math.max(0, Math.floor(l2Rem))
-                  if (l2Reward > 0) {
-                    l2State.l2_qkey += l2Reward
-                    l2State.simulated_paid += l2Reward
-                  }
+                const l2Req = Math.round(applied * 0.10)
+                const l2Res = simApplyReferralFIFO(l2State, l2Req)
+                if (l2Res.accepted > 0) {
+                  l2State.l2_qkey += l2Res.accepted
                 } else {
                   if (!capSkipUsers.includes(lvl2.referrer_id as number)) capSkipUsers.push(lvl2.referrer_id as number)
                 }
@@ -8220,13 +8400,14 @@ app.get('/api/admin/daily-preview', async (c) => {
         }
       }
 
-      if (stakingProcessed.length > 0) {
+      if (stakingProcessed.length > 0 || cappedDuringLoop) {
         ownerState.stakings_processed.push({
           staking_id: staking.staking_id as number,
           accrual_dates: stakingProcessed,
           amount: staking.amount as number,
           daily_rate: stakingDailyRate,
-          per_day_qkey: perDayQkey
+          per_day_qkey: perDayQkey,
+          capped_during_loop: cappedDuringLoop
         })
       }
     }
