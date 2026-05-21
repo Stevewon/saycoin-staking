@@ -22454,7 +22454,9 @@ app.get('/dashboard', (c) => {
                         </div>
                     </div>
 
-                    <!-- 추천 수당 합계 (별도 라인, QKEY 단위) -->
+                    <!-- ★ 사장님 지시 2026-05-21: "총 추천 보상" 띠 사용자 화면에서 숨김
+                         (산하 매출 USD 카드만 남기고 QKEY 합계 라인은 비노출 처리)
+                         아래 블록은 HTML 주석 처리 — DOM 에서 제거되며 JS는 가드로 안전 동작.
                     <div class="bg-gradient-to-r from-yellow-50 to-orange-50 rounded-lg p-3 mb-4 sm:mb-6 border border-yellow-200 flex items-center justify-between">
                         <div class="flex items-center gap-2">
                             <i class="fas fa-coins text-yellow-600"></i>
@@ -22465,6 +22467,8 @@ app.get('/dashboard', (c) => {
                             <span class="text-[10px] sm:text-xs text-gray-500 ml-2">(L1 <span id="level1Rewards">0</span> + L2 <span id="level2Rewards">0</span>)</span>
                         </div>
                     </div>
+                    -->
+                    <div class="mb-4 sm:mb-6"></div>
 
                     <!-- 추천인 목록 탭 + 검색 -->
                     <div class="mb-4">
@@ -24446,8 +24450,10 @@ app.get('/dashboard', (c) => {
                         document.getElementById('level2Count').textContent = stats.level2Count;
                         document.getElementById('totalCount').textContent = totalCount;
 
-                        // 추천 수당 (QKEY) — 별도 라인
-                        document.getElementById('totalRewards').textContent = Math.round(stats.totalRewards).toLocaleString() + ' QKEY';
+                        // 추천 수당 (QKEY) — 별도 라인 ★ 2026-05-21 사장님 지시로 HTML 비노출
+                        //   엘리먼트가 주석 처리되어 null 일 수 있으므로 모두 가드 처리
+                        var totalRewardsEl0 = document.getElementById('totalRewards');
+                        if (totalRewardsEl0) totalRewardsEl0.textContent = Math.round(stats.totalRewards).toLocaleString() + ' QKEY';
                         var l1RewardsEl = document.getElementById('level1Rewards');
                         var l2RewardsEl = document.getElementById('level2Rewards');
                         if (l1RewardsEl) l1RewardsEl.textContent = Math.round(stats.level1Rewards || 0).toLocaleString();
