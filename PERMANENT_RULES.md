@@ -669,4 +669,27 @@ cap_pct = paid_total ÷ (staking.amount × 150) × 100
 
 ---
 
-**이 영구룰은 사장님 직접 정의 (2026-05-21) — 절대 변경/삭제 금지.**
+## 영구룰 #pagination-stable (2026-05-22 사장님 직접 정의)
+
+cron 의 `/api/rewards/daily` batch 페이지네이션은 다음 규칙을 따른다:
+
+1. **활성 staking SELECT 시 status 안정 집합**: `WHERE status IN ('active','capped','completed')`
+   - ❌ 절대 `status = 'active'` 만 쓰지 말 것 (OFFSET 시프트 사고 원인)
+2. **OFFSET 기반 페이지네이션 유지** (workflow 변경 불필요)
+3. **capped 처리는 인앱 pre-check 만**: SQL 결과 집합은 batch 호출 사이에 변하지 않아야 함
+4. **L5189 등의 `UPDATE staking SET status='capped' WHERE id=? AND status='active'`** 는
+   idempotent — 이미 capped인 행에는 무영향
+5. **cappedSkipCount 카운터 증가 허용** — 이미 capped된 staking 도 매일 pre-check까지 도달하지만
+   잔액/INSERT 영향은 0건 (단순 카운터 증가만)
+
+### 사고 기록 (2026-05-22 cron)
+- 빅뱅(uid=42) staking#45가 batch#1 (offset=0) 에서 cap pre-check로 status='capped' UPDATE 됨
+- 이로 인해 batch#2 (offset=10) 시 active 집합이 58→57로 줄어들어
+  staking#47 (qt1234 uid=50) 이 OFFSET 시프트로 **건너뛰어짐** (silent skip)
+- 누락분: qt1234 daily 750 + solbat L1 150 + bigbang L2 75
+- 보정: `/api/admin/rewards/manual-adjust` 로 3건 manual_insert (5/22 처리완료)
+- 영구 패치: 본 영구룰 #pagination-stable 시행 — SQL `status IN ('active','capped','completed')`
+
+---
+
+**이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22 추가) — 절대 변경/삭제 금지.**
