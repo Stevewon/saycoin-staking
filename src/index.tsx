@@ -4979,11 +4979,20 @@ app.post('/api/rewards/daily', async (c) => {
     const batchSize = Math.max(1, Math.min(50, parseInt(c.req.query('batchSize') || '20') || 20))
     const offset = Math.max(0, parseInt(c.req.query('offset') || '0') || 0)
 
-    // 전체 대상 수 (모니터링/응답용)
+    // ★★★★★ 영구룰 #pagination-stable (2026-05-22 사장님 명령) ★★★★★
+    //   원인: 기존 SQL이 status='active' 만 SELECT → cap pre-check 시 status='capped'로
+    //         UPDATE한 후, 다음 batch 호출 시 active 집합이 줄어들어 OFFSET 시프트 발생
+    //         → 5/22 cron에서 빅뱅 staking#45 capped UPDATE 직후 batch#2 에서 staking#47(qt1234)
+    //           이 건너뛰어진 사고 발생 (uid=50 daily 750 + uid=44 L1 150 + uid=42 L2 75 누락)
+    //   대책: SQL은 status IN ('active','capped','completed')로 안정 집합 유지,
+    //         cap pre-check가 자체적으로 capped를 skip → OFFSET 시프트 없음
+    //   부작용: 이미 capped된 staking이 매 cron마다 pre-check까지 도달 (cappedSkipCount +1)
+    //         하지만 L5189의 UPDATE는 WHERE status='active' 조건이라 capped 행에는 무영향
+    //         (idempotent). 잔액/INSERT 영향 0건.
     const totalRow = await db.prepare(`
       SELECT COUNT(*) as cnt
       FROM staking s
-      WHERE s.status = 'active'
+      WHERE s.status IN ('active','capped','completed')
         AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
     `).bind(yesterdayKst, yesterdayKst).first() as any
@@ -5004,7 +5013,7 @@ app.post('/api/rewards/daily', async (c) => {
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
         (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
       FROM staking s
-      WHERE s.status = 'active'
+      WHERE s.status IN ('active','capped','completed')
         AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
       ORDER BY s.id ASC
