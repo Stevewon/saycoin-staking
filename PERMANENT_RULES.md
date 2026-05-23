@@ -728,4 +728,77 @@ cron 의 `/api/rewards/daily` batch 페이지네이션은 다음 규칙을 따�
 
 ---
 
+## 영구룰 #Phase3-QX부활 (2026-05-22 사장님 직접 정의)
+
+### 사장님 직접 인용 (2026-05-22, lis7238 승인대기 화면 캡처)
+> "5월 6일 이후에는 $1,000 기준당 신규로 스테이킹 진입할때 qta 75,000개 qx 10,000개 총 2종이 사용자 메인내역에 찍혀야 하는데 현재 qx 코인이 찍히지 않음"
+
+### 정책 변천사
+| Phase | 적용기간 | QTA | QX | QKEY 즉시지급 |
+|-------|---------|-----|-----|---------|
+| Phase1 | ~ 2026-05-10 | 75,000 | 10,000 | 5,000 |
+| Phase2 | 2026-05-11 ~ 2026-05-21 | 75,000 | 0 | 0 |
+| **Phase3** | **2026-05-22 ~ 영구** | **75,000** | **10,000** | **0** |
+
+### 핵심 원칙
+1. **Phase3 (5/22~) 신규 진입자는 $1,000당 QTA 75,000 + QX 10,000 자동 지급** (`/api/staking/create` 시점에 staking 행에 저장)
+2. **QKEY 즉시지급은 Phase2 이후 영구 0** (일일배당 QKEY 와 분리, 사장님 별도 명령 없는 한 변경 금지)
+3. **회사 지급분(QTA/QX) 은 qta_initial/qx_initial 격리** → 출금 불가 보호 자산 (영구정책 2026-05-14)
+4. **승인 시점에 staking.qx_reward 컬럼 값을 그대로 잔액에 합산** — Phase3 이전에 INSERT 된 row 는 qx_reward=0 으로 박혀 있어 보정 필요
+
+### 보정 API (5/22 이후 진입자 중 QX 누락분)
+**`POST /api/admin/rewards/qx-phase3-supplement`**
+- body: `{ fromDate?, toDate?, stakingId?, dryRun? }`
+- 단일 보정: `stakingId` 지정 → 해당 staking 만 QX 보정
+- 범위 보정: 기본 `fromDate='2026-05-22', toDate=오늘 KST` → 범위 내 qx_reward=0 인 staking 전수 보정
+- 중복방지: `transactions(qx_phase3_supplement)` 에 staking_id 매핑 이미 있으면 skip
+- active staking: 잔액 즉시 +, pending staking: staking 행만 정정 (승인 시 자동 지급)
+
+### 코드 변경 이력
+- `src/index.tsx::/api/staking/create` 의 `qxReward` 계산 로직에 `isPhase3` 분기 추가
+- `src/index.tsx::/api/admin/rewards/qx-phase3-supplement` 신규 endpoint 추가
+
+---
+
+## 영구룰 #어드민-잔액수정-3종 (2026-05-22 사장님 직접 정의)
+
+### 사장님 직접 인용 (2026-05-22)
+> "어드민에서 qta, qx코인도 잔액수정이 가능하게 해주세요."
+
+### 핵심 원칙
+1. **어드민 잔액수정 API 가 QKEY/QTA/QX 3종 모두 지원**
+2. **body 에 `coin: 'QKEY' | 'QTA' | 'QX'` 파라미터 추가** — 미지정 시 QKEY (하위호환)
+3. **음수 잔액 방지 가드** — `newBal < 0` 이면 HTTP 400 거절 (실수로 보호 자산 깎는 사고 차단)
+4. **transactions.coin_type 컬럼에 코인 종류 동적 기록** — 사용자/어드민 화면 동일 노출
+5. **사유(reason) 필수** — 기존 룰 유지 (구체적 사유 없이는 변경 불가)
+
+### API 사용법
+**`POST /api/admin/users/adjust-balance`**
+```json
+{
+  "userId": 50,
+  "amount": 10000,
+  "mode": "delta",          // "delta"=가산/차감 | "set"=직접설정
+  "coin": "QX",             // "QKEY" (기본) | "QTA" | "QX"
+  "reason": "5/22 신규룰 QX 누락분 보정"
+}
+```
+
+응답:
+```json
+{
+  "success": true,
+  "userId": 50, "coin": "QX",
+  "previousBalance": 0, "newBalance": 10000,
+  "delta": 10000, "direction": "increase",
+  "txId": 11000,
+  "description": "[어드민 수정] ▲증액 +10,000 QX (이전 0 → 이후 10,000) | 사유: ..."
+}
+```
+
+### 코드 변경 이력
+- `src/index.tsx::/api/admin/users/adjust-balance` 에 COIN_MAP 도입 + balanceCol 동적 처리 + 음수 가드 + transactions.coin_type 동적 기록
+
+---
+
 **이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22 추가) — 절대 변경/삭제 금지.**
