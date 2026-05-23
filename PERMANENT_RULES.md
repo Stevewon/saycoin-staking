@@ -801,7 +801,10 @@ cron 의 `/api/rewards/daily` batch 페이지네이션은 다음 규칙을 따�
 
 ---
 
-## 영구룰 #어드민-수정-정산포함 (2026-05-23 사장님 직접 정의)
+## 영구룰 #어드민-수정-정산포함 (2026-05-23 사장님 직접 정의) — ⚠️ 차감 케이스는 #어드민-수정-initial우선차감 으로 대체됨 (2026-05-23 재정의)
+
+> ⚠️ **부분 폐기 알림**: 본 룰의 **증액(+) 동작은 여전히 유효**하지만, **차감(-) 동작은 아래 #어드민-수정-initial우선차감 룰로 대체**되었습니다 (2026-05-23 사장님 재명령).
+> 이유: withdrawable 동기 차감은 회사 잘못 지급분 회수가 불가능해서 (initial=30,000, withdrawable=1,000 케이스에서 -10,000 거절됨), 사장님이 차감 시에는 initial 부터 회수하라고 재정의함.
 
 ### 사장님 직접 인용 (2026-05-23)
 > "어드민에서는 Qx와 QKEy 수정도 가능하게 해주고 어드민 수정했을때는 늘 합산및 정산에 포함되게끔 지금처럼 놓치지않고"
@@ -852,4 +855,90 @@ const COIN_MAP = {
 
 ---
 
-**이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22, 2026-05-23 추가) — 절대 변경/삭제 금지.**
+## 영구룰 #어드민-수정-initial우선차감 (2026-05-23 사장님 직접 재정의 — 차감 동작 최종 확정)
+
+### 사장님 직접 인용 (2026-05-23, 최종 결정 메시지)
+> "출금가능 수량은 절대적으로 유지하는게 맞고! 사용자는 저 수량이상은 절대 출금가능이 안되게 하면되고 어드민 관리자가 잘못지급된 부분이 있다치면 이니셜을 건드려도 차감이 되게 해달라는거야"
+
+추가 인용 (배경):
+> "qta qx도 수정가능한거요.. 최초지급분이라고해도 어드민에서는 수정가능할수있게! ... 사용자내역에도 물론 지금처럼 보여야하고 '관리자수정' 이라고"
+
+### 배경 (왜 이 룰이 #어드민-수정-정산포함 의 차감 동작을 대체하는가)
+- 이전 룰(#어드민-수정-정산포함)은 **차감 시에도** `qta_withdrawable / qx_withdrawable` 을 동기 차감하도록 강제했음.
+- 실제 사례 (2026-05-23 사장님 신고): 회원 잔액 `qx_balance=31,000, qx_initial=30,000, qx_withdrawable=1,000` 인 상태에서 **재매출 차감으로 -10,000** 시도 → `newWd = 1,000 + (-10,000) = -9,000` → `newWd < 0` 가드에 걸려 거절.
+- 사장님 의도: **회사가 잘못 지급한 마케팅 분(initial) 은 어드민이 회수할 수 있어야 한다.** 동시에 **사용자가 실제로 정산해서 번 출금가능(withdrawable) 은 절대 침범 금지.**
+
+### 핵심 원칙 (절대 위반 금지) — 차감 동작에 한함
+1. **차감(-) 시 `*_withdrawable` 은 절대 안 건드린다** (사용자 수익 신성불가침)
+   - `newWd = curWd` (변동 없음)
+2. **차감(-) 시 `*_initial` 부터 회수한다** (회사 지급분 회수)
+   - `newIni = curIni + delta` (delta < 0 이므로 감소)
+3. **차감(-) 시 `*_balance` 도 동기 -delta** (표시 총합 정합성)
+   - `newBal = curBal + delta`
+4. **`*_initial < 0` 음수 허용** (사장님 명시 허용 — "이니셜을 건드려도 차감이 되게")
+5. **유일한 거절 가드**: `newBal < 0` 만 거절 (표시 잔액 음수 방지)
+6. **증액(+) 동작은 이전 룰 #어드민-수정-정산포함 유지**:
+   - `newWd = curWd + delta` (정산 포함)
+   - `newIni = curIni` (그대로)
+   - `newBal = curBal + delta`
+7. **사용자측 표시 prefix**: `[관리자 수정]` (이전 `[어드민 수정]` → 사장님 명시 변경)
+
+### COIN_MAP 정의 (확장)
+```typescript
+const COIN_MAP = {
+  'QKEY': { col: 'qkey_balance', label: 'QKEY', wcol: null,               icol: null            }, // 단일 컬럼
+  'QTA':  { col: 'qta_balance',  label: 'QTA',  wcol: 'qta_withdrawable', icol: 'qta_initial'   }, // 3컬럼
+  'QX':   { col: 'qx_balance',   label: 'QX',   wcol: 'qx_withdrawable',  icol: 'qx_initial'    }  // 3컬럼
+}
+```
+
+### UPDATE 동작 매트릭스 (최종 — 증액/차감 분기)
+| coin | 방향 | balance | withdrawable | initial |
+|------|------|---------|--------------|---------|
+| QKEY | +/-  | +/-delta | (단일 컬럼)  | (없음)  |
+| QTA  | +    | +delta  | +delta (정산 포함) | 그대로 |
+| QTA  | -    | -delta  | **그대로 (절대 보존 🔒)** | -delta (회수) |
+| QX   | +    | +delta  | +delta (정산 포함) | 그대로 |
+| QX   | -    | -delta  | **그대로 (절대 보존 🔒)** | -delta (회수, 음수 허용) |
+
+### 가드 매트릭스 (최종)
+| 조건 | 동작 |
+|------|------|
+| `newBal < 0` | HTTP 400 거절 — "표시 잔액이 음수가 됩니다" |
+| `newWd < 0` | ⚠️ **가드 제거됨** (차감 시 withdrawable 은 그대로라 음수 불가, 증액 시는 양수 증가만) |
+| `newIni < 0` | ✅ **허용** (회사 지급 한도 초과 회수 — 사장님 명시) |
+
+### 실제 사례 검증 (사장님 신고 케이스)
+- **Before**: `qx_balance=31,000, qx_initial=30,000, qx_withdrawable=1,000`, delta=`-10,000`
+- **After**: `qx_balance=21,000, qx_initial=20,000, qx_withdrawable=1,000` ✅
+  - 표시 총합 21,000 = initial 20,000 + withdrawable 1,000 (정합성 유지)
+  - 출금가능 1,000 그대로 (사용자 수익 보호)
+  - initial 10,000 회수 (회사 지급분에서 차감)
+
+### 응답 필드 (어드민 UI 표시용)
+- `previousBalance` / `newBalance`
+- `previousWithdrawable` / `newWithdrawable` (차감 시 동일값)
+- `previousInitial` / `newInitial` (차감 시 변동)
+- `withdrawablePreserved`: 차감일 때만 `true` (사용자측 신성불가침 확인)
+- `initialAdjusted`: 차감일 때만 `true` (initial 회수 발생 확인)
+- `withdrawableSynced`: QTA/QX 면 항상 `true` (즉시 정산 반영)
+- `delta` / `direction` (`'increase' | 'decrease'`)
+
+### 사용자측 표시 (수당 보상 내역)
+- **prefix**: `[관리자 수정]` (사장님 명시)
+- **형식**: `[관리자 수정] ▲증액 +500 QX (이전 1,000 → 이후 1,500) | 사유: <reason>`
+- **형식**: `[관리자 수정] ▼차감 -10,000 QX (이전 31,000 → 이후 21,000) | 사유: <reason>`
+- transactions 테이블에 `type='admin_adjustment', coin_type=<COIN>, amount=delta, description=<rich>` 로 기록
+
+### 어드민 모달 미리보기 동작
+- **증액(+)**: `출금가능: wd → wd+delta (정산 포함)` 강조, `초기지급분: ini (변동 없음)` 보조 표시
+- **차감(-)**: `초기지급분: ini → ini+delta (회사 지급분 회수)` 강조, `출금가능: wd (절대 보존 🔒)` 보호 강조
+- initial 이 음수가 될 경우: amber 경고 박스 "회사 지급 한도 초과 회수 (사장님 허용 ✅)" 표시
+
+### 코드 변경 이력
+- `src/index.tsx::/api/admin/users/adjust-balance` — COIN_MAP 에 `icol` 추가, SELECT 에 `qta_initial/qx_initial` 추가, 차감/증액 분기 로직, `newWd < 0` 가드 제거, 3컬럼 UPDATE, description prefix `[관리자 수정]`, 응답 4필드 (`previousInitial/newInitial/withdrawablePreserved/initialAdjusted`) 추가
+- `src/index.tsx::updateAdjPreview` / `submitAdjustBalance` (admin 모달 JS) — 증액/차감 분기 미리보기, confirm/alert 메시지 분기 표시
+
+---
+
+**이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22, 2026-05-23 두 차례 추가) — 절대 변경/삭제 금지.**

@@ -18550,38 +18550,42 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
     if (!reasonRaw || reasonRaw === '관리자 보정') {
       return c.json({ error: '수정 사유(reason)를 구체적으로 입력해주세요. 사유 없이는 잔액을 변경할 수 없습니다.' }, 400)
     }
-    // 코인 종류 결정 (기본 QKEY — 하위호환)
-    //   COIN_MAP: 표시용 잔액 컬럼(col) + 출금가능 컬럼(wcol) 매핑
-    //   QKEY: 단일 컬럼(qkey_balance)이 곧 출금가능분이므로 wcol = null
-    //   QTA/QX: qta_balance(표시) ≠ qta_withdrawable(출금가능) 분리 보관 → 둘 다 동기화 필수
+    // 코인 종류 결정 (기본 QKEY - 하위호환)
+    //   COIN_MAP: 표시 잔액 컬럼(col) + 출금가능 컬럼(wcol) + 회사지급분 컬럼(icol)
+    //   QKEY: 단일 컬럼(qkey_balance) - wcol/icol 없음
+    //   QTA/QX: balance(표시) / initial(회사지급분, 출금불가) / withdrawable(출금가능) 3컬럼 분리
     const coinRaw = String(coin || 'QKEY').toUpperCase().trim()
-    const COIN_MAP: Record<string, { col: string; label: string; wcol: string | null }> = {
-      'QKEY': { col: 'qkey_balance', label: 'QKEY', wcol: null },
-      'QTA':  { col: 'qta_balance',  label: 'QTA',  wcol: 'qta_withdrawable' },
-      'QX':   { col: 'qx_balance',   label: 'QX',   wcol: 'qx_withdrawable'  }
+    const COIN_MAP: Record<string, { col: string; label: string; wcol: string | null; icol: string | null }> = {
+      'QKEY': { col: 'qkey_balance', label: 'QKEY', wcol: null,               icol: null            },
+      'QTA':  { col: 'qta_balance',  label: 'QTA',  wcol: 'qta_withdrawable', icol: 'qta_initial'   },
+      'QX':   { col: 'qx_balance',   label: 'QX',   wcol: 'qx_withdrawable',  icol: 'qx_initial'    }
     }
     if (!COIN_MAP[coinRaw]) {
       return c.json({ error: `coin 은 QKEY, QTA, QX 중 하나여야 합니다 (받음: ${coinRaw})` }, 400)
     }
     const balanceCol = COIN_MAP[coinRaw].col
     const coinLabel  = COIN_MAP[coinRaw].label
-    const wCol       = COIN_MAP[coinRaw].wcol  // null이면 별도 withdrawable 동기화 불필요(QKEY)
+    const wCol       = COIN_MAP[coinRaw].wcol  // QKEY 일 때 null
+    const iCol       = COIN_MAP[coinRaw].icol  // QKEY 일 때 null
 
     const uid = Number(userId)
-    // ★ 사장님 영구명령 (2026-05-23) #어드민-수정-정산포함:
-    //   QTA/QX 도 출금가능 컬럼(qta_withdrawable/qx_withdrawable) 함께 조회 → 정합성 검증 후 동기 업데이트
+    // ★ 사장님 영구명령 (2026-05-23 재정의) #어드민-수정-initial우선차감:
+    //   3컬럼(balance/initial/withdrawable) 모두 조회 → 차감 시 initial 우선 회수, withdrawable 절대 보존
     const cur = await db.prepare(
       `SELECT id, email, name,
-              COALESCE(qta_balance,0) as qta_balance,
-              COALESCE(qx_balance,0) as qx_balance,
-              COALESCE(qkey_balance,0) as qkey_balance,
+              COALESCE(qta_balance,0)      as qta_balance,
+              COALESCE(qx_balance,0)       as qx_balance,
+              COALESCE(qkey_balance,0)     as qkey_balance,
               COALESCE(qta_withdrawable,0) as qta_withdrawable,
-              COALESCE(qx_withdrawable,0) as qx_withdrawable
+              COALESCE(qx_withdrawable,0)  as qx_withdrawable,
+              COALESCE(qta_initial,0)      as qta_initial,
+              COALESCE(qx_initial,0)       as qx_initial
          FROM users WHERE id = ?`
     ).bind(uid).first()
     if (!cur) return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
     const curBal = Number((cur as any)[balanceCol]) || 0
     const curWd  = wCol ? (Number((cur as any)[wCol]) || 0) : curBal  // QKEY는 출금가능=잔액
+    const curIni = iCol ? (Number((cur as any)[iCol]) || 0) : 0       // QKEY는 initial 개념 없음
     let delta = 0
     if (String(mode || 'delta') === 'set') {
       delta = Number(amount) - curBal
@@ -18592,50 +18596,83 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
       return c.json({ success: true, message: '변경 사항 없음', currentBalance: curBal, coin: coinLabel })
     }
     const newBal = curBal + delta
-    const newWd  = wCol ? (curWd + delta) : newBal  // 표시잔액과 출금가능을 항상 같은 delta로 동기 이동
 
-    // ★ 안전 가드 — QTA/QX 차감 시 음수 잔액 차단
-    //   영구정책 (2026-05-14): 회사 최초지급분(qta_initial/qx_initial)은 출금 불가 보호 자산
-    //   → 어드민도 실수로 보호 자산을 깎지 못하도록 음수 잔액 차단
+    // ============================================================
+    // ★★★ 사장님 영구명령 (2026-05-23 최종 확정) #어드민-수정-initial우선차감
+    //
+    // 직접 인용:
+    //   "출금가능 수량은 절대적으로 유지하는게 맞고! 사용자는 저 수량이상은 절대 출금가능이
+    //    안되게 하면되고, 어드민 관리자가 잘못지급된 부분이 있다치면 이니셜을 건드려도 차감이
+    //    되게 해달라는거야"
+    //
+    // 차감(-) 시:
+    //   1) qta_initial / qx_initial 부터 차감 (회사 잘못 지급분 회수)
+    //   2) qta_withdrawable / qx_withdrawable 은 절대 안 건드림 (사용자 수익 신성불가침)
+    //   3) qta_balance / qx_balance 도 -delta 동기 차감 (표시 총합)
+    //   4) qta_initial 이 음수가 되어도 허용 (회수 진행 - 사장님 명시 의도)
+    //   5) qta_balance < 0 만 거절 (음수 표시 잔액 방지)
+    //
+    // 증액(+) 시:
+    //   1) qta_balance / qx_balance 동기 +delta
+    //   2) qta_withdrawable / qx_withdrawable 도 +delta (새 지급분은 출금 가능, 정산 포함)
+    //   3) qta_initial / qx_initial 은 그대로 (회사 마케팅 지급분은 신규 증액 대상 아님)
+    //
+    // QKEY (단일 컬럼) 동작: balance만 +/- (이전과 동일)
+    // ============================================================
+    let newWd = curWd
+    let newIni = curIni
+    if (wCol && iCol) {
+      if (delta >= 0) {
+        // 증액: withdrawable 동기 + (정산 포함), initial 그대로
+        newWd  = curWd + delta
+        newIni = curIni
+      } else {
+        // 차감: initial 우선 회수, withdrawable 절대 보존
+        newWd  = curWd          // 절대 안 건드림!
+        newIni = curIni + delta // delta < 0 이므로 감소 (초과 시 음수 허용)
+      }
+    } else {
+      // QKEY: 단일 컬럼이므로 balance 그대로 가는 거 = withdrawable 와 동치
+      newWd  = newBal
+      newIni = 0
+    }
+
+    // 가드: balance < 0 만 거절 (표시 잔액 음수 방지)
+    //   initial 음수는 허용 - 어드민 회수가 회사 지급 한도를 넘는 경우 사장님 명시 허용
+    //   withdrawable 은 차감 시 그대로라 음수가 될 일 없음 (증액만 영향)
     if (newBal < 0) {
       return c.json({
-        error: `잔액이 음수가 됩니다 (현재 ${curBal} ${coinLabel} ${delta >= 0 ? '+' : ''}${delta} = ${newBal}). 차감 가능 한도를 초과했습니다.`,
+        error: `표시 잔액이 음수가 됩니다 (현재 ${curBal} ${coinLabel} ${delta >= 0 ? '+' : ''}${delta} = ${newBal}). 차감 가능 한도를 초과했습니다.`,
         currentBalance: curBal,
         attemptedDelta: delta,
         coin: coinLabel
       }, 400)
     }
-    // ★ 추가 가드 — QTA/QX 차감 시 출금가능분도 음수가 되지 않게 (초과 차감 방지)
-    //   회사 지급분(qta_initial/qx_initial) 보호의 마지막 방어선
-    if (wCol && newWd < 0) {
-      return c.json({
-        error: `출금가능 ${coinLabel} 가 음수가 됩니다 (현재 출금가능 ${curWd} ${delta >= 0 ? '+' : ''}${delta} = ${newWd}). 회사 최초 지급분(${coinLabel} initial)은 차감할 수 없습니다.`,
-        currentBalance: curBal,
-        currentWithdrawable: curWd,
-        attemptedDelta: delta,
-        coin: coinLabel
-      }, 400)
-    }
+    // ★ 출금가능 음수 가드는 제거됨 (2026-05-23 사장님 명령)
+    //   사장님 인용: "출금가능 수량은 절대적으로 유지하는게 맞고! ... 이니셜을 건드려도 차감이 되게"
+    //   → 차감 시 withdrawable 은 그대로(절대 보존), initial 만 회수하므로 더 이상 newWd < 0 가드 필요 없음
+    //   → initial 음수는 사장님이 명시적으로 허용
 
     // 풍부한 description 생성 (사용자/어드민 양측에 명확히 표시)
-    //   형식: [어드민 수정] ▲증액 +500 QKEY (이전 2,000 → 이후 2,500) | 사유: <reason>
-    //   또는: [어드민 수정] ▼차감 -300 QKEY (이전 2,000 → 이후 1,700) | 사유: <reason>
+    //   ★ 사장님 룰 (2026-05-23): 사용자 화면에 "관리자 수정" 으로 표시
+    //   형식: [관리자 수정] ▲증액 +500 QKEY (이전 2,000 → 이후 2,500) | 사유: <reason>
+    //   형식: [관리자 수정] ▼차감 -10,000 QX (이전 31,000 → 이후 21,000) | 사유: <reason>
     const fmt = (n: number) => Math.round(n).toLocaleString('ko-KR')
     const arrow = delta >= 0 ? '▲증액' : '▼차감'
     const sign = delta >= 0 ? '+' : ''
-    const richDesc = `[어드민 수정] ${arrow} ${sign}${fmt(delta)} ${coinLabel} (이전 ${fmt(curBal)} → 이후 ${fmt(newBal)}) | 사유: ${reasonRaw}`
+    const richDesc = `[관리자 수정] ${arrow} ${sign}${fmt(delta)} ${coinLabel} (이전 ${fmt(curBal)} → 이후 ${fmt(newBal)}) | 사유: ${reasonRaw}`
     // 1) admin_adjustment 거래 기록 (description 에 사유+변동량 모두 포함, coin_type 동적)
     const ins = await db.prepare(
       `INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'admin_adjustment', ?, ?, ?)`
     ).bind(uid, coinLabel, delta, richDesc).run()
-    // 2) 잔액 컬럼 업데이트 + (QTA/QX는) 출금가능 컬럼 동시 업데이트
-    //    ★ 사장님 영구명령 (2026-05-23) #어드민-수정-정산포함:
-    //       "어드민 수정했을때는 늘 합산및 정산에 포함되게끔 지금처럼 놓치지않고"
-    //       → QTA/QX 도 출금/스왑/정산 집계 대상이 되도록 withdrawable 컬럼 동기 이동
-    if (wCol) {
+    // 2) 컬럼 업데이트 - 3컬럼(QTA/QX) or 1컬럼(QKEY)
+    //    ★ 사장님 영구명령 #어드민-수정-initial우선차감 (위 큰 주석 참조)
+    //    차감 시: balance -delta, initial -delta (회수), withdrawable 그대로
+    //    증액 시: balance +delta, withdrawable +delta (정산 포함), initial 그대로
+    if (wCol && iCol) {
       await db.prepare(
-        `UPDATE users SET ${balanceCol} = ?, ${wCol} = ? WHERE id = ?`
-      ).bind(newBal, newWd, uid).run()
+        `UPDATE users SET ${balanceCol} = ?, ${wCol} = ?, ${iCol} = ? WHERE id = ?`
+      ).bind(newBal, newWd, newIni, uid).run()
     } else {
       await db.prepare(
         `UPDATE users SET ${balanceCol} = ? WHERE id = ?`
@@ -18651,6 +18688,10 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
       newBalance: newBal,
       previousWithdrawable: curWd,
       newWithdrawable: newWd,
+      previousInitial: curIni,
+      newInitial: newIni,
+      withdrawablePreserved: (delta < 0 && !!wCol),  // 차감일 때만 withdrawable 보존됨
+      initialAdjusted: (delta < 0 && !!iCol),         // 차감일 때만 initial 회수 발생
       withdrawableSynced: !!wCol,  // QTA/QX 일 때만 true (출금/정산 즉시 포함)
       delta,
       direction: delta >= 0 ? 'increase' : 'decrease',
@@ -27433,7 +27474,13 @@ app.get('/admin/dashboard', (c) => {
                 if (hasWithdrawable) {
                     wdBox.style.display = '';
                     document.getElementById('adjCurrentWithdrawable').textContent = wd.toLocaleString() + ' ' + coin;
-                    initNote.innerHTML = '★ 회사 최초 지급분(' + coin + ' initial): <span class="font-bold text-rose-700">' + initial.toLocaleString() + ' ' + coin + '</span> (출금불가 보호) | 어드민 수정 시 출금가능 컬럼도 같은 delta 로 동기 이동됩니다';
+                    // ★ 사장님 영구명령 #어드민-수정-initial우선차감 (2026-05-23):
+                    //   증액(+): withdrawable 동기 + (정산 포함), initial 그대로
+                    //   차감(-): initial 우선 회수, withdrawable 절대 보존
+                    initNote.innerHTML =
+                        '★ 회사 최초 지급분(' + coin + ' initial): <span class="font-bold text-rose-700">' + initial.toLocaleString() + ' ' + coin + '</span> (출금불가 보호)<br/>' +
+                        '<span class="text-emerald-700">증액(+) 시:</span> 표시잔액 + 출금가능 동시 증가 (정산 포함, initial 변동 없음)<br/>' +
+                        '<span class="text-rose-700">차감(-) 시:</span> 표시잔액 + <b>초기지급분(initial)</b> 회수 — 출금가능은 절대 보존(사용자 수익 신성불가침)';
                 } else {
                     wdBox.style.display = 'none';
                     initNote.innerHTML = 'QKEY 는 단일 컬럼이므로 잔액=출금가능 입니다 (자동 정산 포함)';
@@ -27455,34 +27502,65 @@ app.get('/admin/dashboard', (c) => {
                 var b = _adjCtx.balances || {};
                 var cur = (coin === 'QKEY') ? (b.qkey || 0) : (coin === 'QTA') ? (b.qta || 0) : (b.qx || 0);
                 var wd  = (coin === 'QTA') ? (b.qta_withdrawable || 0) : (coin === 'QX') ? (b.qx_withdrawable || 0) : cur;
+                var ini = (coin === 'QTA') ? (b.qta_initial || 0) : (coin === 'QX') ? (b.qx_initial || 0) : 0;
                 var newBal, delta;
                 if (mode === 'set') { newBal = amt; delta = amt - cur; }
                 else { newBal = cur + amt; delta = amt; }
-                var newWd = (coin === 'QKEY') ? newBal : (wd + delta);  // QTA/QX 는 동기 이동
+                // ★ 사장님 영구명령 #어드민-수정-initial우선차감 (2026-05-23):
+                //   증액(+): newWd = wd + delta, newIni = ini (그대로)
+                //   차감(-): newWd = wd (절대 보존!), newIni = ini + delta (음수 허용)
+                //   QKEY: 단일 컬럼 (newWd = newBal, ini 개념 없음)
+                var newWd, newIni;
+                if (coin === 'QKEY') {
+                    newWd = newBal;
+                    newIni = 0;
+                } else if (delta >= 0) {
+                    newWd  = wd + delta;
+                    newIni = ini;
+                } else {
+                    newWd  = wd;             // 절대 보존
+                    newIni = ini + delta;    // 음수 허용
+                }
                 var sign = delta >= 0 ? '+' : '';
                 var arrow = delta >= 0 ? '▲증액' : '▼차감';
                 var deltaColor = delta >= 0 ? 'text-emerald-700' : 'text-rose-700';
                 var deltaBg = delta >= 0 ? 'bg-emerald-50' : 'bg-rose-50';
-                // 가드 경고
+                // 가드 경고: balance < 0 만 거절 (initial 음수는 사장님 허용)
                 var warnHtml = '';
                 if (newBal < 0) {
                     warnHtml = '<div class="bg-red-100 border border-red-300 rounded p-2 mt-1 text-xs text-red-700"><i class="fas fa-times-circle mr-1"></i>표시 잔액이 음수가 됩니다 → 서버에서 거절됩니다</div>';
-                } else if (coin !== 'QKEY' && newWd < 0) {
-                    warnHtml = '<div class="bg-red-100 border border-red-300 rounded p-2 mt-1 text-xs text-red-700"><i class="fas fa-shield-alt mr-1"></i>출금가능이 음수가 됩니다 — 회사 최초 지급분(initial) 침범 → 서버에서 거절됩니다</div>';
+                } else if (coin !== 'QKEY' && delta < 0 && newIni < 0) {
+                    // 정보성 알림: initial 이 음수가 되어도 서버는 허용 (회수 진행)
+                    warnHtml = '<div class="bg-amber-50 border border-amber-300 rounded p-2 mt-1 text-xs text-amber-800"><i class="fas fa-info-circle mr-1"></i>초기지급분(initial)이 음수가 됩니다 — 회사 지급 한도 초과 회수 (사장님 허용 ✅)</div>';
                 }
-                var wdLine = (coin === 'QKEY') ? '' :
-                    '<div class="mt-1 text-xs text-gray-600">출금가능: ' + wd.toLocaleString() + ' → <span class="font-bold ' + (newWd < 0 ? 'text-red-700' : 'text-emerald-700') + '">' + newWd.toLocaleString() + '</span> ' + coin + ' (동기 이동)</div>';
+                // 라인 구성: 증액 시 출금가능 변동, 차감 시 초기지급분 변동
+                var detailLines = '';
+                if (coin !== 'QKEY') {
+                    if (delta >= 0) {
+                        // 증액: withdrawable 변동 강조, initial 그대로
+                        detailLines =
+                            '<div class="mt-1 text-xs text-gray-700">출금가능: ' + wd.toLocaleString() + ' → <span class="font-bold text-emerald-700">' + newWd.toLocaleString() + '</span> ' + coin + ' <span class="text-emerald-600">(정산 포함 +' + Math.abs(delta).toLocaleString() + ')</span></div>' +
+                            '<div class="mt-0.5 text-xs text-gray-500">초기지급분: ' + ini.toLocaleString() + ' → ' + newIni.toLocaleString() + ' ' + coin + ' (변동 없음)</div>';
+                    } else {
+                        // 차감: initial 변동 강조, withdrawable 보존 강조
+                        var iniColor = newIni < 0 ? 'text-amber-700' : 'text-rose-700';
+                        detailLines =
+                            '<div class="mt-1 text-xs text-gray-700">초기지급분: ' + ini.toLocaleString() + ' → <span class="font-bold ' + iniColor + '">' + newIni.toLocaleString() + '</span> ' + coin + ' <span class="text-rose-600">(회사 지급분 회수 ' + delta.toLocaleString() + ')</span></div>' +
+                            '<div class="mt-0.5 text-xs text-emerald-700"><i class="fas fa-shield-alt mr-1"></i>출금가능: ' + wd.toLocaleString() + ' → <b>' + newWd.toLocaleString() + '</b> ' + coin + ' (절대 보존 🔒)</div>';
+                    }
+                }
                 preview.innerHTML = 
                     '<div class="' + deltaBg + ' rounded p-2 mb-1">' +
                     '<span class="font-bold ' + deltaColor + '">' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' ' + coin + '</span>' +
                     '</div>' +
                     '표시 잔액: ' + cur.toLocaleString() + ' → <span class="font-bold text-yellow-700">' + newBal.toLocaleString() + '</span> ' + coin +
-                    wdLine + warnHtml;
+                    detailLines + warnHtml;
                 // 사용자측에 표시될 description 미리보기
+                //   ★ 사장님 룰: prefix 는 "[관리자 수정]" (이전: [어드민 수정])
                 var reason = (document.getElementById('adjDescription').value || '').trim();
                 if (descPreview) {
                     if (reason) {
-                        descPreview.innerHTML = '<span class="text-gray-500">사용자 화면 표시:</span> <span class="font-mono text-gray-700">[어드민 수정] ' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' ' + coin + ' (이전 ' + cur.toLocaleString() + ' → 이후 ' + newBal.toLocaleString() + ') | 사유: ' + reason + '</span>';
+                        descPreview.innerHTML = '<span class="text-gray-500">사용자 화면 표시:</span> <span class="font-mono text-gray-700">[관리자 수정] ' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' ' + coin + ' (이전 ' + cur.toLocaleString() + ' → 이후 ' + newBal.toLocaleString() + ') | 사유: ' + reason + '</span>';
                     } else {
                         descPreview.innerHTML = '<span class="text-red-500">⚠️ 사유를 입력하면 사용자측 표시 형식이 미리보기됩니다</span>';
                     }
@@ -27504,12 +27582,31 @@ app.get('/admin/dashboard', (c) => {
                 }
                 var b = _adjCtx.balances || {};
                 var cur = (coin === 'QKEY') ? (b.qkey || 0) : (coin === 'QTA') ? (b.qta || 0) : (b.qx || 0);
+                var wd  = (coin === 'QTA') ? (b.qta_withdrawable || 0) : (coin === 'QX') ? (b.qx_withdrawable || 0) : cur;
+                var ini = (coin === 'QTA') ? (b.qta_initial || 0) : (coin === 'QX') ? (b.qx_initial || 0) : 0;
                 var newBal = (mode === 'set') ? amt : (cur + amt);
                 var delta = (mode === 'set') ? (amt - cur) : amt;
                 if (Math.abs(delta) < 0.0001) { alert('변경 사항이 없습니다'); return; }
                 var sign = delta >= 0 ? '+' : '';
                 var arrow = delta >= 0 ? '▲증액' : '▼차감';
-                var syncNote = (coin === 'QKEY') ? '' : '※ 출금가능(' + coin + '_withdrawable) 도 동일 delta 로 자동 동기화됩니다.\\n';
+                // ★ 사장님 영구명령 #어드민-수정-initial우선차감 (2026-05-23):
+                //   증액: withdrawable 동기 + (정산 포함)
+                //   차감: initial 우선 회수, withdrawable 절대 보존
+                var policyNote = '';
+                if (coin !== 'QKEY') {
+                    if (delta >= 0) {
+                        var newWdPreview = wd + delta;
+                        policyNote =
+                            '※ 출금가능(' + coin + '_withdrawable): ' + wd.toLocaleString() + ' → ' + newWdPreview.toLocaleString() + ' (정산 포함 +' + delta.toLocaleString() + ')\\n' +
+                            '※ 초기지급분(' + coin + '_initial): ' + ini.toLocaleString() + ' (변동 없음)\\n';
+                    } else {
+                        var newIniPreview = ini + delta;
+                        policyNote =
+                            '※ 초기지급분(' + coin + '_initial): ' + ini.toLocaleString() + ' → ' + newIniPreview.toLocaleString() + ' (회사 지급분 회수 ' + delta.toLocaleString() + ')\\n' +
+                            '🔒 출금가능(' + coin + '_withdrawable): ' + wd.toLocaleString() + ' (절대 보존 — 사용자 수익 신성불가침)\\n' +
+                            (newIniPreview < 0 ? '⚠️ initial 이 음수가 됩니다 — 회사 지급 한도 초과 회수 (사장님 허용 ✅)\\n' : '');
+                    }
+                }
                 if (!confirm(
                     '★ ' + coin + ' 잔액 수정 확인 ★\\n\\n' +
                     '회원: #' + _adjCtx.userId + ' ' + _adjCtx.name + ' (' + _adjCtx.email + ')\\n' +
@@ -27519,8 +27616,8 @@ app.get('/admin/dashboard', (c) => {
                     '이후 잔액: ' + newBal.toLocaleString() + ' ' + coin + '\\n' +
                     '─────────────────────────\\n' +
                     '사유: ' + reason + '\\n' +
-                    syncNote + '\\n' +
-                    '※ 이 내역은 사용자측 "수당 보상 내역" 에 그대로 표시됩니다.\\n\\n' +
+                    policyNote + '\\n' +
+                    '※ 이 내역은 사용자측 "수당 보상 내역" 에 [관리자 수정] 으로 표시됩니다.\\n\\n' +
                     '적용하시겠습니까?'
                 )) return;
                 try {
@@ -27535,14 +27632,25 @@ app.get('/admin/dashboard', (c) => {
                     if (res.data.success) {
                         var d = res.data.delta || 0;
                         var resArrow = d >= 0 ? '▲증액' : '▼차감';
-                        var wdLine = res.data.withdrawableSynced ? 
-                            '\\n출금가능: ' + (res.data.previousWithdrawable || 0).toLocaleString() + ' → ' + (res.data.newWithdrawable || 0).toLocaleString() + ' ' + coin + ' (동기 반영 ✅)' : '';
+                        // 결과 알림: 증액 시 withdrawable 변동, 차감 시 initial 변동 강조
+                        var detailLine = '';
+                        if (coin !== 'QKEY') {
+                            if (d >= 0) {
+                                // 증액 완료
+                                detailLine = '\\n출금가능: ' + (res.data.previousWithdrawable || 0).toLocaleString() + ' → ' + (res.data.newWithdrawable || 0).toLocaleString() + ' ' + coin + ' (정산 포함 ✅)';
+                            } else {
+                                // 차감 완료: initial 회수, withdrawable 보존
+                                detailLine =
+                                    '\\n초기지급분: ' + (res.data.previousInitial || 0).toLocaleString() + ' → ' + (res.data.newInitial || 0).toLocaleString() + ' ' + coin + ' (회사 지급분 회수 ✅)' +
+                                    '\\n출금가능: ' + (res.data.previousWithdrawable || 0).toLocaleString() + ' ' + coin + ' (절대 보존 🔒)';
+                            }
+                        }
                         alert(
                             '✅ ' + coin + ' 잔액 수정 완료\\n\\n' +
                             resArrow + ' ' + (d >= 0 ? '+' : '') + Math.abs(d).toLocaleString() + ' ' + coin + '\\n' +
                             '이전: ' + (res.data.previousBalance || 0).toLocaleString() + ' ' + coin + '\\n' +
                             '이후: ' + (res.data.newBalance || 0).toLocaleString() + ' ' + coin +
-                            wdLine + '\\n' +
+                            detailLine + '\\n' +
                             '사유: ' + (res.data.reason || reason) + '\\n' +
                             'tx ID: ' + res.data.txId
                         );
