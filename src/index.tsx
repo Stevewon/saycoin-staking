@@ -2937,6 +2937,9 @@ app.get('/api/admin/users', async (c) => {
     const db = c.env.DB
     
     // 사용자 목록 조회 (스테이킹 총 수량 + 추천인 정보 포함)
+    // ★ 사장님 영구명령 (2026-05-23) #어드민-수정-3코인UI:
+    //   회원관리 탭의 잔액 수정 모달에서 QKEY/QTA/QX 3종 + 각 출금가능/초기지급 표시를 위해
+    //   SELECT 에 qta_withdrawable / qx_withdrawable / qta_initial / qx_initial 포함
     const users = await db.prepare(`
       SELECT 
         u.id, 
@@ -2949,6 +2952,10 @@ app.get('/api/admin/users', async (c) => {
         u.qx_balance, 
         u.qkey_balance,
         u.usdt_balance, 
+        COALESCE(u.qta_withdrawable, 0) as qta_withdrawable,
+        COALESCE(u.qx_withdrawable, 0) as qx_withdrawable,
+        COALESCE(u.qta_initial, 0) as qta_initial,
+        COALESCE(u.qx_initial, 0) as qx_initial,
         u.country,
         u.language,
         u.referral_code,
@@ -2959,7 +2966,9 @@ app.get('/api/admin/users', async (c) => {
       FROM users u
       LEFT JOIN staking s ON u.id = s.user_id
       GROUP BY u.id, u.name, u.email, u.phone, u.wallet_address, u.usdt_wallet_address,
-               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance, u.country, u.language,
+               u.qta_balance, u.qx_balance, u.qkey_balance, u.usdt_balance,
+               u.qta_withdrawable, u.qx_withdrawable, u.qta_initial, u.qx_initial,
+               u.country, u.language,
                u.referral_code, u.referrer_id, u.created_at
       ORDER BY u.created_at DESC
     `).all()
@@ -25778,19 +25787,39 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
-                <!-- QKEY 잔액 임의 수정 모달 (숨김) -->
+                <!-- 잔액 임의 수정 모달 (QKEY / QTA / QX 3종 지원) -->
+                <!-- ★ 사장님 영구명령 (2026-05-23) #어드민-수정-3코인UI: 코인 선택 드롭다운 + 출금가능 표시 -->
                 <div id="adjustBalanceModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
                     <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
                         <div class="flex justify-between items-center mb-4">
-                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-coins text-yellow-500 mr-2"></i>QKEY 잔액 임의 수정</h3>
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-coins text-yellow-500 mr-2"></i>잔액 임의 수정 <span class="text-xs font-normal text-gray-500">(QKEY / QTA / QX)</span></h3>
                             <button onclick="closeAdjustBalanceModal()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
                         </div>
                         <div class="space-y-4">
                             <div class="bg-gray-50 rounded-lg p-3">
                                 <p class="text-xs text-gray-500 mb-1">대상 회원</p>
                                 <p class="text-sm font-bold text-gray-800" id="adjUserInfo">-</p>
-                                <p class="text-xs text-gray-600 mt-2">현재 잔액</p>
-                                <p class="text-lg font-bold text-yellow-600" id="adjCurrentBalance">- QKEY</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">코인 선택 <span class="text-red-500">*</span></label>
+                                <select id="adjCoin" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-transparent font-bold" onchange="onAdjCoinChange()">
+                                    <option value="QKEY">QKEY — 데일리/매칭 수당 코인 (출금 가능)</option>
+                                    <option value="QTA">QTA  — 스테이킹 코인 (출금가능 컬럼 동기)</option>
+                                    <option value="QX">QX   — 거래 코인 (출금가능 컬럼 동기)</option>
+                                </select>
+                            </div>
+                            <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <p class="text-xs text-gray-600">표시 잔액 (총합)</p>
+                                        <p class="text-lg font-bold text-yellow-700" id="adjCurrentBalance">- QKEY</p>
+                                    </div>
+                                    <div id="adjWithdrawableBox">
+                                        <p class="text-xs text-gray-600">출금가능 잔액</p>
+                                        <p class="text-lg font-bold text-emerald-700" id="adjCurrentWithdrawable">-</p>
+                                    </div>
+                                </div>
+                                <p class="text-[10px] text-gray-500 mt-1" id="adjInitialNote"></p>
                             </div>
                             <div>
                                 <label class="block text-sm font-medium text-gray-700 mb-1">수정 모드</label>
@@ -25800,7 +25829,7 @@ app.get('/admin/dashboard', (c) => {
                                 </select>
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">금액 (QKEY)</label>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">금액 (<span id="adjAmountUnit">QKEY</span>)</label>
                                 <input type="number" id="adjAmount" placeholder="예: 10000 또는 -5000" oninput="updateAdjPreview()"
                                     class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-transparent" />
                                 <p class="text-xs text-gray-500 mt-1">delta 모드: 양수=가산, 음수=차감 / set 모드: 새 잔액 값</p>
@@ -26748,9 +26777,9 @@ app.get('/admin/dashboard', (c) => {
                                     class="px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
                                     <i class="fas fa-search mr-1 sm:mr-2"></i>\${I18N.t('admin.view_detail')}
                                 </button>
-                                <button onclick="openAdjustBalanceModal(\${u.id}, '\${esc(u.email)}', '\${esc(u.name)}', \${u.qkey_balance || 0})" 
+                                <button onclick='openAdjustBalanceModal(\${u.id}, "\${esc(u.email)}", "\${esc(u.name)}", { qkey: \${u.qkey_balance || 0}, qta: \${u.qta_balance || 0}, qx: \${u.qx_balance || 0}, qta_withdrawable: \${u.qta_withdrawable || 0}, qx_withdrawable: \${u.qx_withdrawable || 0}, qta_initial: \${u.qta_initial || 0}, qx_initial: \${u.qx_initial || 0} })' 
                                     class="px-3 sm:px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
-                                    <i class="fas fa-coins mr-1 sm:mr-2"></i>QKEY 잔액 수정
+                                    <i class="fas fa-coins mr-1 sm:mr-2"></i>잔액 수정 (QKEY/QTA/QX)
                                 </button>
                                 <button onclick="deleteUser(\${u.id}, '\${esc(u.name)}', '\${esc(u.email)}', \${u.staking_amount})" 
                                     class="px-3 sm:px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition duration-200 text-xs sm:text-sm">
@@ -27332,20 +27361,40 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // ============================================
-            // QKEY 잔액 임의 수정 (관리자 보정)
+            // 잔액 임의 수정 (관리자 보정) — QKEY / QTA / QX 3종 지원
+            // ★ 사장님 영구명령 (2026-05-23) #어드민-수정-3코인UI
             // ============================================
-            let _adjCtx = { userId: 0, email: '', name: '', currentBalance: 0 };
+            // _adjCtx.balances: { qkey, qta, qx, qta_withdrawable, qx_withdrawable, qta_initial, qx_initial }
+            // _adjCtx.coin: 현재 선택된 코인 (QKEY|QTA|QX)
+            let _adjCtx = { userId: 0, email: '', name: '', coin: 'QKEY', balances: {} };
 
-            function openAdjustBalanceModal(userId, email, name, currentBalance) {
-                _adjCtx = { userId: userId, email: email, name: name, currentBalance: Number(currentBalance) || 0 };
+            // 4번째 인자가 객체이면 3코인 모드, 숫자이면 하위호환 (QKEY 단독)
+            function openAdjustBalanceModal(userId, email, name, balances) {
+                var b;
+                if (typeof balances === 'object' && balances !== null) {
+                    b = {
+                        qkey: Number(balances.qkey || 0),
+                        qta:  Number(balances.qta  || 0),
+                        qx:   Number(balances.qx   || 0),
+                        qta_withdrawable: Number(balances.qta_withdrawable || 0),
+                        qx_withdrawable:  Number(balances.qx_withdrawable  || 0),
+                        qta_initial:      Number(balances.qta_initial      || 0),
+                        qx_initial:       Number(balances.qx_initial       || 0)
+                    };
+                } else {
+                    // 하위호환: 4번째 인자가 숫자(QKEY 잔액)
+                    b = { qkey: Number(balances || 0), qta: 0, qx: 0, qta_withdrawable: 0, qx_withdrawable: 0, qta_initial: 0, qx_initial: 0 };
+                }
+                _adjCtx = { userId: userId, email: email, name: name, coin: 'QKEY', balances: b };
                 document.getElementById('adjUserInfo').textContent = '#' + userId + ' ' + name + ' (' + email + ')';
-                document.getElementById('adjCurrentBalance').textContent = (_adjCtx.currentBalance).toLocaleString() + ' QKEY';
+                document.getElementById('adjCoin').value = 'QKEY';
                 document.getElementById('adjMode').value = 'delta';
                 document.getElementById('adjAmount').value = '';
                 document.getElementById('adjDescription').value = '';
                 document.getElementById('adjPreview').textContent = '금액을 입력하면 미리보기가 표시됩니다';
                 var dp = document.getElementById('adjDescPreview');
                 if (dp) dp.textContent = '';
+                onAdjCoinChange();  // 코인 별 현재잔액/출금가능 표시 갱신
                 var m = document.getElementById('adjustBalanceModal');
                 m.classList.remove('hidden');
                 m.classList.add('flex');
@@ -27357,7 +27406,43 @@ app.get('/admin/dashboard', (c) => {
                 m.classList.remove('flex');
             }
 
+            // 코인 선택 변경 시: 현재 잔액 / 출금가능 / 초기지급분 표시 + 단위 변경
+            function onAdjCoinChange() {
+                var coin = document.getElementById('adjCoin').value;
+                _adjCtx.coin = coin;
+                var b = _adjCtx.balances || {};
+                var cur = 0, wd = 0, initial = 0, hasWithdrawable = false;
+                if (coin === 'QKEY') {
+                    cur = b.qkey || 0;
+                    hasWithdrawable = false;  // QKEY 는 단일 컬럼 (잔액 = 출금가능)
+                } else if (coin === 'QTA') {
+                    cur = b.qta || 0;
+                    wd = b.qta_withdrawable || 0;
+                    initial = b.qta_initial || 0;
+                    hasWithdrawable = true;
+                } else if (coin === 'QX') {
+                    cur = b.qx || 0;
+                    wd = b.qx_withdrawable || 0;
+                    initial = b.qx_initial || 0;
+                    hasWithdrawable = true;
+                }
+                document.getElementById('adjCurrentBalance').textContent = cur.toLocaleString() + ' ' + coin;
+                document.getElementById('adjAmountUnit').textContent = coin;
+                var wdBox = document.getElementById('adjWithdrawableBox');
+                var initNote = document.getElementById('adjInitialNote');
+                if (hasWithdrawable) {
+                    wdBox.style.display = '';
+                    document.getElementById('adjCurrentWithdrawable').textContent = wd.toLocaleString() + ' ' + coin;
+                    initNote.innerHTML = '★ 회사 최초 지급분(' + coin + ' initial): <span class="font-bold text-rose-700">' + initial.toLocaleString() + ' ' + coin + '</span> (출금불가 보호) | 어드민 수정 시 출금가능 컬럼도 같은 delta 로 동기 이동됩니다';
+                } else {
+                    wdBox.style.display = 'none';
+                    initNote.innerHTML = 'QKEY 는 단일 컬럼이므로 잔액=출금가능 입니다 (자동 정산 포함)';
+                }
+                updateAdjPreview();  // 코인 바뀌면 미리보기도 갱신
+            }
+
             function updateAdjPreview() {
+                var coin = (document.getElementById('adjCoin') || {}).value || 'QKEY';
                 var mode = document.getElementById('adjMode').value;
                 var amt = Number(document.getElementById('adjAmount').value);
                 var preview = document.getElementById('adjPreview');
@@ -27367,24 +27452,37 @@ app.get('/admin/dashboard', (c) => {
                     if (descPreview) descPreview.textContent = '';
                     return; 
                 }
-                var cur = _adjCtx.currentBalance;
+                var b = _adjCtx.balances || {};
+                var cur = (coin === 'QKEY') ? (b.qkey || 0) : (coin === 'QTA') ? (b.qta || 0) : (b.qx || 0);
+                var wd  = (coin === 'QTA') ? (b.qta_withdrawable || 0) : (coin === 'QX') ? (b.qx_withdrawable || 0) : cur;
                 var newBal, delta;
                 if (mode === 'set') { newBal = amt; delta = amt - cur; }
                 else { newBal = cur + amt; delta = amt; }
+                var newWd = (coin === 'QKEY') ? newBal : (wd + delta);  // QTA/QX 는 동기 이동
                 var sign = delta >= 0 ? '+' : '';
                 var arrow = delta >= 0 ? '▲증액' : '▼차감';
                 var deltaColor = delta >= 0 ? 'text-emerald-700' : 'text-rose-700';
                 var deltaBg = delta >= 0 ? 'bg-emerald-50' : 'bg-rose-50';
+                // 가드 경고
+                var warnHtml = '';
+                if (newBal < 0) {
+                    warnHtml = '<div class="bg-red-100 border border-red-300 rounded p-2 mt-1 text-xs text-red-700"><i class="fas fa-times-circle mr-1"></i>표시 잔액이 음수가 됩니다 → 서버에서 거절됩니다</div>';
+                } else if (coin !== 'QKEY' && newWd < 0) {
+                    warnHtml = '<div class="bg-red-100 border border-red-300 rounded p-2 mt-1 text-xs text-red-700"><i class="fas fa-shield-alt mr-1"></i>출금가능이 음수가 됩니다 — 회사 최초 지급분(initial) 침범 → 서버에서 거절됩니다</div>';
+                }
+                var wdLine = (coin === 'QKEY') ? '' :
+                    '<div class="mt-1 text-xs text-gray-600">출금가능: ' + wd.toLocaleString() + ' → <span class="font-bold ' + (newWd < 0 ? 'text-red-700' : 'text-emerald-700') + '">' + newWd.toLocaleString() + '</span> ' + coin + ' (동기 이동)</div>';
                 preview.innerHTML = 
                     '<div class="' + deltaBg + ' rounded p-2 mb-1">' +
-                    '<span class="font-bold ' + deltaColor + '">' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' QKEY</span>' +
+                    '<span class="font-bold ' + deltaColor + '">' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' ' + coin + '</span>' +
                     '</div>' +
-                    '이전 ' + cur.toLocaleString() + ' QKEY → 이후 <span class="font-bold text-yellow-700">' + newBal.toLocaleString() + ' QKEY</span>';
+                    '표시 잔액: ' + cur.toLocaleString() + ' → <span class="font-bold text-yellow-700">' + newBal.toLocaleString() + '</span> ' + coin +
+                    wdLine + warnHtml;
                 // 사용자측에 표시될 description 미리보기
                 var reason = (document.getElementById('adjDescription').value || '').trim();
                 if (descPreview) {
                     if (reason) {
-                        descPreview.innerHTML = '<span class="text-gray-500">사용자 화면 표시:</span> <span class="font-mono text-gray-700">[어드민 수정] ' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' QKEY (이전 ' + cur.toLocaleString() + ' → 이후 ' + newBal.toLocaleString() + ') | 사유: ' + reason + '</span>';
+                        descPreview.innerHTML = '<span class="text-gray-500">사용자 화면 표시:</span> <span class="font-mono text-gray-700">[어드민 수정] ' + arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' ' + coin + ' (이전 ' + cur.toLocaleString() + ' → 이후 ' + newBal.toLocaleString() + ') | 사유: ' + reason + '</span>';
                     } else {
                         descPreview.innerHTML = '<span class="text-red-500">⚠️ 사유를 입력하면 사용자측 표시 형식이 미리보기됩니다</span>';
                     }
@@ -27392,6 +27490,7 @@ app.get('/admin/dashboard', (c) => {
             }
 
             async function submitAdjustBalance() {
+                var coin = document.getElementById('adjCoin').value;
                 var mode = document.getElementById('adjMode').value;
                 var amtRaw = document.getElementById('adjAmount').value;
                 if (amtRaw === '' || amtRaw === null) { alert('금액을 입력해주세요'); return; }
@@ -27403,21 +27502,24 @@ app.get('/admin/dashboard', (c) => {
                     document.getElementById('adjDescription').focus();
                     return;
                 }
-                var cur = _adjCtx.currentBalance;
+                var b = _adjCtx.balances || {};
+                var cur = (coin === 'QKEY') ? (b.qkey || 0) : (coin === 'QTA') ? (b.qta || 0) : (b.qx || 0);
                 var newBal = (mode === 'set') ? amt : (cur + amt);
                 var delta = (mode === 'set') ? (amt - cur) : amt;
                 if (Math.abs(delta) < 0.0001) { alert('변경 사항이 없습니다'); return; }
                 var sign = delta >= 0 ? '+' : '';
                 var arrow = delta >= 0 ? '▲증액' : '▼차감';
+                var syncNote = (coin === 'QKEY') ? '' : '※ 출금가능(' + coin + '_withdrawable) 도 동일 delta 로 자동 동기화됩니다.\\n';
                 if (!confirm(
-                    '★ QKEY 잔액 수정 확인 ★\\n\\n' +
+                    '★ ' + coin + ' 잔액 수정 확인 ★\\n\\n' +
                     '회원: #' + _adjCtx.userId + ' ' + _adjCtx.name + ' (' + _adjCtx.email + ')\\n' +
                     '─────────────────────────\\n' +
-                    arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' QKEY\\n' +
-                    '이전 잔액: ' + cur.toLocaleString() + ' QKEY\\n' +
-                    '이후 잔액: ' + newBal.toLocaleString() + ' QKEY\\n' +
+                    arrow + ' ' + sign + Math.abs(delta).toLocaleString() + ' ' + coin + '\\n' +
+                    '이전 잔액: ' + cur.toLocaleString() + ' ' + coin + '\\n' +
+                    '이후 잔액: ' + newBal.toLocaleString() + ' ' + coin + '\\n' +
                     '─────────────────────────\\n' +
-                    '사유: ' + reason + '\\n\\n' +
+                    '사유: ' + reason + '\\n' +
+                    syncNote + '\\n' +
                     '※ 이 내역은 사용자측 "수당 보상 내역" 에 그대로 표시됩니다.\\n\\n' +
                     '적용하시겠습니까?'
                 )) return;
@@ -27427,16 +27529,20 @@ app.get('/admin/dashboard', (c) => {
                         amount: amt,
                         reason: reason,
                         description: reason,
-                        mode: mode
+                        mode: mode,
+                        coin: coin
                     });
                     if (res.data.success) {
                         var d = res.data.delta || 0;
                         var resArrow = d >= 0 ? '▲증액' : '▼차감';
+                        var wdLine = res.data.withdrawableSynced ? 
+                            '\\n출금가능: ' + (res.data.previousWithdrawable || 0).toLocaleString() + ' → ' + (res.data.newWithdrawable || 0).toLocaleString() + ' ' + coin + ' (동기 반영 ✅)' : '';
                         alert(
-                            '✅ 잔액 수정 완료\\n\\n' +
-                            resArrow + ' ' + (d >= 0 ? '+' : '') + Math.abs(d).toLocaleString() + ' QKEY\\n' +
-                            '이전: ' + (res.data.previousBalance || 0).toLocaleString() + ' QKEY\\n' +
-                            '이후: ' + (res.data.newBalance || 0).toLocaleString() + ' QKEY\\n' +
+                            '✅ ' + coin + ' 잔액 수정 완료\\n\\n' +
+                            resArrow + ' ' + (d >= 0 ? '+' : '') + Math.abs(d).toLocaleString() + ' ' + coin + '\\n' +
+                            '이전: ' + (res.data.previousBalance || 0).toLocaleString() + ' ' + coin + '\\n' +
+                            '이후: ' + (res.data.newBalance || 0).toLocaleString() + ' ' + coin +
+                            wdLine + '\\n' +
                             '사유: ' + (res.data.reason || reason) + '\\n' +
                             'tx ID: ' + res.data.txId
                         );
