@@ -801,4 +801,55 @@ cron 의 `/api/rewards/daily` batch 페이지네이션은 다음 규칙을 따�
 
 ---
 
-**이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22 추가) — 절대 변경/삭제 금지.**
+## 영구룰 #어드민-수정-정산포함 (2026-05-23 사장님 직접 정의)
+
+### 사장님 직접 인용 (2026-05-23)
+> "어드민에서는 Qx와 QKEy 수정도 가능하게 해주고 어드민 수정했을때는 늘 합산및 정산에 포함되게끔 지금처럼 놓치지않고"
+
+### 배경 (왜 이 룰이 필요한가)
+- QTA/QX 는 2개 컬럼으로 분리 보관:
+  - `qta_balance`/`qx_balance`: **표시용 총합** (회사 지급분 + 출금가능분 합산)
+  - `qta_withdrawable`/`qx_withdrawable`: **출금/정산 대상** (데일리/매칭/추천 출처만)
+  - `qta_initial`/`qx_initial`: **회사 최초 지급분 (출금 불가, 보호 자산)**
+- 출금 API (`/api/withdraw/request`) 와 스왑 정산은 `*_withdrawable` 컬럼만 본다.
+- 따라서 어드민이 `qta_balance` 만 +10,000 늘려도, `qta_withdrawable` 이 0 이면 사용자는 출금 불가 → 사장님이 의도한 "정산에 포함" 이 깨진다.
+- QKEY 는 컬럼이 하나(`qkey_balance`)이므로 자동으로 정산 포함됨 = "지금처럼".
+
+### 핵심 원칙 (절대 위반 금지)
+1. **어드민 잔액 수정(`/api/admin/users/adjust-balance`)은 QTA/QX 의 경우 `*_withdrawable` 컬럼도 같은 delta 로 동기 이동**
+2. **`qta_balance` 변동량 == `qta_withdrawable` 변동량** (QX 동일) — 항상 동일한 delta
+3. **차감(-) 시 이중 가드**:
+   - `newBal < 0` 이면 거절 (표시 잔액 음수 방지)
+   - `qta_withdrawable < 0` 이면 거절 (회사 지급분 `qta_initial` 침범 방지)
+4. **QKEY 는 wcol=null** — 단일 컬럼이라 별도 동기화 불필요 (기존 동작 유지)
+5. **응답에 `previousWithdrawable / newWithdrawable / withdrawableSynced` 포함** — 어드민 화면에서 즉시 확인 가능
+
+### COIN_MAP 정의
+```typescript
+const COIN_MAP = {
+  'QKEY': { col: 'qkey_balance', label: 'QKEY', wcol: null },              // 단일 컬럼
+  'QTA':  { col: 'qta_balance',  label: 'QTA',  wcol: 'qta_withdrawable' },// 표시+출금가능 동기
+  'QX':   { col: 'qx_balance',   label: 'QX',   wcol: 'qx_withdrawable'  } // 표시+출금가능 동기
+}
+```
+
+### UPDATE 동작 매트릭스
+| coin | balance 변화 | withdrawable 변화 | 정산 포함 시점 |
+|------|--------------|-------------------|----------------|
+| QKEY | +/-delta | (없음, 단일컬럼) | 즉시 |
+| QTA  | +/-delta | +/-delta (동기) | 즉시 (출금/스왑/정산 즉시 반영) |
+| QX   | +/-delta | +/-delta (동기) | 즉시 (출금/스왑/정산 즉시 반영) |
+
+### 가드 매트릭스 (차감 시)
+| 조건 | 동작 |
+|------|------|
+| `newBal < 0` | HTTP 400 거절 — "잔액이 음수가 됩니다" |
+| `newWd < 0` (QTA/QX만) | HTTP 400 거절 — "회사 최초 지급분(initial) 은 차감할 수 없습니다" |
+| 양수(증액) | 항상 허용 — balance + withdrawable 둘 다 +delta |
+
+### 코드 변경 이력
+- `src/index.tsx::/api/admin/users/adjust-balance` 에 `wcol` 필드 추가 + withdrawable 동기 UPDATE + 이중 음수 가드 + 응답 필드 확장
+
+---
+
+**이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22, 2026-05-23 추가) — 절대 변경/삭제 금지.**

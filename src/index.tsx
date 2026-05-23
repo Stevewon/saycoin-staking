@@ -18542,24 +18542,37 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
       return c.json({ error: '수정 사유(reason)를 구체적으로 입력해주세요. 사유 없이는 잔액을 변경할 수 없습니다.' }, 400)
     }
     // 코인 종류 결정 (기본 QKEY — 하위호환)
+    //   COIN_MAP: 표시용 잔액 컬럼(col) + 출금가능 컬럼(wcol) 매핑
+    //   QKEY: 단일 컬럼(qkey_balance)이 곧 출금가능분이므로 wcol = null
+    //   QTA/QX: qta_balance(표시) ≠ qta_withdrawable(출금가능) 분리 보관 → 둘 다 동기화 필수
     const coinRaw = String(coin || 'QKEY').toUpperCase().trim()
-    const COIN_MAP: Record<string, { col: string; label: string }> = {
-      'QKEY': { col: 'qkey_balance', label: 'QKEY' },
-      'QTA':  { col: 'qta_balance',  label: 'QTA'  },
-      'QX':   { col: 'qx_balance',   label: 'QX'   }
+    const COIN_MAP: Record<string, { col: string; label: string; wcol: string | null }> = {
+      'QKEY': { col: 'qkey_balance', label: 'QKEY', wcol: null },
+      'QTA':  { col: 'qta_balance',  label: 'QTA',  wcol: 'qta_withdrawable' },
+      'QX':   { col: 'qx_balance',   label: 'QX',   wcol: 'qx_withdrawable'  }
     }
     if (!COIN_MAP[coinRaw]) {
       return c.json({ error: `coin 은 QKEY, QTA, QX 중 하나여야 합니다 (받음: ${coinRaw})` }, 400)
     }
     const balanceCol = COIN_MAP[coinRaw].col
     const coinLabel  = COIN_MAP[coinRaw].label
+    const wCol       = COIN_MAP[coinRaw].wcol  // null이면 별도 withdrawable 동기화 불필요(QKEY)
 
     const uid = Number(userId)
+    // ★ 사장님 영구명령 (2026-05-23) #어드민-수정-정산포함:
+    //   QTA/QX 도 출금가능 컬럼(qta_withdrawable/qx_withdrawable) 함께 조회 → 정합성 검증 후 동기 업데이트
     const cur = await db.prepare(
-      `SELECT id, email, name, qta_balance, qx_balance, qkey_balance FROM users WHERE id = ?`
+      `SELECT id, email, name,
+              COALESCE(qta_balance,0) as qta_balance,
+              COALESCE(qx_balance,0) as qx_balance,
+              COALESCE(qkey_balance,0) as qkey_balance,
+              COALESCE(qta_withdrawable,0) as qta_withdrawable,
+              COALESCE(qx_withdrawable,0) as qx_withdrawable
+         FROM users WHERE id = ?`
     ).bind(uid).first()
     if (!cur) return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
     const curBal = Number((cur as any)[balanceCol]) || 0
+    const curWd  = wCol ? (Number((cur as any)[wCol]) || 0) : curBal  // QKEY는 출금가능=잔액
     let delta = 0
     if (String(mode || 'delta') === 'set') {
       delta = Number(amount) - curBal
@@ -18570,14 +18583,26 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
       return c.json({ success: true, message: '변경 사항 없음', currentBalance: curBal, coin: coinLabel })
     }
     const newBal = curBal + delta
+    const newWd  = wCol ? (curWd + delta) : newBal  // 표시잔액과 출금가능을 항상 같은 delta로 동기 이동
 
-    // ★ 안전 가드 — QTA/QX 차감 시 출금가능분(qta_withdrawable / qx_withdrawable)을 초과하지 못하게
+    // ★ 안전 가드 — QTA/QX 차감 시 음수 잔액 차단
     //   영구정책 (2026-05-14): 회사 최초지급분(qta_initial/qx_initial)은 출금 불가 보호 자산
     //   → 어드민도 실수로 보호 자산을 깎지 못하도록 음수 잔액 차단
     if (newBal < 0) {
       return c.json({
-        error: `잔액이 음수가 됩니다 (현재 ${curBal} ${coinLabel} - ${Math.abs(delta)} = ${newBal}). 차감 가능 한도를 초과했습니다.`,
+        error: `잔액이 음수가 됩니다 (현재 ${curBal} ${coinLabel} ${delta >= 0 ? '+' : ''}${delta} = ${newBal}). 차감 가능 한도를 초과했습니다.`,
         currentBalance: curBal,
+        attemptedDelta: delta,
+        coin: coinLabel
+      }, 400)
+    }
+    // ★ 추가 가드 — QTA/QX 차감 시 출금가능분도 음수가 되지 않게 (초과 차감 방지)
+    //   회사 지급분(qta_initial/qx_initial) 보호의 마지막 방어선
+    if (wCol && newWd < 0) {
+      return c.json({
+        error: `출금가능 ${coinLabel} 가 음수가 됩니다 (현재 출금가능 ${curWd} ${delta >= 0 ? '+' : ''}${delta} = ${newWd}). 회사 최초 지급분(${coinLabel} initial)은 차감할 수 없습니다.`,
+        currentBalance: curBal,
+        currentWithdrawable: curWd,
         attemptedDelta: delta,
         coin: coinLabel
       }, 400)
@@ -18594,8 +18619,19 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
     const ins = await db.prepare(
       `INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'admin_adjustment', ?, ?, ?)`
     ).bind(uid, coinLabel, delta, richDesc).run()
-    // 2) 잔액 컬럼 업데이트 (coin 별로 컬럼명 동적 적용)
-    await db.prepare(`UPDATE users SET ${balanceCol} = ? WHERE id = ?`).bind(newBal, uid).run()
+    // 2) 잔액 컬럼 업데이트 + (QTA/QX는) 출금가능 컬럼 동시 업데이트
+    //    ★ 사장님 영구명령 (2026-05-23) #어드민-수정-정산포함:
+    //       "어드민 수정했을때는 늘 합산및 정산에 포함되게끔 지금처럼 놓치지않고"
+    //       → QTA/QX 도 출금/스왑/정산 집계 대상이 되도록 withdrawable 컬럼 동기 이동
+    if (wCol) {
+      await db.prepare(
+        `UPDATE users SET ${balanceCol} = ?, ${wCol} = ? WHERE id = ?`
+      ).bind(newBal, newWd, uid).run()
+    } else {
+      await db.prepare(
+        `UPDATE users SET ${balanceCol} = ? WHERE id = ?`
+      ).bind(newBal, uid).run()
+    }
     return c.json({
       success: true,
       userId: uid,
@@ -18604,6 +18640,9 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
       coin: coinLabel,
       previousBalance: curBal,
       newBalance: newBal,
+      previousWithdrawable: curWd,
+      newWithdrawable: newWd,
+      withdrawableSynced: !!wCol,  // QTA/QX 일 때만 true (출금/정산 즉시 포함)
       delta,
       direction: delta >= 0 ? 'increase' : 'decrease',
       txId: ins.meta?.last_row_id,
