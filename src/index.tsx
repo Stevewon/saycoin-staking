@@ -2570,14 +2570,25 @@ app.post('/api/staking/create', async (c) => {
     const db = c.env.DB
 
     // 코인 지급 수량 계산 (날짜 기반 정책)
-    // ~5/10: QTA 75,000 / QX 10,000 / QKEY 5,000 per $1,000 (사장님 지시 2026-05-04 연장)
-    // 5/11~: QTA 75,000 only (QX·QKEY 즉시지급 없음, 일일배당 QKEY만 유지)
-    const PHASE2_DATE = new Date('2026-05-11T00:00:00+09:00') // KST 기준 5월 11일 00:00 (5/10 23:59:59 까지 3종 지급)
+    // ~5/10  (Phase1): QTA 75,000 / QX 10,000 / QKEY 5,000 per $1,000 (사장님 지시 2026-05-04 연장)
+    // 5/11~5/21 (Phase2): QTA 75,000 only (QX·QKEY 즉시지급 없음, 일일배당 QKEY만 유지)
+    // 5/22~  (Phase3): QTA 75,000 + QX 10,000 (QKEY 즉시지급은 계속 없음) — 사장님 영구명령 2026-05-22
+    //   사장님 직접 인용 (lis7238 승인대기 화면 캡처 기반):
+    //     "5월 6일 이후에는 $1,000 기준당 신규로 스테이킹 진입할때 qta 75,000개 qx 10,000개
+    //      총 2종이 사용자 메인내역에 찍혀야 하는데 현재 qx 코인이 찍히지 않음"
+    //   ※ 즉시 적용 시점은 사장님 명령 시점인 5/22 (KST) 기준
+    const PHASE2_DATE = new Date('2026-05-11T00:00:00+09:00') // 5/11~ QX·QKEY 0 (Phase2 시작)
+    const PHASE3_DATE = new Date('2026-05-22T00:00:00+09:00') // 5/22~ QX 부활 (Phase3 시작)
     const now = new Date()
     const isPhase2 = now >= PHASE2_DATE
+    const isPhase3 = now >= PHASE3_DATE
 
     const qtaReward = (amount / 1000) * 75000
-    const qxReward = isPhase2 ? 0 : (amount / 1000) * 10000
+    // QX: Phase1(~5/10) 10,000 + Phase3(5/22~) 10,000 부활 / Phase2(5/11~5/21) 만 0
+    const qxReward = isPhase3 ? (amount / 1000) * 10000
+                    : isPhase2 ? 0
+                    : (amount / 1000) * 10000
+    // QKEY 즉시지급: Phase1 만 유지 (5/11 이후 영구 0 — 일일배당 QKEY 와 분리)
     const qkeyReward = isPhase2 ? 0 : (amount / 1000) * 5000
 
     // 일일 배당률 계산
@@ -18507,16 +18518,21 @@ app.post('/api/admin/rewards/purge-after-date', async (c) => {
   }
 })
 
-// 어드민: 사용자 QKEY 잔액 임의 수정 + admin_adjustment 거래 자동 기록
-//   - body: { userId, amount, description?, mode? }
+// 어드민: 사용자 잔액 임의 수정 + admin_adjustment 거래 자동 기록
+//   - body: { userId, amount, description?, mode?, coin? }
 //     amount: 양수면 가산, 음수면 차감 (mode='delta' 기본)
 //     mode='set' 사용 시 amount 를 잔액 그대로 세팅하고 차이값을 admin_adjustment 로 기록
+//     coin: 'QKEY' (기본) | 'QTA' | 'QX'  — 사장님 영구명령 2026-05-22 추가
 //   - description 미지정 시 '관리자 보정' 사용
+//
+// ★ 사장님 영구명령 (2026-05-22) — 사용자 화면 캡처 기반
+//    "어드민에서 qta, qx코인도 잔액수정이 가능하게 해주세요"
+//   → 기존 QKEY 전용 로직을 3종 코인 모두 지원하도록 확장. coin 미지정 시 하위호환을 위해 QKEY 처리.
 app.post('/api/admin/users/adjust-balance', async (c) => {
   try {
     const db = c.env.DB
     const body = await c.req.json().catch(() => ({}))
-    const { userId, amount, description, mode, reason } = body || {}
+    const { userId, amount, description, mode, reason, coin } = body || {}
     if (!userId || amount === undefined || amount === null) {
       return c.json({ error: 'userId, amount 가 필요합니다' }, 400)
     }
@@ -18525,10 +18541,25 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
     if (!reasonRaw || reasonRaw === '관리자 보정') {
       return c.json({ error: '수정 사유(reason)를 구체적으로 입력해주세요. 사유 없이는 잔액을 변경할 수 없습니다.' }, 400)
     }
+    // 코인 종류 결정 (기본 QKEY — 하위호환)
+    const coinRaw = String(coin || 'QKEY').toUpperCase().trim()
+    const COIN_MAP: Record<string, { col: string; label: string }> = {
+      'QKEY': { col: 'qkey_balance', label: 'QKEY' },
+      'QTA':  { col: 'qta_balance',  label: 'QTA'  },
+      'QX':   { col: 'qx_balance',   label: 'QX'   }
+    }
+    if (!COIN_MAP[coinRaw]) {
+      return c.json({ error: `coin 은 QKEY, QTA, QX 중 하나여야 합니다 (받음: ${coinRaw})` }, 400)
+    }
+    const balanceCol = COIN_MAP[coinRaw].col
+    const coinLabel  = COIN_MAP[coinRaw].label
+
     const uid = Number(userId)
-    const cur = await db.prepare(`SELECT id, email, name, qkey_balance FROM users WHERE id = ?`).bind(uid).first()
+    const cur = await db.prepare(
+      `SELECT id, email, name, qta_balance, qx_balance, qkey_balance FROM users WHERE id = ?`
+    ).bind(uid).first()
     if (!cur) return c.json({ error: '사용자를 찾을 수 없습니다' }, 404)
-    const curBal = Number((cur as any).qkey_balance) || 0
+    const curBal = Number((cur as any)[balanceCol]) || 0
     let delta = 0
     if (String(mode || 'delta') === 'set') {
       delta = Number(amount) - curBal
@@ -18536,27 +18567,41 @@ app.post('/api/admin/users/adjust-balance', async (c) => {
       delta = Number(amount)
     }
     if (Math.abs(delta) < 0.0001) {
-      return c.json({ success: true, message: '변경 사항 없음', currentBalance: curBal })
+      return c.json({ success: true, message: '변경 사항 없음', currentBalance: curBal, coin: coinLabel })
     }
     const newBal = curBal + delta
+
+    // ★ 안전 가드 — QTA/QX 차감 시 출금가능분(qta_withdrawable / qx_withdrawable)을 초과하지 못하게
+    //   영구정책 (2026-05-14): 회사 최초지급분(qta_initial/qx_initial)은 출금 불가 보호 자산
+    //   → 어드민도 실수로 보호 자산을 깎지 못하도록 음수 잔액 차단
+    if (newBal < 0) {
+      return c.json({
+        error: `잔액이 음수가 됩니다 (현재 ${curBal} ${coinLabel} - ${Math.abs(delta)} = ${newBal}). 차감 가능 한도를 초과했습니다.`,
+        currentBalance: curBal,
+        attemptedDelta: delta,
+        coin: coinLabel
+      }, 400)
+    }
+
     // 풍부한 description 생성 (사용자/어드민 양측에 명확히 표시)
     //   형식: [어드민 수정] ▲증액 +500 QKEY (이전 2,000 → 이후 2,500) | 사유: <reason>
     //   또는: [어드민 수정] ▼차감 -300 QKEY (이전 2,000 → 이후 1,700) | 사유: <reason>
     const fmt = (n: number) => Math.round(n).toLocaleString('ko-KR')
     const arrow = delta >= 0 ? '▲증액' : '▼차감'
     const sign = delta >= 0 ? '+' : ''
-    const richDesc = `[어드민 수정] ${arrow} ${sign}${fmt(delta)} QKEY (이전 ${fmt(curBal)} → 이후 ${fmt(newBal)}) | 사유: ${reasonRaw}`
-    // 1) admin_adjustment 거래 기록 (description 에 사유+변동량 모두 포함)
+    const richDesc = `[어드민 수정] ${arrow} ${sign}${fmt(delta)} ${coinLabel} (이전 ${fmt(curBal)} → 이후 ${fmt(newBal)}) | 사유: ${reasonRaw}`
+    // 1) admin_adjustment 거래 기록 (description 에 사유+변동량 모두 포함, coin_type 동적)
     const ins = await db.prepare(
-      `INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'admin_adjustment', 'QKEY', ?, ?)`
-    ).bind(uid, delta, richDesc).run()
-    // 2) qkey_balance 업데이트 (기존 로직 유지 — 신규 set/update 코드 추가 없음)
-    await db.prepare(`UPDATE users SET qkey_balance = ? WHERE id = ?`).bind(newBal, uid).run()
+      `INSERT INTO transactions (user_id, type, coin_type, amount, description) VALUES (?, 'admin_adjustment', ?, ?, ?)`
+    ).bind(uid, coinLabel, delta, richDesc).run()
+    // 2) 잔액 컬럼 업데이트 (coin 별로 컬럼명 동적 적용)
+    await db.prepare(`UPDATE users SET ${balanceCol} = ? WHERE id = ?`).bind(newBal, uid).run()
     return c.json({
       success: true,
       userId: uid,
       email: (cur as any).email,
       name: (cur as any).name,
+      coin: coinLabel,
       previousBalance: curBal,
       newBalance: newBal,
       delta,
@@ -18774,6 +18819,137 @@ app.post('/api/admin/rewards/three-set-supplement', async (c) => {
     return c.json({ success: true, ...summary })
   } catch (error: any) {
     console.error('three-set-supplement error:', error)
+    return c.json({ error: 'D1 error: ' + (error?.message || String(error)) }, 500)
+  }
+})
+
+// ============================================================
+// [Phase3 신규] QX 단독 보정 — 5/22~ 진입자 중 qx_reward=0 인 staking 행 보정
+//   사장님 영구명령 (2026-05-22, lis7238 화면 캡처 기반):
+//     "5월 6일 이후에는 $1,000 기준당 신규로 스테이킹 진입할때
+//      qta 75,000개 qx 10,000개 총 2종이 사용자 메인내역에 찍혀야 하는데
+//      현재 qx 코인이 찍히지 않음"
+//
+//   대상: status IN ('active','pending') AND COALESCE(qx_reward,0) = 0
+//         AND date(created_at, '+9 hours') BETWEEN fromDate AND toDate
+//   동작:
+//     - staking 행의 qx_reward 를 (amount/1000)*10000 으로 정정
+//     - status='active' 인 경우만 잔액 즉시 추가 + transactions(qx_phase3_supplement) 기록
+//     - status='pending' 인 경우 staking 행만 정정 (승인 시 자동 지급)
+//   중복방지: transactions(qx_phase3_supplement) 에 staking_id 매핑 이미 있으면 skip
+//
+//   body: { fromDate?, toDate?, stakingId?, dryRun? }
+//     - stakingId 지정 시 단일 보정, 미지정 시 fromDate~toDate 범위 일괄 보정
+//     - fromDate 기본 '2026-05-22', toDate 기본 오늘 KST
+// ============================================================
+app.post('/api/admin/rewards/qx-phase3-supplement', async (c) => {
+  try {
+    const db = c.env.DB
+    const body = await c.req.json().catch(() => ({}))
+    const { fromDate, toDate, stakingId, dryRun } = body || {}
+
+    const fd = fromDate || '2026-05-22'
+    const td = toDate || kstDateStr(new Date())
+
+    let targets: any
+    if (stakingId) {
+      // 단일 보정
+      targets = await db.prepare(`
+        SELECT s.id, s.user_id, s.amount, s.status, s.qta_reward, s.qx_reward, s.qkey_reward,
+               s.created_at, u.email, u.name, u.qx_balance
+        FROM staking s LEFT JOIN users u ON s.user_id = u.id
+        WHERE s.id = ?
+      `).bind(stakingId).all()
+    } else {
+      // 범위 보정
+      targets = await db.prepare(`
+        SELECT s.id, s.user_id, s.amount, s.status, s.qta_reward, s.qx_reward, s.qkey_reward,
+               s.created_at, u.email, u.name, u.qx_balance
+        FROM staking s LEFT JOIN users u ON s.user_id = u.id
+        WHERE s.status IN ('active','pending')
+          AND COALESCE(s.qx_reward, 0) = 0
+          AND date(s.created_at, '+9 hours') >= date(?)
+          AND date(s.created_at, '+9 hours') <= date(?)
+      `).bind(fd, td).all()
+    }
+
+    const summary = {
+      fromDate: fd, toDate: td, stakingId: stakingId || null, dryRun: !!dryRun,
+      candidate_count: (targets.results || []).length,
+      processed: [] as any[],
+      skipped_duplicate: [] as any[],
+      skipped_already_paid: [] as any[],
+      total_qx_added: 0
+    }
+
+    for (const s of (targets.results || []) as any[]) {
+      const correctQx = (s.amount / 1000) * 10000
+      const currentQx = s.qx_reward || 0
+      const qxDelta = correctQx - currentQx
+
+      if (qxDelta <= 0) {
+        summary.skipped_already_paid.push({
+          staking_id: s.id, user_id: s.user_id, email: s.email,
+          current_qx_reward: currentQx, reason: 'qx_reward already >= correct value'
+        })
+        continue
+      }
+
+      // 중복 방지: 같은 staking_id 에 qx_phase3_supplement 이미 있으면 skip
+      const dup = await db.prepare(`
+        SELECT id FROM transactions
+        WHERE user_id = ? AND type = 'qx_phase3_supplement' AND description LIKE ?
+        LIMIT 1
+      `).bind(s.user_id, `%staking_id=${s.id}%`).first()
+
+      if (dup) {
+        summary.skipped_duplicate.push({
+          staking_id: s.id, user_id: s.user_id, email: s.email,
+          reason: 'transactions(qx_phase3_supplement) already exists'
+        })
+        continue
+      }
+
+      summary.processed.push({
+        staking_id: s.id, user_id: s.user_id, email: s.email, name: s.name,
+        amount: s.amount, status: s.status,
+        before: { qx_reward: currentQx, qx_balance: s.qx_balance || 0 },
+        after:  { qx_reward: correctQx },
+        delta:  { qx: qxDelta },
+        created_at: s.created_at
+      })
+      summary.total_qx_added += qxDelta
+
+      if (!dryRun) {
+        // 1) staking 행의 qx_reward 정정 (active/pending 모두)
+        await db.prepare(`UPDATE staking SET qx_reward = ? WHERE id = ?`)
+          .bind(correctQx, s.id).run()
+
+        // 2) status='active' 인 경우만 잔액 즉시 +
+        //    영구정책 (2026-05-14): 회사 지급분이므로 qx_initial 도 함께 증가 → 출금불가 보호
+        if (s.status === 'active') {
+          await ensureWithdrawableSchema(db)
+          await db.prepare(`
+            UPDATE users
+            SET qx_balance = COALESCE(qx_balance, 0) + ?,
+                qx_initial = COALESCE(qx_initial, 0) + ?
+            WHERE id = ?
+          `).bind(qxDelta, qxDelta, s.user_id).run()
+
+          await db.prepare(`
+            INSERT INTO transactions (user_id, type, coin_type, amount, description)
+            VALUES (?, 'qx_phase3_supplement', 'QX', ?, ?)
+          `).bind(s.user_id, qxDelta,
+            `Phase3 QX 보정 (staking_id=${s.id}, amount=$${s.amount}, 5/22~ 룰 적용 누락분)`
+          ).run()
+        }
+        // status='pending' 은 staking 행만 정정 (사장님 [승인] 클릭 시 자동 지급)
+      }
+    }
+
+    return c.json({ success: true, ...summary })
+  } catch (error: any) {
+    console.error('qx-phase3-supplement error:', error)
     return c.json({ error: 'D1 error: ' + (error?.message || String(error)) }, 500)
   }
 })
