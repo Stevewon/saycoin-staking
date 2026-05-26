@@ -1858,15 +1858,20 @@ app.post('/api/withdrawal/request', async (c) => {
       }, 400)
     }
 
-    const { userId, coinType, amount, walletAddress } = await c.req.json()
+    const { userId, coinType, amount: _amountRaw, walletAddress } = await c.req.json()
 
-    if (!userId || !coinType || !amount || !walletAddress) {
+    if (!userId || !coinType || !_amountRaw || !walletAddress) {
       return c.json({ error: t(c, 'profile.required_fields') }, 400)
     }
 
     if (!['QTA', 'QX', 'QKEY', 'USDT'].includes(coinType)) {
       return c.json({ error: t(c, 'withdrawal.invalid_coin') }, 400)
     }
+
+    // ★★★ 영구룰 #no-decimal (사장님 2026-05-26) ★★★
+    //   소수점 절대 금지 — 0.1, 0.3, 0.9 모두 1로 자동 보정 (Math.ceil)
+    //   입력 단계부터 정수로 강제하여 이후 모든 계산이 정수 단위로 진행되도록 함
+    const amount = Math.ceil(Number(_amountRaw))
 
     if (amount <= 0) {
       return c.json({ error: t(c, 'withdrawal.invalid_amount') }, 400)
@@ -1888,21 +1893,19 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: 'USDT 출금은 100 USDT 이상부터 가능합니다. (100개 이하 출금 불가)' }, 400)
     }
 
-    // ★★★ 영구룰 #qta-qx-net-천단위 (사장님 정책 2026-05-26) ★★★
+    // ★★★ 영구룰 #qta-qx-net-천단위 + #no-decimal (사장님 정책 2026-05-26) ★★★
     //   QTA/QX 출금은 "수수료 차감 후 실수령액(net)" 이 1,000 의 배수여야 함
-    //   amount × (1 - 0.05) = net 이 1000 배수 → amount 는 자동으로 결정됨
-    //   예: net=5,000 → amount=5,000/0.95=5,263.16 (← 비정수)
-    //       net=10,000 → amount=10,526.32
-    //   → 따라서 사용자 입력은 "net" 기준으로 받고, gross(amount) 는 서버에서 round
-    //   → 또는 사용자가 직접 amount 를 입력했을 경우 round(amount*0.95)/1000 정수 검증
+    //   소수점 절대 금지 — Math.ceil 로 정수 강제
+    //   예: net=5,000 → amount=ceil(5,000/0.95)=5,264 (정수)
+    //       net=10,000 → amount=ceil(10,000/0.95)=10,527 (정수)
     if (coinType === 'QTA' || coinType === 'QX') {
-      const _net = Math.round(amount * (1 - WITHDRAWAL_FEE_RATE) * 100) / 100  // 소수 2자리
-      // net 이 1000 의 배수인지 검증 (소수점 오차 허용: ±1)
-      const _netRounded = Math.round(_net)
-      if (Math.abs(_net - _netRounded) > 1 || _netRounded % 1000 !== 0 || _netRounded <= 0) {
+      // fee 와 net 도 정수 (Math.ceil — 수수료 올림)
+      const _feeChk = Math.ceil(amount * WITHDRAWAL_FEE_RATE)
+      const _net = amount - _feeChk  // 정수 - 정수 = 정수
+      if (_net <= 0 || _net % 1000 !== 0) {
         // 가능한 최대 net (현재 amount 이하의 최대 1000 배수)
         const _maxNetFloor = Math.floor(_net / 1000) * 1000
-        const _suggestAmount = _maxNetFloor > 0 ? Math.ceil((_maxNetFloor / (1 - WITHDRAWAL_FEE_RATE)) * 100) / 100 : 0
+        const _suggestAmount = _maxNetFloor > 0 ? Math.ceil(_maxNetFloor / (1 - WITHDRAWAL_FEE_RATE)) : 0
         return c.json({
           error: `${coinType} 출금은 수수료 5% 차감 후 실수령액(net)이 1,000 ${coinType} 의 배수여야 합니다. 현재 신청: ${amount.toLocaleString()} ${coinType} → 실수령: ${_net.toLocaleString()} ${coinType}. 권장 신청액: ${_suggestAmount.toLocaleString()} ${coinType} (실수령 ${_maxNetFloor.toLocaleString()} ${coinType})`,
           net_not_thousand: true,
@@ -1974,25 +1977,35 @@ app.post('/api/withdrawal/request', async (c) => {
 
     const currentWithdrawable = Number(user[withdrawableField] || 0)
 
-    // ★ 5% 출금 수수료 계산 (사장님 정책 2026-05-11)
-    const fee = Math.round(amount * WITHDRAWAL_FEE_RATE * 100) / 100  // 소수점 2자리 반올림
-    const netAmount = Math.round((amount - fee) * 100) / 100           // 사용자 실수령액
+    // ★ 5% 출금 수수료 계산 (사장님 정책 2026-05-11 + #no-decimal 2026-05-26)
+    //   Math.ceil — 수수료 올림 (사용자에게 유리한 방향 아니지만 정수 강제 + 잔액 정합 보장)
+    const fee = Math.ceil(amount * WITHDRAWAL_FEE_RATE)         // 정수
+    const netAmount = amount - fee                              // 정수 - 정수 = 정수
     // ★★★ 영구룰 #balance↔tx정합 (사장님 정책 2026-05-26) ★★★
-    //   잔액에서 차감할 총량 = 신청액(amount) + 수수료(fee)
-    //   기존 버그: amount 만 차감 → balance > tx_sum (-fee) mismatch 발생 + 음수 잔액 허용
-    const totalRequired = Math.round((amount + fee) * 100) / 100
+    //   잔액에서 차감할 총량 = 신청액(amount) + 수수료(fee) — 모두 정수
+    const totalRequired = amount + fee
 
     if (currentWithdrawable < totalRequired) {
       const coinLabel = coinType === 'QTA' ? 'QTA' : coinType === 'QX' ? 'QX' : coinType === 'QKEY' ? 'QKEY' : 'USDT'
-      // 최대 출금 가능액 계산 (수수료 포함하여 잔액 내에서)
-      //   currentWithdrawable >= amount × 1.05 → amount ≤ currentWithdrawable / 1.05
-      let maxWithdrawable = Math.floor((currentWithdrawable / (1 + WITHDRAWAL_FEE_RATE)) * 100) / 100
-      // QTA/QX 의 경우 net 이 1000 배수 되도록 floor
+      // 최대 출금 가능액 계산 (수수료 포함하여 잔액 내에서) — 모두 정수
+      //   currentWithdrawable >= amount + ceil(amount*0.05) ≈ amount × 1.05
+      //   amount ≤ floor(currentWithdrawable / 1.05)
+      let maxWithdrawable = Math.floor(currentWithdrawable / (1 + WITHDRAWAL_FEE_RATE))
+      // QTA/QX 의 경우 net 이 1000 배수 되도록 보정
       if (coinType === 'QTA' || coinType === 'QX') {
-        const _maxNet = Math.floor((maxWithdrawable * (1 - WITHDRAWAL_FEE_RATE)) / 1000) * 1000
-        maxWithdrawable = _maxNet > 0 ? Math.round((_maxNet / (1 - WITHDRAWAL_FEE_RATE)) * 100) / 100 : 0
+        // net = maxW - ceil(maxW*0.05) 를 1000 배수로 내림 후 gross 재계산
+        const _maxNetRaw = maxWithdrawable - Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)
+        const _maxNet = Math.floor(_maxNetRaw / 1000) * 1000
+        // gross = ceil(net / 0.95) — net 의 1000 배수에서 역산
+        maxWithdrawable = _maxNet > 0 ? Math.ceil(_maxNet / (1 - WITHDRAWAL_FEE_RATE)) : 0
+        // 재검증: 잔액 초과 시 한 단위(1000) 내려서 재시도
+        while (maxWithdrawable > 0 && (maxWithdrawable + Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)) > currentWithdrawable) {
+          const _adjustedNet = _maxNet - 1000
+          maxWithdrawable = _adjustedNet > 0 ? Math.ceil(_adjustedNet / (1 - WITHDRAWAL_FEE_RATE)) : 0
+          if (_adjustedNet <= 0) break
+        }
       }
-      const _maxNetDisplay = Math.round(maxWithdrawable * (1 - WITHDRAWAL_FEE_RATE) * 100) / 100
+      const _maxNetDisplay = maxWithdrawable - Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)
       return c.json({
         error: `출금가능 ${coinLabel} 수량이 부족합니다. 출금가능 잔액 ${currentWithdrawable.toLocaleString()} ${coinLabel} / 신청 ${amount.toLocaleString()} ${coinLabel} + 수수료 5% ${fee.toLocaleString()} ${coinLabel} = 총 필요 ${totalRequired.toLocaleString()} ${coinLabel}. 최대 출금 가능: ${maxWithdrawable.toLocaleString()} ${coinLabel} (실수령 ${_maxNetDisplay.toLocaleString()} ${coinLabel}). 회사 최초 지급분은 출금 대상이 아닙니다.`,
         insufficient_with_fee: true,
@@ -2167,7 +2180,8 @@ app.post('/api/withdrawal/cancel/:withdrawalId', async (c) => {
                    coin === 'QX' ? 'qx_balance' :
                    coin === 'QKEY' ? null : 'usdt_balance'
     const feeValue = ((withdrawal as any).fee || 0) as number
-    const refundAmount = Math.round(((withdrawal.amount as number) + feeValue) * 100) / 100
+    // 영구룰 #no-decimal — 환불액도 정수 강제 (구 데이터 소수 → 올림)
+    const refundAmount = Math.ceil((withdrawal.amount as number) + feeValue)
     if (dField) {
       await db.prepare(`
         UPDATE users SET ${wField} = COALESCE(${wField},0) + ?, ${dField} = ${dField} + ? WHERE id = ?
@@ -3596,7 +3610,8 @@ app.post('/api/admin/withdrawal/reject/:withdrawalId', async (c) => {
                                withdrawal.coin_type === 'QX' ? 'qx_withdrawable' :
                                withdrawal.coin_type === 'QKEY' ? null : 'usdt_withdrawable'
     const feeValue = (withdrawal.fee || 0) as number
-    const refundAmount = Math.round(((withdrawal.amount as number) + feeValue) * 100) / 100  // amount + fee 전체 환불
+    // 영구룰 #no-decimal — 환불액도 정수 강제 (구 데이터 소수 → 올림)
+    const refundAmount = Math.ceil((withdrawal.amount as number) + feeValue)  // amount + fee 전체 환불 (정수)
 
     if (withdrawableField2) {
       // QTA/QX/USDT: withdrawable + balance 양쪽 환불 (차감 시 양쪽 차감했으므로)
@@ -24597,15 +24612,21 @@ app.get('/dashboard', (c) => {
                     return;
                 }
 
-                // ★ 최대 출금 가능 계산 (영구룰 #balance↔tx정합 — 수수료 5% 포함)
-                //   withdrawable >= amount × 1.05  →  amount ≤ withdrawable / 1.05
+                // ★ 최대 출금 가능 계산 (영구룰 #balance↔tx정합 + #no-decimal — 정수 강제)
+                //   withdrawable >= amount + ceil(amount × 0.05) ≈ amount × 1.05
+                //   amount ≤ floor(withdrawable / 1.05) — 정수
                 const _feeRate = 0.05;
-                let maxWithdrawable = Math.floor((withdrawable / (1 + _feeRate)) * 100) / 100;
-                // QTA/QX 는 net (실수령액) 이 1,000 배수여야 함 → max net = floor(maxWd × 0.95 / 1000) × 1000
-                let maxNet = Math.round(maxWithdrawable * (1 - _feeRate) * 100) / 100;
+                let maxWithdrawable = Math.floor(withdrawable / (1 + _feeRate));
+                // QTA/QX 는 net (실수령액) 이 1,000 배수여야 함 → net 기준 1000 단위 내림 후 gross 역산 (모두 정수)
+                let maxNet = maxWithdrawable - Math.ceil(maxWithdrawable * _feeRate);
                 if (coinType === 'QTA' || coinType === 'QX') {
                     maxNet = Math.floor(maxNet / 1000) * 1000;
-                    maxWithdrawable = maxNet > 0 ? Math.round((maxNet / (1 - _feeRate)) * 100) / 100 : 0;
+                    maxWithdrawable = maxNet > 0 ? Math.ceil(maxNet / (1 - _feeRate)) : 0;
+                    // 역산한 gross 가 잔액을 초과하면 1000 단위 내려 재시도
+                    while (maxWithdrawable > 0 && (maxWithdrawable + Math.ceil(maxWithdrawable * _feeRate)) > withdrawable) {
+                        maxNet -= 1000;
+                        maxWithdrawable = maxNet > 0 ? Math.ceil(maxNet / (1 - _feeRate)) : 0;
+                    }
                 }
 
                 if (maxWithdrawable <= 0) {
@@ -24616,8 +24637,8 @@ app.get('/dashboard', (c) => {
                 }
 
                 // QTA/QX: 사용자에게 "실수령액(net)" 을 천 단위로 입력 받음
-                //   gross(amount) = net / 0.95 로 자동 계산 → 잔액 차감
-                // QKEY/USDT: 기존처럼 gross 입력
+                //   gross(amount) = ceil(net / 0.95) — 정수로 자동 계산 → 잔액 차감
+                // QKEY/USDT: 기존처럼 gross 입력 (소수 → ceil 정수 보정)
                 const isThousandsCoin = (coinType === 'QTA' || coinType === 'QX');
                 const promptMsg = coinType + ' ' + I18N.t('dash.withdrawal_title') + '\\n\\n' +
                     I18N.t('dash.withdrawable_label') + ': ' + withdrawable.toLocaleString() + ' ' + coinType + '\\n' +
@@ -24630,15 +24651,16 @@ app.get('/dashboard', (c) => {
                 const amountStr = prompt(promptMsg);
 
                 if (!amountStr) return;
-                const userInput = parseFloat(amountStr.replace(/,/g, ''));
-
+                // ★ 영구룰 #no-decimal — 사용자 입력 즉시 정수 보정 (0.1 → 1, 0.3 → 1, 0.9 → 1)
+                let userInput = parseFloat(amountStr.replace(/,/g, ''));
                 if (isNaN(userInput) || userInput <= 0) {
                     alert(I18N.t('alert.enter_valid_amount'));
                     return;
                 }
+                userInput = Math.ceil(userInput);
 
-                // QTA/QX: 사용자 입력은 net (천 단위) → amount(gross) 계산
-                // QKEY/USDT: 사용자 입력 그대로 amount
+                // QTA/QX: 사용자 입력은 net (천 단위) → amount(gross) 계산 (모두 정수)
+                // QKEY/USDT: 사용자 입력 그대로 amount (정수)
                 let amount, _fee, _net;
                 if (isThousandsCoin) {
                     if (userInput % 1000 !== 0) {
@@ -24647,16 +24669,16 @@ app.get('/dashboard', (c) => {
                         return;
                     }
                     _net = userInput;
-                    amount = Math.round((_net / (1 - _feeRate)) * 100) / 100;  // gross
-                    _fee = Math.round((amount - _net) * 100) / 100;
+                    amount = Math.ceil(_net / (1 - _feeRate));  // gross 정수 올림
+                    _fee = amount - _net;                       // 정수 - 정수 = 정수
                 } else {
                     amount = userInput;
-                    _fee = Math.round(amount * _feeRate * 100) / 100;
-                    _net = Math.round((amount - _fee) * 100) / 100;
+                    _fee = Math.ceil(amount * _feeRate);  // 수수료 정수 올림
+                    _net = amount - _fee;                 // 정수 - 정수 = 정수
                 }
 
-                // ★ 수수료 포함 잔액 체크 (영구룰 #balance↔tx정합)
-                const totalRequired = Math.round((amount + _fee) * 100) / 100;
+                // ★ 수수료 포함 잔액 체크 (영구룰 #balance↔tx정합) — 정수
+                const totalRequired = amount + _fee;
                 if (totalRequired > withdrawable) {
                     alert(I18N.t('dash.wd_insufficient_with_fee').replace('{coin}', coinType) + '\\n\\n' +
                           I18N.t('dash.withdrawable_label') + ': ' + withdrawable.toLocaleString() + ' ' + coinType + '\\n' +
