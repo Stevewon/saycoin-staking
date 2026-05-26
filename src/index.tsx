@@ -21086,22 +21086,34 @@ app.get('/api/user/:userId', async (c) => {
 // 거래 내역 조회 (사용자 화면)
 //   ★ '_purge_internal' 타입은 어드민의 내부 정리용 감사 로그이므로 사용자 화면에서 숨김
 //     (잔액 변동분만 거래내역 SUM 과 일치시키기 위한 보정 row, 사용자에겐 노출 X)
+// ★★ 영구룰 #user-tx-pagination (2026-05-26 사장님 명령) ★★
+//   - 활동량 많은 회원(예: 솔밧 #44 = 232건)이 화면에서 잘리는 문제 해결
+//   - ?limit=N&offset=M 페이지네이션 도입 (default limit=100, max=1000)
+//   - pagination 메타 함께 반환 (total, limit, offset, hasMore)
+//   - 기존 호출자(파라미터 미지정)는 default limit=100 으로 backward compatible
 app.get('/api/transactions/:userId', async (c) => {
   try {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
+    // 페이지네이션 파라미터 (안전 캡: limit 1~1000, offset 0~)
+    const limitRaw = parseInt(c.req.query('limit') || '100', 10)
+    const offsetRaw = parseInt(c.req.query('offset') || '0', 10)
+    const limit = Math.min(Math.max(isNaN(limitRaw) ? 100 : limitRaw, 1), 1000)
+    const offset = Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0)
+
     // 사용자 화면 전용: 사용자가 실제 받은 QKEY 수량만 정확히 표시
-    // - coin_type = 'QKEY' 만 반환 (QTA/QX/USDT staking 보상은 사용자 거래내역에서 제외 → 표시합 부풀림 방지)
-    // - _purge_internal / balance_sync / admin_adjust 어드민 보정용은 사용자에게 숨김
-    // - 어드민 화면(/api/admin/diag/transactions, /api/admin/user/:userId) 은 별도 raw 그대로 노출
-    // - 모든 표시는 KST(+9h) 기준: GROUP BY 도 KST 일자, created_at 응답값도 KST 시각으로 변환
-    // - 같은 KST 일자/type 거래는 SUM(amount) 으로 1줄 합산 표시
-    // ★ 2026-05-12 사장님 옵션 A: swap 누락 보정 ★
-    // - 모든 coin_type 노출 (QTA/QX/QKEY/USDT) — swap_in QX 등 사용자 본인 거래 모두 표시
     // - 어드민 내부 보정 marker 만 숨김 (_purge_internal / balance_sync / admin_adjust / admin_adjustment)
     // - GROUP BY 제거 — swap 여러 건이 1줄로 합쳐지지 않도록 raw 행별 표시
-    // - LIMIT 100 — swap 많은 사용자 잘림 방지
+    // - 전체 건수 도 함께 반환 (프론트가 '더보기' 버튼 노출 결정)
+    const totalRow = await db.prepare(`
+      SELECT COUNT(*) AS total
+      FROM transactions
+      WHERE user_id = ?
+        AND type NOT IN ('_purge_internal', 'balance_sync', 'admin_adjust', 'admin_adjustment')
+    `).bind(userId).first<any>()
+    const total = Number(totalRow?.total || 0)
+
     const transactions = await db.prepare(`
       SELECT
         id,
@@ -21115,12 +21127,20 @@ app.get('/api/transactions/:userId', async (c) => {
       WHERE user_id = ?
         AND type NOT IN ('_purge_internal', 'balance_sync', 'admin_adjust', 'admin_adjustment')
       ORDER BY datetime(created_at, '+9 hours') DESC, id DESC
-      LIMIT 100
-    `).bind(userId).all()
+      LIMIT ? OFFSET ?
+    `).bind(userId, limit, offset).all()
 
+    const results = transactions.results || []
     return c.json({ 
       success: true, 
-      transactions: transactions.results 
+      transactions: results,
+      pagination: {
+        total,
+        limit,
+        offset,
+        returned: results.length,
+        hasMore: (offset + results.length) < total
+      }
     })
   } catch (error) {
     return c.json({ error: t(c, 'user.tx_error') }, 500)
@@ -21188,6 +21208,15 @@ app.get('/api/referral-rewards/:userId', async (c) => {
     const userId = c.req.param('userId')
     const db = c.env.DB
 
+    // ★★ 영구룰 #user-tx-pagination (2026-05-26 사장님 명령) ★★
+    //   - 활동량 많은 회원(추천 다수자) 화면 잘림 방지
+    //   - ?limit=N&offset=M 페이지네이션 도입 (default limit=300, max=2000)
+    //   - pagination 메타 함께 반환 (total, limit, offset, hasMore)
+    const limitRaw = parseInt(c.req.query('limit') || '300', 10)
+    const offsetRaw = parseInt(c.req.query('offset') || '0', 10)
+    const limit = Math.min(Math.max(isNaN(limitRaw) ? 300 : limitRaw, 1), 2000)
+    const offset = Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0)
+
     // 전체 보상 내역 (배당금 + 직접판매 + 매칭추천수당 + 회수/복구 + 어드민 보정 포함, 누적)
     // ★ rollback/restore/admin_adjustment 타입도 포함시켜 사용자 화면이 어드민과 일치하도록 함
     // ★ 사장님 룰 (2026-05-06): 어드민 잔액 수정 내역(admin_adjustment) 도 사용자측에 명시 노출
@@ -21215,8 +21244,8 @@ app.get('/api/referral-rewards/:userId', async (c) => {
       FROM transactions t
       WHERE t.user_id = ? AND t.type IN ('daily_qkey', 'direct_referral', 'referral_reward', 'daily_reward_rollback', 'referral_reward_rollback', 'rollback_restore', 'admin_adjustment')
       ORDER BY t.created_at DESC
-      LIMIT 300
-    `).bind(userId).all()
+      LIMIT ? OFFSET ?
+    `).bind(userId, limit, offset).all()
 
     // 카테고리별 통계 계산 (rollback 차감 포함하여 net 합계)
     const stats = await db.prepare(`
@@ -21246,9 +21275,11 @@ app.get('/api/referral-rewards/:userId', async (c) => {
     const refLevel1Net = stats?.level1_total || 0
     const refLevel2Net = stats?.level2_total || 0
     // 매칭(level1+level2)에 대한 회수는 ref_rollback_total로 별도 표기
+    const rewardsResults = rewards.results || []
+    const totalCount = Number(stats?.total_count || 0)
     return c.json({
       success: true,
-      rewards: rewards.results || [],
+      rewards: rewardsResults,
       stats: {
         dailyTotal: dailyNet,
         dailyCount: stats?.daily_count || 0,
@@ -21262,7 +21293,15 @@ app.get('/api/referral-rewards/:userId', async (c) => {
         refRollback: refRollback,
         rollbackRestore: rollbackRestore,
         grandTotal: stats?.grand_total || 0,
-        totalCount: stats?.total_count || 0
+        totalCount: totalCount
+      },
+      pagination: {
+        // ★ #user-tx-pagination — 활동량 많은 회원 화면 잘림 방지
+        total: totalCount,
+        limit: limit,
+        offset: offset,
+        returned: rewardsResults.length,
+        hasMore: (offset + rewardsResults.length) < totalCount
       }
     })
   } catch (error) {
@@ -23125,6 +23164,16 @@ app.get('/dashboard', (c) => {
                                     </tr>
                                 </tbody>
                             </table>
+                        </div>
+                        <!-- ★ #user-tx-pagination — 더보기 버튼 (활동량 많은 회원 전체 내역 조회) -->
+                        <div id="rewards-pagination" class="mt-3 text-center hidden">
+                            <button id="rewards-load-more-btn" type="button"
+                                onclick="loadMoreReferralRewards()"
+                                class="inline-flex items-center px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold rounded-lg shadow-sm transition disabled:opacity-50 disabled:cursor-not-allowed">
+                                <i class="fas fa-chevron-down mr-2"></i>
+                                <span id="rewards-load-more-label">더 보기</span>
+                                <span id="rewards-load-more-progress" class="ml-2 text-xs opacity-90"></span>
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -25172,14 +25221,24 @@ app.get('/dashboard', (c) => {
                 }
             }
 
+            // ★ #user-tx-pagination — 보상 내역 페이지네이션 상태
+            var REWARDS_PAGE_SIZE = 300;   // 한 번에 가져올 건수 (서버 default 와 동일)
+            var rewardsLoadedCount = 0;    // 현재 화면에 표시된 row 수
+            var rewardsTotalCount = 0;     // 서버가 알려준 전체 row 수
+
             // 전체 보상 내역 로드 (배당금 + 직접판매 + 성과금)
-            async function loadReferralRewards() {
+            // append=false 면 첫 페이지(초기 로드 또는 탭 클릭), true 면 '더 보기' 클릭으로 누적 추가
+            async function loadReferralRewards(append) {
                 try {
-                    const response = await axios.get('/api/referral-rewards/' + currentUser.id);
+                    var offset = append ? rewardsLoadedCount : 0;
+                    var url = '/api/referral-rewards/' + currentUser.id + '?limit=' + REWARDS_PAGE_SIZE + '&offset=' + offset;
+                    const response = await axios.get(url);
                     if (response.data.success) {
                         const { rewards, stats } = response.data;
-                        
-                        // 통계 업데이트
+                        const pagination = response.data.pagination || { total: rewards.length, hasMore: false, returned: rewards.length };
+                        rewardsTotalCount = pagination.total || (stats && stats.totalCount) || rewards.length;
+
+                        // 통계 업데이트 (전체 기준 — append 여부와 무관하게 늘 최신 stats 반영)
                         document.getElementById('reward-daily-total').textContent = Math.round(stats.dailyTotal).toLocaleString() + ' QKEY';
                         document.getElementById('reward-daily-count').textContent = stats.dailyCount;
                         document.getElementById('reward-direct-total').textContent = Math.round(stats.directTotal).toLocaleString() + ' QKEY';
@@ -25201,13 +25260,14 @@ app.get('/dashboard', (c) => {
                         
                         // 테이블 렌더링
                         var tableBody = document.getElementById('rewards-table-body');
-                        if (rewards.length === 0) {
+                        if (!append && rewards.length === 0) {
                             tableBody.innerHTML = '<tr><td colspan="4" class="px-4 py-8 text-center text-gray-500">' +
                                 '<i class="fas fa-inbox text-4xl mb-3 opacity-50 block"></i>' +
                                 '<p>' + I18N.t('dash.no_rewards') + '</p>' +
                                 '</td></tr>';
+                            rewardsLoadedCount = 0;
                         } else {
-                            tableBody.innerHTML = rewards.map(function(reward) {
+                            var newRowsHtml = rewards.map(function(reward) {
                                 var badgeClass = '';
                                 var badgeText = reward.reward_category || reward.type;
                                 var amountColor = '';
@@ -25311,12 +25371,59 @@ app.get('/dashboard', (c) => {
                                     '</td>' +
                                 '</tr>';
                             }).join('');
+
+                            if (append) {
+                                // 기존 행 뒤에 누적 추가 (이전에 표시된 행 유지)
+                                tableBody.insertAdjacentHTML('beforeend', newRowsHtml);
+                                rewardsLoadedCount += rewards.length;
+                            } else {
+                                // 첫 페이지: 전체 교체
+                                tableBody.innerHTML = newRowsHtml;
+                                rewardsLoadedCount = rewards.length;
+                            }
+                        }
+
+                        // ★ #user-tx-pagination — '더 보기' 버튼 상태 업데이트
+                        var paginationDiv = document.getElementById('rewards-pagination');
+                        var moreBtn = document.getElementById('rewards-load-more-btn');
+                        var moreLabel = document.getElementById('rewards-load-more-label');
+                        var moreProgress = document.getElementById('rewards-load-more-progress');
+                        if (paginationDiv && moreBtn && moreProgress) {
+                            var hasMore = !!(pagination && pagination.hasMore);
+                            if (hasMore) {
+                                paginationDiv.classList.remove('hidden');
+                                moreBtn.disabled = false;
+                                if (moreLabel) moreLabel.textContent = '더 보기';
+                                moreProgress.textContent = '(' + rewardsLoadedCount.toLocaleString() + ' / ' + rewardsTotalCount.toLocaleString() + ')';
+                            } else if (rewardsTotalCount > REWARDS_PAGE_SIZE) {
+                                // 더 이상 가져올 것 없지만 전체가 한 페이지 이상이었으면 완료 표시
+                                paginationDiv.classList.remove('hidden');
+                                moreBtn.disabled = true;
+                                if (moreLabel) moreLabel.textContent = '전체 로드 완료';
+                                moreProgress.textContent = '(' + rewardsLoadedCount.toLocaleString() + ' / ' + rewardsTotalCount.toLocaleString() + ')';
+                            } else {
+                                // 한 페이지로 끝남 — 버튼 자체 숨김
+                                paginationDiv.classList.add('hidden');
+                            }
                         }
                     }
                 } catch (error) {
                     console.error('Failed to load rewards:', error);
                     document.getElementById('rewards-table-body').innerHTML = 
                         '<tr><td colspan="4" class="px-4 py-8 text-center text-red-500">' + I18N.t('dash.no_rewards') + '</td></tr>';
+                }
+            }
+
+            // ★ #user-tx-pagination — '더 보기' 버튼 클릭 핸들러
+            async function loadMoreReferralRewards() {
+                var btn = document.getElementById('rewards-load-more-btn');
+                var label = document.getElementById('rewards-load-more-label');
+                if (btn) btn.disabled = true;
+                if (label) label.textContent = '불러오는 중...';
+                try {
+                    await loadReferralRewards(true);
+                } finally {
+                    if (btn) btn.disabled = false;
                 }
             }
 

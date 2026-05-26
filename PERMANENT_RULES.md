@@ -1,8 +1,58 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-20 (★ 영구룰 #보충TX_created_at = 해당reward_date_고정 — 사장님 직접 명령 / 정분(84) 사례)
+**최종 업데이트**: 2026-05-26 (★ 영구룰 #user-tx-pagination = 사용자 거래/보상 내역 페이지네이션 필수 — 솔밧(44) 5/14 표시 누락 사례)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
+
+---
+
+## 🔴 영구룰 #user-tx-pagination (2026-05-26 신규 — 사장님 명령 / 솔밧(44) 사례)
+
+> **사용자 거래·보상 내역 API 는 절대 고정 LIMIT 으로 자르지 말 것. 반드시 `limit/offset` 페이지네이션 + 전체건수(`total`)와 `hasMore` 메타를 함께 반환해야 한다.**
+
+### 배경
+- 솔밧(#44 강인팔/solbat) 5/14 일자 화면 누락 클레임
+- 조사 결과: DB 에는 5/14 19건(6,225 QKEY) 정상 적재, **하지만 사용자 화면 LIMIT 100 으로 잘림**
+- 솔밧 총 transactions = 232건 → 100건만 표시 → 132건이 사용자에게 보이지 않음
+- 향후 활동 많은 모든 회원(추천 다수자, 장기 사용자)에게 동일 문제 발생 가능
+
+### 절대 원칙
+1. ❌ 사용자 거래·보상 내역 API 응답에 **단순 고정 LIMIT** 만 두는 것 금지
+2. ✅ 반드시 `?limit=N&offset=M` 쿼리 파라미터 수용 (default = 합리적 기본값, max 캡 설정)
+3. ✅ 응답에 `pagination: { total, limit, offset, returned, hasMore }` 메타 포함
+4. ✅ Frontend 는 `hasMore=true` 일 때 반드시 "더 보기" 버튼 또는 페이지 UI 노출
+5. ✅ 파라미터 미지정 시 default 동작 = 기존 호출자와 backward compatible
+
+### 적용 대상 endpoint
+- `/api/transactions/:userId` (default limit=100, max=1000)
+- `/api/referral-rewards/:userId` (default limit=300, max=2000)
+- 향후 추가될 모든 사용자 내역 조회 API
+
+### 코드 패턴 (필수)
+```typescript
+// Backend
+const limitRaw = parseInt(c.req.query('limit') || '<DEFAULT>', 10)
+const offsetRaw = parseInt(c.req.query('offset') || '0', 10)
+const limit = Math.min(Math.max(isNaN(limitRaw) ? <DEFAULT> : limitRaw, 1), <MAX>)
+const offset = Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0)
+
+// 전체 건수 별도 COUNT
+const totalRow = await db.prepare(`SELECT COUNT(*) AS total FROM ... WHERE ...`).bind(...).first()
+const total = Number(totalRow?.total || 0)
+
+// 본 데이터
+const rows = await db.prepare(`SELECT ... ORDER BY ... LIMIT ? OFFSET ?`).bind(..., limit, offset).all()
+
+return c.json({
+  success: true,
+  data: rows.results,
+  pagination: { total, limit, offset, returned: rows.results.length, hasMore: (offset + rows.results.length) < total }
+})
+```
+
+### 위반 시
+- 사용자가 자신의 활동을 일부만 보게 됨 → "누락" 클레임 발생 → 신뢰 손상
+- 어드민 측 정산은 정확해도 사용자 신뢰는 회복 불가
 
 ---
 
