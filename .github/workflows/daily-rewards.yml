@@ -1,9 +1,10 @@
-name: Daily QKEY Rewards (KST 08:00)
+name: Daily QKEY Rewards (KST 06:00)
 
 on:
   schedule:
-    # KST 08:00 = UTC 23:00 (rule jeong-gyu-si-gak 2026-05-19)
-    - cron: "0 23 * * *"
+    # KST 06:00 = UTC 21:00 (사장님 명령 2026-05-27 — 2시간 당김, 08:00 절대 금지)
+    # (이전: 0 23 * * * = KST 08:00 — 2026-05-19 ~ 2026-05-26 운영, 폐기)
+    - cron: "0 21 * * *"
 
   workflow_dispatch:
 
