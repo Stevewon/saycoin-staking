@@ -61262,6 +61262,149 @@ app.get('/api/diag/scan-513-paid', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// scan-l1l2-desc-mismatch — referral_reward 중 description LIKE 'L1%'/'L2%' 인 row 전수 스캔 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 배경 (사장님 명령 2026-06-01, 옵션 C):
+//   솔밧(user 44) 보상 화면 4개 항목 합 = 189,000 vs 총 보상 = 192,000 차이 3,000 QKEY 발견.
+//   원인: referral_reward 14건 (5/11 paid) description="L1 추천 보상 (QKEY)"/"L2 추천 보상 (QKEY)"
+//        백엔드 stats SQL 의 LIKE '%Level 1%'/'%Level 2%' 매칭 실패로 화면 4개 항목 어느 곳에도 분류 안됨.
+//        grandTotal 에는 포함되어 화면 합과 불일치.
+//   5/19 paid 는 이미 fix-519-tx-description 으로 정정 완료.
+//   사장님 명령: 5/11 paid + 다른 모든 paid_date 에 동일 패턴 있는지 전수 조사.
+//
+// 동작: 100% READ-ONLY. SELECT 만. 어떤 row 도 변경하지 않음.
+//   - referral_reward 중 description 이 'Level 1'/'Level 2' 미포함이고 'L1'/'L2' 시작인 row 전부 집계
+//   - paid_date(=tx created_at의 KST date) / user_id / level(L1|L2) 별 그룹
+//   - 영향받는 회원 list + 각 회원의 총 누락 합계
+//   - description 패턴 distinct
+//   - 통계 요약: 총 row 수, 총 QKEY, 영향 회원 수, 영향 paid_date 수
+//
+// 경로: GET /api/diag/scan-l1l2-desc-mismatch?key=ADMIN_PW
+//       [&paid_date=YYYY-MM-DD]  특정 paid_date 만 보고 싶을 때
+//       [&user_id=N]              특정 사용자만 필터
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/scan-l1l2-desc-mismatch', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+    const filterPaidDate = (c.req.query('paid_date') || '').trim()
+    const filterUserIdRaw = (c.req.query('user_id') || '').trim()
+    const filterUserId = filterUserIdRaw ? parseInt(filterUserIdRaw, 10) : null
+
+    // 0) 의심 대상 row: type=referral_reward 이고 description 이 Level 1/Level 2 미포함 + L1/L2 시작
+    //    KST paid_date = date(created_at, '+9 hours')
+    //    description 정규화: 양끝 공백/탭 제거 후 매칭
+    //    영구룰 #balance↔tx정합 — read-only 만, balance 변경 절대 안함
+    let where = `
+      type = 'referral_reward'
+      AND coin_type = 'QKEY'
+      AND description IS NOT NULL
+      AND description NOT LIKE '%Level 1%'
+      AND description NOT LIKE '%Level 2%'
+      AND (TRIM(description) LIKE 'L1%' OR TRIM(description) LIKE 'L2%')
+    `
+    const binds: any[] = []
+    if (filterPaidDate) {
+      where += ` AND date(created_at, '+9 hours') = ?`
+      binds.push(filterPaidDate)
+    }
+    if (filterUserId !== null && !isNaN(filterUserId)) {
+      where += ` AND user_id = ?`
+      binds.push(filterUserId)
+    }
+
+    // 1) 전체 통계
+    const totalStats = await db.prepare(`
+      SELECT COUNT(*) AS total_rows,
+             COALESCE(SUM(amount), 0) AS total_qkey,
+             COUNT(DISTINCT user_id) AS distinct_users,
+             COUNT(DISTINCT date(created_at, '+9 hours')) AS distinct_paid_dates
+      FROM transactions
+      WHERE ${where}
+    `).bind(...binds).first<any>()
+
+    // 2) paid_date × level 별 집계
+    const byPaidDate = await db.prepare(`
+      SELECT date(created_at, '+9 hours') AS paid_date_kst,
+             CASE WHEN TRIM(description) LIKE 'L1%' THEN 'L1'
+                  WHEN TRIM(description) LIKE 'L2%' THEN 'L2'
+                  ELSE 'OTHER' END AS level_tag,
+             COUNT(*) AS rows_cnt,
+             COALESCE(SUM(amount), 0) AS qkey_sum,
+             COUNT(DISTINCT user_id) AS users_cnt
+      FROM transactions
+      WHERE ${where}
+      GROUP BY paid_date_kst, level_tag
+      ORDER BY paid_date_kst DESC, level_tag ASC
+    `).bind(...binds).all<any>()
+
+    // 3) 영향받는 사용자 list (각 회원의 총 누락 QKEY)
+    //    ⚠️ users 테이블도 created_at 컬럼이 있어서 JOIN 후 unqualified 컬럼은 ambiguous.
+    //    안전하게 subquery 로 transactions 필터링 → users JOIN 으로 이름/이메일 부착.
+    const byUser = await db.prepare(`
+      SELECT t.user_id,
+             u.name AS user_name,
+             u.email AS user_email,
+             t.rows_cnt,
+             t.qkey_sum,
+             t.distinct_paid_dates
+      FROM (
+        SELECT user_id,
+               COUNT(*) AS rows_cnt,
+               COALESCE(SUM(amount), 0) AS qkey_sum,
+               COUNT(DISTINCT date(created_at, '+9 hours')) AS distinct_paid_dates
+        FROM transactions
+        WHERE ${where}
+        GROUP BY user_id
+      ) t
+      LEFT JOIN users u ON u.id = t.user_id
+      ORDER BY t.qkey_sum DESC, t.user_id ASC
+    `).bind(...binds).all<any>()
+
+    // 4) description distinct 패턴
+    const distinctDesc = await db.prepare(`
+      SELECT description, COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS qkey_sum
+      FROM transactions
+      WHERE ${where}
+      GROUP BY description
+      ORDER BY cnt DESC
+      LIMIT 30
+    `).bind(...binds).all<any>()
+
+    // 5) 샘플 row 10건 (전체 / paid_date 정렬)
+    const sampleRows = await db.prepare(`
+      SELECT id, user_id, amount, description,
+             date(created_at, '+9 hours') AS paid_date_kst,
+             created_at
+      FROM transactions
+      WHERE ${where}
+      ORDER BY created_at DESC, id ASC
+      LIMIT 20
+    `).bind(...binds).all<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'SCAN_READ_ONLY',
+      filter: {
+        paid_date: filterPaidDate || null,
+        user_id: filterUserId
+      },
+      total: totalStats,
+      by_paid_date: byPaidDate.results || [],
+      by_user: byUser.results || [],
+      distinct_descriptions: distinctDesc.results || [],
+      sample_rows: sampleRows.results || [],
+      took_ms: Date.now() - t0,
+      note: '이 endpoint 는 READ-ONLY 입니다. 어떤 row 도 변경/삭제하지 않습니다.'
+    })
+  } catch (e: any) {
+    return c.json({ error: String(e?.message || e), took_ms: Date.now() - t0 }, 500)
+  }
+})
+
+// ════════════════════════════════════════════════════════════════════════
 // fix-519-tx-description — 5/19 referral_reward TX description 정정 (DRY-RUN + EXEC)
 // ════════════════════════════════════════════════════════════════════════
 // 문제: UI 의 dash 화면 로직 (src/index.tsx:24488)
