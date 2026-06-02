@@ -61404,6 +61404,183 @@ app.get('/api/diag/scan-l1l2-desc-mismatch', async (c) => {
   }
 })
 
+
+// ════════════════════════════════════════════════════════════════════════
+// fix-511-tx-description — 5/11 referral_reward TX description 정정 (DRY-RUN + EXEC)
+// ════════════════════════════════════════════════════════════════════════
+// 배경 (사장님 옵션 D 명령 2026-06-01):
+//   scan-l1l2-desc-mismatch 전수 조사 결과:
+//     2026-05-11 paid_date 의 referral_reward TX 105건 (19명) 이 description='L1 추천 보상 (QKEY)'/'L2 추천 보상 (QKEY)' 형식
+//     → 화면 stats SQL LIKE '%Level 1%'/'%Level 2%' 매칭 실패 → 4개 항목 합 ≠ grandTotal
+//   다른 paid_date 에는 동일 패턴 0건. 오직 5/11 만 영향.
+//   현재 cron 코드(src/index.tsx)는 description='추천 보너스 (Level 1)'/'추천 보너스 (Level 2)' 만 사용
+//   → 5/11 105건의 'L1...'/'L2...' 형식은 과거 잔재. 이를 통일.
+//
+// 수정안:
+//   description='L1 추천 보상 (QKEY)' → '추천 보너스 (Level 1)' (다른 정상 일자와 100% 동일)
+//   description='L2 추천 보상 (QKEY)' → '추천 보너스 (Level 2)'
+//
+// 가드 (옵션 D 안전 강화):
+//   - paid_date 의 RR id 매핑 + description 정확 일치 조건 ('L1 추천 보상 (QKEY)' / 'L2 추천 보상 (QKEY)') 동시 만족
+//   - amount/type/coin_type/created_at/ref_id 변경 없음 (description 만)
+//   - balance 변경 없음
+//   - referral_rewards 마스터 변경 없음 (transactions 만)
+//   - 다른 paid_date 에 description 정상인 row 영향 0
+//
+// DRY-RUN: GET /api/diag/fix-511-tx-description?key=ADMIN_PW
+// EXEC:    GET /api/diag/fix-511-tx-description?key=ADMIN_PW&confirm=FIX_511_TX_DESC
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/fix-511-tx-description', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_511_TX_DESC'
+    const db = c.env.DB
+
+    const PAID = '2026-05-11'
+    // 다른 정상 일자와 100% 동일하게 통일
+    const OLD_L1 = 'L1 추천 보상 (QKEY)'
+    const OLD_L2 = 'L2 추천 보상 (QKEY)'
+    const NEW_L1 = '추천 보너스 (Level 1)'
+    const NEW_L2 = '추천 보너스 (Level 2)'
+
+    // 5/11 paid 의 RR L1/L2 ids 수집
+    const rrL1 = await db.prepare(`
+      SELECT id FROM referral_rewards WHERE paid_date=? AND level=1
+    `).bind(PAID).all<any>()
+    const rrL2 = await db.prepare(`
+      SELECT id FROM referral_rewards WHERE paid_date=? AND level=2
+    `).bind(PAID).all<any>()
+    const l1Ids = (rrL1.results || []).map((r:any) => r.id)
+    const l2Ids = (rrL2.results || []).map((r:any) => r.id)
+
+    // 매핑된 TX 확인 (chunked) — description='L1...'/'L2...' 일치하는 것만
+    const CHUNK = 50
+    let txL1: any[] = []
+    let txL2: any[] = []
+    if (l1Ids.length > 0) {
+      for (let i = 0; i < l1Ids.length; i += CHUNK) {
+        const chunk = l1Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, ref_id, description, amount, user_id FROM transactions
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+            AND description = ?
+        `).bind(...chunk, OLD_L1).all<any>()
+        txL1 = txL1.concat((r.results || []) as any[])
+      }
+    }
+    if (l2Ids.length > 0) {
+      for (let i = 0; i < l2Ids.length; i += CHUNK) {
+        const chunk = l2Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          SELECT id, ref_id, description, amount, user_id FROM transactions
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+            AND description = ?
+        `).bind(...chunk, OLD_L2).all<any>()
+        txL2 = txL2.concat((r.results || []) as any[])
+      }
+    }
+
+    // 변경 전 distinct description (전체 5/11 RR TX — 정상 + 비정상)
+    const distinctAllBefore = await db.prepare(`
+      SELECT description, COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS qkey_sum
+      FROM transactions
+      WHERE type='referral_reward' AND coin_type='QKEY'
+        AND ref_id IN (SELECT id FROM referral_rewards WHERE paid_date=?)
+      GROUP BY description
+      ORDER BY cnt DESC
+    `).bind(PAID).all<any>()
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        confirm_token_required: 'FIX_511_TX_DESC',
+        paid_date: PAID,
+        rr_l1_count: l1Ids.length,
+        rr_l2_count: l2Ids.length,
+        tx_l1_to_fix: txL1.length,
+        tx_l2_to_fix: txL2.length,
+        tx_l1_qkey_sum: txL1.reduce((s,r)=>s+Number(r.amount||0),0),
+        tx_l2_qkey_sum: txL2.reduce((s,r)=>s+Number(r.amount||0),0),
+        old_desc_l1: OLD_L1,
+        old_desc_l2: OLD_L2,
+        new_desc_l1: NEW_L1,
+        new_desc_l2: NEW_L2,
+        distinct_all_before: distinctAllBefore.results || [],
+        sample_l1: txL1.slice(0, 5),
+        sample_l2: txL2.slice(0, 5),
+        guards: [
+          '오직 paid_date=2026-05-11 의 RR L1/L2 ref_id 매핑 TX 중',
+          'description 이 정확히 "L1 추천 보상 (QKEY)" / "L2 추천 보상 (QKEY)" 인 row 만',
+          'description 만 UPDATE (amount/type/coin_type/created_at/ref_id 무변경)',
+          'balance 영향 0',
+          '다른 날짜 영향 0',
+          'referral_rewards 마스터 무변경',
+        ],
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    // EXEC — description 정확 일치 조건으로 안전 UPDATE
+    let updL1 = 0, updL2 = 0
+    if (l1Ids.length > 0) {
+      for (let i = 0; i < l1Ids.length; i += CHUNK) {
+        const chunk = l1Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          UPDATE transactions SET description=?
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+            AND description = ?
+        `).bind(NEW_L1, ...chunk, OLD_L1).run()
+        updL1 += (r.meta?.changes || 0)
+      }
+    }
+    if (l2Ids.length > 0) {
+      for (let i = 0; i < l2Ids.length; i += CHUNK) {
+        const chunk = l2Ids.slice(i, i + CHUNK)
+        const ph = chunk.map(()=>'?').join(',')
+        const r = await db.prepare(`
+          UPDATE transactions SET description=?
+          WHERE type='referral_reward' AND coin_type='QKEY' AND ref_id IN (${ph})
+            AND description = ?
+        `).bind(NEW_L2, ...chunk, OLD_L2).run()
+        updL2 += (r.meta?.changes || 0)
+      }
+    }
+
+    // 사후 검증 — 5/11 RR TX distinct
+    const distinctAllAfter = await db.prepare(`
+      SELECT description, COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS qkey_sum
+      FROM transactions
+      WHERE type='referral_reward' AND coin_type='QKEY'
+        AND ref_id IN (SELECT id FROM referral_rewards WHERE paid_date=?)
+      GROUP BY description
+      ORDER BY cnt DESC
+    `).bind(PAID).all<any>()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC_DONE',
+      confirm: 'FIX_511_TX_DESC',
+      paid_date: PAID,
+      updated_l1: updL1,
+      updated_l2: updL2,
+      expected_l1: txL1.length,
+      expected_l2: txL2.length,
+      distinct_all_after: distinctAllAfter.results || [],
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
 // ════════════════════════════════════════════════════════════════════════
 // fix-519-tx-description — 5/19 referral_reward TX description 정정 (DRY-RUN + EXEC)
 // ════════════════════════════════════════════════════════════════════════
