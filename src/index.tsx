@@ -61582,6 +61582,149 @@ app.get('/api/diag/fix-511-tx-description', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// audit-4item-vs-grandtotal — 전체 회원 4-item sum vs grandTotal 일제 정합성 스캔 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 목적: 사장님 영구질문 "각 계정별 총합도 우리가 저번에 맞췄는데 그것도 이상없이 잘 맞추고있는거지?"
+//   → 솔밧 사건(옵션 D)으로 19명 정정 후, 전체 회원 중 4-item(daily+direct+L1+L2) ≠ grandTotal
+//     mismatch 가 남아있는지 일제 점검.
+//
+// 4-item: dailyTotal + directTotal + level1Total + level2Total  (UI 노출 4개 합)
+// grandTotal: SUM(amount) over types
+//   ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback','rollback_restore')
+// diff = grandTotal − 4item  (양수이면 4-item 에 안 잡힌 row 가 있다는 뜻)
+//
+// 4-item 에 잡히지 않는 정상 사유:
+//   - daily_reward_rollback (음수) / referral_reward_rollback (음수) / rollback_restore (양수)
+//   - referral_reward 중 description LIKE '%Level 1%'/'%Level 2%' 미일치
+//     (예: 'Level 0', 변종 표기 등) → 옵션 D 잔여 케이스
+//
+// READ-ONLY: 어떤 row 도 변경/삭제하지 않음.
+// 경로: GET /api/diag/audit-4item-vs-grandtotal?key=ADMIN_PW [&limit=200] [&min_diff=1]
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/audit-4item-vs-grandtotal', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+    const limit = Math.max(1, Math.min(2000, Number(c.req.query('limit') || 500)))
+    const minDiff = Math.max(0, Number(c.req.query('min_diff') || 1))
+
+    // 1) 전 회원 4-item / grandTotal / 잔여 합 단일 쿼리 (ambiguous 회피: users 단독 SELECT 후 LEFT JOIN subquery)
+    const sql = `
+      SELECT 
+        u.id AS user_id,
+        u.name AS user_name,
+        u.email AS user_email,
+        COALESCE(tx.daily_total, 0)            AS daily_total,
+        COALESCE(tx.direct_total, 0)           AS direct_total,
+        COALESCE(tx.level1_total, 0)           AS level1_total,
+        COALESCE(tx.level2_total, 0)           AS level2_total,
+        COALESCE(tx.daily_rollback_total, 0)   AS daily_rollback_total,
+        COALESCE(tx.ref_rollback_total, 0)     AS ref_rollback_total,
+        COALESCE(tx.rollback_restore_total, 0) AS rollback_restore_total,
+        COALESCE(tx.referral_other_total, 0)   AS referral_other_total,
+        COALESCE(tx.referral_other_count, 0)   AS referral_other_count,
+        COALESCE(tx.grand_total, 0)            AS grand_total,
+        COALESCE(tx.total_count, 0)            AS total_count
+      FROM users u
+      LEFT JOIN (
+        SELECT 
+          user_id,
+          SUM(CASE WHEN type = 'daily_qkey' THEN amount ELSE 0 END) AS daily_total,
+          SUM(CASE WHEN type = 'direct_referral' THEN amount ELSE 0 END) AS direct_total,
+          SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%Level 1%' THEN amount ELSE 0 END) AS level1_total,
+          SUM(CASE WHEN type = 'referral_reward' AND description LIKE '%Level 2%' THEN amount ELSE 0 END) AS level2_total,
+          SUM(CASE WHEN type = 'daily_reward_rollback' THEN amount ELSE 0 END) AS daily_rollback_total,
+          SUM(CASE WHEN type = 'referral_reward_rollback' THEN amount ELSE 0 END) AS ref_rollback_total,
+          SUM(CASE WHEN type = 'rollback_restore' THEN amount ELSE 0 END) AS rollback_restore_total,
+          SUM(CASE WHEN type = 'referral_reward' 
+                    AND (description IS NULL OR (description NOT LIKE '%Level 1%' AND description NOT LIKE '%Level 2%'))
+                   THEN amount ELSE 0 END) AS referral_other_total,
+          SUM(CASE WHEN type = 'referral_reward' 
+                    AND (description IS NULL OR (description NOT LIKE '%Level 1%' AND description NOT LIKE '%Level 2%'))
+                   THEN 1 ELSE 0 END) AS referral_other_count,
+          SUM(amount) AS grand_total,
+          COUNT(*) AS total_count
+        FROM transactions
+        WHERE type IN ('daily_qkey','direct_referral','referral_reward','daily_reward_rollback','referral_reward_rollback','rollback_restore')
+        GROUP BY user_id
+      ) tx ON tx.user_id = u.id
+      WHERE COALESCE(tx.total_count, 0) > 0
+      ORDER BY u.id ASC
+    `
+    const rs = await db.prepare(sql).all<any>()
+    const rows = rs.results || []
+
+    // 2) 4-item 합 / diff 계산 + 분류
+    const enriched = rows.map((r: any) => {
+      const daily = Number(r.daily_total) || 0
+      const direct = Number(r.direct_total) || 0
+      const l1 = Number(r.level1_total) || 0
+      const l2 = Number(r.level2_total) || 0
+      const fourItem = daily + direct + l1 + l2
+      const gt = Number(r.grand_total) || 0
+      const diff = gt - fourItem
+      // diff 의 정상 구성: daily_rollback + ref_rollback + rollback_restore + referral_other
+      const dRb = Number(r.daily_rollback_total) || 0
+      const rRb = Number(r.ref_rollback_total) || 0
+      const rRs = Number(r.rollback_restore_total) || 0
+      const refOther = Number(r.referral_other_total) || 0
+      const explained = dRb + rRb + rRs + refOther
+      const unexplained = diff - explained // 0 이어야 정상
+      return {
+        user_id: r.user_id,
+        user_name: r.user_name,
+        user_email: r.user_email,
+        four_item_sum: fourItem,
+        grand_total: gt,
+        diff: diff,
+        explained_breakdown: {
+          daily_rollback: dRb,
+          ref_rollback: rRb,
+          rollback_restore: rRs,
+          referral_other_total: refOther,
+          referral_other_count: Number(r.referral_other_count) || 0
+        },
+        explained_sum: explained,
+        unexplained: unexplained,
+        total_count: Number(r.total_count) || 0,
+        components: { daily, direct, level1: l1, level2: l2 }
+      }
+    })
+
+    // 3) 분류
+    const okExact = enriched.filter(x => x.diff === 0)
+    const okExplained = enriched.filter(x => x.diff !== 0 && x.unexplained === 0)
+    const suspect = enriched.filter(x => x.unexplained !== 0)
+
+    // 4) 필터 적용 결과 (상위 limit)
+    const sortedSuspect = [...suspect].sort((a, b) => Math.abs(b.unexplained) - Math.abs(a.unexplained))
+    const sortedExplained = [...okExplained].sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff))
+
+    return c.json({
+      ok: true,
+      mode: 'AUDIT_READ_ONLY',
+      summary: {
+        users_total: enriched.length,
+        ok_exact_count: okExact.length,         // 4-item == grandTotal (정확 일치)
+        ok_explained_count: okExplained.length, // 4-item != grandTotal 이지만 rollback/restore/refOther 로 100% 설명됨
+        suspect_count: suspect.length,           // 설명 안 되는 잔여 차이 (조사 대상)
+        suspect_total_unexplained: suspect.reduce((s, x) => s + x.unexplained, 0)
+      },
+      suspect_users: sortedSuspect.slice(0, limit),
+      explained_users_top: sortedExplained.filter(x => Math.abs(x.diff) >= minDiff).slice(0, limit),
+      ok_exact_user_ids: okExact.map(x => x.user_id),
+      note: 'READ-ONLY. unexplained != 0 인 회원만 별건 조사 대상. explained 는 rollback/restore/refOther 로 차이 설명됨.',
+      took_ms: Date.now() - t0
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // fix-519-tx-description — 5/19 referral_reward TX description 정정 (DRY-RUN + EXEC)
 // ════════════════════════════════════════════════════════════════════════
 // 문제: UI 의 dash 화면 로직 (src/index.tsx:24488)
