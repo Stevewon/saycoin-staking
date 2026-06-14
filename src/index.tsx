@@ -22878,32 +22878,18 @@ app.get('/dashboard', (c) => {
                                 </div>
                             </div>
                             
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <!-- 지갑주소 입력 -->
-                                <div class="bg-white rounded-lg p-3 border border-blue-200 shadow-sm">
-                                    <label class="block text-xs text-gray-600 mb-1 font-medium" data-i18n="dash.company_wallet">회사 지갑주소 BEP-20 (BSC)</label>
-                                    <div class="flex items-center gap-2 mb-2">
-                                        <input type="text" id="companyWallet" 
-                                            value="0x8b6E72e378A99aEBc291C2C6861766d519239100" 
-                                            readonly
-                                            class="flex-1 min-w-0 px-2 py-2 bg-gray-50 border border-gray-300 rounded font-mono text-xs sm:text-sm truncate">
-                                        <button type="button" onclick="copyCompanyWallet()" 
-                                            class="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded font-medium transition">
-                                            <i class="fas fa-copy mr-1"></i><span data-i18n="common.copy">복사</span>
-                                        </button>
-                                    </div>
-                                    <button type="button" onclick="openTxidInput()" 
-                                        class="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded font-medium transition">
-                                        <i class="fas fa-receipt mr-1"></i><span data-i18n="dash.txid_entry">입금 확인 (TXID)</span>
-                                    </button>
+                            <!-- 입금주소 별도안내 영역 (지갑주소/QR 표시 제거 — 사장님 영구명령 2026-06-04 #입금주소-별도안내) -->
+                            <div class="bg-white rounded-lg p-4 sm:p-5 border-2 border-purple-300 shadow-sm">
+                                <label class="block text-xs text-gray-600 mb-2 font-medium" data-i18n="dash.company_wallet">회사 지갑주소 BEP-20 (BSC)</label>
+                                <div class="flex flex-col items-center justify-center py-4 mb-3 bg-gradient-to-br from-purple-50 to-blue-50 rounded-lg border border-purple-200">
+                                    <i class="fas fa-shield-alt text-purple-500 text-2xl mb-2"></i>
+                                    <p class="text-2xl sm:text-3xl font-extrabold text-purple-700 tracking-wider" data-i18n="dash.deposit_address_separate">별도안내</p>
+                                    <p class="text-xs sm:text-sm text-gray-600 mt-3 text-center px-2 leading-relaxed" data-i18n="dash.deposit_address_separate_desc">회사 정책에 따라 입금 주소는 별도로 안내됩니다. 아래 [입금 확인 (TXID)] 버튼을 눌러 진행하세요.</p>
                                 </div>
-
-                                <!-- QR 코드 -->
-                                <div class="bg-white rounded-lg p-3 border border-blue-200 shadow-sm flex flex-col items-center justify-center">
-                                    <label class="block text-xs text-gray-600 mb-2 font-medium" data-i18n="dash.qr_label">QR 코드로 간편 입금</label>
-                                    <div id="qrcode" class="bg-white p-2 rounded"></div>
-                                    <p class="text-xs text-gray-500 mt-2 text-center" data-i18n="dash.qr_scan">BEP-20 (BSC)</p>
-                                </div>
+                                <button type="button" onclick="openTxidInput()" 
+                                    class="w-full px-4 py-3 bg-green-600 hover:bg-green-700 text-white rounded font-medium transition">
+                                    <i class="fas fa-receipt mr-1"></i><span data-i18n="dash.txid_entry">입금 확인 (TXID)</span>
+                                </button>
                             </div>
                         </div>
 
@@ -23469,8 +23455,8 @@ app.get('/dashboard', (c) => {
                     document.getElementById('userWallet').title = wallet; // 호버 시 전체 주소 표시
                 }
                 
-                // QR 코드 생성
-                generateQRCode();
+                // QR 코드 생성 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): 입금주소/QR 표시 제거됨
+                // generateQRCode();  // disabled
                 
                 // 병렬 로딩 (빠른 로드)
                 await Promise.allSettled([
@@ -24719,7 +24705,7 @@ app.get('/dashboard', (c) => {
                 }
             }
 
-            // 회사 지갑주소 복사
+            // 회사 지갑주소 복사 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 에서 호출되지 않음 (보존: 차후 재활용용)
             function copyCompanyWallet() {
                 const walletInput = document.getElementById('companyWallet');
                 walletInput.select();
@@ -24739,7 +24725,7 @@ app.get('/dashboard', (c) => {
                 });
             }
 
-            // QR 코드 생성
+            // QR 코드 생성 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 에서 호출되지 않음 (보존: 차후 재활용용)
             function generateQRCode() {
                 const companyWallet = '0x8b6E72e378A99aEBc291C2C6861766d519239100';
                 const qrcodeContainer = document.getElementById('qrcode');
