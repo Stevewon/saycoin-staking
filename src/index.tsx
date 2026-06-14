@@ -61680,6 +61680,299 @@ app.get('/api/diag/audit-4item-vs-grandtotal', async (c) => {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// weekend-direct-and-next-monday-payout-audit — 주말 신규진입 직접매출 + 다음 평일 페이드 예정 종합 진단 (READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 영구질문 (2026-06-14 일):
+//   "어제 휴일 신규매출자의 직접매출 지급이 정확했는지 그리고 내일 월요일이 평일 지급이라
+//    금요일 확정분과 어제 토요일 신규진입자들의 확정분이 내일 페이드 되야하는거야"
+//
+// 분석 범위:
+//   1) 휴일 신규진입자 (start_date_kst ∈ [from, to]) 의 direct_referral TX 즉시 지급 확인
+//   2) reward_date ∈ [reward_from, reward_to] 의 daily_qkey / referral_reward TX 가 paid_date == target_paid_date 인지
+//   3) 다음 평일 (예정 paid_date) 가 nextBusinessDayKstStr() 로 정확히 계산되는지 확인
+//
+// READ-ONLY: 어떤 row 도 변경/삭제하지 않음.
+// 경로: GET /api/diag/weekend-direct-and-next-monday-payout-audit
+//        ?key=ADMIN_PW
+//        &weekend_from=YYYY-MM-DD          (휴일 신규진입 검사 시작일)
+//        &weekend_to=YYYY-MM-DD            (휴일 신규진입 검사 종료일)
+//        &reward_from=YYYY-MM-DD           (페이드 대기 reward_date 검사 시작일)
+//        &reward_to=YYYY-MM-DD             (페이드 대기 reward_date 검사 종료일)
+//        &expected_paid_date=YYYY-MM-DD    (다음 평일 = 예정 paid_date)
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/diag/weekend-direct-and-next-monday-payout-audit', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 403)
+    const db = c.env.DB
+
+    const weekendFrom = c.req.query('weekend_from') || ''
+    const weekendTo = c.req.query('weekend_to') || ''
+    const rewardFrom = c.req.query('reward_from') || ''
+    const rewardTo = c.req.query('reward_to') || ''
+    const expectedPaidDate = c.req.query('expected_paid_date') || ''
+
+    const re = /^\d{4}-\d{2}-\d{2}$/
+    if (!re.test(weekendFrom) || !re.test(weekendTo) || !re.test(rewardFrom) || !re.test(rewardTo) || !re.test(expectedPaidDate)) {
+      return c.json({ error: 'weekend_from, weekend_to, reward_from, reward_to, expected_paid_date 모두 YYYY-MM-DD 형식 필요' }, 400)
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // [1] 휴일/주말 신규 진입자 (start_date_kst ∈ [weekend_from, weekend_to])
+    //     + 각 진입자의 추천인(referrer_id) 정보
+    // ─────────────────────────────────────────────────────────
+    const weekendEntrants = await db.prepare(`
+      SELECT 
+        s.id AS staking_id,
+        s.user_id,
+        u.name AS user_name,
+        u.email AS user_email,
+        u.referrer_id,
+        ref.name AS referrer_name,
+        ref.email AS referrer_email,
+        s.amount AS stake_amount,
+        s.coin_type,
+        s.start_date_kst,
+        s.status,
+        s.created_at
+      FROM staking s
+      LEFT JOIN users u ON u.id = s.user_id
+      LEFT JOIN users ref ON ref.id = u.referrer_id
+      WHERE s.start_date_kst BETWEEN ? AND ?
+        AND s.status IN ('active','pending')
+      ORDER BY s.start_date_kst ASC, s.user_id ASC
+    `).bind(weekendFrom, weekendTo).all<any>()
+    const entrants = weekendEntrants.results || []
+
+    // ─────────────────────────────────────────────────────────
+    // [2] 위 진입자의 추천인에게 지급된 direct_referral TX
+    //     (created_at 의 KST 날짜가 weekend_from ~ weekend_to 범위)
+    // ─────────────────────────────────────────────────────────
+    const entrantUserIds = entrants.map((e: any) => e.user_id)
+    let directRefTxByEntrant: any[] = []
+    if (entrantUserIds.length > 0) {
+      // ref_id 는 staking_id 또는 user_id 일 수 있어 둘 다 LEFT JOIN
+      // direct_referral 의 description 에는 보통 신규 진입자 이름이 들어가 있으나
+      // 가장 정확한 매칭은 ref_id = staking_id (staking 적립 보상 추적)
+      const placeholders = entrants.map(() => '?').join(',')
+      const stakingIds = entrants.map((e: any) => e.staking_id)
+      const sql = `
+        SELECT 
+          t.id AS tx_id,
+          t.user_id AS receiver_id,
+          ur.name AS receiver_name,
+          t.amount,
+          t.coin_type,
+          t.description,
+          t.ref_id,
+          t.created_at,
+          date(t.created_at, '+9 hours') AS paid_date_kst
+        FROM transactions t
+        LEFT JOIN users ur ON ur.id = t.user_id
+        WHERE t.type = 'direct_referral'
+          AND t.ref_id IN (${placeholders})
+        ORDER BY t.created_at ASC, t.id ASC
+      `
+      const rs = await db.prepare(sql).bind(...stakingIds).all<any>()
+      directRefTxByEntrant = rs.results || []
+    }
+
+    // 진입자별로 직접보상 지급 여부 매핑
+    const drMap: Record<number, any[]> = {}
+    for (const tx of directRefTxByEntrant) {
+      const rid = Number(tx.ref_id)
+      if (!drMap[rid]) drMap[rid] = []
+      drMap[rid].push(tx)
+    }
+
+    const entrantsEnriched = entrants.map((e: any) => {
+      const drs = drMap[e.staking_id] || []
+      const drSum = drs.reduce((s, x) => s + (Number(x.amount) || 0), 0)
+      // 추천인 있는데 direct_referral 0건 = 누락 의심
+      const hasReferrer = !!e.referrer_id
+      const drMissing = hasReferrer && drs.length === 0
+      return {
+        staking_id: e.staking_id,
+        user_id: e.user_id,
+        user_name: e.user_name,
+        user_email: e.user_email,
+        start_date_kst: e.start_date_kst,
+        stake_amount: e.stake_amount,
+        coin_type: e.coin_type,
+        status: e.status,
+        referrer_id: e.referrer_id,
+        referrer_name: e.referrer_name,
+        referrer_email: e.referrer_email,
+        direct_referral_tx_count: drs.length,
+        direct_referral_tx_sum: drSum,
+        direct_referral_txs: drs,
+        direct_referral_missing: drMissing
+      }
+    })
+    const drMissingList = entrantsEnriched.filter(e => e.direct_referral_missing)
+
+    // ─────────────────────────────────────────────────────────
+    // [3] reward_date ∈ [reward_from, reward_to] 의 daily/referral TX
+    //     → paid_date(== date(created_at,'+9 hours')) 가 expected_paid_date 와 일치하는지
+    // ─────────────────────────────────────────────────────────
+    // daily_rewards 테이블 (확정분) 기준으로 조회 후 transactions 조인
+    const pendingPayouts = await db.prepare(`
+      SELECT 
+        dr.id AS daily_reward_id,
+        dr.user_id,
+        u.name AS user_name,
+        u.email AS user_email,
+        dr.staking_id,
+        dr.amount AS reward_amount,
+        dr.reward_date,
+        dr.created_at AS reward_confirmed_at,
+        (SELECT t.id FROM transactions t 
+           WHERE t.type = 'daily_qkey' AND t.ref_id = dr.id 
+           LIMIT 1) AS daily_tx_id,
+        (SELECT date(t.created_at, '+9 hours') FROM transactions t 
+           WHERE t.type = 'daily_qkey' AND t.ref_id = dr.id 
+           LIMIT 1) AS daily_paid_date_kst,
+        (SELECT t.amount FROM transactions t 
+           WHERE t.type = 'daily_qkey' AND t.ref_id = dr.id 
+           LIMIT 1) AS daily_paid_amount
+      FROM daily_rewards dr
+      LEFT JOIN users u ON u.id = dr.user_id
+      WHERE dr.reward_date BETWEEN ? AND ?
+      ORDER BY dr.reward_date ASC, dr.user_id ASC
+    `).bind(rewardFrom, rewardTo).all<any>()
+    const drList = pendingPayouts.results || []
+
+    // 분류:
+    //   - already_paid: daily_tx_id 존재 AND daily_paid_date_kst == expected_paid_date  → 정상
+    //   - already_paid_wrong_date: daily_tx_id 존재 AND date != expected            → 비정상 (조사)
+    //   - pending: daily_tx_id 없음 → 다음 cron 대상
+    const drCategorized = drList.map((r: any) => {
+      let category = 'unknown'
+      if (!r.daily_tx_id) category = 'pending_for_next_cron'
+      else if (r.daily_paid_date_kst === expectedPaidDate) category = 'already_paid_on_expected_date'
+      else category = 'already_paid_on_other_date'
+      return {
+        daily_reward_id: r.daily_reward_id,
+        user_id: r.user_id,
+        user_name: r.user_name,
+        user_email: r.user_email,
+        staking_id: r.staking_id,
+        reward_date: r.reward_date,
+        reward_amount: r.reward_amount,
+        reward_confirmed_at: r.reward_confirmed_at,
+        daily_tx_id: r.daily_tx_id,
+        daily_paid_date_kst: r.daily_paid_date_kst,
+        daily_paid_amount: r.daily_paid_amount,
+        category
+      }
+    })
+
+    // ─────────────────────────────────────────────────────────
+    // [4] reward_date 기간의 referral_reward 도 함께 (L1+L2 → 추천인 페이드)
+    //     referral_rewards 테이블 → transactions(type=referral_reward, ref_id)
+    // ─────────────────────────────────────────────────────────
+    const refRewards = await db.prepare(`
+      SELECT 
+        rr.id AS referral_reward_id,
+        rr.user_id AS receiver_id,
+        u.name AS receiver_name,
+        rr.staking_id,
+        rr.level,
+        rr.amount AS reward_amount,
+        rr.reward_date,
+        rr.created_at AS reward_confirmed_at,
+        (SELECT t.id FROM transactions t 
+           WHERE t.type = 'referral_reward' AND t.ref_id = rr.id 
+           LIMIT 1) AS tx_id,
+        (SELECT date(t.created_at, '+9 hours') FROM transactions t 
+           WHERE t.type = 'referral_reward' AND t.ref_id = rr.id 
+           LIMIT 1) AS paid_date_kst,
+        (SELECT t.description FROM transactions t 
+           WHERE t.type = 'referral_reward' AND t.ref_id = rr.id 
+           LIMIT 1) AS tx_description
+      FROM referral_rewards rr
+      LEFT JOIN users u ON u.id = rr.user_id
+      WHERE rr.reward_date BETWEEN ? AND ?
+      ORDER BY rr.reward_date ASC, rr.user_id ASC, rr.level ASC
+    `).bind(rewardFrom, rewardTo).all<any>()
+    const rrList = refRewards.results || []
+    const rrCategorized = rrList.map((r: any) => {
+      let category = 'unknown'
+      if (!r.tx_id) category = 'pending_for_next_cron'
+      else if (r.paid_date_kst === expectedPaidDate) category = 'already_paid_on_expected_date'
+      else category = 'already_paid_on_other_date'
+      return {
+        referral_reward_id: r.referral_reward_id,
+        receiver_id: r.receiver_id,
+        receiver_name: r.receiver_name,
+        staking_id: r.staking_id,
+        level: r.level,
+        reward_date: r.reward_date,
+        reward_amount: r.reward_amount,
+        reward_confirmed_at: r.reward_confirmed_at,
+        tx_id: r.tx_id,
+        paid_date_kst: r.paid_date_kst,
+        tx_description: r.tx_description,
+        category
+      }
+    })
+
+    // ─────────────────────────────────────────────────────────
+    // [5] 요약 통계
+    // ─────────────────────────────────────────────────────────
+    const summary = {
+      // 휴일 신규 진입자
+      weekend_entrants_total: entrantsEnriched.length,
+      weekend_entrants_with_referrer: entrantsEnriched.filter(e => !!e.referrer_id).length,
+      weekend_entrants_direct_paid_ok: entrantsEnriched.filter(e => !!e.referrer_id && e.direct_referral_tx_count > 0).length,
+      weekend_entrants_direct_missing: drMissingList.length,
+      weekend_entrants_direct_total_qkey: entrantsEnriched.reduce((s, e) => s + e.direct_referral_tx_sum, 0),
+
+      // daily reward (확정→페이드 예정)
+      daily_reward_total: drCategorized.length,
+      daily_pending_for_next_cron: drCategorized.filter(r => r.category === 'pending_for_next_cron').length,
+      daily_already_paid_on_expected: drCategorized.filter(r => r.category === 'already_paid_on_expected_date').length,
+      daily_already_paid_on_other: drCategorized.filter(r => r.category === 'already_paid_on_other_date').length,
+      daily_pending_total_qkey: drCategorized.filter(r => r.category === 'pending_for_next_cron')
+        .reduce((s, r) => s + (Number(r.reward_amount) || 0), 0),
+
+      // referral reward (확정→페이드 예정)
+      referral_reward_total: rrCategorized.length,
+      referral_pending_for_next_cron: rrCategorized.filter(r => r.category === 'pending_for_next_cron').length,
+      referral_already_paid_on_expected: rrCategorized.filter(r => r.category === 'already_paid_on_expected_date').length,
+      referral_already_paid_on_other: rrCategorized.filter(r => r.category === 'already_paid_on_other_date').length,
+      referral_pending_total_qkey: rrCategorized.filter(r => r.category === 'pending_for_next_cron')
+        .reduce((s, r) => s + (Number(r.reward_amount) || 0), 0),
+    }
+
+    return c.json({
+      ok: true,
+      mode: 'READ_ONLY_AUDIT',
+      params: {
+        weekend_from: weekendFrom,
+        weekend_to: weekendTo,
+        reward_from: rewardFrom,
+        reward_to: rewardTo,
+        expected_paid_date: expectedPaidDate
+      },
+      summary,
+      weekend_entrants: entrantsEnriched,
+      weekend_entrants_direct_missing: drMissingList,
+      daily_reward_pending: drCategorized.filter(r => r.category === 'pending_for_next_cron'),
+      daily_reward_already_paid: drCategorized.filter(r => r.category !== 'pending_for_next_cron'),
+      referral_reward_pending: rrCategorized.filter(r => r.category === 'pending_for_next_cron'),
+      referral_reward_already_paid: rrCategorized.filter(r => r.category !== 'pending_for_next_cron'),
+      note: 'READ-ONLY. weekend_entrants_direct_missing 가 있으면 별건 조사. pending_for_next_cron 합계가 다음 cron 에서 정확히 페이드되어야 함.',
+      took_ms: Date.now() - t0
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════
 // fix-519-tx-description — 5/19 referral_reward TX description 정정 (DRY-RUN + EXEC)
 // ════════════════════════════════════════════════════════════════════════
 // 문제: UI 의 dash 화면 로직 (src/index.tsx:24488)
