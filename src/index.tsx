@@ -24705,46 +24705,15 @@ app.get('/dashboard', (c) => {
                 }
             }
 
-            // 회사 지갑주소 복사 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 에서 호출되지 않음 (보존: 차후 재활용용)
+            // 회사 지갑주소 복사 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 제거됨, 호출 시 안내만 표시 (no-op)
             function copyCompanyWallet() {
-                const walletInput = document.getElementById('companyWallet');
-                walletInput.select();
-                walletInput.setSelectionRange(0, 99999); // 모바일 지원
-                
-                // 클립보드에 복사
-                navigator.clipboard.writeText(walletInput.value).then(() => {
-                    alert(I18N.t('alert.copied') + '\\n\\n' + walletInput.value);
-                }).catch(err => {
-                    // fallback: execCommand 사용
-                    try {
-                        document.execCommand('copy');
-                        alert(I18N.t('alert.copied') + '\\n\\n' + walletInput.value);
-                    } catch (e) {
-                        alert(I18N.t('alert.copy_fail'));
-                    }
-                });
+                try { alert(I18N.t('alert.deposit_address_separate') || '입금 주소는 별도로 안내됩니다.'); } catch(e) {}
             }
 
-            // QR 코드 생성 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 에서 호출되지 않음 (보존: 차후 재활용용)
+            // QR 코드 생성 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 제거됨, no-op
             function generateQRCode() {
-                const companyWallet = '0x8b6E72e378A99aEBc291C2C6861766d519239100';
-                const qrcodeContainer = document.getElementById('qrcode');
-                
-                // 기존 QR 코드 제거
-                qrcodeContainer.innerHTML = '';
-                
-                // 모바일에서는 더 작은 QR 코드
-                const qrSize = window.innerWidth < 640 ? 120 : 150;
-                
-                // QR 코드 생성
-                new QRCode(qrcodeContainer, {
-                    text: companyWallet,
-                    width: qrSize,
-                    height: qrSize,
-                    colorDark: '#000000',
-                    colorLight: '#ffffff',
-                    correctLevel: QRCode.CorrectLevel.H
-                });
+                // 입금 주소는 별도로 안내되므로 QR 코드를 화면에 생성하지 않음
+                return;
             }
 
             // TXID 입력 팝업 열기
