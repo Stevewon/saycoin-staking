@@ -61723,24 +61723,26 @@ app.get('/api/diag/weekend-direct-and-next-monday-payout-audit', async (c) => {
     //     + 각 진입자의 추천인(referrer_id) 정보
     // ─────────────────────────────────────────────────────────
     const weekendEntrants = await db.prepare(`
-      SELECT 
-        s.id AS staking_id,
-        s.user_id,
-        u.name AS user_name,
-        u.email AS user_email,
-        u.referrer_id,
-        ref.name AS referrer_name,
-        ref.email AS referrer_email,
-        s.amount AS stake_amount,
-        s.start_date_kst,
-        s.status,
-        s.created_at
-      FROM staking s
-      LEFT JOIN users u ON u.id = s.user_id
-      LEFT JOIN users ref ON ref.id = u.referrer_id
-      WHERE s.start_date_kst BETWEEN ? AND ?
-        AND s.status IN ('active','pending')
-      ORDER BY s.start_date_kst ASC, s.user_id ASC
+      SELECT * FROM (
+        SELECT 
+          s.id AS staking_id,
+          s.user_id,
+          u.name AS user_name,
+          u.email AS user_email,
+          u.referrer_id,
+          ref.name AS referrer_name,
+          ref.email AS referrer_email,
+          s.amount AS stake_amount,
+          date(s.start_date, '+9 hours') AS start_date_kst,
+          s.status,
+          s.created_at
+        FROM staking s
+        LEFT JOIN users u ON u.id = s.user_id
+        LEFT JOIN users ref ON ref.id = u.referrer_id
+        WHERE s.status IN ('active','pending')
+      ) sub
+      WHERE start_date_kst BETWEEN ? AND ?
+      ORDER BY start_date_kst ASC, user_id ASC
     `).bind(weekendFrom, weekendTo).all<any>()
     const entrants = weekendEntrants.results || []
 
