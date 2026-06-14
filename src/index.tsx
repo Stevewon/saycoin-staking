@@ -61732,7 +61732,6 @@ app.get('/api/diag/weekend-direct-and-next-monday-payout-audit', async (c) => {
         ref.name AS referrer_name,
         ref.email AS referrer_email,
         s.amount AS stake_amount,
-        s.coin_type,
         s.start_date_kst,
         s.status,
         s.created_at
@@ -61799,7 +61798,6 @@ app.get('/api/diag/weekend-direct-and-next-monday-payout-audit', async (c) => {
         user_email: e.user_email,
         start_date_kst: e.start_date_kst,
         stake_amount: e.stake_amount,
-        coin_type: e.coin_type,
         status: e.status,
         referrer_id: e.referrer_id,
         referrer_name: e.referrer_name,
