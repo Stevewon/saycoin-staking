@@ -61824,7 +61824,7 @@ app.get('/api/diag/weekend-direct-and-next-monday-payout-audit', async (c) => {
         u.name AS user_name,
         u.email AS user_email,
         dr.staking_id,
-        dr.amount AS reward_amount,
+        dr.usdt_amount AS reward_amount,
         dr.reward_date,
         dr.created_at AS reward_confirmed_at,
         (SELECT t.id FROM transactions t 
@@ -61875,11 +61875,11 @@ app.get('/api/diag/weekend-direct-and-next-monday-payout-audit', async (c) => {
     const refRewards = await db.prepare(`
       SELECT 
         rr.id AS referral_reward_id,
-        rr.user_id AS receiver_id,
+        rr.referrer_id AS receiver_id,
         u.name AS receiver_name,
         rr.staking_id,
         rr.level,
-        rr.amount AS reward_amount,
+        rr.reward_amount AS reward_amount,
         rr.reward_date,
         rr.created_at AS reward_confirmed_at,
         (SELECT t.id FROM transactions t 
@@ -61892,9 +61892,9 @@ app.get('/api/diag/weekend-direct-and-next-monday-payout-audit', async (c) => {
            WHERE t.type = 'referral_reward' AND t.ref_id = rr.id 
            LIMIT 1) AS tx_description
       FROM referral_rewards rr
-      LEFT JOIN users u ON u.id = rr.user_id
+      LEFT JOIN users u ON u.id = rr.referrer_id
       WHERE rr.reward_date BETWEEN ? AND ?
-      ORDER BY rr.reward_date ASC, rr.user_id ASC, rr.level ASC
+      ORDER BY rr.reward_date ASC, rr.referrer_id ASC, rr.level ASC
     `).bind(rewardFrom, rewardTo).all<any>()
     const rrList = refRewards.results || []
     const rrCategorized = rrList.map((r: any) => {
