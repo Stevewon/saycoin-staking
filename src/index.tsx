@@ -3831,6 +3831,26 @@ app.post('/api/admin/user/:userId/update-wallet', async (c) => {
   }
 })
 
+// GET /api/admin/user/:userId/wallet-history
+// 사장님 2026-06-15 추가지시: "db테이블에만 이력기록을 둘게 아니라 어드민 관리자도 볼수있게 해야지!"
+app.get('/api/admin/user/:userId/wallet-history', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = c.req.param('userId')
+    await ensureWalletChangeHistoryTable(db)
+    const rows = await db.prepare(`
+      SELECT id, user_id, wallet_type, old_wallet, new_wallet, reason, changed_at, changed_by
+      FROM wallet_change_history
+      WHERE user_id = ?
+      ORDER BY id DESC
+    `).bind(userId).all()
+    return c.json({ success: true, user_id: Number(userId), history: rows.results || [] })
+  } catch (error: any) {
+    console.error('wallet-history error:', error)
+    return c.json({ success: false, error: String(error?.message || error) }, 500)
+  }
+})
+
 // 관리자: 회원 코인 잔액 리셋 (잔액 0 + 관련 거래내역/출금/보상 기록 전부 삭제)
 // 관리자: 특정 스테이킹의 reset_at 마킹을 해제 (잘못 리셋된 건 복구용)
 app.post('/api/admin/staking/:stakingId/unmark-reset', async (c) => {
@@ -26136,6 +26156,19 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 지갑주소 변경이력 모달 (사장님 2026-06-15 지시) -->
+                <div id="walletHistoryModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col">
+                        <div class="flex justify-between items-center p-4 sm:p-6 pb-3 border-b border-gray-200 flex-shrink-0">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-history text-gray-600 mr-2"></i>지갑주소 변경이력</h3>
+                            <button onclick="closeWalletHistoryModal()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                        </div>
+                        <div id="walletHistoryContent" class="overflow-y-auto overflow-x-hidden flex-1 p-4 sm:p-6 pt-3" style="-webkit-overflow-scrolling: touch;">
+                            <p class="text-center py-8 text-gray-500">로딩 중...</p>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 잔액 임의 수정 모달 (QKEY / QTA / QX 3종 지원) -->
                 <!-- ★ 사장님 영구명령 (2026-05-23) #어드민-수정-3코인UI: 코인 선택 드롭다운 + 출금가능 표시 -->
                 <div id="adjustBalanceModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
@@ -27571,7 +27604,7 @@ app.get('/admin/dashboard', (c) => {
                             '<div class="grid grid-cols-2 gap-2 text-sm">' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.col_name') + ':</span> ' + esc(u.name) + '</div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.phone_label') + '</span> ' + esc(u.phone || 'N/A') + '</div>' +
-                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.qkey_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.wallet_address) + '</span> <button onclick="editWalletQkey(' + u.id + ')" class="ml-1 px-2 py-0.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700" title="QKEY 지갑주소 변경"><i class="fas fa-edit"></i></button></div>' +
+                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.qkey_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.wallet_address) + '</span> <button onclick="editWalletQkey(' + u.id + ')" class="ml-1 px-2 py-0.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700" title="QKEY 지갑주소 변경"><i class="fas fa-edit"></i></button> <button onclick="showWalletHistory(' + u.id + ')" class="ml-1 px-2 py-0.5 bg-gray-600 text-white text-xs rounded hover:bg-gray-700" title="지갑주소 변경이력"><i class="fas fa-history"></i></button></div>' +
                                 '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.usdt_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.usdt_wallet_address || 'N/A') + '</span> <button onclick="editWalletUsdt(' + u.id + ')" class="ml-1 px-2 py-0.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700" title="USDT 지갑주소 변경"><i class="fas fa-edit"></i></button></div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referral_code_label') + '</span> <span class="font-bold text-purple-600">' + esc(u.referral_code || '-') + '</span></div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referrer_label') + '</span> ' + (referrer ? esc(referrer.name) + ' (' + esc(referrer.email) + ')' : I18N.t('admin.referrer_none')) + '</div>' +
@@ -27707,6 +27740,58 @@ app.get('/admin/dashboard', (c) => {
                     var msg = (e && e.response && e.response.data && e.response.data.error) ? e.response.data.error : (e && e.message) || String(e);
                     alert('변경 실패: ' + msg);
                 }
+            }
+
+            // 사장님 2026-06-15 추가지시: 지갑주소 변경이력 모달
+            async function showWalletHistory(userId) {
+                document.getElementById('walletHistoryModal').classList.remove('hidden');
+                var content = document.getElementById('walletHistoryContent');
+                content.innerHTML = '<p class="text-center py-8 text-gray-500"><i class="fas fa-spinner fa-spin mr-2"></i>로딩 중...</p>';
+                try {
+                    var res = await axios.get('/api/admin/user/' + userId + '/wallet-history');
+                    if (!res.data || !res.data.success) {
+                        content.innerHTML = '<p class="text-center py-8 text-red-500">조회 실패</p>';
+                        return;
+                    }
+                    var history = res.data.history || [];
+                    if (history.length === 0) {
+                        content.innerHTML = '<p class="text-center py-8 text-gray-500">변경 이력이 없습니다.</p>';
+                        return;
+                    }
+                    var html = '<div class="overflow-x-auto"><table class="w-full text-xs">'
+                        + '<thead class="bg-gray-100"><tr>'
+                        + '<th class="px-2 py-2 text-left">변경일시 (KST)</th>'
+                        + '<th class="px-2 py-2 text-center">종류</th>'
+                        + '<th class="px-2 py-2 text-left">이전 주소</th>'
+                        + '<th class="px-2 py-2 text-left">새 주소</th>'
+                        + '<th class="px-2 py-2 text-left">사유</th>'
+                        + '<th class="px-2 py-2 text-center">변경자</th>'
+                        + '</tr></thead><tbody class="divide-y">';
+                    for (var i = 0; i < history.length; i++) {
+                        var h = history[i];
+                        var typeBadge = h.wallet_type === 'qkey'
+                            ? '<span class="px-1.5 py-0.5 rounded text-xs bg-yellow-100 text-yellow-700 font-bold">QKEY</span>'
+                            : '<span class="px-1.5 py-0.5 rounded text-xs bg-green-100 text-green-700 font-bold">USDT</span>';
+                        html += '<tr>'
+                            + '<td class="px-2 py-2 whitespace-nowrap">' + esc(h.changed_at || '-') + '</td>'
+                            + '<td class="px-2 py-2 text-center">' + typeBadge + '</td>'
+                            + '<td class="px-2 py-2 font-mono break-all">' + esc(h.old_wallet || '(없음)') + '</td>'
+                            + '<td class="px-2 py-2 font-mono break-all">' + esc(h.new_wallet || '-') + '</td>'
+                            + '<td class="px-2 py-2">' + esc(h.reason || '-') + '</td>'
+                            + '<td class="px-2 py-2 text-center text-gray-500">' + esc(h.changed_by || 'admin') + '</td>'
+                            + '</tr>';
+                    }
+                    html += '</tbody></table></div>';
+                    html += '<p class="text-xs text-gray-400 mt-2">총 ' + history.length + '건</p>';
+                    content.innerHTML = html;
+                } catch (e) {
+                    var msg = (e && e.response && e.response.data && e.response.data.error) ? e.response.data.error : (e && e.message) || String(e);
+                    content.innerHTML = '<p class="text-center py-8 text-red-500">조회 실패: ' + esc(msg) + '</p>';
+                }
+            }
+
+            function closeWalletHistoryModal() {
+                document.getElementById('walletHistoryModal').classList.add('hidden');
             }
 
             // 코인 3종 잔액 리셋 (QTA+QX+QKEY 잔액 0, 스테이킹/진입금액/데일리배당은 계속 진행)
