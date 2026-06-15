@@ -3750,6 +3750,87 @@ app.get('/api/admin/user/:userId', async (c) => {
   }
 })
 
+// ============================================================
+// 관리자: 회원 지갑주소 변경 (2026-06-15 사장님 지시 — 재시도)
+// ----------------------------------------------------
+// 사장님 2026-06-15 직접 지시:
+//   "어드민에서 관리자만 지갑주소만 바꾸게 해달라고!!! 딴거 건들지말고!"
+// 사용자 본인 요청 절차 없음 — 사장님이 전화로 받아 관리자가 직접 수정
+// 이력은 DB 에만 기록 (wallet_change_history) — 화면 UI 는 만들지 않음
+// 이전 PR #51 의 JS escape 버그 회피: 프론트는 wallet_type 별로 함수 분리
+// ============================================================
+async function ensureWalletChangeHistoryTable(db: any) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS wallet_change_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      wallet_type TEXT NOT NULL,
+      old_wallet TEXT,
+      new_wallet TEXT,
+      reason TEXT,
+      changed_at TEXT NOT NULL,
+      changed_by TEXT
+    )
+  `).run()
+}
+
+// POST /api/admin/user/:userId/update-wallet
+// Body: { wallet_type: 'qkey' | 'usdt', new_wallet: string, reason?: string }
+app.post('/api/admin/user/:userId/update-wallet', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = c.req.param('userId')
+    const body = await c.req.json<{ wallet_type?: string; new_wallet?: string; reason?: string }>()
+    const walletType = (body.wallet_type || '').trim()
+    const newWallet = (body.new_wallet || '').trim()
+    const reason = (body.reason || '').trim()
+
+    if (walletType !== 'qkey' && walletType !== 'usdt') {
+      return c.json({ success: false, error: 'invalid wallet_type (qkey|usdt)' }, 400)
+    }
+    if (!newWallet) {
+      return c.json({ success: false, error: 'new_wallet required' }, 400)
+    }
+
+    const user = await db.prepare(`SELECT id, wallet_address, usdt_wallet_address FROM users WHERE id = ?`).bind(userId).first() as any
+    if (!user) return c.json({ success: false, error: 'user not found' }, 404)
+
+    const oldWallet = walletType === 'qkey' ? (user.wallet_address || '') : (user.usdt_wallet_address || '')
+    if (oldWallet === newWallet) {
+      return c.json({ success: false, error: 'same as current wallet' }, 400)
+    }
+
+    // 다른 회원이 이미 쓰는 주소면 차단 (qkey 만 unique — usdt 는 동일주소 다회원 허용 가능성 있어 사장님 정책상 동일 차단)
+    const dup = await db.prepare(
+      walletType === 'qkey'
+        ? `SELECT id, email FROM users WHERE wallet_address = ? AND id != ?`
+        : `SELECT id, email FROM users WHERE usdt_wallet_address = ? AND id != ?`
+    ).bind(newWallet, userId).first() as any
+    if (dup) {
+      return c.json({ success: false, error: 'wallet already used by user_id=' + dup.id + ' (' + dup.email + ')' }, 409)
+    }
+
+    await ensureWalletChangeHistoryTable(db)
+    const nowKst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('T', ' ').substring(0, 19)
+
+    if (walletType === 'qkey') {
+      await db.prepare(`UPDATE users SET wallet_address = ? WHERE id = ?`).bind(newWallet, userId).run()
+    } else {
+      await db.prepare(`UPDATE users SET usdt_wallet_address = ? WHERE id = ?`).bind(newWallet, userId).run()
+    }
+
+    await db.prepare(`
+      INSERT INTO wallet_change_history (user_id, wallet_type, old_wallet, new_wallet, reason, changed_at, changed_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(userId, walletType, oldWallet, newWallet, reason || null, nowKst, 'admin').run()
+
+    return c.json({ success: true, user_id: Number(userId), wallet_type: walletType, old_wallet: oldWallet, new_wallet: newWallet, changed_at: nowKst })
+  } catch (error: any) {
+    console.error('update-wallet error:', error)
+    return c.json({ success: false, error: String(error?.message || error) }, 500)
+  }
+})
+
 // 관리자: 회원 코인 잔액 리셋 (잔액 0 + 관련 거래내역/출금/보상 기록 전부 삭제)
 // 관리자: 특정 스테이킹의 reset_at 마킹을 해제 (잘못 리셋된 건 복구용)
 app.post('/api/admin/staking/:stakingId/unmark-reset', async (c) => {
@@ -27490,8 +27571,8 @@ app.get('/admin/dashboard', (c) => {
                             '<div class="grid grid-cols-2 gap-2 text-sm">' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.col_name') + ':</span> ' + esc(u.name) + '</div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.phone_label') + '</span> ' + esc(u.phone || 'N/A') + '</div>' +
-                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.qkey_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.wallet_address) + '</span></div>' +
-                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.usdt_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.usdt_wallet_address || 'N/A') + '</span></div>' +
+                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.qkey_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.wallet_address) + '</span> <button onclick="editWalletQkey(' + u.id + ')" class="ml-1 px-2 py-0.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700" title="QKEY 지갑주소 변경"><i class="fas fa-edit"></i></button></div>' +
+                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.usdt_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.usdt_wallet_address || 'N/A') + '</span> <button onclick="editWalletUsdt(' + u.id + ')" class="ml-1 px-2 py-0.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700" title="USDT 지갑주소 변경"><i class="fas fa-edit"></i></button></div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referral_code_label') + '</span> <span class="font-bold text-purple-600">' + esc(u.referral_code || '-') + '</span></div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referrer_label') + '</span> ' + (referrer ? esc(referrer.name) + ' (' + esc(referrer.email) + ')' : I18N.t('admin.referrer_none')) + '</div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referees_label') + '</span> ' + referralCount + I18N.t('admin.people_unit') + '</div>' +
@@ -27597,6 +27678,35 @@ app.get('/admin/dashboard', (c) => {
 
             function closeUserDetail() {
                 document.getElementById('userDetailModal').classList.add('hidden');
+            }
+
+            // 사장님 2026-06-15 지시: 관리자가 회원 지갑주소 변경
+            // wallet_type 별로 함수 분리 — onclick 인자는 숫자(uid)만 → 따옴표 escape 불필요
+            async function editWalletQkey(userId) { await __editWallet(userId, 'qkey', 'QKEY'); }
+            async function editWalletUsdt(userId) { await __editWallet(userId, 'usdt', 'USDT'); }
+            async function __editWallet(userId, walletType, label) {
+                var newWallet = prompt(label + ' 지갑주소를 새로 입력하세요\\n(취소를 누르면 변경하지 않습니다)');
+                if (newWallet === null) return;
+                newWallet = (newWallet || '').trim();
+                if (!newWallet) { alert('지갑주소가 비어 있습니다.'); return; }
+                var reason = prompt('변경 사유를 입력하세요 (선택)\\n예: 회원 전화 요청으로 지갑 변경');
+                if (reason === null) reason = '';
+                try {
+                    var res = await axios.post('/api/admin/user/' + userId + '/update-wallet', {
+                        wallet_type: walletType,
+                        new_wallet: newWallet,
+                        reason: reason
+                    });
+                    if (res.data && res.data.success) {
+                        alert(label + ' 지갑주소가 변경되었습니다.\\n이전: ' + (res.data.old_wallet || '(없음)') + '\\n신규: ' + res.data.new_wallet);
+                        showUserDetail(userId); // 회원 상세 모달 재로드
+                    } else {
+                        alert('변경 실패: ' + ((res.data && res.data.error) || '알 수 없는 오류'));
+                    }
+                } catch (e) {
+                    var msg = (e && e.response && e.response.data && e.response.data.error) ? e.response.data.error : (e && e.message) || String(e);
+                    alert('변경 실패: ' + msg);
+                }
             }
 
             // 코인 3종 잔액 리셋 (QTA+QX+QKEY 잔액 0, 스테이킹/진입금액/데일리배당은 계속 진행)
