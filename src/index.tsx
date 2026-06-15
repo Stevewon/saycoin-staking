@@ -3750,6 +3750,173 @@ app.get('/api/admin/user/:userId', async (c) => {
   }
 })
 
+// ════════════════════════════════════════════════════════════════════════
+// 관리자: 회원 지갑주소 변경 + 변경이력 기록
+// ════════════════════════════════════════════════════════════════════════
+// 사장님 지시 (2026-06-14): "어드민에서 관리자의 권한으로 지갑주소를 변경할수
+//   있게 해줘! 다만 언제 바꿨는지 그리고 기존 지갑주소도 확인할수 있게 기록해주고!"
+//
+// 정책:
+//   - 사용자는 직접 변경 못함. 관리자만 변경 가능 (전화로 회원이 요청).
+//   - 변경 시 이전 지갑주소 + 신규 지갑주소 + 변경 시각 (KST) + 사유 모두 기록.
+//   - 변경 가능 컬럼: wallet_address (QKEY 지갑) / usdt_wallet_address (USDT 지갑)
+//   - 이력 테이블: wallet_change_history (자동 생성, 멱등)
+//
+// 안전장치:
+//   - 신규 주소가 기존과 동일하면 변경 안 함 (no-op)
+//   - 신규 주소가 다른 회원이 이미 사용 중이면 거부 (wallet_address UNIQUE 제약 회피)
+//   - 사유 미입력 시 거부
+// ════════════════════════════════════════════════════════════════════════
+async function ensureWalletChangeHistoryTable(db: any) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS wallet_change_history (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       INTEGER NOT NULL,
+      wallet_type   TEXT NOT NULL,
+      old_wallet    TEXT,
+      new_wallet    TEXT NOT NULL,
+      changed_by    TEXT NOT NULL DEFAULT 'admin',
+      reason        TEXT,
+      changed_at    TEXT NOT NULL DEFAULT (datetime('now','+9 hours')),
+      ip_address    TEXT
+    )
+  `).run()
+  try {
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_wallet_change_history_user ON wallet_change_history(user_id)`).run()
+  } catch(e) {}
+  try {
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_wallet_change_history_changed_at ON wallet_change_history(changed_at)`).run()
+  } catch(e) {}
+}
+
+// 관리자: 회원 지갑주소 변경
+//   POST /api/admin/user/:userId/update-wallet
+//   Body: { wallet_type: 'qkey' | 'usdt', new_wallet: string, reason: string }
+app.post('/api/admin/user/:userId/update-wallet', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = Number(c.req.param('userId'))
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return c.json({ success: false, error: '잘못된 user_id' }, 400)
+    }
+
+    const body = await c.req.json().catch(() => ({})) as any
+    const walletType = String(body.wallet_type || '').toLowerCase()
+    const newWalletRaw = String(body.new_wallet || '').trim()
+    const reason = String(body.reason || '').trim()
+
+    if (walletType !== 'qkey' && walletType !== 'usdt') {
+      return c.json({ success: false, error: 'wallet_type 은 qkey 또는 usdt 이어야 합니다' }, 400)
+    }
+    if (!newWalletRaw) {
+      return c.json({ success: false, error: '신규 지갑주소를 입력하세요' }, 400)
+    }
+    if (!reason) {
+      return c.json({ success: false, error: '변경 사유는 필수입니다 (기록용)' }, 400)
+    }
+    if (newWalletRaw.length > 200) {
+      return c.json({ success: false, error: '지갑주소가 너무 깁니다 (최대 200자)' }, 400)
+    }
+
+    // 회원 확인 + 기존 지갑주소 조회
+    const user = await db.prepare(`
+      SELECT id, email, name, wallet_address, usdt_wallet_address FROM users WHERE id = ?
+    `).bind(userId).first() as any
+    if (!user) return c.json({ success: false, error: '회원을 찾을 수 없습니다' }, 404)
+
+    const columnName = walletType === 'qkey' ? 'wallet_address' : 'usdt_wallet_address'
+    const oldWallet = walletType === 'qkey' ? (user.wallet_address || '') : (user.usdt_wallet_address || '')
+
+    // 동일 주소면 변경 안 함
+    if (oldWallet === newWalletRaw) {
+      return c.json({ success: false, error: '신규 지갑주소가 기존과 동일합니다 (변경 사항 없음)' }, 400)
+    }
+
+    // 중복 사용 체크 — 다른 회원이 같은 주소를 이미 쓰는지
+    const duplicateUser = await db.prepare(`
+      SELECT id, email, name FROM users WHERE ${columnName} = ? AND id != ?
+    `).bind(newWalletRaw, userId).first() as any
+    if (duplicateUser) {
+      return c.json({
+        success: false,
+        error: `해당 지갑주소는 이미 다른 회원이 사용 중입니다 (회원ID=${duplicateUser.id}, ${duplicateUser.name} / ${duplicateUser.email})`
+      }, 409)
+    }
+
+    // 이력 테이블 보장
+    await ensureWalletChangeHistoryTable(db)
+
+    // 트랜잭션 형태로 처리: UPDATE users → INSERT history
+    const ipAddr = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || ''
+
+    // 1) users 테이블 업데이트
+    await db.prepare(`UPDATE users SET ${columnName} = ? WHERE id = ?`).bind(newWalletRaw, userId).run()
+
+    // 2) 변경 이력 기록 (KST 시각)
+    const insRes = await db.prepare(`
+      INSERT INTO wallet_change_history (user_id, wallet_type, old_wallet, new_wallet, changed_by, reason, ip_address)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(userId, walletType, oldWallet || null, newWalletRaw, 'admin', reason, ipAddr || null).run()
+    const historyId = (insRes as any)?.meta?.last_row_id ?? null
+
+    return c.json({
+      success: true,
+      message: '지갑주소가 변경되었습니다',
+      user_id: userId,
+      wallet_type: walletType,
+      old_wallet: oldWallet,
+      new_wallet: newWalletRaw,
+      history_id: historyId,
+      reason
+    })
+  } catch (error) {
+    console.error('지갑주소 변경 오류:', error)
+    return c.json({ success: false, error: String(error) }, 500)
+  }
+})
+
+// 관리자: 회원 지갑주소 변경 이력 조회
+//   GET /api/admin/user/:userId/wallet-history
+app.get('/api/admin/user/:userId/wallet-history', async (c) => {
+  try {
+    const db = c.env.DB
+    const userId = Number(c.req.param('userId'))
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return c.json({ success: false, error: '잘못된 user_id' }, 400)
+    }
+
+    // 이력 테이블 보장 (최초 호출 시 자동 생성)
+    await ensureWalletChangeHistoryTable(db)
+
+    const user = await db.prepare(`
+      SELECT id, email, name, wallet_address, usdt_wallet_address FROM users WHERE id = ?
+    `).bind(userId).first() as any
+    if (!user) return c.json({ success: false, error: '회원을 찾을 수 없습니다' }, 404)
+
+    const rows = await db.prepare(`
+      SELECT id, user_id, wallet_type, old_wallet, new_wallet, changed_by, reason, changed_at, ip_address
+      FROM wallet_change_history
+      WHERE user_id = ?
+      ORDER BY id DESC
+    `).bind(userId).all()
+
+    return c.json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        wallet_address: user.wallet_address || '',
+        usdt_wallet_address: user.usdt_wallet_address || ''
+      },
+      history: rows.results || []
+    })
+  } catch (error) {
+    console.error('지갑주소 이력 조회 오류:', error)
+    return c.json({ success: false, error: String(error) }, 500)
+  }
+})
+
 // 관리자: 회원 코인 잔액 리셋 (잔액 0 + 관련 거래내역/출금/보상 기록 전부 삭제)
 // 관리자: 특정 스테이킹의 reset_at 마킹을 해제 (잘못 리셋된 건 복구용)
 app.post('/api/admin/staking/:stakingId/unmark-reset', async (c) => {
@@ -26125,6 +26292,60 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 지갑주소 변경 모달 (관리자 전용) — 사장님 2026-06-14 지시 -->
+                <div id="walletChangeModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-wallet text-blue-600 mr-2"></i>지갑주소 변경 <span id="wcWalletTypeLabel" class="text-sm font-normal text-gray-500"></span></h3>
+                            <button onclick="closeWalletChangeModal()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                        </div>
+                        <div class="space-y-4">
+                            <div class="bg-gray-50 rounded-lg p-3">
+                                <p class="text-xs text-gray-500 mb-1">대상 회원</p>
+                                <p class="text-sm font-bold text-gray-800" id="wcUserInfo">-</p>
+                            </div>
+                            <div class="bg-orange-50 border border-orange-200 rounded-lg p-3">
+                                <p class="text-xs text-gray-500 mb-1">기존 지갑주소</p>
+                                <p class="text-xs font-mono break-all text-gray-800" id="wcCurrentWallet">-</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">신규 지갑주소 <span class="text-red-500">*</span></label>
+                                <input type="text" id="wcNewWallet" placeholder="새 지갑주소를 입력하세요"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm font-mono" />
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">
+                                    변경 사유 <span class="text-red-500 font-bold">*</span>
+                                    <span class="text-xs text-gray-500 font-normal">(필수 — 이력에 기록됨)</span>
+                                </label>
+                                <textarea id="wcReason" rows="2"
+                                    placeholder="예: 회원 전화 요청으로 지갑 분실/변경 / 신규 BEP-20 주소로 교체 등"
+                                    class="w-full px-3 py-2 border-2 border-red-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm resize-none"></textarea>
+                            </div>
+                            <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-xs text-yellow-800">
+                                <i class="fas fa-exclamation-triangle mr-1"></i>변경 시각 / 이전 주소 / 신규 주소 / 사유가 자동 기록됩니다.
+                            </div>
+                            <div class="flex gap-2 pt-2">
+                                <button onclick="closeWalletChangeModal()" class="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium">취소</button>
+                                <button onclick="submitWalletChange()" class="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold"><i class="fas fa-check mr-1"></i>변경</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 지갑주소 변경 이력 모달 (관리자 전용) -->
+                <div id="walletHistoryModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 hidden">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+                        <div class="flex justify-between items-center p-4 sm:p-6 pb-3 border-b border-gray-200 flex-shrink-0">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-history text-gray-600 mr-2"></i>지갑주소 변경 이력</h3>
+                            <button onclick="closeWalletHistoryModal()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                        </div>
+                        <div id="walletHistoryContent" class="overflow-y-auto overflow-x-hidden flex-1 p-4 sm:p-6 pt-3">
+                            <p class="text-center py-8 text-gray-500"><i class="fas fa-spinner fa-spin mr-2"></i>로딩 중...</p>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 매출 현황 (숨김) -->
                 <div id="content-sales" class="bg-white rounded-lg shadow-md p-4 sm:p-6 hidden">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
@@ -27490,8 +27711,13 @@ app.get('/admin/dashboard', (c) => {
                             '<div class="grid grid-cols-2 gap-2 text-sm">' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.col_name') + ':</span> ' + esc(u.name) + '</div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.phone_label') + '</span> ' + esc(u.phone || 'N/A') + '</div>' +
-                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.qkey_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.wallet_address) + '</span></div>' +
-                                '<div class="col-span-2"><span class="text-gray-500">' + I18N.t('admin.usdt_wallet_label') + '</span> <span class="font-mono text-xs">' + esc(u.usdt_wallet_address || 'N/A') + '</span></div>' +
+                                '<div class="col-span-2 flex items-center gap-2 flex-wrap"><span class="text-gray-500">' + I18N.t('admin.qkey_wallet_label') + '</span> <span class="font-mono text-xs break-all">' + esc(u.wallet_address) + '</span>' +
+                                    ' <button onclick="openWalletChangeModal(' + u.id + ', \'qkey\')" class="px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded">수정</button>' +
+                                    ' <button onclick="openWalletHistoryModal(' + u.id + ')" class="px-2 py-0.5 text-xs bg-gray-600 hover:bg-gray-700 text-white rounded">이력</button>' +
+                                '</div>' +
+                                '<div class="col-span-2 flex items-center gap-2 flex-wrap"><span class="text-gray-500">' + I18N.t('admin.usdt_wallet_label') + '</span> <span class="font-mono text-xs break-all">' + esc(u.usdt_wallet_address || 'N/A') + '</span>' +
+                                    ' <button onclick="openWalletChangeModal(' + u.id + ', \'usdt\')" class="px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded">수정</button>' +
+                                '</div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referral_code_label') + '</span> <span class="font-bold text-purple-600">' + esc(u.referral_code || '-') + '</span></div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referrer_label') + '</span> ' + (referrer ? esc(referrer.name) + ' (' + esc(referrer.email) + ')' : I18N.t('admin.referrer_none')) + '</div>' +
                                 '<div><span class="text-gray-500">' + I18N.t('admin.referees_label') + '</span> ' + referralCount + I18N.t('admin.people_unit') + '</div>' +
@@ -27670,6 +27896,131 @@ app.get('/admin/dashboard', (c) => {
 
             function closeAdjustBalanceModal() {
                 var m = document.getElementById('adjustBalanceModal');
+                m.classList.add('hidden');
+                m.classList.remove('flex');
+            }
+
+            // ============================================
+            // 지갑주소 변경 (관리자 전용) — 사장님 2026-06-14 지시
+            // ============================================
+            var __walletChangeCtx = { userId: null, walletType: null };
+
+            async function openWalletChangeModal(userId, walletType) {
+                __walletChangeCtx.userId = userId;
+                __walletChangeCtx.walletType = walletType;
+                // 회원 정보 조회 (현재 지갑주소 가져오기)
+                try {
+                    var res = await axios.get('/api/admin/user/' + userId);
+                    if (!res.data.success) {
+                        alert('회원 정보 조회 실패');
+                        return;
+                    }
+                    var u = res.data.user;
+                    var current = walletType === 'qkey' ? (u.wallet_address || '') : (u.usdt_wallet_address || '');
+                    document.getElementById('wcWalletTypeLabel').textContent = '(' + (walletType === 'qkey' ? 'QKEY 지갑' : 'USDT 지갑') + ')';
+                    document.getElementById('wcUserInfo').textContent = u.name + ' (' + u.email + ') / ID=' + u.id;
+                    document.getElementById('wcCurrentWallet').textContent = current || '(미설정)';
+                    document.getElementById('wcNewWallet').value = '';
+                    document.getElementById('wcReason').value = '';
+                    var m = document.getElementById('walletChangeModal');
+                    m.classList.remove('hidden');
+                    m.classList.add('flex');
+                } catch(e) {
+                    alert('회원 정보 조회 오류: ' + (e.message || e));
+                }
+            }
+
+            function closeWalletChangeModal() {
+                var m = document.getElementById('walletChangeModal');
+                m.classList.add('hidden');
+                m.classList.remove('flex');
+                __walletChangeCtx = { userId: null, walletType: null };
+            }
+
+            async function submitWalletChange() {
+                var ctx = __walletChangeCtx;
+                if (!ctx.userId || !ctx.walletType) { alert('대상 회원 정보가 없습니다'); return; }
+                var newWallet = (document.getElementById('wcNewWallet').value || '').trim();
+                var reason = (document.getElementById('wcReason').value || '').trim();
+                if (!newWallet) { alert('신규 지갑주소를 입력하세요'); return; }
+                if (!reason) { alert('변경 사유는 필수입니다'); return; }
+                if (!confirm('정말 지갑주소를 변경하시겠습니까?\n\n신규: ' + newWallet + '\n사유: ' + reason)) return;
+                try {
+                    var res = await axios.post('/api/admin/user/' + ctx.userId + '/update-wallet', {
+                        wallet_type: ctx.walletType,
+                        new_wallet: newWallet,
+                        reason: reason
+                    });
+                    if (res.data && res.data.success) {
+                        alert('지갑주소가 변경되었습니다.\n\n이전: ' + (res.data.old_wallet || '(미설정)') + '\n신규: ' + res.data.new_wallet);
+                        closeWalletChangeModal();
+                        // 회원 상세 모달 새로고침
+                        if (typeof showUserDetail === 'function') {
+                            showUserDetail(ctx.userId);
+                        }
+                    } else {
+                        alert('변경 실패: ' + ((res.data && res.data.error) || '알 수 없는 오류'));
+                    }
+                } catch(e) {
+                    var errMsg = (e.response && e.response.data && e.response.data.error) || e.message || String(e);
+                    alert('변경 오류: ' + errMsg);
+                }
+            }
+
+            async function openWalletHistoryModal(userId) {
+                var m = document.getElementById('walletHistoryModal');
+                var content = document.getElementById('walletHistoryContent');
+                content.innerHTML = '<p class="text-center py-8 text-gray-500"><i class="fas fa-spinner fa-spin mr-2"></i>로딩 중...</p>';
+                m.classList.remove('hidden');
+                m.classList.add('flex');
+                try {
+                    var res = await axios.get('/api/admin/user/' + userId + '/wallet-history');
+                    if (!res.data || !res.data.success) {
+                        content.innerHTML = '<p class="text-center py-8 text-red-500">이력 조회 실패</p>';
+                        return;
+                    }
+                    var u = res.data.user;
+                    var hist = res.data.history || [];
+                    var html = '<div class="mb-3 bg-gray-50 rounded-lg p-3 text-sm">' +
+                        '<p class="font-bold text-gray-800 mb-1">' + esc(u.name) + ' (' + esc(u.email) + ') / ID=' + u.id + '</p>' +
+                        '<p class="text-xs text-gray-600">현재 QKEY 지갑: <span class="font-mono break-all">' + esc(u.wallet_address || '(미설정)') + '</span></p>' +
+                        '<p class="text-xs text-gray-600">현재 USDT 지갑: <span class="font-mono break-all">' + esc(u.usdt_wallet_address || '(미설정)') + '</span></p>' +
+                        '</div>';
+                    if (hist.length === 0) {
+                        html += '<p class="text-center py-6 text-gray-500 text-sm">변경 이력이 없습니다</p>';
+                    } else {
+                        html += '<div class="overflow-x-auto"><table class="w-full text-xs">' +
+                            '<thead class="bg-gray-100"><tr>' +
+                                '<th class="px-2 py-2 text-left">변경시각 (KST)</th>' +
+                                '<th class="px-2 py-2 text-center">지갑 종류</th>' +
+                                '<th class="px-2 py-2 text-left">이전 주소</th>' +
+                                '<th class="px-2 py-2 text-left">신규 주소</th>' +
+                                '<th class="px-2 py-2 text-left">사유</th>' +
+                                '<th class="px-2 py-2 text-center">변경자</th>' +
+                            '</tr></thead><tbody class="divide-y">';
+                        for (var i=0; i<hist.length; i++) {
+                            var h = hist[i];
+                            var wtLabel = h.wallet_type === 'qkey' ? 'QKEY' : (h.wallet_type === 'usdt' ? 'USDT' : esc(h.wallet_type));
+                            var wtColor = h.wallet_type === 'qkey' ? 'yellow' : 'green';
+                            html += '<tr>' +
+                                '<td class="px-2 py-2 text-gray-700 whitespace-nowrap">' + esc(h.changed_at) + '</td>' +
+                                '<td class="px-2 py-2 text-center"><span class="px-1.5 py-0.5 bg-' + wtColor + '-100 text-' + wtColor + '-700 rounded text-xs font-bold">' + wtLabel + '</span></td>' +
+                                '<td class="px-2 py-2 font-mono text-xs break-all text-red-600">' + esc(h.old_wallet || '(미설정)') + '</td>' +
+                                '<td class="px-2 py-2 font-mono text-xs break-all text-blue-600">' + esc(h.new_wallet) + '</td>' +
+                                '<td class="px-2 py-2 text-gray-700">' + esc(h.reason || '-') + '</td>' +
+                                '<td class="px-2 py-2 text-center text-gray-500">' + esc(h.changed_by || 'admin') + '</td>' +
+                            '</tr>';
+                        }
+                        html += '</tbody></table></div>';
+                    }
+                    content.innerHTML = html;
+                } catch(e) {
+                    content.innerHTML = '<p class="text-center py-8 text-red-500">조회 오류: ' + esc(e.message || String(e)) + '</p>';
+                }
+            }
+
+            function closeWalletHistoryModal() {
+                var m = document.getElementById('walletHistoryModal');
                 m.classList.add('hidden');
                 m.classList.remove('flex');
             }
