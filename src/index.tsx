@@ -53181,6 +53181,43 @@ app.get('/api/diag/fix-sat-upline-matching', async (c) => {
 
 
 // ============================================================
+// staking 단위 daily_rewards 조회 — 읽기 전용
+//   경로: GET /api/diag/staking-dailies?key=ADMIN_PW&staking_id=45
+// ============================================================
+app.get('/api/diag/staking-dailies', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const db = c.env.DB
+    const sid = parseInt(c.req.query('staking_id') || '0')
+    const stk = await db.prepare(`
+      SELECT id, user_id, amount, status, daily_rate,
+        date(start_date,'+9 hours') AS start_kst, date(end_date,'+9 hours') AS end_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = staking.id) AS dr_count,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = staking.id) AS last_reward
+      FROM staking WHERE id = ?
+    `).bind(sid).first<any>()
+    const dr = await db.prepare(`
+      SELECT reward_date, paid_date, usdt_amount, created_at FROM daily_rewards
+      WHERE staking_id = ? ORDER BY reward_date
+    `).bind(sid).all()
+    // 같은 user 의 모든 staking 요약
+    const userStakings = stk ? await db.prepare(`
+      SELECT id, status, date(start_date,'+9 hours') AS start_kst,
+        (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = staking.id) AS dr_count,
+        (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = staking.id) AS last_reward
+      FROM staking WHERE user_id = ? ORDER BY id
+    `).bind(stk.user_id).all() : { results: [] }
+    return c.json({
+      ok: true, staking: stk,
+      daily_rewards: (dr.results || []),
+      user_all_stakings: (userStakings.results || []),
+    })
+  } catch (e) { return c.json({ error: String(e) }, 500) }
+})
+
+
+// ============================================================
 // 내일(또는 임의일) cron 지급 시뮬레이션 — 읽기 전용 (데이터 변경 0)
 // 사장님 영구명령 (2026-06-16): "내일 지급되야 하는데 또 누락이 되면 절대안된다"
 //   + "기존 지급자들도 계속 지급되야할 부분이 있으면 지급이 되야하고"
