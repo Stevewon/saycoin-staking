@@ -803,6 +803,11 @@ I18N._translations['ko'] = {
   'udyn.tx_reason': '사유:',
   'udyn.load_more': '더 보기',
   'udyn.load_complete': '전체 로드 완료',
+  'ubuy.insufficient_title': 'QKEY 잔액이 부족합니다',
+  'ubuy.product_price': '상품 가격',
+  'ubuy.my_balance': '보유 잔액',
+  'ubuy.shortage_amount': '부족 금액',
+  'ubuy.insufficient_guide': 'QKEY를 충전한 후 다시 시도해주세요.',
 
 };
 
@@ -1739,6 +1744,11 @@ I18N._translations['ja'] = {
   'udyn.tx_reason': '理由:',
   'udyn.load_more': 'もっと見る',
   'udyn.load_complete': 'すべて読み込み完了',
+  'ubuy.insufficient_title': 'QKEY残高が不足しています',
+  'ubuy.product_price': '商品価格',
+  'ubuy.my_balance': '保有残高',
+  'ubuy.shortage_amount': '不足金額',
+  'ubuy.insufficient_guide': 'QKEYをチャージしてから再度お試しください。',
 
 };
 
