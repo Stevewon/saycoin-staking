@@ -808,6 +808,9 @@ I18N._translations['ko'] = {
   'ubuy.my_balance': '보유 잔액',
   'ubuy.shortage_amount': '부족 금액',
   'ubuy.insufficient_guide': 'QKEY를 충전한 후 다시 시도해주세요.',
+  'admin.id_placeholder': '관리자 ID를 입력하세요',
+  'admin.password_placeholder': '비밀번호를 입력하세요',
+  'admin.search_email_name': '이메일/이름으로 검색...',
 
 };
 
@@ -1749,6 +1752,9 @@ I18N._translations['ja'] = {
   'ubuy.my_balance': '保有残高',
   'ubuy.shortage_amount': '不足金額',
   'ubuy.insufficient_guide': 'QKEYをチャージしてから再度お試しください。',
+  'admin.id_placeholder': '管理者IDを入力してください',
+  'admin.password_placeholder': 'パスワードを入力してください',
+  'admin.search_email_name': 'メール/名前で検索...',
 
 };
 
