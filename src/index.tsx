@@ -24548,7 +24548,7 @@ app.get('/dashboard', (c) => {
                 
                 if (myQkey < priceQkey) {
                     var shortage = priceQkey - myQkey;
-                    alert(I18N.t('ubuy.insufficient_title') + '\n\n' + I18N.t('ubuy.product_price') + ': ' + priceQkey.toLocaleString() + ' QKEY\n' + I18N.t('ubuy.my_balance') + ': ' + myQkey.toLocaleString() + ' QKEY\n' + I18N.t('ubuy.shortage_amount') + ': ' + shortage.toLocaleString() + ' QKEY\n\n' + I18N.t('ubuy.insufficient_guide'));
+                    alert(I18N.t('ubuy.insufficient_title') + '\\n\\n' + I18N.t('ubuy.product_price') + ': ' + priceQkey.toLocaleString() + ' QKEY\\n' + I18N.t('ubuy.my_balance') + ': ' + myQkey.toLocaleString() + ' QKEY\\n' + I18N.t('ubuy.shortage_amount') + ': ' + shortage.toLocaleString() + ' QKEY\\n\\n' + I18N.t('ubuy.insufficient_guide'));
                     return;
                 }
                 // 옵션 확인
