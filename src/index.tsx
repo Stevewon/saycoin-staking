@@ -53249,7 +53249,7 @@ app.get('/api/diag/cron-simulate', async (c) => {
     const activeStakings = await db.prepare(`
       SELECT
         s.user_id, s.id as staking_id, s.amount, s.period_days, s.period_months,
-        s.daily_rate, s.start_date, s.end_date,
+        s.daily_rate, s.start_date, s.end_date, s.status,
         date(s.start_date, '+9 hours') as start_date_kst,
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
         (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
@@ -53315,11 +53315,20 @@ app.get('/api/diag/cron-simulate', async (c) => {
     const matchingPlan: any[] = []
     let totalDaily = 0, totalMatch = 0
 
+    const skippedCapped: any[] = []
     for (const s of rows) {
       const uid = Number(s.user_id)
       const stakingId = Number(s.staking_id)
       const amount = Number(s.amount)
       const periodDays = Number(s.period_days) || (Number(s.period_months) * 30)
+
+      // ★ 실제 cron 의 isStakingCapped 사전체크(L5418) 반영 ★
+      //   이 staking 이 이미 cap200 도달(status=capped/completed)이면 cron 은 즉시 skip → 재지급 0
+      //   (시뮬에서 capped staking 의 과거분이 백필로 잡히던 부정확함 제거)
+      if (s.status === 'capped' || s.status === 'completed') {
+        skippedCapped.push({ user_id: uid, staking_id: stakingId, status: s.status, last_reward_date: s.last_reward_date })
+        continue
+      }
 
       // accrual 날짜 (cron 과 동일 함수)
       const accrualDates = getStakingAccrualDatesKst(
@@ -53404,8 +53413,10 @@ app.get('/api/diag/cron-simulate', async (c) => {
       daily_payouts: dailyPlan.length, total_daily_qkey: totalDaily,
       matching_payouts: matchingPlan.filter(m => (m.payable || 0) > 0).length,
       total_matching_qkey: totalMatch,
+      skipped_capped_count: skippedCapped.length,
       daily_plan: dailyPlan,
       matching_plan: matchingPlan,
+      skipped_capped: skippedCapped,
       duration_ms: Date.now() - t0,
     })
   } catch (error) {
