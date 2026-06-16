@@ -22867,7 +22867,7 @@ app.get('/', (c) => {
                 const passwordConfirm = document.getElementById('registerPasswordConfirm').value;
                 const referralCode = document.getElementById('registerReferralCode').value.trim().toUpperCase();
                 const country = navigator.language.split('-')[1] || '';
-                const language = I18N.currentLang || navigator.language.split('-')[0] || '';
+                const language = I18N.getLang() || navigator.language.split('-')[0] || '';
 
                 console.log('입력값:', { name, email, phone, walletAddress, usdtWalletAddress, password, passwordConfirm, referralCode, country, language });
 
