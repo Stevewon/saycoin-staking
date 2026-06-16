@@ -22780,7 +22780,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko7"></script>
+        <script src="/static/i18n.js?v=20260616ko8"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23089,8 +23089,8 @@ app.get('/dashboard', (c) => {
                     <!-- 퀀타리움 스테이킹 현황 (첫 번째 - full width) -->
                     <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.purchase_transfer">퀀타리움구매(USDT)</span>
-                            <i class="fas fa-chart-line text-xl sm:text-2xl"></i>
+                            <span class="text-[11px] sm:text-sm opacity-90 leading-tight flex-1 pr-1" data-i18n="dash.purchase_transfer">퀀타리움구매(USDT)</span>
+                            <i class="fas fa-chart-line text-xl sm:text-2xl flex-shrink-0"></i>
                         </div>
                         <p class="text-2xl sm:text-3xl font-bold" id="stakingStatus">0</p>
                         <p class="text-xs opacity-75 mt-1" id="stakingCount"></p>
@@ -23099,38 +23099,38 @@ app.get('/dashboard', (c) => {
                     <!-- USDT Balance (두 번째) — 사장님 2026-05-15 (3차) 지시: 출금불가 완전 제거, 출금가능만 표시 -->
                     <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.usdt_balance">USDT 잔액</span>
-                            <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
+                            <span class="text-[11px] sm:text-sm opacity-90 leading-tight flex-1 pr-1" data-i18n="dash.usdt_balance">USDT 잔액</span>
+                            <i class="fas fa-dollar-sign text-xl sm:text-2xl flex-shrink-0"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1"><span data-i18n="ucard.withdrawable">출금가능</span> <span id="usdtWithdrawable" class="font-semibold">0</span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1 leading-tight whitespace-nowrap"><span data-i18n="ucard.withdrawable">출금가능</span> <span id="usdtWithdrawable" class="font-semibold">0</span></p>
                     </div>
                     
                     <!-- QTA (세 번째) — 옵션 A: 회사지급분 (출금가능분) -->
                     <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qta_coin">QTA코인(지갑전송수량)</span>
-                            <i class="fas fa-coins text-xl sm:text-2xl"></i>
+                            <span class="text-[11px] sm:text-sm opacity-90 leading-tight flex-1 pr-1" data-i18n="dash.qta_coin">QTA코인(지갑전송수량)</span>
+                            <i class="fas fa-coins text-xl sm:text-2xl flex-shrink-0"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qtaBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1"><span data-i18n="ucard.company_paid">회사지급</span> <span id="qtaInitial" class="font-semibold">0</span> <span class="opacity-80">(<span data-i18n="ucard.withdrawable">출금가능</span> <span id="qtaWithdrawable" class="font-semibold">0</span>)</span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1 leading-tight whitespace-nowrap"><span data-i18n="ucard.company_paid">회사지급</span> <span id="qtaInitial" class="font-semibold">0</span> <span class="opacity-80">(<span data-i18n="ucard.withdrawable">출금가능</span> <span id="qtaWithdrawable" class="font-semibold">0</span>)</span></p>
                     </div>
                     
                     <!-- QX (네 번째) — 옵션 A: 회사지급분 (출금가능분) -->
                     <div class="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qx_coin">QX 코인</span>
-                            <i class="fas fa-coins text-xl sm:text-2xl"></i>
+                            <span class="text-[11px] sm:text-sm opacity-90 leading-tight flex-1 pr-1" data-i18n="dash.qx_coin">QX 코인</span>
+                            <i class="fas fa-coins text-xl sm:text-2xl flex-shrink-0"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qxBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1"><span data-i18n="ucard.company_paid">회사지급</span> <span id="qxInitial" class="font-semibold">0</span> <span class="opacity-80">(<span data-i18n="ucard.withdrawable">출금가능</span> <span id="qxWithdrawable" class="font-semibold">0</span>)</span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1 leading-tight whitespace-nowrap"><span data-i18n="ucard.company_paid">회사지급</span> <span id="qxInitial" class="font-semibold">0</span> <span class="opacity-80">(<span data-i18n="ucard.withdrawable">출금가능</span> <span id="qxWithdrawable" class="font-semibold">0</span>)</span></p>
                     </div>
                     
                     <!-- QKEY (다섯 번째 - QX 옆 배치) -->
                     <div class="bg-gradient-to-br from-yellow-500 to-yellow-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
-                            <span class="text-xs sm:text-sm opacity-90" data-i18n="dash.qkey_coin">QKEY 코인</span>
-                            <i class="fas fa-key text-xl sm:text-2xl"></i>
+                            <span class="text-[11px] sm:text-sm opacity-90 leading-tight flex-1 pr-1" data-i18n="dash.qkey_coin">QKEY 코인</span>
+                            <i class="fas fa-key text-xl sm:text-2xl flex-shrink-0"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qkeyBalance">0</p>
                     </div>
@@ -23781,7 +23781,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko7"></script>
+        <script src="/static/i18n.js?v=20260616ko8"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -26017,7 +26017,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko7"></script>
+        <script src="/static/i18n.js?v=20260616ko8"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27023,7 +27023,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko7"></script>
+        <script src="/static/i18n.js?v=20260616ko8"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
