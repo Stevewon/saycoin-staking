@@ -22780,7 +22780,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja"></script>
+        <script src="/static/i18n.js?v=20260616ja2"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23068,15 +23068,15 @@ app.get('/dashboard', (c) => {
                 <div class="max-w-7xl mx-auto px-3 sm:px-4 flex">
                     <button onclick="switchDashPage('main')" id="dashNav-main"
                         class="flex items-center gap-1 px-4 py-3 text-sm font-bold text-purple-600 border-b-2 border-purple-600 transition">
-                        <i class="fas fa-chart-line"></i><span>대시보드</span>
+                        <i class="fas fa-chart-line"></i><span data-i18n="unav.dashboard">대시보드</span>
                     </button>
                     <button onclick="switchDashPage('shop')" id="dashNav-shop"
                         class="flex items-center gap-1 px-4 py-3 text-sm font-bold text-gray-400 hover:text-pink-600 transition">
-                        <i class="fas fa-shopping-cart"></i><span>쇼핑몰</span>
+                        <i class="fas fa-shopping-cart"></i><span data-i18n="unav.shop">쇼핑몰</span>
                     </button>
                     <button onclick="switchDashPage('notice')" id="dashNav-notice"
                         class="flex items-center gap-1 px-4 py-3 text-sm font-bold text-gray-400 hover:text-blue-600 transition">
-                        <i class="fas fa-bullhorn"></i><span>공지사항</span>
+                        <i class="fas fa-bullhorn"></i><span data-i18n="unav.notice">공지사항</span>
                         <span id="noticeUnreadBadge" class="hidden ml-1 px-1.5 py-0.5 text-[10px] bg-red-500 text-white rounded-full font-bold">N</span>
                     </button>
                 </div>
@@ -23103,7 +23103,7 @@ app.get('/dashboard', (c) => {
                             <i class="fas fa-dollar-sign text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="usdtBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">출금가능 <span id="usdtWithdrawable" class="font-semibold">0</span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1"><span data-i18n="ucard.withdrawable">출금가능</span> <span id="usdtWithdrawable" class="font-semibold">0</span></p>
                     </div>
                     
                     <!-- QTA (세 번째) — 옵션 A: 회사지급분 (출금가능분) -->
@@ -23113,7 +23113,7 @@ app.get('/dashboard', (c) => {
                             <i class="fas fa-coins text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qtaBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">회사지급 <span id="qtaInitial" class="font-semibold">0</span> <span class="opacity-80">(출금가능 <span id="qtaWithdrawable" class="font-semibold">0</span>)</span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1"><span data-i18n="ucard.company_paid">회사지급</span> <span id="qtaInitial" class="font-semibold">0</span> <span class="opacity-80">(<span data-i18n="ucard.withdrawable">출금가능</span> <span id="qtaWithdrawable" class="font-semibold">0</span>)</span></p>
                     </div>
                     
                     <!-- QX (네 번째) — 옵션 A: 회사지급분 (출금가능분) -->
@@ -23123,7 +23123,7 @@ app.get('/dashboard', (c) => {
                             <i class="fas fa-coins text-xl sm:text-2xl"></i>
                         </div>
                         <p class="text-xl sm:text-3xl font-bold" id="qxBalance">0</p>
-                        <p class="text-[10px] sm:text-xs opacity-90 mt-1">회사지급 <span id="qxInitial" class="font-semibold">0</span> <span class="opacity-80">(출금가능 <span id="qxWithdrawable" class="font-semibold">0</span>)</span></p>
+                        <p class="text-[10px] sm:text-xs opacity-90 mt-1"><span data-i18n="ucard.company_paid">회사지급</span> <span id="qxInitial" class="font-semibold">0</span> <span class="opacity-80">(<span data-i18n="ucard.withdrawable">출금가능</span> <span id="qxWithdrawable" class="font-semibold">0</span>)</span></p>
                     </div>
                     
                     <!-- QKEY (다섯 번째 - QX 옆 배치) -->
@@ -23459,9 +23459,9 @@ app.get('/dashboard', (c) => {
                                 <i class="fas fa-sync-alt mr-1"></i>새로고침
                             </button>
                         </div>
-                        <p class="text-xs text-gray-500 mb-2"><i class="fas fa-info-circle mr-1"></i>처리대기(pending) 상태에서만 취소가 가능하며, 취소 시 신청금액이 즉시 환불됩니다.</p>
+                        <p class="text-xs text-gray-500 mb-2"><i class="fas fa-info-circle mr-1"></i><span data-i18n="uwd.cancel_desc">처리대기(pending) 상태에서만 취소가 가능하며, 취소 시 신청금액이 즉시 환불됩니다.</span></p>
                         <div id="myWithdrawList" class="space-y-2 max-h-[50vh] overflow-y-auto">
-                            <p class="text-center text-gray-400 text-sm py-4">출금 신청 내역을 불러오는 중...</p>
+                            <p class="text-center text-gray-400 text-sm py-4" data-i18n="uwd.loading_history">출금 신청 내역을 불러오는 중...</p>
                         </div>
                     </div>
                 </div>
@@ -23490,19 +23490,19 @@ app.get('/dashboard', (c) => {
                     <!-- 산하 매출 통계 (어드민 산하매출 모달과 동일 기준: 진입금액 USD) -->
                     <div class="grid grid-cols-3 gap-2 sm:gap-4 mb-4 sm:mb-6">
                         <div class="bg-blue-50 rounded-lg p-3 sm:p-4 border border-blue-200 text-center">
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1">1대 매출</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="usales.level1">1대 매출</p>
                             <p class="text-lg sm:text-2xl font-bold text-blue-600">$<span id="level1Sales">0</span></p>
-                            <p class="text-xs sm:text-sm text-gray-500 mt-1"><span id="level1Count">0</span>명</p>
+                            <p class="text-xs sm:text-sm text-gray-500 mt-1"><span id="level1Count">0</span><span data-i18n="usales.people">명</span></p>
                         </div>
                         <div class="bg-purple-50 rounded-lg p-3 sm:p-4 border border-purple-200 text-center">
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1">2대 매출</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="usales.level2">2대 매출</p>
                             <p class="text-lg sm:text-2xl font-bold text-purple-600">$<span id="level2Sales">0</span></p>
-                            <p class="text-xs sm:text-sm text-gray-500 mt-1"><span id="level2Count">0</span>명</p>
+                            <p class="text-xs sm:text-sm text-gray-500 mt-1"><span id="level2Count">0</span><span data-i18n="usales.people">명</span></p>
                         </div>
                         <div class="bg-green-50 rounded-lg p-3 sm:p-4 border border-green-200 text-center">
-                            <p class="text-xs sm:text-sm text-gray-600 mb-1">총 매출 (전체)</p>
+                            <p class="text-xs sm:text-sm text-gray-600 mb-1" data-i18n="usales.total_all">총 매출 (전체)</p>
                             <p class="text-lg sm:text-2xl font-bold text-green-600">$<span id="totalSales">0</span></p>
-                            <p class="text-xs sm:text-sm text-gray-500 mt-1"><span id="totalCount">0</span>명</p>
+                            <p class="text-xs sm:text-sm text-gray-500 mt-1"><span id="totalCount">0</span><span data-i18n="usales.people">명</span></p>
                         </div>
                     </div>
 
@@ -23623,7 +23623,7 @@ app.get('/dashboard', (c) => {
                                 onclick="loadMoreReferralRewards()"
                                 class="inline-flex items-center px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold rounded-lg shadow-sm transition disabled:opacity-50 disabled:cursor-not-allowed">
                                 <i class="fas fa-chevron-down mr-2"></i>
-                                <span id="rewards-load-more-label">더 보기</span>
+                                <span id="rewards-load-more-label" data-i18n="ucommon.more">더 보기</span>
                                 <span id="rewards-load-more-progress" class="ml-2 text-xs opacity-90"></span>
                             </button>
                         </div>
@@ -23646,10 +23646,10 @@ app.get('/dashboard', (c) => {
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6">
                     <div class="flex items-center justify-between mb-4">
                         <h2 class="text-xl sm:text-2xl font-bold text-gray-800">
-                            <i class="fas fa-shopping-cart mr-2 text-pink-600"></i>QKEY 쇼핑몰
+                            <i class="fas fa-shopping-cart mr-2 text-pink-600"></i>QKEY <span data-i18n="unav.shop">쇼핑몰</span>
                         </h2>
                         <div class="flex items-center gap-2">
-                            <span class="text-xs text-gray-500">(1 QKEY = 10원)</span>
+                            <span class="text-xs text-gray-500" data-i18n="ushop.subtitle_krw">(1 QKEY = 10원)</span>
                             <span id="shopQkeyBalance" class="text-sm font-bold text-pink-700 bg-pink-50 px-2 py-1 rounded">0 QKEY</span>
                         </div>
                     </div>
@@ -23657,36 +23657,36 @@ app.get('/dashboard', (c) => {
                     <div class="flex border-b mb-4">
                         <button onclick="switchShopTab('products')" id="shopTab-products"
                             class="flex-1 py-2 text-sm font-bold text-pink-600 border-b-2 border-pink-600 transition">
-                            <i class="fas fa-store mr-1"></i>상품목록
+                            <i class="fas fa-store mr-1"></i><span data-i18n="ushop.my_orders">상품목록</span>
                         </button>
                         <button onclick="switchShopTab('orders')" id="shopTab-orders"
                             class="flex-1 py-2 text-sm font-bold text-gray-400 hover:text-gray-600 transition">
-                            <i class="fas fa-receipt mr-1"></i>내 구매내역
+                            <i class="fas fa-receipt mr-1"></i><span data-i18n="ushop.my_orders">내 구매내역</span>
                         </button>
                     </div>
                     <!-- 상품 패널 -->
                     <div id="shopPanel-products">
                         <!-- 카테고리 필터 -->
                         <div id="shopCategoryFilter" class="flex flex-wrap gap-2 mb-4">
-                            <button onclick="filterShopCategory('전체')" class="shopCatBtn px-3 py-1 rounded-full text-xs font-bold bg-pink-600 text-white">전체</button>
+                            <button onclick="filterShopCategory('전체')" class="shopCatBtn px-3 py-1 rounded-full text-xs font-bold bg-pink-600 text-white" data-i18n="ushop.all">전체</button>
                         </div>
                         <div id="shopProductList" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4">
-                            <p class="col-span-2 sm:col-span-3 lg:col-span-4 text-center text-gray-400 py-8 text-sm">상품을 불러오는 중...</p>
+                            <p class="col-span-2 sm:col-span-3 lg:col-span-4 text-center text-gray-400 py-8 text-sm" data-i18n="ushop.loading_products">상품을 불러오는 중...</p>
                         </div>
                     </div>
                     <!-- 구매내역 패널 -->
                     <div id="shopPanel-orders" class="hidden">
                         <div class="flex items-center justify-between mb-3">
-                            <h3 class="font-bold text-gray-700 text-sm"><i class="fas fa-receipt mr-1 text-pink-500"></i>내 구매 내역</h3>
+                            <h3 class="font-bold text-gray-700 text-sm"><i class="fas fa-receipt mr-1 text-pink-500"></i><span data-i18n="ushop.my_orders">내 구매 내역</span></h3>
                             <div class="flex items-center gap-2">
-                                <button onclick="openInquiryModal()" class="px-3 py-1 bg-blue-50 hover:bg-blue-100 rounded text-xs font-medium text-blue-700 border border-blue-200"><i class="fas fa-comment-dots mr-1"></i>문의하기</button>
-                                <button onclick="loadMyInquiries()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-clipboard-list mr-1"></i>내 문의내역</button>
-                                <button onclick="loadMyOrders()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-sync-alt mr-1"></i>새로고침</button>
+                                <button onclick="openInquiryModal()" class="px-3 py-1 bg-blue-50 hover:bg-blue-100 rounded text-xs font-medium text-blue-700 border border-blue-200"><i class="fas fa-comment-dots mr-1"></i><span data-i18n="ushop.inquiry">문의하기</span></button>
+                                <button onclick="loadMyInquiries()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-clipboard-list mr-1"></i><span data-i18n="ushop.my_inquiries">내 문의내역</span></button>
+                                <button onclick="loadMyOrders()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700"><i class="fas fa-sync-alt mr-1"></i><span data-i18n="ushop.refresh">새로고침</span></button>
                             </div>
                         </div>
-                        <p class="text-xs text-gray-500 mb-3"><i class="fas fa-info-circle mr-1"></i>구매한 상품의 결제·배송 상태를 실시간으로 확인할 수 있습니다. 문의 내용은 본인과 쇼핑몰 관리자만 볼 수 있습니다.</p>
+                        <p class="text-xs text-gray-500 mb-3"><i class="fas fa-info-circle mr-1"></i><span data-i18n="ushop.orders_desc">구매한 상품의 결제·배송 상태를 실시간으로 확인할 수 있습니다. 문의 내용은 본인과 쇼핑몰 관리자만 볼 수 있습니다.</span></p>
                         <div id="shopMyOrders" class="space-y-2 max-h-[70vh] overflow-y-auto">
-                            <p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-shopping-bag text-3xl text-gray-200 mb-2 block"></i>아직 구매 내역이 없습니다</p>
+                            <p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-shopping-bag text-3xl text-gray-200 mb-2 block"></i><span data-i18n="ushop.no_orders">아직 구매 내역이 없습니다</span></p>
                         </div>
                     </div>
                 </div>
@@ -23696,38 +23696,38 @@ app.get('/dashboard', (c) => {
             <div id="inquiryModal" class="fixed inset-0 bg-black/50 z-[100] hidden items-center justify-center p-4">
                 <div class="bg-white rounded-xl shadow-2xl max-w-md w-full p-5">
                     <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-comment-dots text-blue-600 mr-2"></i>쇼핑몰 문의하기</h3>
+                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-comment-dots text-blue-600 mr-2"></i><span data-i18n="ushop.inquiry_title">쇼핑몰 문의하기</span></h3>
                         <button onclick="closeInquiryModal()" class="text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
                     </div>
                     <div class="space-y-3">
                         <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1">문의 유형 <span class="text-red-500">*</span></label>
+                            <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.inquiry_type">문의 유형</span> <span class="text-red-500">*</span></label>
                             <select id="inquiryCategory" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
-                                <option value="">선택해주세요</option>
-                                <option value="shipping">배송 문의</option>
-                                <option value="refund">환불 문의</option>
-                                <option value="other">기타 문의</option>
+                                <option value="" data-i18n="ushop.select_please">선택해주세요</option>
+                                <option value="shipping" data-i18n="ushop.inquiry_shipping">배송 문의</option>
+                                <option value="refund" data-i18n="ushop.inquiry_refund">환불 문의</option>
+                                <option value="other" data-i18n="ushop.inquiry_etc">기타 문의</option>
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1">관련 주문 (선택)</label>
+                            <label class="block text-xs font-medium text-gray-700 mb-1" data-i18n="ushop.related_order">관련 주문 (선택)</label>
                             <select id="inquiryOrderId" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
-                                <option value="">없음</option>
+                                <option value="" data-i18n="ushop.none">없음</option>
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1">제목 <span class="text-red-500">*</span></label>
+                            <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.title_label">제목</span> <span class="text-red-500">*</span></label>
                             <input id="inquiryTitle" type="text" maxlength="100" placeholder="문의 제목" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
                         </div>
                         <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1">내용 <span class="text-red-500">*</span></label>
+                            <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.content_label">내용</span> <span class="text-red-500">*</span></label>
                             <textarea id="inquiryContent" rows="5" maxlength="2000" placeholder="문의 내용을 자세히 적어주세요" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
                         </div>
-                        <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i>문의 내용은 본인과 쇼핑몰 관리자만 열람 가능합니다.</p>
+                        <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i><span data-i18n="ushop.inquiry_private">문의 내용은 본인과 쇼핑몰 관리자만 열람 가능합니다.</span></p>
                     </div>
                     <div class="flex gap-2 mt-4">
-                        <button onclick="closeInquiryModal()" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium text-gray-700">취소</button>
-                        <button onclick="submitInquiry()" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-bold"><i class="fas fa-paper-plane mr-1"></i>문의 등록</button>
+                        <button onclick="closeInquiryModal()" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium text-gray-700" data-i18n="common.cancel">취소</button>
+                        <button onclick="submitInquiry()" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-bold"><i class="fas fa-paper-plane mr-1"></i><span data-i18n="ushop.submit_inquiry">문의 등록</span></button>
                     </div>
                 </div>
             </div>
@@ -23736,12 +23736,12 @@ app.get('/dashboard', (c) => {
             <div id="myInquiriesModal" class="fixed inset-0 bg-black/50 z-[100] hidden items-center justify-center p-4">
                 <div class="bg-white rounded-xl shadow-2xl max-w-2xl w-full p-5 max-h-[85vh] flex flex-col">
                     <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clipboard-list text-blue-600 mr-2"></i>내 문의 내역</h3>
+                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clipboard-list text-blue-600 mr-2"></i><span data-i18n="ushop.my_inquiry_list">내 문의 내역</span></h3>
                         <button onclick="closeMyInquiriesModal()" class="text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
                     </div>
-                    <p class="text-[11px] text-gray-500 mb-3"><i class="fas fa-lock mr-1"></i>본인이 작성한 문의만 표시됩니다.</p>
+                    <p class="text-[11px] text-gray-500 mb-3"><i class="fas fa-lock mr-1"></i><span data-i18n="ushop.my_inquiry_only">본인이 작성한 문의만 표시됩니다.</span></p>
                     <div id="myInquiriesList" class="space-y-2 overflow-y-auto flex-1">
-                        <p class="text-center text-gray-400 text-sm py-8">불러오는 중...</p>
+                        <p class="text-center text-gray-400 text-sm py-8" data-i18n="ushop.loading">불러오는 중...</p>
                     </div>
                 </div>
             </div>
@@ -23751,15 +23751,15 @@ app.get('/dashboard', (c) => {
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6">
                     <div class="flex items-center justify-between mb-4">
                         <h2 class="text-xl sm:text-2xl font-bold text-gray-800">
-                            <i class="fas fa-bullhorn mr-2 text-blue-600"></i>공지사항
+                            <i class="fas fa-bullhorn mr-2 text-blue-600"></i><span data-i18n="unav.notice">공지사항</span>
                         </h2>
                         <button onclick="loadNotices()" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700">
-                            <i class="fas fa-sync-alt mr-1"></i>새로고침
+                            <i class="fas fa-sync-alt mr-1"></i><span data-i18n="ushop.refresh">새로고침</span>
                         </button>
                     </div>
-                    <p class="text-xs text-gray-500 mb-4"><i class="fas fa-info-circle mr-1"></i>중요 공지는 상단에 고정 표시됩니다. 항목을 클릭하면 전체 내용을 확인할 수 있습니다.</p>
+                    <p class="text-xs text-gray-500 mb-4"><i class="fas fa-info-circle mr-1"></i><span data-i18n="unotice.important_pinned">중요 공지는 상단에 고정 표시됩니다. 항목을 클릭하면 전체 내용을 확인할 수 있습니다.</span></p>
                     <div id="noticeList" class="space-y-2">
-                        <p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-bullhorn text-3xl text-gray-200 mb-2 block"></i>공지사항을 불러오는 중...</p>
+                        <p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-bullhorn text-3xl text-gray-200 mb-2 block"></i><span data-i18n="unotice.loading">공지사항을 불러오는 중...</span></p>
                     </div>
                 </div>
             </div>
@@ -23774,14 +23774,14 @@ app.get('/dashboard', (c) => {
                 </div>
                 <div class="px-4 py-2 border-b bg-gray-50 flex items-center gap-2 text-[11px] text-gray-500">
                     <span id="noticeDetailDate"></span>
-                    <span id="noticeDetailPin" class="hidden px-1.5 py-0.5 bg-red-100 text-red-700 rounded font-bold">중요</span>
+                    <span id="noticeDetailPin" class="hidden px-1.5 py-0.5 bg-red-100 text-red-700 rounded font-bold" data-i18n="unotice.important">중요</span>
                 </div>
                 <div id="noticeDetailContent" class="flex-1 overflow-y-auto p-4 text-sm text-gray-700 whitespace-pre-wrap break-words"></div>
             </div>
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja"></script>
+        <script src="/static/i18n.js?v=20260616ja2"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24297,7 +24297,7 @@ app.get('/dashboard', (c) => {
             function renderShopProducts(products) {
                 var el = document.getElementById('shopProductList');
                 if (products.length === 0) {
-                    el.innerHTML = '<p class="col-span-2 sm:col-span-3 lg:col-span-4 text-center text-gray-400 py-8 text-sm">등록된 상품이 없습니다</p>';
+                    el.innerHTML = '<p class="col-span-2 sm:col-span-3 lg:col-span-4 text-center text-gray-400 py-8 text-sm">' + I18N.t('ushop.no_products') + '</p>';
                     return;
                 }
                 el.innerHTML = '';
@@ -24321,14 +24321,14 @@ app.get('/dashboard', (c) => {
                         card.appendChild(ph);
                     }
                     // 텍스트 정보
-                    var stockText = p.stock === -1 ? '' : (p.stock <= 0 ? '<span class="text-red-500 text-xs font-bold">품절</span>' : '<span class="text-xs text-gray-500">재고 ' + p.stock + '</span>');
+                    var stockText = p.stock === -1 ? '' : (p.stock <= 0 ? '<span class="text-red-500 text-xs font-bold">' + I18N.t('ushop.sold_out') + '</span>' : '<span class="text-xs text-gray-500">' + I18N.t('ushop.stock') + ' ' + p.stock + '</span>');
                     var bal = currentUser ? (currentUser.qkey_balance || 0) : 0;
                     var shortageHtml = bal < priceQkey ? '<p class="text-xs text-red-500 font-bold mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>QKEY 부족 (' + (priceQkey - bal).toLocaleString() + ' 부족)</p>' : '';
                     // 옵션 HTML
                     var optsHtml = '';
-                    try { var opts=[]; if(p.options) opts=JSON.parse(p.options); optsHtml = opts.map(function(o,idx){ return '<div class="mt-1"><label class="text-xs text-gray-500">' + escapeHtml(o.name) + '</label><select id="opt_' + p.id + '_' + idx + '" class="w-full px-2 py-1 border rounded text-xs bg-white"><option value="">선택</option>' + (o.values||[]).map(function(v){ return '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; }).join('') + '</select></div>'; }).join(''); } catch(e){}
+                    try { var opts=[]; if(p.options) opts=JSON.parse(p.options); optsHtml = opts.map(function(o,idx){ return '<div class="mt-1"><label class="text-xs text-gray-500">' + escapeHtml(o.name) + '</label><select id="opt_' + p.id + '_' + idx + '" class="w-full px-2 py-1 border rounded text-xs bg-white"><option value="">' + I18N.t('ushop.select') + '</option>' + (o.values||[]).map(function(v){ return '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; }).join('') + '</select></div>'; }).join(''); } catch(e){}
                     // 상세보기 버튼
-                    var detailBtnHtml = p.detail_image_url ? '<button class="shopDetailBtn w-full mb-1 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs transition" data-pid="' + p.id + '"><i class="fas fa-search-plus mr-1"></i>상세보기</button>' : '';
+                    var detailBtnHtml = p.detail_image_url ? '<button class="shopDetailBtn w-full mb-1 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs transition" data-pid="' + p.id + '"><i class="fas fa-search-plus mr-1"></i>' + I18N.t('ushop.view_detail') + '</button>' : '';
                     var infoDiv = document.createElement('div');
                     infoDiv.innerHTML = '<h4 class="font-bold text-sm text-gray-800 truncate">' + escapeHtml(p.name) + '</h4>' +
                         '<p class="text-xs text-gray-500 truncate mb-1">' + escapeHtml((p.description||'').replace(/<[^>]*>/g,'').substring(0,80)) + '</p>' +
@@ -24358,29 +24358,29 @@ app.get('/dashboard', (c) => {
                     var orders = res.data.orders || [];
                     var el = document.getElementById('shopMyOrders');
                     if (orders.length === 0) {
-                        el.innerHTML = '<p class="text-center text-gray-400 text-sm py-4">구매 내역이 없습니다</p>';
+                        el.innerHTML = '<p class="text-center text-gray-400 text-sm py-4">' + I18N.t('ushop.no_purchase') + '</p>';
                         return;
                     }
                     el.innerHTML = orders.map(function(o) {
                         var date = new Date(o.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
-                        var statusMap = {paid:'결제완료',shipping:'배송중',delivered:'배송완료',cancelled:'취소완료'};
+                        var statusMap = {paid:I18N.t('uorder.status_paid'),shipping:I18N.t('uorder.status_shipping'),delivered:I18N.t('uorder.status_delivered'),cancelled:I18N.t('uorder.status_cancelled')};
                         var statusColor = {paid:'green',shipping:'blue',delivered:'gray',cancelled:'red'};
                         // 결제완료(paid) 상태에서만 취소 버튼 노출
                         var cancelBtn = o.status === 'paid'
-                            ? '<button onclick="cancelMyOrder(' + o.id + ', \\'' + escapeHtml(o.product_name).replace(/'/g,"\\\\'") + '\\', ' + Number(o.qkey_used) + ')" class="mt-2 w-full py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-xs font-extrabold transition shadow border-2 border-red-700"><i class="fas fa-ban mr-1"></i>구매취소</button>'
+                            ? '<button onclick="cancelMyOrder(' + o.id + ', \\'' + escapeHtml(o.product_name).replace(/'/g,"\\\\'") + '\\', ' + Number(o.qkey_used) + ')" class="mt-2 w-full py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-xs font-extrabold transition shadow border-2 border-red-700"><i class="fas fa-ban mr-1"></i>' + I18N.t('ushop.cancel_order') + '</button>'
                             : '';
                         // 취소된 주문의 경우: 취소 일시/사유/환불 정보 표시
                         var cancelInfo = '';
                         if (o.status === 'cancelled') {
                             var cDate = o.cancelled_at ? new Date(o.cancelled_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
-                            var cBy = o.cancelled_by === 'admin' ? '관리자' : (o.cancelled_by === 'user' ? '본인' : '시스템');
+                            var cBy = o.cancelled_by === 'admin' ? I18N.t('uorder.by_admin') : (o.cancelled_by === 'user' ? I18N.t('uorder.by_user') : I18N.t('uorder.by_system'));
                             var cReason = o.cancel_reason || '-';
                             cancelInfo = '<div class="mt-2 p-2 bg-red-50 border border-red-200 rounded text-[11px] text-red-700">' +
-                                '<p class="font-bold"><i class="fas fa-times-circle mr-1"></i>취소 처리됨</p>' +
-                                '<p>· 취소일시: ' + cDate + '</p>' +
-                                '<p>· 처리자: ' + cBy + '</p>' +
-                                '<p>· 사유: ' + escapeHtml(cReason) + '</p>' +
-                                '<p>· 환불: ' + Number(o.qkey_used).toLocaleString() + ' QKEY (즉시 반환됨)</p>' +
+                                '<p class="font-bold"><i class="fas fa-times-circle mr-1"></i>' + I18N.t('uorder.cancel_done') + '</p>' +
+                                '<p>· ' + I18N.t('uorder.cancel_date') + ': ' + cDate + '</p>' +
+                                '<p>· ' + I18N.t('uorder.cancel_by') + ': ' + cBy + '</p>' +
+                                '<p>· ' + I18N.t('uorder.cancel_reason') + ': ' + escapeHtml(cReason) + '</p>' +
+                                '<p>· ' + I18N.t('uorder.cancel_refund') + ': ' + Number(o.qkey_used).toLocaleString() + ' QKEY (' + I18N.t('uorder.refund_returned') + ')</p>' +
                             '</div>';
                         }
                         return '<div class="bg-gray-50 rounded-lg p-3 mb-2 ' + (o.status === 'cancelled' ? 'opacity-90' : '') + '">' +
@@ -26009,7 +26009,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja"></script>
+        <script src="/static/i18n.js?v=20260616ja2"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27015,7 +27015,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja"></script>
+        <script src="/static/i18n.js?v=20260616ja2"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
