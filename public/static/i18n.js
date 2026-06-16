@@ -1204,7 +1204,7 @@ I18N._translations['ja'] = {
   'dash.title': 'ダッシュボード - QUANTARIUM STAKING',
   'dash.purchase_transfer': 'Quantarium購入(USDT)',
   'dash.usdt_balance': 'USDT残高',
-  'dash.qta_coin': 'QTAコイン(ウォレット送金数量)',
+  'dash.qta_coin': 'QTAコイン(送金数量)',
   'dash.qx_coin': 'QXコイン',
   'dash.qkey_coin': 'QKEYコイン',
   'dash.cap_title': '手当進捗 (200%キャップ)',
