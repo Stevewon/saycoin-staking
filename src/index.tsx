@@ -53004,6 +53004,183 @@ app.get('/api/diag/fix-holiday-entrant-2pay', async (c) => {
 
 
 // ============================================================
+// ★ 사장님 영구명령 (2026-06-16) — 토요일 진입자 6/13(토) 확정분 윗라인 L1/L2 매칭 보정 ★
+//   누락 원인: fix-holiday-entrant-2pay 가 본인 daily 만 INSERT, 윗라인 L1/L2 매칭 미INSERT.
+//   영구룰(PERMANENT_RULES L1 20% / L2 10%): referee 의 그날 그 staking daily_qkey 의
+//     L1=20%, L2=10% 를 윗라인이 같은 reward_date 로 받아야 함 (휴일분도 익일처리로 함께 지급).
+//   보정 대상: reward_date=2026-06-13(토), paid_date=2026-06-15(월) 의 L1/L2 (각 6건, 총 12건)
+//   금액: round(daily_qkey * 0.20) / round(daily_qkey * 0.10)
+//   cap200 체크: 수령자 paid 합(daily+referral+direct) 이 staking cap_target(amount*2*rate) 초과분 제외
+//   이중지급 가드: (referrer,referee,referee_staking,reward_date,level) 이미 있으면 SKIP
+//
+//   경로: GET /api/diag/fix-sat-upline-matching?key=ADMIN_PW            (DRY_RUN)
+//         GET /api/diag/fix-sat-upline-matching?key=ADMIN_PW&confirm=FIX_UPLINE_613
+// ============================================================
+app.get('/api/diag/fix-sat-upline-matching', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_UPLINE_613'
+    const db = c.env.DB
+
+    const REWARD_DATE = '2026-06-13' // 토요일 확정분
+    const PAID_DATE   = '2026-06-15' // 월요일 지급
+    const CREATED_L   = '2026-06-14 23:00:00'   // daily KST 08:00 of 6/15
+    const CREATED_R   = '2026-06-14 23:00:01'   // referral 1초 늦게
+
+    // 6/13(토) 확정분 본인 daily 목록 (앞서 보정으로 reward_date=6/13 으로 정정됨)
+    const dailies = await db.prepare(`
+      SELECT dr.user_id AS referee_id, dr.staking_id, dr.usdt_amount AS daily_qkey, u.name AS referee_name
+      FROM daily_rewards dr
+      INNER JOIN staking s ON s.id = dr.staking_id
+      LEFT JOIN users u ON u.id = dr.user_id
+      WHERE dr.reward_date = ? AND dr.paid_date = ?
+        AND date(s.start_date, '+9 hours') = '2026-06-13'
+      ORDER BY dr.staking_id
+    `).bind(REWARD_DATE, PAID_DATE).all()
+    const dRows = (dailies.results || []) as any[]
+
+    const USD_TO_QKEY_LOCAL = USD_TO_QKEY
+
+    // 수령자 cap 잔여 계산 (이미 처리한 receiver 의 인메모리 누적 반영)
+    const capCache = new Map<number, { pool: number, capTarget: number }>()
+    async function capRemaining(receiverId: number): Promise<number> {
+      if (!capCache.has(receiverId)) {
+        const stk = await db.prepare(`
+          SELECT COALESCE(SUM(amount),0) AS amt FROM staking
+          WHERE user_id = ? AND status IN ('active','completed','capped')
+        `).bind(receiverId).first<any>()
+        const capTarget = Number(stk?.amt || 0) * 2 * USD_TO_QKEY_LOCAL
+        const paid = await db.prepare(`
+          SELECT COALESCE(SUM(amount),0) AS total FROM transactions
+          WHERE user_id = ? AND coin_type='QKEY'
+            AND type IN ('daily_qkey','referral_reward','direct_referral')
+        `).bind(receiverId).first<any>()
+        capCache.set(receiverId, { pool: Number(paid?.total || 0), capTarget })
+      }
+      const st = capCache.get(receiverId)!
+      return Math.max(0, st.capTarget - st.pool)
+    }
+    function capConsume(receiverId: number, amt: number) {
+      const st = capCache.get(receiverId)
+      if (st) st.pool += amt
+    }
+
+    async function referrerOf(uid: number): Promise<number | null> {
+      const r = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(uid).first<any>()
+      return r?.referrer_id ?? null
+    }
+    // 수령자가 해당 reward_date 시점 active staking 보유했는지
+    async function hasActiveStaking(uid: number, dateStr: string): Promise<boolean> {
+      const r = await db.prepare(`
+        SELECT id FROM staking
+        WHERE user_id = ? AND status IN ('active','capped','completed')
+          AND date(start_date,'+9 hours') <= date(?)
+          AND date(end_date,'+9 hours') >= date(?)
+        LIMIT 1
+      `).bind(uid, dateStr, dateStr).first<any>()
+      return !!r
+    }
+
+    const plan: any[] = []
+    const execResults: any[] = []
+
+    for (const d of dRows) {
+      const refereeId = Number(d.referee_id)
+      const stakingId = Number(d.staking_id)
+      const dq = Number(d.daily_qkey)
+      const l1 = await referrerOf(refereeId)
+      const l2 = l1 ? await referrerOf(l1) : null
+
+      for (const lv of [1, 2] as const) {
+        const receiver = lv === 1 ? l1 : l2
+        if (!receiver) continue
+        const rate = lv === 1 ? 0.20 : 0.10
+        let amount = Math.round(dq * rate)
+        if (amount <= 0) continue
+
+        // 수령자 active staking 필요 (영구룰)
+        const active = await hasActiveStaking(receiver, REWARD_DATE)
+        // 이중지급 가드
+        const dup = await db.prepare(`
+          SELECT COUNT(*) AS c FROM referral_rewards
+          WHERE referrer_id = ? AND referee_id = ? AND level = ?
+            AND (reward_date = ? OR paid_date = ?)
+            AND (staking_id = ? OR (staking_id IS NULL AND original_amount = ?))
+        `).bind(receiver, refereeId, lv, REWARD_DATE, PAID_DATE, stakingId, dq).first<any>()
+        const alreadyExists = Number(dup?.c || 0) > 0
+
+        // cap 잔여
+        const remain = await capRemaining(receiver)
+        const capped = remain <= 0
+        const payable = Math.min(amount, Math.max(0, Math.floor(remain)))
+
+        const planRow = {
+          referee_id: refereeId, referee_name: d.referee_name, staking_id: stakingId,
+          level: lv, receiver_id: receiver, daily_qkey: dq,
+          matching_amount: amount, payable, already_exists: alreadyExists,
+          no_active_staking: !active, capped,
+        }
+
+        if (!isExec) { plan.push(planRow); continue }
+
+        // EXEC
+        if (alreadyExists) { execResults.push({ ...planRow, action: 'SKIP_dup' }); continue }
+        if (!active)       { execResults.push({ ...planRow, action: 'SKIP_no_active_staking' }); continue }
+        if (payable <= 0)  { execResults.push({ ...planRow, action: 'SKIP_capped' }); continue }
+
+        // referral_rewards INSERT
+        const ins = await db.prepare(`
+          INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date, staking_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(receiver, refereeId, lv, dq, payable, REWARD_DATE, PAID_DATE, stakingId, CREATED_L).run()
+        const rrId = (ins as any)?.meta?.last_row_id ?? null
+        // 잔액 +
+        await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(payable, receiver).run()
+        // transactions INSERT (ref_id 1:1)
+        await db.prepare(`
+          INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+          VALUES (?, 'referral_reward', 'QKEY', ?, ?, ?, ?)
+        `).bind(receiver, payable, `추천 보너스 (Level ${lv})`, rrId, CREATED_R).run()
+        capConsume(receiver, payable)
+        execResults.push({ ...planRow, action: `INSERT rr#${rrId}, 잔액 +${payable}` })
+      }
+    }
+
+    if (!isExec) {
+      const totalL1 = plan.filter(p => p.level === 1).reduce((s, p) => s + p.payable, 0)
+      const totalL2 = plan.filter(p => p.level === 2).reduce((s, p) => s + p.payable, 0)
+      return c.json({
+        ok: true, mode: 'DRY_RUN',
+        rule: '토요일(6/13) 확정분 윗라인 L1 20% / L2 10% 매칭 보정 (paid 6/15)',
+        daily_count: dRows.length,
+        matching_to_insert: plan.length,
+        total_L1_qkey: totalL1, total_L2_qkey: totalL2,
+        plan,
+        confirm_token_required: 'FIX_UPLINE_613',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    const inserted = execResults.filter(r => String(r.action).startsWith('INSERT'))
+    const credited = inserted.reduce((s, r) => s + Number(r.payable || 0), 0)
+    return c.json({
+      ok: true, mode: 'EXEC',
+      processed: execResults.length,
+      inserted_count: inserted.length,
+      total_credited_qkey: credited,
+      results: execResults,
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================
 // 영구룰 #익일처리 + #정규시각 100% 준수 — 스키마 정정 + paid_date 정정
 // 사장님 명령 "나" (2026-05-19): UNIQUE INDEX 교체 (paid_date → reward_date 기반) +
 // paid_date 영구룰 #익일처리 대로 정정 + created_at 영구룰 #정규시각 대로 정정
