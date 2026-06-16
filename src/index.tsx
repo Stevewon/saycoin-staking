@@ -53293,6 +53293,17 @@ app.get('/api/diag/cron-simulate', async (c) => {
       )
       if (accrualDates.length === 0) continue
 
+      // 이 staking 의 기존 daily_rewards (staking_id, reward_date / paid_date) 집합 — 실제 cron UNIQUE 가드 반영
+      const existRows = await db.prepare(`
+        SELECT reward_date, paid_date FROM daily_rewards WHERE staking_id = ?
+      `).bind(stakingId).all()
+      const existRewardSet = new Set<string>()
+      const existPaidSet = new Set<string>()
+      for (const e of (existRows.results || []) as any[]) {
+        if (e.reward_date) existRewardSet.add(String(e.reward_date))
+        if (e.paid_date) existPaidSet.add(String(e.paid_date))
+      }
+
       // 거치기간 초과분 컷
       let processedCnt = Number(s.rewarded_count) || 0
       for (const accrualDate of accrualDates) {
@@ -53305,17 +53316,22 @@ app.get('/api/diag/cron-simulate', async (c) => {
         const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY_LOCAL)
         const accrualPaidDate = nextBusinessDayKstStr(accrualDate)
 
+        // ★ 실제 cron UNIQUE 가드 반영: 이미 같은 staking 에 reward_date 또는 paid_date 가 있으면 SKIP (재지급 안 됨)
+        const alreadyPaid = existRewardSet.has(accrualDate) || existPaidSet.has(accrualPaidDate)
+
         // 본인 cap
         const remain = await capRemain(uid)
-        const payable = Math.min(qkeyAmount, Math.max(0, Math.floor(remain)))
+        let payable = Math.min(qkeyAmount, Math.max(0, Math.floor(remain)))
         const capped = payable <= 0
+        if (alreadyPaid) payable = 0   // 이미 지급된 건은 0 (cron 도 UNIQUE 로 SKIP)
         if (payable > 0) capUse(uid, payable)
         totalDaily += payable
         dailyPlan.push({
           user_id: uid, name: nameOf(uid), staking_id: stakingId,
           reward_date: accrualDate, paid_date: accrualPaidDate,
-          qkey: qkeyAmount, payable, capped,
+          qkey: qkeyAmount, payable, capped, already_paid: alreadyPaid,
         })
+        if (alreadyPaid) continue   // 이미 지급분이면 매칭도 SKIP (cron 도 dup 가드)
 
         // 윗라인 매칭 (cron 과 동일: L1 20%, L2 10%, accrualDate 시점 active 추천인만)
         const l1 = referrerOf(uid)
