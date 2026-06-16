@@ -53222,7 +53222,32 @@ app.get('/api/diag/cron-simulate', async (c) => {
         AND date(s.start_date, '+9 hours') <= date(?)
       ORDER BY s.id ASC
     `).bind(yesterdayKst, yesterdayKst).all()
-    const rows = (activeStakings.results || []) as any[]
+    let rows = (activeStakings.results || []) as any[]
+
+    // 특정 진입일/유저만 필터 (성능 + 핀포인트 검증)
+    const onlyEntry = c.req.query('only_entry_date') || ''   // 예: 2026-06-13 진입자만
+    const onlyUserQ = c.req.query('only_user') || ''
+    if (onlyEntry) rows = rows.filter(r => String(r.start_date_kst) === onlyEntry)
+    if (onlyUserQ) {
+      const ids = onlyUserQ.split(',').map(x => parseInt(x.trim())).filter(Boolean)
+      rows = rows.filter(r => ids.includes(Number(r.user_id)))
+    }
+
+    // ── N+1 제거: 전 유저 name/referrer 일괄 프리로드 ──
+    const userMap = new Map<number, { name: string, referrer_id: number | null }>()
+    const allUsers = await db.prepare(`SELECT id, name, referrer_id FROM users`).all()
+    for (const u of (allUsers.results || []) as any[]) {
+      userMap.set(Number(u.id), { name: u.name || `u${u.id}`, referrer_id: u.referrer_id ?? null })
+    }
+    // 활성 staking 보유 유저 집합 (reward_date 무관 근사 — 시뮬 검증용)
+    const activeStakingUserSet = new Set<number>()
+    const actStkUsers = await db.prepare(`
+      SELECT DISTINCT user_id FROM staking
+      WHERE status IN ('active','capped','completed')
+        AND date(start_date,'+9 hours') <= date(?)
+        AND date(end_date,'+9 hours') >= date(?)
+    `).bind(yesterdayKst, yesterdayKst).all()
+    for (const u of (actStkUsers.results || []) as any[]) activeStakingUserSet.add(Number(u.user_id))
 
     // 본인 cap 잔여 (paid pool 기반, FIFO 근사 — 시뮬이므로 user 합산 cap 으로 충분)
     const capCache = new Map<number, { pool: number, capTarget: number }>()
@@ -53245,29 +53270,9 @@ app.get('/api/diag/cron-simulate', async (c) => {
     async function capRemain(uid: number) { const s = await loadCap(uid); return Math.max(0, s.capTarget - s.pool) }
     function capUse(uid: number, amt: number) { const s = capCache.get(uid); if (s) s.pool += amt }
 
-    async function referrerOf(uid: number): Promise<number | null> {
-      const r = await db.prepare(`SELECT referrer_id FROM users WHERE id = ?`).bind(uid).first<any>()
-      return r?.referrer_id ?? null
-    }
-    async function nameOf(uid: number): Promise<string> {
-      const r = await db.prepare(`SELECT name FROM users WHERE id = ?`).bind(uid).first<any>()
-      return r?.name || `u${uid}`
-    }
-    async function hasActiveStaking(uid: number, dateStr: string): Promise<boolean> {
-      const r = await db.prepare(`
-        SELECT id FROM staking
-        WHERE user_id = ? AND status IN ('active','capped','completed')
-          AND date(start_date,'+9 hours') <= date(?)
-          AND date(end_date,'+9 hours') >= date(?)
-        LIMIT 1
-      `).bind(uid, dateStr, dateStr).first<any>()
-      return !!r
-    }
-    // 일일배당 rate (cron 과 동일 차등)
-    function dailyRateFor(amount: number): number {
-      // cron 의 daily_rate 컬럼 우선, 없으면 금액별 기본률
-      return 0 // placeholder — 실제 계산은 staking.daily_rate 사용
-    }
+    function referrerOf(uid: number): number | null { return userMap.get(uid)?.referrer_id ?? null }
+    function nameOf(uid: number): string { return userMap.get(uid)?.name || `u${uid}` }
+    function hasActiveStaking(uid: number): boolean { return activeStakingUserSet.has(uid) }
 
     const dailyPlan: any[] = []
     const matchingPlan: any[] = []
@@ -53307,23 +53312,23 @@ app.get('/api/diag/cron-simulate', async (c) => {
         if (payable > 0) capUse(uid, payable)
         totalDaily += payable
         dailyPlan.push({
-          user_id: uid, name: await nameOf(uid), staking_id: stakingId,
+          user_id: uid, name: nameOf(uid), staking_id: stakingId,
           reward_date: accrualDate, paid_date: accrualPaidDate,
           qkey: qkeyAmount, payable, capped,
         })
 
         // 윗라인 매칭 (cron 과 동일: L1 20%, L2 10%, accrualDate 시점 active 추천인만)
-        const l1 = await referrerOf(uid)
-        const l2 = l1 ? await referrerOf(l1) : null
+        const l1 = referrerOf(uid)
+        const l2 = l1 ? referrerOf(l1) : null
         for (const lv of [1, 2] as const) {
           const receiver = lv === 1 ? l1 : l2
           if (!receiver) continue
           const mrate = lv === 1 ? 0.20 : 0.10
           const matchAmt = Math.round(qkeyAmount * mrate)
           if (matchAmt <= 0) continue
-          const active = await hasActiveStaking(receiver, accrualDate)
+          const active = hasActiveStaking(receiver)
           if (!active) {
-            matchingPlan.push({ from_user: uid, level: lv, receiver_id: receiver, receiver_name: await nameOf(receiver), reward_date: accrualDate, paid_date: accrualPaidDate, match_amount: matchAmt, payable: 0, skip: 'no_active_staking' })
+            matchingPlan.push({ from_user: uid, level: lv, receiver_id: receiver, receiver_name: nameOf(receiver), reward_date: accrualDate, paid_date: accrualPaidDate, match_amount: matchAmt, payable: 0, skip: 'no_active_staking' })
             continue
           }
           const mr = await capRemain(receiver)
@@ -53331,7 +53336,7 @@ app.get('/api/diag/cron-simulate', async (c) => {
           if (mpay > 0) capUse(receiver, mpay)
           totalMatch += mpay
           matchingPlan.push({
-            from_user: uid, level: lv, receiver_id: receiver, receiver_name: await nameOf(receiver),
+            from_user: uid, level: lv, receiver_id: receiver, receiver_name: nameOf(receiver),
             reward_date: accrualDate, paid_date: accrualPaidDate,
             match_amount: matchAmt, payable: mpay, capped: mpay <= 0,
           })
