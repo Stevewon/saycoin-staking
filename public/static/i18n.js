@@ -7,6 +7,21 @@ const I18N = {
   _currentLang: 'ko',
   _translations: {},
   _isKoreaIP: false,
+  _previewMode: false,   // 보스 검수용: 한국 IP에서도 언어 강제 보기 (?lang=xx&force=1 또는 ?preview=xx)
+
+  // URL 쿼리스트링에서 강제 언어 미리보기 파라미터 파싱
+  _getForcedLang() {
+    try {
+      var qs = new URLSearchParams(window.location.search);
+      // 방식1) ?preview=ja  /  방식2) ?lang=ja&force=1
+      var preview = qs.get('preview');
+      if (preview && this._translations[preview]) return preview;
+      var lang = qs.get('lang');
+      var force = qs.get('force');
+      if (lang && force && this._translations[lang]) return lang;
+    } catch (e) {}
+    return null;
+  },
 
   // Get current language
   getLang() {
@@ -20,8 +35,8 @@ const I18N = {
 
   // Set language and apply
   setLang(lang) {
-    // 한국 IP에서는 한국어 외 변경 불가
-    if (this._isKoreaIP) lang = 'ko';
+    // 한국 IP에서는 한국어 외 변경 불가 (단, 보스 검수 미리보기 모드는 예외)
+    if (this._isKoreaIP && !this._previewMode) lang = 'ko';
     if (!this._translations[lang]) lang = 'ko';
     this._currentLang = lang;
     localStorage.setItem('quantarium_lang', lang);
@@ -51,6 +66,19 @@ const I18N = {
     const countryMeta = document.querySelector('meta[name="user-country"]');
     const userCountry = countryMeta ? countryMeta.getAttribute('content').toUpperCase() : '';
     this._isKoreaIP = (userCountry === 'KR');
+
+    // ★ 보스 검수용 강제 미리보기: ?lang=ja&force=1 또는 ?preview=ja
+    //   → 한국 IP라도 해당 언어로 강제 표시 + 언어 선택기 노출 (실유저 정책은 영향 없음)
+    const forced = this._getForcedLang();
+    if (forced) {
+      this._previewMode = true;
+      this._isKoreaIP = false;   // 미리보기 동안만 한국 IP 잠금 해제
+      this._currentLang = forced;
+      localStorage.setItem('quantarium_lang', forced);
+      document.documentElement.lang = this._currentLang;
+      this.applyAll();
+      return;
+    }
 
     if (this._isKoreaIP) {
       // 한국 IP: 무조건 한국어, localStorage도 강제 (기존 정책 유지)
@@ -123,8 +151,8 @@ function createLangSelector(containerId) {
   const container = document.getElementById(containerId);
   if (!container) return;
 
-  // 한국 IP에서는 언어 선택기 완전히 숨김
-  if (I18N.isKoreaIP()) {
+  // 한국 IP에서는 언어 선택기 완전히 숨김 (단, 보스 검수 미리보기 모드는 노출)
+  if (I18N.isKoreaIP() && !I18N._previewMode) {
     container.innerHTML = '';
     container.style.display = 'none';
     return;
@@ -720,6 +748,90 @@ I18N._translations['ko'] = {
   'uorder.by_user': '본인',
   'uorder.by_system': '시스템',
   'uorder.refund_returned': '즉시 반환됨',
+  'uwd.history_title': '출금 신청 내역',
+  'ucommon.refresh': '새로고침',
+  'ushop.inquiry_title_ph': '문의 제목',
+  'ushop.inquiry_content_ph': '문의 내용을 자세히 적어주세요',
+  'ushop.shortage': 'QKEY 부족',
+  'ushop.shortage_suffix': '부족',
+  'ushop.won': '원',
+  'ushop.buy_now': '구매하기',
+  'ushop.price_label': '가격',
+  'ushop.stock_count_suffix': '개',
+  'unotice.load_fail': '공지사항을 불러올 수 없습니다',
+  'uinquiry.login_required': '로그인이 필요합니다',
+  'uinquiry.none': '없음',
+  'uinquiry.loading': '불러오는 중...',
+  'uinquiry.query_failed': '조회 실패',
+  'uinquiry.none_registered': '등록된 문의가 없습니다',
+  'uinquiry.answered': '답변완료',
+  'uinquiry.answer_pending': '답변대기',
+  'uinquiry.admin_reply': '관리자 답변',
+  'uinquiry.order_no': '주문',
+  'uinquiry.query_error': '조회 중 오류가 발생했습니다',
+  'uinquiry.cat_shipping': '배송',
+  'uinquiry.cat_refund': '환불',
+  'uinquiry.cat_other': '기타',
+  'uinquiry.select_type': '문의 유형(배송/환불/기타)을 선택해주세요',
+  'uinquiry.enter_title': '제목을 입력해주세요',
+  'uinquiry.enter_content': '문의 내용을 입력해주세요',
+  'uinquiry.submitted': '문의가 등록되었습니다',
+  'uinquiry.submit_failed': '문의 등록 실패',
+  'uinquiry.submit_error': '문의 등록 중 오류가 발생했습니다',
+  'uorder.cancel_confirm_pre': '정말 [',
+  'uorder.cancel_confirm_mid': '] 주문을 취소하시겠습니까?',
+  'uorder.cancel_confirm_refund': '취소 시',
+  'uorder.cancel_confirm_refund_suffix': 'QKEY가 즉시 환불됩니다.',
+  'uorder.cancel_confirm_note': '(배송중/배송완료 상태는 취소 불가)',
+  'uorder.cancel_success': '구매가 취소되었습니다.',
+  'uorder.cancel_failed': '취소 처리 실패',
+  'uorder.cancel_error': '취소 처리 중 오류가 발생했습니다',
+  'ubuy.insufficient_title': '❌ QKEY 잔액이 부족합니다!',
+  'ubuy.product_price': '상품가격',
+  'ubuy.my_balance': '보유 잔액',
+  'ubuy.shortage_amount': '부족 금액',
+  'ubuy.insufficient_guide': 'QKEY를 충전하거나 스테이킹 배당으로 적립 후 다시 시도해주세요.',
+  'ubuy.select_option_suffix': '을(를) 선택해주세요.',
+  'ubuy.selected_option': '선택옵션',
+  'ubuy.balance_after': '결제 후 잔액',
+  'ubuy.confirm_buy': '구매하시겠습니까?',
+  'ubuy.recipient_name': '수령인 이름:',
+  'ubuy.contact': '연락처:',
+  'ubuy.shipping_address': '배송주소:',
+  'ubuy.shipping_memo': '배송메모 (선택):',
+  'ubuy.error': '구매 처리 중 오류',
+  'urewards.recover_dividend': '배당금 회수',
+  'urewards.recover_reward': '성과금 회수',
+  'urewards.recover_restore': '회수 복구',
+  'urewards.admin_increase': '▲ 어드민 증액',
+  'urewards.admin_decrease': '▼ 어드민 차감',
+  'urewards.change': '변동',
+  'urewards.before': '이전',
+  'urewards.after': '이후',
+  'urewards.reason': '사유',
+  'urewards.load_complete': '전체 로드 완료',
+  'urewards.loading': '불러오는 중...',
+  'uwd.no_history2': '출금 신청 내역이 없습니다',
+  'uwd.status_pending': '처리대기',
+  'uwd.status_approved': '승인완료',
+  'uwd.status_rejected': '거절됨',
+  'uwd.status_cancelled': '취소됨',
+  'uwd.cancel_btn': '출금 신청 취소',
+  'uwd.cancel_confirm': '이 출금 신청을 취소하시겠습니까?',
+  'uwd.cancel_coin': '코인',
+  'uwd.cancel_amount': '금액',
+  'uwd.cancel_refund': '즉시 환불됩니다.',
+  'uwd.cancelled_success': '출금 신청이 취소되었습니다.',
+  'uwd.cancelled_by_admin': '관리자',
+  'uwd.cancelled_by_user': '본인',
+  'uwd.cancelled_by_system': '시스템',
+  'uwd.refund_done': '환불완료',
+  'uwd.apply_date': '신청일',
+  'uwd.wallet': '지갑',
+  'uwd.next_date': '다음 출금 신청일',
+  'uwd.cancel_processing_fail': '취소 처리 실패',
+  'uwd.load_fail': '출금 내역을 불러올 수 없습니다',
+  'uswap.min_withdraw_note': '출금은 100 USDT 이상',
 
 };
 
@@ -1573,6 +1685,90 @@ I18N._translations['ja'] = {
   'uorder.by_user': 'ご本人',
   'uorder.by_system': 'システム',
   'uorder.refund_returned': '即時返金されました',
+  'uwd.history_title': '出金申請履歴',
+  'ucommon.refresh': '更新',
+  'ushop.inquiry_title_ph': 'お問い合わせ件名',
+  'ushop.inquiry_content_ph': 'お問い合わせ内容を詳しくご記入ください',
+  'ushop.shortage': 'QKEY不足',
+  'ushop.shortage_suffix': '不足',
+  'ushop.won': 'ウォン',
+  'ushop.buy_now': '購入する',
+  'ushop.price_label': '価格',
+  'ushop.stock_count_suffix': '個',
+  'unotice.load_fail': 'お知らせを読み込めませんでした',
+  'uinquiry.login_required': 'ログインが必要です',
+  'uinquiry.none': 'なし',
+  'uinquiry.loading': '読み込み中...',
+  'uinquiry.query_failed': '照会失敗',
+  'uinquiry.none_registered': '登録されたお問い合わせがありません',
+  'uinquiry.answered': '回答完了',
+  'uinquiry.answer_pending': '回答待ち',
+  'uinquiry.admin_reply': '管理者の回答',
+  'uinquiry.order_no': '注文',
+  'uinquiry.query_error': '照会中にエラーが発生しました',
+  'uinquiry.cat_shipping': '配送',
+  'uinquiry.cat_refund': '返金',
+  'uinquiry.cat_other': 'その他',
+  'uinquiry.select_type': 'お問い合わせ種別（配送/返金/その他）を選択してください',
+  'uinquiry.enter_title': '件名を入力してください',
+  'uinquiry.enter_content': 'お問い合わせ内容を入力してください',
+  'uinquiry.submitted': 'お問い合わせが登録されました',
+  'uinquiry.submit_failed': 'お問い合わせ登録失敗',
+  'uinquiry.submit_error': 'お問い合わせ登録中にエラーが発生しました',
+  'uorder.cancel_confirm_pre': '本当に [',
+  'uorder.cancel_confirm_mid': '] の注文をキャンセルしますか?',
+  'uorder.cancel_confirm_refund': 'キャンセル時',
+  'uorder.cancel_confirm_refund_suffix': 'QKEYが即時返金されます。',
+  'uorder.cancel_confirm_note': '(配送中/配送完了の状態はキャンセル不可)',
+  'uorder.cancel_success': '購入がキャンセルされました。',
+  'uorder.cancel_failed': 'キャンセル処理失敗',
+  'uorder.cancel_error': 'キャンセル処理中にエラーが発生しました',
+  'ubuy.insufficient_title': '❌ QKEY残高が不足しています!',
+  'ubuy.product_price': '商品価格',
+  'ubuy.my_balance': '保有残高',
+  'ubuy.shortage_amount': '不足金額',
+  'ubuy.insufficient_guide': 'QKEYをチャージするか、ステーキング配当で積立後に再度お試しください。',
+  'ubuy.select_option_suffix': 'を選択してください。',
+  'ubuy.selected_option': '選択オプション',
+  'ubuy.balance_after': '決済後の残高',
+  'ubuy.confirm_buy': '購入しますか?',
+  'ubuy.recipient_name': '受取人氏名:',
+  'ubuy.contact': '連絡先:',
+  'ubuy.shipping_address': '配送先住所:',
+  'ubuy.shipping_memo': '配送メモ (任意):',
+  'ubuy.error': '購入処理中にエラーが発生しました',
+  'urewards.recover_dividend': '配当金回収',
+  'urewards.recover_reward': '成果報酬回収',
+  'urewards.recover_restore': '回収復元',
+  'urewards.admin_increase': '▲ 管理者増額',
+  'urewards.admin_decrease': '▼ 管理者減額',
+  'urewards.change': '変動',
+  'urewards.before': '変更前',
+  'urewards.after': '変更後',
+  'urewards.reason': '事由',
+  'urewards.load_complete': '全件読み込み完了',
+  'urewards.loading': '読み込み中...',
+  'uwd.no_history2': '出金申請履歴がありません',
+  'uwd.status_pending': '処理待ち',
+  'uwd.status_approved': '承認完了',
+  'uwd.status_rejected': '却下',
+  'uwd.status_cancelled': 'キャンセル済み',
+  'uwd.cancel_btn': '出金申請キャンセル',
+  'uwd.cancel_confirm': 'この出金申請をキャンセルしますか?',
+  'uwd.cancel_coin': 'コイン',
+  'uwd.cancel_amount': '金額',
+  'uwd.cancel_refund': '即時返金されます。',
+  'uwd.cancelled_success': '出金申請がキャンセルされました。',
+  'uwd.cancelled_by_admin': '管理者',
+  'uwd.cancelled_by_user': 'ご本人',
+  'uwd.cancelled_by_system': 'システム',
+  'uwd.refund_done': '返金完了',
+  'uwd.apply_date': '申請日',
+  'uwd.wallet': 'ウォレット',
+  'uwd.next_date': '次回の出金申請日',
+  'uwd.cancel_processing_fail': 'キャンセル処理失敗',
+  'uwd.load_fail': '出金履歴を読み込めませんでした',
+  'uswap.min_withdraw_note': '出金は100 USDT以上',
 
 };
 
