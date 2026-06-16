@@ -22780,7 +22780,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja4"></script>
+        <script src="/static/i18n.js?v=20260616ja5"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23305,8 +23305,8 @@ app.get('/dashboard', (c) => {
                         </div>
                         <!-- 수량 입력 -->
                         <div class="mb-3">
-                            <label class="block text-sm font-bold text-gray-700 mb-2" id="swapQkeyInputLabel">수량 입력</label>
-                            <input type="number" id="swapQkeyAmount" min="1" placeholder="수량 입력" oninput="updateSwapPreview('qkey')"
+                            <label class="block text-sm font-bold text-gray-700 mb-2" id="swapQkeyInputLabel" data-i18n="udyn.swap_amount">수량 입력</label>
+                            <input type="number" id="swapQkeyAmount" min="1" placeholder="수량 입력" data-i18n-placeholder="udyn.swap_amount" oninput="updateSwapPreview('qkey')"
                                 class="w-full px-4 py-3 border-2 border-gray-200 rounded-lg text-sm sm:text-base focus:outline-none focus:border-indigo-500">
                         </div>
                         <!-- 미리보기 -->
@@ -23349,8 +23349,8 @@ app.get('/dashboard', (c) => {
                         </div>
                         <!-- 수량 입력 -->
                         <div class="mb-3">
-                            <label class="block text-sm font-bold text-gray-700 mb-2" id="swapUsdtInputLabel">USDT 수량 입력</label>
-                            <input type="number" id="swapUsdtAmount" min="1" placeholder="USDT 수량 입력" oninput="updateSwapPreview('usdt')"
+                            <label class="block text-sm font-bold text-gray-700 mb-2" id="swapUsdtInputLabel" data-i18n="udyn.swap_usdt_amount">USDT 수량 입력</label>
+                            <input type="number" id="swapUsdtAmount" min="1" placeholder="USDT 수량 입력" data-i18n-placeholder="udyn.swap_usdt_amount" oninput="updateSwapPreview('usdt')"
                                 class="w-full px-4 py-3 border-2 border-gray-200 rounded-lg text-sm sm:text-base focus:outline-none focus:border-green-500">
                         </div>
                         <!-- 미리보기 -->
@@ -23452,11 +23452,11 @@ app.get('/dashboard', (c) => {
                     <div class="mt-6 pt-4 border-t">
                         <div class="flex items-center justify-between mb-3">
                             <h3 class="font-bold text-gray-700 text-sm sm:text-base">
-                                <i class="fas fa-history mr-1 text-gray-500"></i>출금 신청 내역
+                                <i class="fas fa-history mr-1 text-gray-500"></i><span data-i18n="udyn.withdrawal_history">출금 신청 내역</span>
                                 <span id="withdrawHistoryCount" class="text-xs text-gray-500 font-normal ml-1"></span>
                             </h3>
                             <button onclick="loadMyWithdrawals()" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium text-gray-700">
-                                <i class="fas fa-sync-alt mr-1"></i>새로고침
+                                <i class="fas fa-sync-alt mr-1"></i><span data-i18n="udyn.refresh">새로고침</span>
                             </button>
                         </div>
                         <p class="text-xs text-gray-500 mb-2"><i class="fas fa-info-circle mr-1"></i><span data-i18n="uwd.cancel_desc">처리대기(pending) 상태에서만 취소가 가능하며, 취소 시 신청금액이 즉시 환불됩니다.</span></p>
@@ -23717,11 +23717,11 @@ app.get('/dashboard', (c) => {
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.title_label">제목</span> <span class="text-red-500">*</span></label>
-                            <input id="inquiryTitle" type="text" maxlength="100" placeholder="문의 제목" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+                            <input id="inquiryTitle" type="text" maxlength="100" placeholder="문의 제목" data-i18n-placeholder="udyn.inquiry_title_ph" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.content_label">내용</span> <span class="text-red-500">*</span></label>
-                            <textarea id="inquiryContent" rows="5" maxlength="2000" placeholder="문의 내용을 자세히 적어주세요" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
+                            <textarea id="inquiryContent" rows="5" maxlength="2000" placeholder="문의 내용을 자세히 적어주세요" data-i18n-placeholder="udyn.inquiry_content_ph" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
                         </div>
                         <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i><span data-i18n="ushop.inquiry_private">문의 내용은 본인과 쇼핑몰 관리자만 열람 가능합니다.</span></p>
                     </div>
@@ -23781,7 +23781,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja4"></script>
+        <script src="/static/i18n.js?v=20260616ja5"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -25779,29 +25779,29 @@ app.get('/dashboard', (c) => {
                                     }
                                 } else if (reward.type === 'daily_reward_rollback') {
                                     badgeClass = 'bg-red-100 text-red-700';
-                                    badgeText = '배당금 회수';
+                                    badgeText = I18N.t('udyn.badge_dividend_rollback');
                                     amountColor = 'text-red-600';
                                     amountPrefix = '';
                                 } else if (reward.type === 'referral_reward_rollback') {
                                     badgeClass = 'bg-red-100 text-red-700';
-                                    badgeText = '성과금 회수';
+                                    badgeText = I18N.t('udyn.badge_referral_rollback');
                                     amountColor = 'text-red-600';
                                     amountPrefix = '';
                                 } else if (reward.type === 'rollback_restore') {
                                     badgeClass = 'bg-teal-100 text-teal-700';
-                                    badgeText = '회수 복구';
+                                    badgeText = I18N.t('udyn.badge_rollback_restore');
                                     amountColor = 'text-teal-600';
                                     amountPrefix = '+';
                                 } else if (reward.type === 'admin_adjustment') {
                                     // ★ 어드민 잔액 보정 내역 (description 에 사유+변동량 포함)
                                     if (amt >= 0) {
                                         badgeClass = 'bg-emerald-100 text-emerald-700 border border-emerald-300';
-                                        badgeText = '▲ 어드민 증액';
+                                        badgeText = I18N.t('udyn.badge_admin_increase');
                                         amountColor = 'text-emerald-700 font-extrabold';
                                         amountPrefix = '+';
                                     } else {
                                         badgeClass = 'bg-rose-100 text-rose-700 border border-rose-300';
-                                        badgeText = '▼ 어드민 차감';
+                                        badgeText = I18N.t('udyn.badge_admin_decrease');
                                         amountColor = 'text-rose-700 font-extrabold';
                                         amountPrefix = '';
                                     }
@@ -25824,9 +25824,9 @@ app.get('/dashboard', (c) => {
                                     var deltaColor = amt >= 0 ? 'text-emerald-700' : 'text-rose-700';
                                     detailsHtml =
                                         '<div class="space-y-1">' +
-                                            (deltaTxt ? '<div class="text-xs font-extrabold ' + deltaColor + '">변동: ' + deltaTxt + '</div>' : '') +
-                                            (prevTxt && afterTxt ? '<div class="text-[11px] text-gray-700">이전 <span class="font-semibold">' + prevTxt + '</span> → 이후 <span class="font-semibold">' + afterTxt + '</span></div>' : '') +
-                                            (reasonTxt ? '<div class="text-[11px] text-gray-800 bg-yellow-50 border border-yellow-200 rounded px-1.5 py-0.5 break-words"><span class="font-semibold">사유:</span> ' + reasonTxt + '</div>' : '') +
+                                            (deltaTxt ? '<div class="text-xs font-extrabold ' + deltaColor + '">' + I18N.t('udyn.tx_change') + deltaTxt + '</div>' : '') +
+                                            (prevTxt && afterTxt ? '<div class="text-[11px] text-gray-700">' + I18N.t('udyn.tx_before') + '<span class="font-semibold">' + prevTxt + '</span> → ' + I18N.t('udyn.tx_after') + '<span class="font-semibold">' + afterTxt + '</span></div>' : '') +
+                                            (reasonTxt ? '<div class="text-[11px] text-gray-800 bg-yellow-50 border border-yellow-200 rounded px-1.5 py-0.5 break-words"><span class="font-semibold">' + I18N.t('udyn.tx_reason') + '</span> ' + reasonTxt + '</div>' : '') +
                                             (!deltaTxt && !reasonTxt ? '<div class="text-xs text-gray-700 break-words">' + rawDesc + '</div>' : '') +
                                         '</div>';
                                 } else {
@@ -25878,13 +25878,13 @@ app.get('/dashboard', (c) => {
                             if (hasMore) {
                                 paginationDiv.classList.remove('hidden');
                                 moreBtn.disabled = false;
-                                if (moreLabel) moreLabel.textContent = '더 보기';
+                                if (moreLabel) moreLabel.textContent = I18N.t('udyn.load_more');
                                 moreProgress.textContent = '(' + rewardsLoadedCount.toLocaleString() + ' / ' + rewardsTotalCount.toLocaleString() + ')';
                             } else if (rewardsTotalCount > REWARDS_PAGE_SIZE) {
                                 // 더 이상 가져올 것 없지만 전체가 한 페이지 이상이었으면 완료 표시
                                 paginationDiv.classList.remove('hidden');
                                 moreBtn.disabled = true;
-                                if (moreLabel) moreLabel.textContent = '전체 로드 완료';
+                                if (moreLabel) moreLabel.textContent = I18N.t('udyn.load_complete');
                                 moreProgress.textContent = '(' + rewardsLoadedCount.toLocaleString() + ' / ' + rewardsTotalCount.toLocaleString() + ')';
                             } else {
                                 // 한 페이지로 끝남 — 버튼 자체 숨김
@@ -25904,7 +25904,7 @@ app.get('/dashboard', (c) => {
                 var btn = document.getElementById('rewards-load-more-btn');
                 var label = document.getElementById('rewards-load-more-label');
                 if (btn) btn.disabled = true;
-                if (label) label.textContent = '불러오는 중...';
+                if (label) label.textContent = I18N.t('udyn.loading');
                 try {
                     await loadReferralRewards(true);
                 } finally {
@@ -26017,7 +26017,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja4"></script>
+        <script src="/static/i18n.js?v=20260616ja5"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27023,7 +27023,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja4"></script>
+        <script src="/static/i18n.js?v=20260616ja5"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
