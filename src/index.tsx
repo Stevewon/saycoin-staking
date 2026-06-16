@@ -53042,7 +53042,7 @@ app.get('/api/diag/fix-sat-upline-matching', async (c) => {
     `).bind(REWARD_DATE, PAID_DATE).all()
     const dRows = (dailies.results || []) as any[]
 
-    const USD_TO_QKEY_LOCAL = USD_TO_QKEY
+    const USD_TO_QKEY_LOCAL = 150
 
     // 수령자 cap 잔여 계산 (이미 처리한 receiver 의 인메모리 누적 반영)
     const capCache = new Map<number, { pool: number, capTarget: number }>()
