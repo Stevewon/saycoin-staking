@@ -5447,7 +5447,25 @@ app.post('/api/rewards/daily', async (c) => {
           //   기존: paid_date = today (cron 실행일) → backfill 시 5/8 reward 도 5/12 paid 되는 위반
           //   정정: 5/8 reward → paid=5/11, 5/11 reward → paid=5/12 처럼 reward 별 정답 paid
           //   created_at = paid_date 의 KST 08:00 (= UTC paid_date-1 23:00)
-          const accrualPaidDate = nextBusinessDayKstStr(accrualDate)
+          //
+          // ★★★ 영구명령 (2026-06-16 사장님) — 토/일/공휴일 진입자는 "첫 평일 당일" PAID ★★★
+          //   getStakingAccrualDatesKst 의 휴일진입자 강제지급분은 reward_date = firstBusinessDay(today).
+          //   이 첫 평일 강제지급 건은 nextBusinessDay 로 하루 밀면 안 되고, 그 첫 평일 당일에 지급해야 함.
+          //   판정: 첫 지급(last_reward_date 없음) + 이 staking 첫 처리분(stakingProcessed 0건)
+          //         + 진입일(start_date_kst)이 휴일 + accrualDate === today(첫 평일=cron 실행일)
+          //   → paid_date = accrualDate (당일), 그 외 일반 reward 는 기존 nextBusinessDay 유지.
+          const startKstStr = staking.start_date_kst as string
+          const startCheckObj = new Date(startKstStr + 'T00:00:00Z')
+          const startCheckUtc = new Date(startCheckObj.getTime() - 9 * 60 * 60 * 1000)
+          const startIsHoliday = !isKoreanBusinessDay(startCheckUtc).isBusinessDay
+          const isHolidayEntrantFirstPay =
+            !staking.last_reward_date &&
+            stakingProcessed.length === 0 &&
+            startIsHoliday &&
+            accrualDate === today
+          const accrualPaidDate = isHolidayEntrantFirstPay
+            ? accrualDate                       // 첫 평일 당일 지급 (사장님 영구명령 2026-06-16)
+            : nextBusinessDayKstStr(accrualDate)
           const accrualDailyCreatedAtUtc = createdAtUtcForPaidDate(accrualPaidDate, 0)
           const accrualReferralCreatedAtUtc = createdAtUtcForPaidDate(accrualPaidDate, 1)
 
@@ -52704,6 +52722,133 @@ app.get('/api/diag/fix-paid-date-holidays', async (c) => {
       ok: true,
       mode: 'EXEC',
       results,
+      balance_change: '없음',
+      duration_ms: Date.now() - t0,
+    })
+  } catch (error) {
+    return c.json({ error: String(error), duration_ms: Date.now() - t0 }, 500)
+  }
+})
+
+
+// ============================================================
+// ★ 사장님 영구명령 (2026-06-16) — 토/일/공휴일 진입자는 "첫 평일 당일"에 PAID 시작 ★
+//   위반 사례: 6/13(토) 진입자 6명 → 첫 reward_date=6/15(월) 인데 paid_date=6/16(화)
+//     (휴일진입자 강제지급분에 nextBusinessDay() 가 적용되어 첫 평일이 하루 밀림)
+//   정정: 첫 평일 강제지급분(reward_date===paid_date 직전영업일 케이스)의 paid_date 를
+//         reward_date 당일(=첫 평일)로 정정 + created_at 을 그 날 KST 08:00 으로 정정
+//   잔액 변경 0 (paid_date/created_at 만 UPDATE), 금액/건수 불변
+//
+//   경로: GET /api/diag/fix-holiday-entrant-firstpaid?key=ADMIN_PW           (DRY_RUN)
+//         GET /api/diag/fix-holiday-entrant-firstpaid?key=ADMIN_PW&confirm=FIX_FIRSTPAID_613
+// ============================================================
+app.get('/api/diag/fix-holiday-entrant-firstpaid', async (c) => {
+  const t0 = Date.now()
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+    const confirm = c.req.query('confirm') || ''
+    const isExec = confirm === 'FIX_FIRSTPAID_613'
+    const db = c.env.DB
+
+    // 정정 대상: 6/13(토) 진입자의 첫 평일 강제지급분
+    //   reward_date = 2026-06-15 (첫 평일, 월)
+    //   현재 paid_date = 2026-06-16 (화) ← 위반
+    //   정정 paid_date = 2026-06-15 (월, 첫 평일 당일)
+    //   정정 created_at = 2026-06-15 KST 08:00 = UTC '2026-06-14 23:00:00'
+    const REWARD_DATE = '2026-06-15'
+    const OLD_PAID    = '2026-06-16'
+    const NEW_PAID    = '2026-06-15'
+    const NEW_CREATED = '2026-06-14 23:00:00'  // KST 08:00 of 6/15
+
+    // 6/13(토) 진입 staking (start_date_kst = 2026-06-13) 의 daily_rewards 중
+    //   reward_date=6/15 AND paid_date=6/16 인 행만 (= 첫 평일 강제지급분)
+    const target = await db.prepare(`
+      SELECT dr.id AS dr_id, dr.user_id, dr.staking_id, dr.usdt_amount AS qkey,
+             dr.reward_date, dr.paid_date, dr.created_at,
+             u.name AS user_name
+      FROM daily_rewards dr
+      INNER JOIN staking s ON s.id = dr.staking_id
+      LEFT JOIN users u ON u.id = dr.user_id
+      WHERE dr.reward_date = ?
+        AND dr.paid_date = ?
+        AND date(s.start_date, '+9 hours') = '2026-06-13'
+      ORDER BY dr.staking_id
+    `).bind(REWARD_DATE, OLD_PAID).all()
+    const drRows = (target.results || []) as any[]
+    const drIds = drRows.map(r => Number(r.dr_id))
+
+    // 연결된 daily_qkey transactions
+    let txRows: any[] = []
+    if (drIds.length > 0) {
+      const placeholders = drIds.map(() => '?').join(',')
+      const tx = await db.prepare(`
+        SELECT id, user_id, ref_id, amount, created_at
+        FROM transactions
+        WHERE type='daily_qkey' AND ref_id IN (${placeholders})
+        ORDER BY ref_id
+      `).bind(...drIds).all()
+      txRows = (tx.results || []) as any[]
+    }
+
+    if (!isExec) {
+      return c.json({
+        ok: true,
+        mode: 'DRY_RUN',
+        rule: '토/일/공휴일 진입자는 첫 평일 당일 PAID (사장님 영구명령 2026-06-16)',
+        fix: { reward_date: REWARD_DATE, old_paid: OLD_PAID, new_paid: NEW_PAID, new_created_at: NEW_CREATED },
+        daily_rewards_to_update: drRows.length,
+        daily_rewards: drRows,
+        daily_qkey_tx_to_update: txRows.length,
+        transactions: txRows,
+        balance_change: '없음 (paid_date/created_at 만 UPDATE, 금액/건수 불변)',
+        confirm_token_required: 'FIX_FIRSTPAID_613',
+        duration_ms: Date.now() - t0,
+      })
+    }
+
+    if (drIds.length === 0) {
+      return c.json({ ok: true, mode: 'EXEC', note: '정정 대상 0건 (이미 정정됐거나 데이터 없음)', duration_ms: Date.now() - t0 })
+    }
+
+    // EXEC — paid_date/created_at 만 UPDATE (잔액/금액 불변)
+    const placeholders = drIds.map(() => '?').join(',')
+    const stmts: any[] = []
+    // 1) daily_rewards.paid_date + created_at 정정
+    stmts.push(db.prepare(`
+      UPDATE daily_rewards
+      SET paid_date = ?, created_at = ?
+      WHERE id IN (${placeholders})
+    `).bind(NEW_PAID, NEW_CREATED, ...drIds))
+    // 2) 연결된 daily_qkey transactions.created_at 정정
+    stmts.push(db.prepare(`
+      UPDATE transactions
+      SET created_at = ?
+      WHERE type='daily_qkey' AND ref_id IN (${placeholders})
+    `).bind(NEW_CREATED, ...drIds))
+
+    const res = await db.batch(stmts)
+
+    // 검증
+    const after = await db.prepare(`
+      SELECT dr.id AS dr_id, dr.user_id, dr.staking_id, dr.reward_date, dr.paid_date, dr.created_at
+      FROM daily_rewards dr
+      WHERE dr.id IN (${placeholders})
+      ORDER BY dr.staking_id
+    `).bind(...drIds).all()
+    const txAfter = await db.prepare(`
+      SELECT id, ref_id, created_at FROM transactions
+      WHERE type='daily_qkey' AND ref_id IN (${placeholders})
+      ORDER BY ref_id
+    `).bind(...drIds).all()
+
+    return c.json({
+      ok: true,
+      mode: 'EXEC',
+      updated_daily_rewards: drIds.length,
+      batch_result_count: res.length,
+      after_daily_rewards: after.results || [],
+      after_transactions: txAfter.results || [],
       balance_change: '없음',
       duration_ms: Date.now() - t0,
     })
