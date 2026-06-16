@@ -22780,7 +22780,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja3"></script>
+        <script src="/static/i18n.js?v=20260616ja4"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23781,7 +23781,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja3"></script>
+        <script src="/static/i18n.js?v=20260616ja4"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -23993,7 +23993,7 @@ app.get('/dashboard', (c) => {
                                 statusText = I18N.t('dash.status_pending');
                             } else if (isReset) {
                                 statusColor = 'gray';
-                                statusText = '리셋됨';
+                                statusText = I18N.t('udyn.status_reset');
                             } else if (s.status === 'active' && isCompleted) {
                                 statusColor = 'blue';
                                 statusText = I18N.t('dash.status_period_end');
@@ -24097,7 +24097,7 @@ app.get('/dashboard', (c) => {
                     // ★ 사장님 2026-05-15 지시: USDT 스왑 1 단위부터 허용 (출금 시점에만 최소 100 USDT 가드)
                     var label = document.getElementById('swapQkeyInputLabel');
                     if (target === 'usdt') {
-                        label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' (Min 1, 출금은 100 USDT 이상)';
+                        label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' ' + I18N.t('udyn.usdt_min_hint');
                     } else {
                         label.textContent = target.toUpperCase() + ' ' + I18N.t('dash.swap_amount_label');
                     }
@@ -24156,12 +24156,12 @@ app.get('/dashboard', (c) => {
                     var list = (res.data && res.data.notices) || [];
                     _noticesCache = list;
                     if (list.length === 0) {
-                        el.innerHTML = '<p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-bullhorn text-3xl text-gray-200 mb-2 block"></i>등록된 공지사항이 없습니다</p>';
+                        el.innerHTML = '<p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-bullhorn text-3xl text-gray-200 mb-2 block"></i>' + I18N.t('unotice.no_notice') + '</p>';
                         return;
                     }
                     el.innerHTML = list.map(function(n) {
                         var date = n.created_at ? new Date(n.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '';
-                        var pinTag = n.is_pinned ? '<span class="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-bold mr-1">중요</span>' : '';
+                        var pinTag = n.is_pinned ? '<span class="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-bold mr-1">' + I18N.t('unotice.important') + '</span>' : '';
                         var preview = String(n.content || '').replace(/<[^>]*>/g,'').substring(0,80);
                         return '<div onclick="openNoticeDetail(' + n.id + ')" class="border rounded-lg p-3 hover:bg-blue-50 cursor-pointer transition">' +
                             '<div class="flex items-center justify-between gap-2">' +
@@ -24174,7 +24174,7 @@ app.get('/dashboard', (c) => {
                         '</div>';
                     }).join('');
                 } catch(e) {
-                    el.innerHTML = '<p class="text-center text-red-400 text-sm py-8">공지사항을 불러올 수 없습니다</p>';
+                    el.innerHTML = '<p class="text-center text-red-400 text-sm py-8">' + I18N.t('unotice.load_error') + '</p>';
                 }
             }
 
@@ -24245,7 +24245,7 @@ app.get('/dashboard', (c) => {
                 if (tab === 'orders') loadMyOrders();
             }
 
-            var _currentShopCategory = '전체';
+            var _currentShopCategory = 'ALL';
 
             async function loadShopProducts() {
                 try {
@@ -24263,14 +24263,15 @@ app.get('/dashboard', (c) => {
                     // 상품 데이터를 전역에 저장
                     window._shopProducts = products;
                     // 카테고리 필터 버튼 생성
-                    var cats = ['전체'];
+                    var cats = ['ALL'];
                     products.forEach(function(p) { if (p.category && cats.indexOf(p.category) < 0) cats.push(p.category); });
                     var filterEl = document.getElementById('shopCategoryFilter');
                     if (filterEl) {
                         filterEl.innerHTML = cats.map(function(c) {
                             var active = c === _currentShopCategory;
+                            var label = (c === 'ALL') ? I18N.t('udyn.cat_all') : c;
                             return '<button onclick="filterShopCategory(\\'' + c + '\\')" class="shopCatBtn px-3 py-1 rounded-full text-xs font-bold transition ' +
-                                (active ? 'bg-pink-600 text-white' : 'bg-gray-200 text-gray-600 hover:bg-pink-100') + '">' + c + '</button>';
+                                (active ? 'bg-pink-600 text-white' : 'bg-gray-200 text-gray-600 hover:bg-pink-100') + '" data-cat="' + c + '">' + label + '</button>';
                         }).join('');
                     }
                     renderShopProducts(products);
@@ -24284,13 +24285,13 @@ app.get('/dashboard', (c) => {
                 var products = window._shopProducts || [];
                 // 필터 버튼 스타일 업데이트
                 document.querySelectorAll('.shopCatBtn').forEach(function(btn) {
-                    if (btn.textContent === cat) {
+                    if (btn.getAttribute('data-cat') === cat) {
                         btn.className = 'shopCatBtn px-3 py-1 rounded-full text-xs font-bold transition bg-pink-600 text-white';
                     } else {
                         btn.className = 'shopCatBtn px-3 py-1 rounded-full text-xs font-bold transition bg-gray-200 text-gray-600 hover:bg-pink-100';
                     }
                 });
-                var filtered = cat === '전체' ? products : products.filter(function(p) { return p.category === cat; });
+                var filtered = cat === 'ALL' ? products : products.filter(function(p) { return p.category === cat; });
                 renderShopProducts(filtered);
             }
 
@@ -24323,7 +24324,7 @@ app.get('/dashboard', (c) => {
                     // 텍스트 정보
                     var stockText = p.stock === -1 ? '' : (p.stock <= 0 ? '<span class="text-red-500 text-xs font-bold">' + I18N.t('ushop.sold_out') + '</span>' : '<span class="text-xs text-gray-500">' + I18N.t('ushop.stock') + ' ' + p.stock + '</span>');
                     var bal = currentUser ? (currentUser.qkey_balance || 0) : 0;
-                    var shortageHtml = bal < priceQkey ? '<p class="text-xs text-red-500 font-bold mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>QKEY 부족 (' + (priceQkey - bal).toLocaleString() + ' 부족)</p>' : '';
+                    var shortageHtml = bal < priceQkey ? '<p class="text-xs text-red-500 font-bold mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>' + I18N.t('udyn.qkey_short').replace('{amount}', (priceQkey - bal).toLocaleString()) + '</p>' : '';
                     // 옵션 HTML
                     var optsHtml = '';
                     try { var opts=[]; if(p.options) opts=JSON.parse(p.options); optsHtml = opts.map(function(o,idx){ return '<div class="mt-1"><label class="text-xs text-gray-500">' + escapeHtml(o.name) + '</label><select id="opt_' + p.id + '_' + idx + '" class="w-full px-2 py-1 border rounded text-xs bg-white"><option value="">' + I18N.t('ushop.select') + '</option>' + (o.values||[]).map(function(v){ return '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; }).join('') + '</select></div>'; }).join(''); } catch(e){}
@@ -24332,7 +24333,7 @@ app.get('/dashboard', (c) => {
                     var infoDiv = document.createElement('div');
                     infoDiv.innerHTML = '<h4 class="font-bold text-sm text-gray-800 truncate">' + escapeHtml(p.name) + '</h4>' +
                         '<p class="text-xs text-gray-500 truncate mb-1">' + escapeHtml((p.description||'').replace(/<[^>]*>/g,'').substring(0,80)) + '</p>' +
-                        '<p class="text-xs text-gray-600 mb-1">' + Number(p.price_krw).toLocaleString() + '원</p>' +
+                        '<p class="text-xs text-gray-600 mb-1">' + Number(p.price_krw).toLocaleString() + I18N.t('udyn.krw_won') + '</p>' +
                         '<p class="text-sm font-bold text-pink-600 mb-1">' + priceQkey.toLocaleString() + ' QKEY</p>' +
                         shortageHtml + stockText + optsHtml + detailBtnHtml;
                     card.appendChild(infoDiv);
@@ -24343,7 +24344,7 @@ app.get('/dashboard', (c) => {
                     var buyBtn = document.createElement('button');
                     buyBtn.className = 'w-full mt-2 py-3 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-extrabold transition shadow-lg border-2 border-blue-700';
                     buyBtn.style.cssText = 'display:block !important; visibility:visible !important; opacity:1 !important;';
-                    buyBtn.innerHTML = '<i class="fas fa-shopping-cart mr-2"></i>구매하기';
+                    buyBtn.innerHTML = '<i class="fas fa-shopping-cart mr-2"></i>' + I18N.t('udyn.buy_now');
                     buyBtn.onclick = (function(pid, pname, pq){ return function(){ buyProduct(pid, pname, pq); }; })(p.id, p.name, priceQkey);
                     card.appendChild(buyBtn);
                     el.appendChild(card);
@@ -24399,11 +24400,11 @@ app.get('/dashboard', (c) => {
 
             // 사용자: 내 주문 취소 (결제완료 상태에서만 가능, QKEY 자동 환불)
             async function cancelMyOrder(orderId, productName, qkeyAmount) {
-                if (!confirm('정말 [' + productName + '] 주문을 취소하시겠습니까?\\n\\n취소 시 ' + Number(qkeyAmount).toLocaleString() + ' QKEY가 즉시 환불됩니다.\\n(배송중/배송완료 상태는 취소 불가)')) return;
+                if (!confirm(I18N.t('udyn.order_cancel_confirm').replace('{name}', productName) + '\\n\\n' + I18N.t('udyn.order_cancel_refund').replace('{amount}', Number(qkeyAmount).toLocaleString()))) return;
                 try {
                     var res = await axios.post('/api/shop/order/' + orderId + '/cancel', { userId: currentUser.id });
                     if (res.data.success) {
-                        alert(res.data.message || '구매가 취소되었습니다.');
+                        alert(res.data.message || I18N.t('udyn.order_cancelled'));
                         // QKEY 잔액 갱신
                         try {
                             var balRes = await axios.get('/api/user/' + currentUser.id);
@@ -24415,23 +24416,23 @@ app.get('/dashboard', (c) => {
                         loadMyOrders();
                         loadShopProducts();
                     } else {
-                        alert(res.data.error || '취소 처리 실패');
+                        alert(res.data.error || I18N.t('udyn.cancel_fail'));
                     }
                 } catch(e) {
-                    alert((e.response && e.response.data && e.response.data.error) || '취소 처리 중 오류가 발생했습니다');
+                    alert((e.response && e.response.data && e.response.data.error) || I18N.t('udyn.cancel_error'));
                 }
             }
 
             // ========== 쇼핑몰 문의 (사용자) ==========
             function openInquiryModal() {
-                if (!currentUser || !currentUser.id) { alert('로그인이 필요합니다'); return; }
+                if (!currentUser || !currentUser.id) { alert(I18N.t('udyn.login_required')); return; }
                 // 폼 초기화
                 document.getElementById('inquiryCategory').value = '';
                 document.getElementById('inquiryTitle').value = '';
                 document.getElementById('inquiryContent').value = '';
                 // 주문 목록 옵션 채우기
                 var sel = document.getElementById('inquiryOrderId');
-                sel.innerHTML = '<option value="">없음</option>';
+                sel.innerHTML = '<option value="">' + I18N.t('udyn.opt_none') + '</option>';
                 (async function() {
                     try {
                         var res = await axios.get('/api/shop/orders/' + currentUser.id);
@@ -24457,14 +24458,14 @@ app.get('/dashboard', (c) => {
             }
 
             async function submitInquiry() {
-                if (!currentUser || !currentUser.id) { alert('로그인이 필요합니다'); return; }
+                if (!currentUser || !currentUser.id) { alert(I18N.t('udyn.login_required')); return; }
                 var category = document.getElementById('inquiryCategory').value;
                 var title = document.getElementById('inquiryTitle').value.trim();
                 var content = document.getElementById('inquiryContent').value.trim();
                 var orderId = document.getElementById('inquiryOrderId').value;
-                if (!category) { alert('문의 유형(배송/환불/기타)을 선택해주세요'); return; }
-                if (!title) { alert('제목을 입력해주세요'); return; }
-                if (!content) { alert('문의 내용을 입력해주세요'); return; }
+                if (!category) { alert(I18N.t('udyn.inquiry_type_required')); return; }
+                if (!title) { alert(I18N.t('udyn.inquiry_title_required')); return; }
+                if (!content) { alert(I18N.t('udyn.inquiry_content_required')); return; }
                 try {
                     var res = await axios.post('/api/shop/inquiry', {
                         userId: currentUser.id,
@@ -24474,44 +24475,44 @@ app.get('/dashboard', (c) => {
                         content: content
                     });
                     if (res.data.success) {
-                        alert('문의가 등록되었습니다');
+                        alert(I18N.t('udyn.inquiry_registered'));
                         closeInquiryModal();
                         loadMyInquiries();
                     } else {
-                        alert(res.data.error || '문의 등록 실패');
+                        alert(res.data.error || I18N.t('udyn.inquiry_fail'));
                     }
                 } catch(e) {
-                    alert((e.response && e.response.data && e.response.data.error) || '문의 등록 중 오류가 발생했습니다');
+                    alert((e.response && e.response.data && e.response.data.error) || I18N.t('udyn.inquiry_error'));
                 }
             }
 
             async function loadMyInquiries() {
-                if (!currentUser || !currentUser.id) { alert('로그인이 필요합니다'); return; }
+                if (!currentUser || !currentUser.id) { alert(I18N.t('udyn.login_required')); return; }
                 var m = document.getElementById('myInquiriesModal');
                 m.classList.remove('hidden');
                 m.classList.add('flex');
                 var listEl = document.getElementById('myInquiriesList');
-                listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-8">불러오는 중...</p>';
+                listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-8">' + I18N.t('udyn.loading') + '</p>';
                 try {
                     var res = await axios.get('/api/shop/inquiries/' + currentUser.id);
-                    if (!res.data.success) { listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-8">조회 실패</p>'; return; }
+                    if (!res.data.success) { listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-8">' + I18N.t('udyn.query_fail') + '</p>'; return; }
                     var items = res.data.inquiries || [];
                     if (items.length === 0) {
-                        listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-inbox text-3xl text-gray-200 mb-2 block"></i>등록된 문의가 없습니다</p>';
+                        listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-8"><i class="fas fa-inbox text-3xl text-gray-200 mb-2 block"></i>' + I18N.t('udyn.no_inquiry') + '</p>';
                         return;
                     }
-                    var catLabel = { shipping:'배송', refund:'환불', other:'기타' };
+                    var catLabel = { shipping:I18N.t('udyn.cat_shipping'), refund:I18N.t('udyn.cat_refund'), other:I18N.t('udyn.cat_other') };
                     var catColor = { shipping:'blue', refund:'orange', other:'gray' };
                     listEl.innerHTML = items.map(function(it) {
                         var date = new Date(it.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
                         var color = catColor[it.category] || 'gray';
                         var statusBadge = it.status === 'answered'
-                            ? '<span class="text-[11px] px-2 py-0.5 bg-green-100 text-green-700 rounded-full">답변완료</span>'
-                            : '<span class="text-[11px] px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">답변대기</span>';
+                            ? '<span class="text-[11px] px-2 py-0.5 bg-green-100 text-green-700 rounded-full">' + I18N.t('udyn.answered') + '</span>'
+                            : '<span class="text-[11px] px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded-full">' + I18N.t('udyn.waiting_answer') + '</span>';
                         var replyBlock = it.admin_reply
-                            ? '<div class="mt-2 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800"><p class="font-bold mb-1"><i class="fas fa-reply mr-1"></i>관리자 답변</p><p class="whitespace-pre-wrap">' + escapeHtml(it.admin_reply) + '</p>' + (it.replied_at ? '<p class="text-[10px] text-blue-500 mt-1">' + new Date(it.replied_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) + '</p>' : '') + '</div>'
+                            ? '<div class="mt-2 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800"><p class="font-bold mb-1"><i class="fas fa-reply mr-1"></i>' + I18N.t('udyn.admin_reply') + '</p><p class="whitespace-pre-wrap">' + escapeHtml(it.admin_reply) + '</p>' + (it.replied_at ? '<p class="text-[10px] text-blue-500 mt-1">' + new Date(it.replied_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) + '</p>' : '') + '</div>'
                             : '';
-                        var orderTag = it.order_id ? '<span class="text-[11px] text-gray-500 ml-2">주문 #' + it.order_id + '</span>' : '';
+                        var orderTag = it.order_id ? '<span class="text-[11px] text-gray-500 ml-2">' + I18N.t('udyn.order_no') + it.order_id + '</span>' : '';
                         return '<div class="bg-gray-50 rounded-lg p-3 border border-gray-200">' +
                             '<div class="flex items-center justify-between mb-1">' +
                                 '<div class="flex items-center gap-2">' +
@@ -24527,7 +24528,7 @@ app.get('/dashboard', (c) => {
                         '</div>';
                     }).join('');
                 } catch(e) {
-                    listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-8">조회 중 오류가 발생했습니다</p>';
+                    listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-8">' + I18N.t('udyn.query_error') + '</p>';
                 }
             }
 
@@ -24559,24 +24560,24 @@ app.get('/dashboard', (c) => {
                     var selEl = document.getElementById('opt_' + productId + '_' + oi);
                     if (selEl) {
                         var val = selEl.value;
-                        if (!val) { alert(opts[oi].name + '을(를) 선택해주세요.'); return; }
+                        if (!val) { alert(opts[oi].name + I18N.t('udyn.option_select_required')); return; }
                         selectedOptions.push(opts[oi].name + ': ' + val);
                     }
                 }
-                var optionText = selectedOptions.length > 0 ? '\\n선택옵션: ' + selectedOptions.join(', ') : '';
+                var optionText = selectedOptions.length > 0 ? '\\n' + I18N.t('udyn.selected_option') + selectedOptions.join(', ') : '';
                 if (!confirm(productName + optionText + '\\n\\n' +
-                    '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\\n' +
-                    '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\\n' +
-                    '결제 후 잔액: ' + (myQkey - priceQkey).toLocaleString() + ' QKEY\\n\\n' +
-                    '구매하시겠습니까?')) return;
+                    I18N.t('udyn.product_price') + priceQkey.toLocaleString() + ' QKEY\\n' +
+                    I18N.t('udyn.balance_held') + myQkey.toLocaleString() + ' QKEY\\n' +
+                    I18N.t('udyn.balance_after') + (myQkey - priceQkey).toLocaleString() + ' QKEY\\n\\n' +
+                    I18N.t('udyn.confirm_purchase'))) return;
 
-                var shippingName = prompt('수령인 이름:');
+                var shippingName = prompt(I18N.t('udyn.recipient_name'));
                 if (!shippingName) return;
-                var shippingPhone = prompt('연락처:');
+                var shippingPhone = prompt(I18N.t('udyn.contact'));
                 if (!shippingPhone) return;
-                var shippingAddress = prompt('배송주소:');
+                var shippingAddress = prompt(I18N.t('udyn.shipping_address'));
                 if (!shippingAddress) return;
-                var shippingMemo = prompt('배송메모 (선택):') || '';
+                var shippingMemo = prompt(I18N.t('udyn.shipping_memo')) || '';
 
                 try {
                     var res = await axios.post('/api/shop/order', {
@@ -24593,7 +24594,7 @@ app.get('/dashboard', (c) => {
                         await updateSwapBalances();
                     }
                 } catch(e) {
-                    alert(e.response?.data?.error || '구매 처리 중 오류');
+                    alert(e.response?.data?.error || I18N.t('udyn.purchase_error'));
                 }
             }
 
@@ -24624,17 +24625,17 @@ app.get('/dashboard', (c) => {
                                 '<div id="pdImgArea"></div>' +
                                 '<div id="pdDescArea" class="text-sm text-gray-600 mb-3"></div>' +
                                 '<div class="flex items-center justify-between bg-pink-50 rounded-lg p-3 mb-3">' +
-                                    '<span class="text-sm text-gray-700">가격</span>' +
-                                    '<div class="text-right"><p class="text-lg font-bold text-pink-600">' + priceQkey.toLocaleString() + ' QKEY</p><p class="text-xs text-gray-500">' + Number(p.price_krw).toLocaleString() + '원</p></div>' +
+                                    '<span class="text-sm text-gray-700">' + I18N.t('udyn.price') + '</span>' +
+                                    '<div class="text-right"><p class="text-lg font-bold text-pink-600">' + priceQkey.toLocaleString() + ' QKEY</p><p class="text-xs text-gray-500">' + Number(p.price_krw).toLocaleString() + I18N.t('udyn.krw_won') + '</p></div>' +
                                 '</div>' +
-                                (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-2">재고: ' + (p.stock <= 0 ? '<span class="text-red-500 font-bold">품절</span>' : p.stock + '개') + '</p>' : '') +
+                                (p.stock !== -1 ? '<p class="text-xs text-gray-500 mb-2">' + I18N.t('udyn.stock') + (p.stock <= 0 ? '<span class="text-red-500 font-bold">' + I18N.t('ushop.sold_out') + '</span>' : p.stock + I18N.t('ushop.unit')) + '</p>' : '') +
                             '</div>' +
                             // 푸터: 화면 하단에 절대 고정, safe-area 대응
                             '<div class="bg-white p-4 border-t sm:rounded-b-2xl flex-shrink-0 shadow-[0_-4px_12px_rgba(0,0,0,0.08)]" ' +
                                  'style="padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));">' +
                                 (p.stock === 0
-                                    ? '<button disabled class="w-full py-4 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed text-base"><i class="fas fa-times-circle mr-1"></i>품절</button>'
-                                    : '<button id="pdBuyBtn" style="display:block !important; visibility:visible !important; opacity:1 !important;" class="w-full py-5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg font-extrabold transition shadow-2xl text-lg border-2 border-blue-700"><i class="fas fa-shopping-cart mr-2"></i>구매하기 (' + priceQkey.toLocaleString() + ' QKEY)</button>') +
+                                    ? '<button disabled class="w-full py-4 bg-gray-300 text-gray-500 rounded-lg font-bold cursor-not-allowed text-base"><i class="fas fa-times-circle mr-1"></i>' + I18N.t('ushop.sold_out') + '</button>'
+                                    : '<button id="pdBuyBtn" style="display:block !important; visibility:visible !important; opacity:1 !important;" class="w-full py-5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg font-extrabold transition shadow-2xl text-lg border-2 border-blue-700"><i class="fas fa-shopping-cart mr-2"></i>' + I18N.t('udyn.buy_now') + ' (' + priceQkey.toLocaleString() + ' QKEY)</button>') +
                             '</div>' +
                         '</div>' +
                     '</div>';
@@ -24749,13 +24750,13 @@ app.get('/dashboard', (c) => {
                     var items = (res.data && res.data.withdrawals) || [];
                     if (countEl) {
                         var pendingCount = items.filter(function(w){ return w.status === 'pending'; }).length;
-                        countEl.textContent = '(' + items.length + '건' + (pendingCount > 0 ? ' / 대기 ' + pendingCount + ')' : ')');
+                        countEl.textContent = '(' + items.length + I18N.t('udyn.count_unit') + (pendingCount > 0 ? ' / ' + I18N.t('udyn.waiting') + ' ' + pendingCount + ')' : ')');
                     }
                     if (items.length === 0) {
-                        listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-4"><i class="fas fa-inbox text-2xl text-gray-200 mb-1 block"></i>출금 신청 내역이 없습니다</p>';
+                        listEl.innerHTML = '<p class="text-center text-gray-400 text-sm py-4"><i class="fas fa-inbox text-2xl text-gray-200 mb-1 block"></i>' + I18N.t('uwd.no_history') + '</p>';
                         return;
                     }
-                    var statusMap = {pending:'처리대기', approved:'승인완료', rejected:'거절됨', cancelled:'취소됨'};
+                    var statusMap = {pending:I18N.t('udyn.status_pending'), approved:I18N.t('udyn.status_approved'), rejected:I18N.t('udyn.status_rejected'), cancelled:I18N.t('udyn.status_cancelled')};
                     var statusBg = {pending:'bg-yellow-100 text-yellow-800', approved:'bg-green-100 text-green-700', rejected:'bg-red-100 text-red-700', cancelled:'bg-gray-200 text-gray-600'};
                     var coinColor = {QTA:'text-blue-600', QX:'text-purple-600', QKEY:'text-yellow-600', USDT:'text-green-600'};
                     listEl.innerHTML = items.map(function(w) {
@@ -24763,21 +24764,21 @@ app.get('/dashboard', (c) => {
                         var amountFmt = w.coin_type === 'USDT' ? Number(w.amount).toFixed(2) : Number(w.amount).toLocaleString();
                         var cancelBtn = '';
                         if (w.status === 'pending') {
-                            cancelBtn = '<button onclick="cancelMyWithdrawal(' + w.id + ', \\'' + w.coin_type + '\\', ' + Number(w.amount) + ')" class="mt-2 w-full py-1.5 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded text-xs font-extrabold transition shadow border border-red-700"><i class="fas fa-ban mr-1"></i>출금 신청 취소</button>';
+                            cancelBtn = '<button onclick="cancelMyWithdrawal(' + w.id + ', \\'' + w.coin_type + '\\', ' + Number(w.amount) + ')" class="mt-2 w-full py-1.5 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded text-xs font-extrabold transition shadow border border-red-700"><i class="fas fa-ban mr-1"></i>' + I18N.t('uwd.cancel_request') + '</button>';
                         }
                         var cancelInfo = '';
                         if (w.status === 'cancelled') {
                             var cDate = w.cancelled_at ? new Date(w.cancelled_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
-                            var cBy = w.cancelled_by === 'admin' ? '관리자' : (w.cancelled_by === 'user' ? '본인' : '시스템');
-                            cancelInfo = '<div class="mt-1 text-[11px] text-gray-500"><i class="fas fa-times-circle mr-1"></i>' + cBy + ' 취소 / ' + cDate + ' / ' + amountFmt + ' ' + w.coin_type + ' 환불완료</div>';
+                            var cBy = w.cancelled_by === 'admin' ? I18N.t('udyn.by_admin') : (w.cancelled_by === 'user' ? I18N.t('udyn.by_self') : I18N.t('udyn.by_system'));
+                            cancelInfo = '<div class="mt-1 text-[11px] text-gray-500"><i class="fas fa-times-circle mr-1"></i>' + cBy + ' ' + I18N.t('udyn.status_cancelled') + ' / ' + cDate + ' / ' + amountFmt + ' ' + w.coin_type + ' ' + I18N.t('uorder.refund_returned') + '</div>';
                         }
                         var walletShort = (w.wallet_address || '').length > 18 ? (w.wallet_address.substring(0,8) + '...' + w.wallet_address.substring(w.wallet_address.length-6)) : (w.wallet_address || '-');
                         return '<div class="bg-gray-50 rounded-lg p-3 border ' + (w.status === 'pending' ? 'border-yellow-300' : (w.status === 'cancelled' ? 'border-gray-200 opacity-90' : 'border-gray-200')) + '">' +
                                 '<div class="flex items-start justify-between gap-2">' +
                                     '<div class="flex-1 min-w-0">' +
                                         '<p class="text-sm font-bold ' + (coinColor[w.coin_type] || 'text-gray-700') + ' ' + (w.status === 'cancelled' ? 'line-through' : '') + '">' + amountFmt + ' ' + w.coin_type + '</p>' +
-                                        '<p class="text-[11px] text-gray-500 mt-0.5">신청일: ' + date + '</p>' +
-                                        '<p class="text-[11px] text-gray-500 truncate" title="' + escapeHtml(w.wallet_address || '') + '">지갑: ' + escapeHtml(walletShort) + '</p>' +
+                                        '<p class="text-[11px] text-gray-500 mt-0.5">' + I18N.t('udyn.apply_date') + date + '</p>' +
+                                        '<p class="text-[11px] text-gray-500 truncate" title="' + escapeHtml(w.wallet_address || '') + '">' + I18N.t('udyn.wallet_label') + ': ' + escapeHtml(walletShort) + '</p>' +
                                     '</div>' +
                                     '<span class="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap ' + (statusBg[w.status] || 'bg-gray-100 text-gray-700') + '">' + (statusMap[w.status] || w.status) + '</span>' +
                                 '</div>' +
@@ -24786,7 +24787,7 @@ app.get('/dashboard', (c) => {
                             '</div>';
                     }).join('');
                 } catch(e) {
-                    listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-4">출금 내역을 불러올 수 없습니다</p>';
+                    listEl.innerHTML = '<p class="text-center text-red-400 text-sm py-4">' + I18N.t('uwd.load_error') + '</p>';
                 }
             }
 
@@ -24822,11 +24823,11 @@ app.get('/dashboard', (c) => {
             // 사용자: 내 출금 신청 취소 (pending 상태에서만, 즉시 환불)
             async function cancelMyWithdrawal(withdrawalId, coinType, amount) {
                 var amountFmt = coinType === 'USDT' ? Number(amount).toFixed(2) : Number(amount).toLocaleString();
-                if (!confirm('이 출금 신청을 취소하시겠습니까?\\n\\n· 코인: ' + coinType + '\\n· 금액: ' + amountFmt + ' ' + coinType + '\\n\\n취소 시 ' + amountFmt + ' ' + coinType + '가 즉시 환불됩니다.')) return;
+                if (!confirm(I18N.t('udyn.withdrawal_cancel_confirm') + '\\n\\n· ' + I18N.t('udyn.coin_label') + coinType + '\\n· ' + I18N.t('udyn.amount_label') + amountFmt + ' ' + coinType + '\\n\\n' + I18N.t('udyn.order_cancel_refund').replace('{amount}', amountFmt + ' ' + coinType))) return;
                 try {
                     var res = await axios.post('/api/withdrawal/cancel/' + withdrawalId, { userId: currentUser.id });
                     if (res.data && res.data.success) {
-                        alert(res.data.message || '출금 신청이 취소되었습니다.');
+                        alert(res.data.message || I18N.t('udyn.withdrawal_cancelled'));
                         // 잔액 즉시 갱신 + 출금 버튼 상태 갱신
                         try {
                             var u = await axios.get('/api/user/' + currentUser.id + '?t=' + Date.now());
@@ -24843,10 +24844,10 @@ app.get('/dashboard', (c) => {
                         await updateWithdrawalBalances();
                         await loadMyWithdrawals();
                     } else {
-                        alert((res.data && res.data.error) || '취소 처리 실패');
+                        alert((res.data && res.data.error) || I18N.t('udyn.cancel_fail'));
                     }
                 } catch(e) {
-                    alert((e.response && e.response.data && e.response.data.error) || '취소 처리 중 오류가 발생했습니다');
+                    alert((e.response && e.response.data && e.response.data.error) || I18N.t('udyn.cancel_error'));
                 }
             }
             
@@ -24921,7 +24922,7 @@ app.get('/dashboard', (c) => {
                     });
                     var extraInfo = '';
                     if (_withdrawalWindowState && _withdrawalWindowState.withdrawalDate) {
-                        extraInfo = '<p class="text-[10px] sm:text-xs text-red-500 mt-1">다음 출금 신청일: ' + _withdrawalWindowState.withdrawalDate + ' (금) 10:00~14:00 KST</p>';
+                        extraInfo = '<p class="text-[10px] sm:text-xs text-red-500 mt-1">' + I18N.t('udyn.next_withdrawal_date') + _withdrawalWindowState.withdrawalDate + ' ' + I18N.t('udyn.withdrawal_window_kst') + '</p>';
                     }
                     if (notice) notice.innerHTML = '<div class="bg-red-50 border border-red-300 rounded-lg p-2 text-center"><p class="text-xs sm:text-sm text-red-700 font-medium"><i class="fas fa-lock mr-1"></i>' + I18N.t('dash.withdrawal_closed') + '</p><p class="text-[10px] sm:text-xs text-red-500 mt-1">' + I18N.t('dash.withdrawal_schedule') + '</p>' + extraInfo + '</div>';
                 }
@@ -25071,7 +25072,7 @@ app.get('/dashboard', (c) => {
 
             // 회사 지갑주소 복사 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 제거됨, 호출 시 안내만 표시 (no-op)
             function copyCompanyWallet() {
-                try { alert(I18N.t('alert.deposit_address_separate') || '입금 주소는 별도로 안내됩니다.'); } catch(e) {}
+                try { alert(I18N.t('alert.deposit_address_separate') || I18N.t('udyn.deposit_address_separate')); } catch(e) {}
             }
 
             // QR 코드 생성 — 영구룰 #입금주소-별도안내 (2026-06-04 사장님 명령): UI 제거됨, no-op
@@ -25925,15 +25926,26 @@ app.get('/dashboard', (c) => {
 
             // Language change callback
             function onLanguageChange(lang) {
-                // Re-render dynamic content
-                if (currentUser) {
-                    loadStakings();
-                    loadReferrals();
-                }
+                // 언어 변경 시 동적으로 그려진 모든 콘텐츠를 현재 언어로 다시 렌더
+                try { if (currentUser) { loadStakings(); loadReferrals(); } } catch(e) {}
+                try { if (typeof loadShopProducts === 'function') loadShopProducts(); } catch(e) {}
+                try { if (typeof loadNotices === 'function') loadNotices(); } catch(e) {}
+                try { if (typeof loadMyWithdrawals === 'function') loadMyWithdrawals(); } catch(e) {}
+                try { if (typeof loadMyOrders === 'function') loadMyOrders(); } catch(e) {}
+                // 정적 data-i18n 요소도 한번 더 적용 (안전장치)
+                try { I18N.applyAll(); } catch(e) {}
+                // 비동기 렌더가 끝난 뒤 한번 더 (깜빡임/한글 잔존 방지)
+                setTimeout(function(){ try { I18N.applyAll(); } catch(e) {} }, 400);
             }
 
             // 페이지 로드 시 실행
             loadDashboard();
+            // ★ 일본어 등 비한국어에서 동적 렌더 후 한글 잔존 방지:
+            //   초기 로드 직후 동적 콘텐츠가 다 그려질 시점에 번역을 재적용
+            if (I18N.getLang() !== 'ko') {
+                setTimeout(function(){ try { I18N.applyAll(); } catch(e) {} }, 600);
+                setTimeout(function(){ try { I18N.applyAll(); } catch(e) {} }, 1500);
+            }
         </script>
     </body>
     </html>
@@ -26005,7 +26017,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja3"></script>
+        <script src="/static/i18n.js?v=20260616ja4"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27011,7 +27023,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja3"></script>
+        <script src="/static/i18n.js?v=20260616ja4"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
@@ -29907,7 +29919,7 @@ app.get('/admin/dashboard', (c) => {
                     }
                     listEl.innerHTML = items.map(function(n) {
                         var date = n.created_at ? new Date(n.created_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}) : '-';
-                        var pinTag = n.is_pinned ? '<span class="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-bold mr-1">중요</span>' : '';
+                        var pinTag = n.is_pinned ? '<span class="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-bold mr-1">' + I18N.t('unotice.important') + '</span>' : '';
                         var statusTag = n.is_active ? '<span class="px-1.5 py-0.5 bg-green-100 text-green-700 rounded text-[10px] font-bold">게시중</span>' : '<span class="px-1.5 py-0.5 bg-gray-200 text-gray-600 rounded text-[10px] font-bold">숨김</span>';
                         var preview = String(n.content || '').replace(/<[^>]*>/g,'').substring(0,100);
                         return '<div class="border rounded-lg p-3 hover:bg-gray-50">' +
