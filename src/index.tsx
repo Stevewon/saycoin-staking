@@ -22780,7 +22780,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja2"></script>
+        <script src="/static/i18n.js?v=20260616ja3"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23781,7 +23781,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja2"></script>
+        <script src="/static/i18n.js?v=20260616ja3"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24547,11 +24547,7 @@ app.get('/dashboard', (c) => {
                 
                 if (myQkey < priceQkey) {
                     var shortage = priceQkey - myQkey;
-                    alert('❌ QKEY 잔액이 부족합니다!\\n\\n' +
-                        '상품가격: ' + priceQkey.toLocaleString() + ' QKEY\\n' +
-                        '보유 잔액: ' + myQkey.toLocaleString() + ' QKEY\\n' +
-                        '부족 금액: ' + shortage.toLocaleString() + ' QKEY\\n\\n' +
-                        'QKEY를 충전하거나 스테이킹 배당으로 적립 후 다시 시도해주세요.');
+                    alert(I18N.t('ubuy.insufficient_title') + '\n\n' + I18N.t('ubuy.product_price') + ': ' + priceQkey.toLocaleString() + ' QKEY\n' + I18N.t('ubuy.my_balance') + ': ' + myQkey.toLocaleString() + ' QKEY\n' + I18N.t('ubuy.shortage_amount') + ': ' + shortage.toLocaleString() + ' QKEY\n\n' + I18N.t('ubuy.insufficient_guide'));
                     return;
                 }
                 // 옵션 확인
@@ -26009,7 +26005,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja2"></script>
+        <script src="/static/i18n.js?v=20260616ja3"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27015,7 +27011,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ja2"></script>
+        <script src="/static/i18n.js?v=20260616ja3"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
