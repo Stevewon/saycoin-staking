@@ -9631,6 +9631,140 @@ app.post('/api/diag/backfill-may04-missing', async (c) => {
 })
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★★★ 직접판매수당 누락 백필 (2026-06-16 사장님 지시) ★★★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//   사실관계:
+//     - 안금주(108) 가 2026-06-13 매출 1,000 USD 스테이킹 승인됨.
+//     - 안금주의 직접 추천인 = 노학선(101).
+//     - 정책: 직접판매수당 = 매출원금 × 10% × 150(USD→QKEY) = 1000 × 0.10 × 150 = 15,000 QKEY.
+//     - 같은 날 오주석(110)/이두형(111) 매출 → 안금주에게 직접판매수당 15,000 QKEY 정상 지급됨.
+//     - 그러나 안금주 매출 → 노학선 직접판매수당 15,000 QKEY 가 referral_rewards/transactions 어디에도 없음 (누락).
+//   추정 원인:
+//     - staking 승인 핸들러(2876줄)는 추천인 본인이 'active 스테이킹 거치기간 내'일 때만 직접판매수당 지급.
+//       안금주 승인 시점에 노학선의 active 스테이킹 윈도(start<=오늘<=end) 판정이 빗나갔거나
+//       승인 트랜잭션 도중 직접추천수당 블록이 예외/스킵된 것으로 보임.
+//   처리:
+//     - 다른 백필 endpoint 와 동일한 EXISTS guard + ref_id 1:1 매핑 패턴.
+//     - (referrer=노학선, referee=안금주, level=0) referral_rewards 행이 이미 있으면 절대 재지급 안 함.
+//     - dry_run=1 로 먼저 검증 후 dry_run=0 으로 실지급.
+//   경로: POST /api/diag/backfill-direct-anguemju?key=ADMIN_PW&dry_run=1|0
+app.post('/api/diag/backfill-direct-anguemju', async (c) => {
+  try {
+    const key = c.req.query('key') || ''
+    if (key !== ADMIN_PW) return c.json({ error: 'unauthorized' }, 401)
+
+    const dryRun = c.req.query('dry_run') === '1'
+    const db = c.env.DB
+
+    const USD_TO_QKEY = 150
+    const REFEREE_NAME = '안금주'   // 매출 발생자 (직접 하부)
+    const REFERRER_NAME = '노학선'  // 직접판매수당 수령자 (직접 추천인)
+    const LEVEL = 0                 // 직접판매(direct_referral)
+    const REWARD_DATE = '2026-06-13'
+    const PAID_DATE = '2026-06-13'
+
+    // 1) 당사자 조회
+    const referee = await db.prepare(`SELECT id, name, email, referrer_id FROM users WHERE name = ? LIMIT 1`).bind(REFEREE_NAME).first() as any
+    const referrer = await db.prepare(`SELECT id, name, email, qkey_balance FROM users WHERE name = ? LIMIT 1`).bind(REFERRER_NAME).first() as any
+    if (!referee) return c.json({ error: `referee '${REFEREE_NAME}' not found` }, 404)
+    if (!referrer) return c.json({ error: `referrer '${REFERRER_NAME}' not found` }, 404)
+
+    const audit: any = {
+      referee: { id: referee.id, name: referee.name, email: referee.email, referrer_id: referee.referrer_id },
+      referrer: { id: referrer.id, name: referrer.name, email: referrer.email, qkey_balance_before: referrer.qkey_balance },
+      checks: {} as any,
+      steps: [] as string[]
+    }
+
+    // 2) 무결성: 안금주의 referrer_id 가 실제로 노학선인지
+    audit.checks.referrer_link_ok = Number(referee.referrer_id) === Number(referrer.id)
+    if (!audit.checks.referrer_link_ok) {
+      return c.json({ error: 'referrer link mismatch', audit }, 400)
+    }
+
+    // 3) 안금주의 매출(staking) 조회 — 직접판매 산정 기준 원금
+    const refereeStaking = await db.prepare(`
+      SELECT id, amount, status, start_date, end_date
+      FROM staking
+      WHERE user_id = ? AND status IN ('active','completed','capped')
+      ORDER BY id ASC
+    `).bind(referee.id).all()
+    const stakingRows = (refereeStaking.results || []) as any[]
+    audit.checks.referee_stakings = stakingRows.map(s => ({ id: s.id, amount: s.amount, status: s.status }))
+    const originalAmount = stakingRows.reduce((sum, s) => sum + Number(s.amount || 0), 0)
+    if (originalAmount <= 0) {
+      return c.json({ error: 'referee has no eligible staking amount', audit }, 400)
+    }
+    audit.checks.original_amount_usd = originalAmount
+
+    // 4) 기대 직접판매수당
+    const directBonusQkey = Math.round(originalAmount * 0.10 * USD_TO_QKEY)
+    audit.checks.expected_direct_qkey = directBonusQkey
+
+    // 5) EXISTS guard — 이미 (노학선, 안금주, level=0) 직접판매 행이 있으면 차단
+    const rrExists = await db.prepare(`
+      SELECT id, reward_amount, reward_date FROM referral_rewards
+      WHERE referrer_id = ? AND referee_id = ? AND level = 0
+      LIMIT 1
+    `).bind(referrer.id, referee.id).first() as any
+    audit.checks.referral_reward_exists = rrExists ? { id: rrExists.id, reward_amount: rrExists.reward_amount, reward_date: rrExists.reward_date } : null
+
+    if (rrExists) {
+      audit.skip_reason = 'already_paid (referral_rewards level=0 exists)'
+      return c.json({ success: true, dry_run: dryRun, action: 'skip', audit }, 200)
+    }
+
+    // 6) 지급 실행 (또는 dry-run)
+    if (dryRun) {
+      audit.steps.push(`[DRY] would UPDATE users(#${referrer.id}) qkey_balance += ${directBonusQkey}`)
+      audit.steps.push(`[DRY] would INSERT referral_rewards(referrer=${referrer.id}, referee=${referee.id}, level=0, original=${originalAmount}, reward=${directBonusQkey}, date=${REWARD_DATE})`)
+      audit.steps.push(`[DRY] would INSERT transactions(type='direct_referral', amount=${directBonusQkey}, ref_id=<rr_id>)`)
+      return c.json({ success: true, dry_run: true, action: 'would_pay', pay_qkey: directBonusQkey, audit })
+    }
+
+    // 잔액 증가
+    await db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`).bind(directBonusQkey, referrer.id).run()
+
+    // referral_rewards 먼저 INSERT → last_row_id 캡처 (승인 핸들러와 동일 스키마/패턴)
+    const rrIns = await db.prepare(`
+      INSERT INTO referral_rewards (referrer_id, referee_id, level, original_amount, reward_amount, reward_date, paid_date)
+      VALUES (?, ?, 0, ?, ?, ?, ?)
+    `).bind(referrer.id, referee.id, originalAmount, directBonusQkey, REWARD_DATE, PAID_DATE).run()
+    const rrId = (rrIns as any)?.meta?.last_row_id ?? null
+    audit.steps.push(`INSERT referral_rewards id=${rrId}`)
+
+    // transactions ref_id 1:1 매핑 가드
+    const txExists = await db.prepare(`
+      SELECT id FROM transactions WHERE type = 'direct_referral' AND ref_id = ? LIMIT 1
+    `).bind(rrId).first()
+    if (!txExists) {
+      await db.prepare(`
+        INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id)
+        VALUES (?, 'direct_referral', 'QKEY', ?, ?, ?)
+      `).bind(referrer.id, directBonusQkey, '직접 추천 보너스', rrId).run()
+      audit.steps.push(`INSERT transactions(direct_referral) ref_id=${rrId}`)
+    } else {
+      audit.steps.push(`transactions already exists for ref_id=${rrId} (skip tx insert)`)
+    }
+
+    const after = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(referrer.id).first() as any
+    audit.referrer.qkey_balance_after = after?.qkey_balance
+
+    return c.json({
+      success: true,
+      dry_run: false,
+      action: 'paid',
+      referral_reward_id: rrId,
+      pay_qkey: directBonusQkey,
+      audit
+    })
+  } catch (error) {
+    console.error('backfill-direct-anguemju error:', error)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 // ★★★ 5/4 백필 정밀 원상복구 (사장님 2026-05-15 긴급 지시 — 중복지급 발생, 즉시 원위치) ★★★
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //   사장님 원문: "휴일매출자들 수당지급을 수정해달라고 하니 기존매출자 매출이 중복으로 되었어
