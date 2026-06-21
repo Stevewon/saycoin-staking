@@ -2587,6 +2587,27 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
 //   - 기존 스테이킹은 staking row에 daily_rate/period_days가 고정 저장되어 영향 없음
 const POLICY_V2_DATE = new Date('2026-04-30T00:00:00+09:00')
 
+// ★★★ 사장님 지시 (2026-06-21) — 신규 진입자 수당 기준 축소 ★★★
+//   2026-06-22 00:00 KST 부터 "신규 진입한" staking 은 모든 수당/캡의 기준금액을
+//   실제 투자금액의 2/3 (= 50000/75000) 로 적용한다.
+//   적용 대상(자동 연동): 데일리 / L1·L2 매칭(데일리 기반) / 직접수당 / 200% cap
+//   예) $1,000 6/22 신규 → 데일리 750→500, 직접수당 15000→10000, cap 300000→200000
+//   ★ 절대원칙: 6/22 이전 진입 staking 은 1도 건드리지 않는다 (기존 룰 100% 유지) ★
+//   식별: staking.start_date 의 KST 날짜(start_date_kst) >= '2026-06-22' 이면 신규로 간주
+const REWARD_BASE_REDUCE_KST = '2026-06-22'  // 이 날짜(KST) 이후 진입분부터 기준 2/3
+const REWARD_BASE_REDUCE_RATIO = 2 / 3       // 50000 / 75000
+
+// staking 의 "수당/캡 기준금액" 계산
+//   - 6/22 이전 진입(start_date_kst < '2026-06-22') : amount 그대로 (기존 룰)
+//   - 6/22 이후 진입(start_date_kst >= '2026-06-22') : amount × 2/3 (신규 축소 기준)
+function getEffectiveBaseAmount(amount: number, startDateKst?: string | null): number {
+  const sdk = (startDateKst || '').slice(0, 10)
+  if (sdk && sdk >= REWARD_BASE_REDUCE_KST) {
+    return amount * REWARD_BASE_REDUCE_RATIO
+  }
+  return amount
+}
+
 // 투자금액별 일일 배당률 계산
 function getDailyRate(amount: number, asOf?: Date): number {
   const now = asOf || new Date()
@@ -2878,7 +2899,12 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
 
         if (referrerActive) {
           const USD_TO_QKEY = 150
-          const directBonusUsd = staking.amount * 0.10 // 매출의 10% (USD)
+          // ★ 사장님 지시 (2026-06-21) — 6/22 이후 신규 진입분만 직접수당 기준 2/3 ★
+          //   진입일 = 방금 승인 시점에 설정한 startDate (= 승인 당일). KST 날짜로 판별.
+          //   (6/22 이전 진입분은 staking.amount 그대로 = 직접수당 매출 10% 기존 룰 유지)
+          const approveStartKst = new Date(startDate.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+          const directBaseAmount = getEffectiveBaseAmount(staking.amount as number, approveStartKst)
+          const directBonusUsd = directBaseAmount * 0.10 // 매출의 10% (USD)
           const directBonusQkey = Math.round(directBonusUsd * USD_TO_QKEY) // QKEY로 변환
 
           await db.prepare(`
@@ -5325,7 +5351,10 @@ app.post('/api/rewards/daily', async (c) => {
       const stakings: StakingState[] = []
       for (const r of stakingRows.results as any[]) {
         const amount = Number(r.amount)
-        const capTarget = amount * 2 * USD_TO_QKEY
+        // ★ 사장님 지시 (2026-06-21) — 6/22 이후 신규 진입분만 cap 기준 2/3 ★
+        //   (6/22 이전 진입분은 amount 그대로 = 기존 200% cap 유지)
+        //   Math.round 로 부동소수점 정리 ($5,000 신규: 999999.99 → 1000000)
+        const capTarget = Math.round(getEffectiveBaseAmount(amount, String(r.start_date_kst || '')) * 2 * USD_TO_QKEY)
         const fill = Math.min(pool, capTarget)
         pool -= fill
         stakings.push({
@@ -5488,8 +5517,12 @@ app.post('/api/rewards/daily', async (c) => {
           if (exists.count > 0) continue
 
           // 금액별 차등 배당률 적용
+          //   ※ 배당률(%)은 staking 진입 당시 저장된 daily_rate 그대로 — 절대 변경 안 함
+          //   ★ 사장님 지시 (2026-06-21) — 6/22 이후 신규 진입분만 "기준금액"을 2/3 로 ★
+          //     (6/22 이전 진입분은 staking.amount 그대로 = 기존 룰 100% 유지)
           const dailyRate = staking.daily_rate || getDailyRate(staking.amount)
-          const usdAmount = staking.amount * dailyRate
+          const effBaseAmount = getEffectiveBaseAmount(staking.amount as number, staking.start_date_kst as string)
+          const usdAmount = effBaseAmount * dailyRate
           let qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
 
           // ★★★ 영구룰 #cap200정책 2️⃣ — 본 staking 도중 cap 재확인 ★★★
@@ -17849,7 +17882,8 @@ app.post('/api/admin/rewards/check-missing-by-kst', async (c) => {
 
     for (const s of missing) {
       const dailyRate = (s.daily_rate as number) || getDailyRate(s.amount as number)
-      const usdAmount = (s.amount as number) * dailyRate
+      // ★ 사장님 지시 (2026-06-21) — 6/22 이후 신규 진입분만 기준금액 2/3 (6/22 이전은 그대로)
+      const usdAmount = getEffectiveBaseAmount(s.amount as number, s.start_date_kst as string) * dailyRate
       const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
       const periodDays = (s.period_days as number) || ((s.period_months as number) * 30)
       if (Number(s.total_paid_count) >= periodDays) continue
@@ -19546,6 +19580,7 @@ app.post('/api/admin/rewards/recalc-by-kst-date', async (c) => {
       SELECT
         s.user_id, s.id as staking_id, s.amount, s.period_days, s.period_months,
         s.daily_rate, s.start_date, s.end_date, s.reset_at,
+        date(s.start_date, '+9 hours') as start_date_kst,
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id AND reward_date = ?) as already_for_date
       FROM staking s
@@ -19573,7 +19608,8 @@ app.post('/api/admin/rewards/recalc-by-kst-date', async (c) => {
         continue
       }
       const dailyRate = s.daily_rate as number
-      const usdAmount = (s.amount as number) * dailyRate
+      // ★ 사장님 지시 (2026-06-21) — 6/22 이후 신규 진입분만 기준금액 2/3 (6/22 이전은 그대로)
+      const usdAmount = getEffectiveBaseAmount(s.amount as number, s.start_date_kst as string) * dailyRate
       const qkeyAmount = Math.round(usdAmount * USD_TO_QKEY)
 
       summary.newly_added_daily.push({
