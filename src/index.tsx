@@ -2657,11 +2657,16 @@ app.post('/api/staking/create', async (c) => {
     //   ※ 즉시 적용 시점은 사장님 명령 시점인 5/22 (KST) 기준
     const PHASE2_DATE = new Date('2026-05-11T00:00:00+09:00') // 5/11~ QX·QKEY 0 (Phase2 시작)
     const PHASE3_DATE = new Date('2026-05-22T00:00:00+09:00') // 5/22~ QX 부활 (Phase3 시작)
+    // ★ QTA 지급 수량 변경 (사장님 지시 2026-06-21) ★
+    //   ~ 6/21 24:00 KST : QTA 75,000 / $1,000
+    //   6/22 00:00 KST ~ : QTA 50,000 / $1,000  (QX·QKEY 등 그 외 정책은 변동 없음)
+    const QTA_REDUCE_DATE = new Date('2026-06-22T00:00:00+09:00') // 6/22 00:00 KST 부터 50,000
     const now = new Date()
     const isPhase2 = now >= PHASE2_DATE
     const isPhase3 = now >= PHASE3_DATE
+    const qtaPer1000 = now >= QTA_REDUCE_DATE ? 50000 : 75000
 
-    const qtaReward = (amount / 1000) * 75000
+    const qtaReward = (amount / 1000) * qtaPer1000
     // QX: Phase1(~5/10) 10,000 + Phase3(5/22~) 10,000 부활 / Phase2(5/11~5/21) 만 0
     const qxReward = isPhase3 ? (amount / 1000) * 10000
                     : isPhase2 ? 0
@@ -25291,7 +25296,10 @@ app.get('/dashboard', (c) => {
                 // 보상 미리보기 (날짜별 정책: ~5/3 QTA 75k + QX 10k + QKEY 5k, 5/4~ QTA 75k only)
                 var PHASE2 = new Date('2026-05-04T00:00:00+09:00');
                 var isPhase2 = new Date() >= PHASE2;
-                var qtaReward = (accumulatedAmount / 1000) * 75000;
+                // ★ QTA 수량 변경 (2026-06-21): 6/22 00:00 KST 부터 50,000/$1,000
+                var QTA_REDUCE = new Date('2026-06-22T00:00:00+09:00');
+                var qtaPer1000 = (new Date() >= QTA_REDUCE) ? 50000 : 75000;
+                var qtaReward = (accumulatedAmount / 1000) * qtaPer1000;
                 var qxReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 10000;
                 var qkeyReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 5000;
                 document.getElementById('qtaRewardPreview').textContent = qtaReward.toLocaleString();
@@ -25328,7 +25336,10 @@ app.get('/dashboard', (c) => {
                 const policy = getPolicy(amount);
                 var _P2 = new Date('2026-05-04T00:00:00+09:00');
                 var _isP2 = new Date() >= _P2;
-                const qtaReward = (amount / 1000) * 75000;
+                // ★ QTA 수량 변경 (2026-06-21): 6/22 00:00 KST 부터 50,000/$1,000
+                var _QTA_REDUCE = new Date('2026-06-22T00:00:00+09:00');
+                var _qtaPer1000 = (new Date() >= _QTA_REDUCE) ? 50000 : 75000;
+                const qtaReward = (amount / 1000) * _qtaPer1000;
                 const qxReward = _isP2 ? 0 : (amount / 1000) * 10000;
                 const qkeyReward = _isP2 ? 0 : (amount / 1000) * 5000;
                 
