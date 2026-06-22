@@ -6030,6 +6030,124 @@ app.get('/api/admin/rewards/cron-lock-status', async (c) => {
   }
 })
 
+// ★★★★★★★★★★★★★★★★★★★★ 데일리 cron 리포트 (사장님 명령 2026-06-22) ★★★★★★★★★★★★★★★★★★★★
+//   목적: "무조건 클론이 돌면 보고를 해줘! 매일 오전에 돌리고 나서"
+//   동작: 최근 N일(기본 10일)의 각 평일에 대해
+//         지급대상(active staking, 영업일, start<=d<=end) vs 실지급(daily_rewards reward_date=d)
+//         을 자동 대조하여 누락 staking 명단을 산출.
+//         + daily_cron_lock 의 cron 완료 시각(last_finished_at) 도 함께 보고.
+//   주의: capped(=200% cap 도달 후 정상중단) staking 은 누락에서 제외 (영구룰 #cap200).
+//         토/일/공휴일은 영업일이 아니므로 점검 대상에서 자동 제외 (영구룰 #공휴일).
+//   읽기전용 (INSERT/UPDATE 절대 없음). GET /api/admin/rewards/cron-report?days=10
+app.get('/api/admin/rewards/cron-report', async (c) => {
+  try {
+    const authHeader = c.req.header('Authorization') || ''
+    if (!authHeader.startsWith('Bearer ')) {
+      return c.json({ success: false, error: '어드민 인증 필요' }, 401)
+    }
+    const token = authHeader.substring(7)
+    if (!verifyAdminToken(token)) {
+      return c.json({ success: false, error: '어드민 토큰 검증 실패' }, 401)
+    }
+
+    const db = c.env.DB
+    const daysParam = Math.max(1, Math.min(30, parseInt(c.req.query('days') || '10')))
+    const todayKst = kstDateStr(new Date())
+
+    // 점검 대상 날짜 목록 (오늘 제외, 어제부터 과거로 daysParam 일, 영업일만)
+    const checkDates: string[] = []
+    let cursor = new Date(todayKst + 'T00:00:00Z')
+    let guard = 0
+    while (checkDates.length < daysParam && guard < 60) {
+      guard++
+      cursor = new Date(cursor.getTime() - 24 * 60 * 60 * 1000)
+      const dStr = cursor.toISOString().slice(0, 10)
+      const checkDate = new Date(cursor.getTime() - 9 * 60 * 60 * 1000)
+      const { isBusinessDay } = isKoreanBusinessDay(checkDate)
+      if (isBusinessDay) checkDates.push(dStr)
+    }
+
+    // 최근 cron lock 상태
+    const recentLocks = await db.prepare(`
+      SELECT lock_date, source, locked_at, last_finished_at
+      FROM daily_cron_lock ORDER BY lock_date DESC LIMIT 14
+    `).all()
+    const lockByDate = new Map<string, any>()
+    for (const r of (recentLocks.results || []) as any[]) {
+      lockByDate.set(String(r.lock_date), r)
+    }
+
+    const report: any[] = []
+    let totalMissing = 0
+
+    for (const d of checkDates) {
+      // 지급대상: active staking, 영업일 d 에 진행 중 (start<=d<=end)
+      // capped/completed 는 정상 종료이므로 제외 — 순수 active 만 "지급되어야 할" 대상
+      const dueRows = await db.prepare(`
+        SELECT s.id AS staking_id, s.user_id, s.amount
+        FROM staking s
+        WHERE s.status = 'active'
+          AND date(s.start_date, '+9 hours') <= ?
+          AND date(s.end_date, '+9 hours') >= ?
+      `).bind(d, d).all()
+      const dueList = (dueRows.results || []) as any[]
+
+      // 실지급: daily_rewards reward_date = d
+      const paidRows = await db.prepare(`
+        SELECT DISTINCT staking_id FROM daily_rewards WHERE reward_date = ?
+      `).bind(d).all()
+      const paidSet = new Set<number>()
+      for (const r of (paidRows.results || []) as any[]) {
+        if (r.staking_id != null) paidSet.add(Number(r.staking_id))
+      }
+
+      // 누락 = 지급대상인데 daily_rewards 없는 active staking
+      const missing: any[] = []
+      for (const due of dueList) {
+        if (!paidSet.has(Number(due.staking_id))) {
+          missing.push({ staking_id: Number(due.staking_id), user_id: Number(due.user_id), amount: Number(due.amount) })
+        }
+      }
+
+      // 누락 staking 의 회원 이메일 보강
+      if (missing.length > 0) {
+        const ids = missing.map(m => m.user_id)
+        const ph = ids.map(() => '?').join(',')
+        const emailRows = await db.prepare(`SELECT id, email FROM users WHERE id IN (${ph})`).bind(...ids).all()
+        const emailById = new Map<number, string>()
+        for (const u of (emailRows.results || []) as any[]) emailById.set(Number(u.id), String(u.email))
+        for (const m of missing) m.email = emailById.get(m.user_id) || ('user#' + m.user_id)
+      }
+
+      const lock = lockByDate.get(d) || null
+      totalMissing += missing.length
+      report.push({
+        date: d,
+        due_count: dueList.length,
+        paid_count: paidSet.size,
+        missing_count: missing.length,
+        missing: missing,
+        cron_locked_at: lock ? lock.locked_at : null,
+        cron_finished_at: lock ? lock.last_finished_at : null,
+        cron_completed: !!(lock && lock.last_finished_at),
+        status: missing.length === 0 ? 'OK' : 'MISSING'
+      })
+    }
+
+    return c.json({
+      success: true,
+      generated_at_kst: kstDateStr(new Date()) + ' ' + new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(11, 19),
+      todayKst,
+      checked_business_days: checkDates.length,
+      total_missing: totalMissing,
+      overall_status: totalMissing === 0 ? 'ALL_OK' : 'HAS_MISSING',
+      report
+    })
+  } catch (error: any) {
+    return c.json({ success: false, error: error?.message || 'unknown' }, 500)
+  }
+})
+
 // ★★★★★★★★★★★★★★★★★★★★ 휴일진입자 전수 평일 누락 점검 (사장님 영구룰 #휴일진입자) ★★★★★★★★★★★★★★★★★★★★
 //   사장님 명령 (2026-05-13): "휴일진입자 현황 빨리 추출, 지급 안되었으면 즉각 지급, 상위 매칭 반영, 두번다시 잊지말것"
 //
@@ -26198,6 +26316,22 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 데일리 cron 리포트 (사장님 명령 2026-06-22: 매일 cron 후 누락 자동 점검 보고) -->
+                <div class="bg-white rounded-lg shadow-md p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-3">
+                        <div class="flex-1">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clipboard-check text-green-600 mr-2"></i>데일리 cron 리포트 (자동 누락 점검)</h3>
+                            <p class="text-sm text-gray-600 mt-1">최근 평일별 <b>지급대상 vs 실지급</b> 자동 대조. 토/일·공휴일·cap도달 자동 제외 (영구룰 준수)</p>
+                        </div>
+                        <button onclick="loadCronReport()" id="cronReportRefreshBtn"
+                            class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-xs sm:text-sm whitespace-nowrap">
+                            <i class="fas fa-sync-alt mr-1"></i>새로고침
+                        </button>
+                    </div>
+                    <div id="cronReportSummary" class="mb-3"></div>
+                    <div id="cronReportBody" class="overflow-x-auto text-sm"></div>
+                </div>
+
                 <!-- 탭 메뉴 -->
                 <div class="bg-white rounded-lg shadow-md mb-4 sm:mb-6">
                     <div class="flex border-b overflow-x-auto -webkit-overflow-scrolling-touch">
@@ -27874,6 +28008,75 @@ app.get('/admin/dashboard', (c) => {
             }
             // 어드민 페이지 로드 시 자동 실행
             try { setTimeout(loadCronLockStatus, 1500); setInterval(loadCronLockStatus, 60000); } catch(e) {}
+
+            // 데일리 cron 리포트 (사장님 명령 2026-06-22) — 최근 평일 누락 자동 점검
+            async function loadCronReport() {
+                var btn = document.getElementById('cronReportRefreshBtn');
+                if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>점검 중...'; }
+                var summaryEl = document.getElementById('cronReportSummary');
+                var bodyEl = document.getElementById('cronReportBody');
+                try {
+                    var token = localStorage.getItem('adminToken') || '';
+                    if (!token) { if (summaryEl) summaryEl.innerHTML = '<span class="text-red-600">어드민 로그인 필요</span>'; return; }
+                    var res = await axios.get('/api/admin/rewards/cron-report?days=10', {
+                        headers: { 'Authorization': 'Bearer ' + token },
+                        validateStatus: function() { return true; }
+                    });
+                    var data = res.data || {};
+                    if (!data.success) {
+                        if (summaryEl) summaryEl.innerHTML = '<span class="text-red-600">조회 실패: ' + (data.error || res.status) + '</span>';
+                        return;
+                    }
+                    // 요약 배너
+                    if (summaryEl) {
+                        if (data.overall_status === 'ALL_OK') {
+                            summaryEl.innerHTML = '<div class="px-4 py-3 bg-green-50 border border-green-300 rounded-lg text-green-800 font-bold">'
+                                + '<i class="fas fa-check-circle mr-2"></i>최근 ' + data.checked_business_days + '영업일 누락 0건 — 전원 정상 지급 ✅'
+                                + '<span class="ml-2 text-xs text-green-600 font-normal">(점검시각 ' + (data.generated_at_kst || '') + ' KST)</span></div>';
+                        } else {
+                            summaryEl.innerHTML = '<div class="px-4 py-3 bg-red-50 border border-red-400 rounded-lg text-red-800 font-bold">'
+                                + '<i class="fas fa-exclamation-triangle mr-2"></i>⚠️ 누락 총 ' + data.total_missing + '건 발견! 즉시 보정 필요'
+                                + '<span class="ml-2 text-xs text-red-600 font-normal">(점검시각 ' + (data.generated_at_kst || '') + ' KST)</span></div>';
+                        }
+                    }
+                    // 표
+                    var rows = (data.report || []).map(function(r) {
+                        var stColor = r.status === 'OK' ? 'text-green-700' : 'text-red-700 font-bold';
+                        var stIcon = r.status === 'OK' ? '✅ 정상' : '🔴 누락 ' + r.missing_count + '건';
+                        var cronCol = r.cron_completed
+                            ? '<span class="text-green-700">완료 ' + (r.cron_finished_at || '') + '</span>'
+                            : (r.cron_locked_at ? '<span class="text-yellow-700">미완료(lock만 ' + r.cron_locked_at + ')</span>' : '<span class="text-gray-400">기록없음</span>');
+                        var missDetail = '';
+                        if (r.missing_count > 0) {
+                            missDetail = '<div class="text-xs text-red-600 mt-1">'
+                                + r.missing.map(function(m){ return m.email + '(staking ' + m.staking_id + ', $' + m.amount + ')'; }).join(', ')
+                                + '</div>';
+                        }
+                        return '<tr class="border-b">'
+                            + '<td class="px-3 py-2 font-mono">' + r.date + '</td>'
+                            + '<td class="px-3 py-2 text-center">' + r.due_count + '</td>'
+                            + '<td class="px-3 py-2 text-center">' + r.paid_count + '</td>'
+                            + '<td class="px-3 py-2 ' + stColor + '">' + stIcon + missDetail + '</td>'
+                            + '<td class="px-3 py-2 text-xs">' + cronCol + '</td>'
+                            + '</tr>';
+                    }).join('');
+                    if (bodyEl) {
+                        bodyEl.innerHTML = '<table class="w-full border-collapse"><thead><tr class="bg-gray-100 text-gray-700">'
+                            + '<th class="px-3 py-2 text-left">평일(reward_date)</th>'
+                            + '<th class="px-3 py-2">지급대상</th>'
+                            + '<th class="px-3 py-2">실지급</th>'
+                            + '<th class="px-3 py-2 text-left">상태</th>'
+                            + '<th class="px-3 py-2 text-left">cron 완료시각</th>'
+                            + '</tr></thead><tbody>' + rows + '</tbody></table>';
+                    }
+                } catch(e) {
+                    if (summaryEl) summaryEl.innerHTML = '<span class="text-red-600">오류: ' + (e.message || e) + '</span>';
+                } finally {
+                    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt mr-1"></i>새로고침'; }
+                }
+            }
+            // 어드민 페이지 로드 시 cron 리포트 자동 점검
+            try { setTimeout(loadCronReport, 2000); } catch(e) {}
 
             // ============================================
             // 회원 상세 보기
