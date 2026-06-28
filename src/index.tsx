@@ -22914,7 +22914,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026062801"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23915,7 +23915,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026062801"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -26157,7 +26157,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026062801"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27179,7 +27179,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026062801"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
