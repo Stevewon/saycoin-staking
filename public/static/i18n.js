@@ -266,7 +266,7 @@ I18N._translations['ko'] = {
   'dash.qta_coin': 'QTA코인(지갑전송수량)',
   'dash.qx_coin': 'QX 코인',
   'dash.qkey_coin': 'QKEY 코인',
-  'dash.cap_title': '수당 진행률 (200% 캡)',
+  'dash.cap_title': '진행률 (200% 캡)',
   'dash.cap_paid': '누적 수령',
   'dash.cap_target': '목표',
   'dash.cap_blocked': '200% 도달 — 수당 지급이 차단되었습니다',

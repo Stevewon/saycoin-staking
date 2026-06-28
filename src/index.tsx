@@ -745,7 +745,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': '추천코드', 'csv.staking_amount': '투자금액($)', 'csv.join_date': '가입일',
     'csv.daily_total': '일일배당합계(QKEY)', 'csv.referral_total': '추천보상합계(QKEY)',
     'csv.total_reward': '총수당(QKEY)',
-    'dash.cap_title': '수당 진행률 (200% 캡)',
+    'dash.cap_title': '진행률 (200% 캡)',
     'dash.cap_paid': '누적 수령',
     'dash.cap_target': '목표',
     'dash.cap_blocked': '200% 도달 — 수당 지급이 차단되었습니다',
@@ -23275,7 +23275,7 @@ app.get('/dashboard', (c) => {
                     <div class="flex items-center justify-between mb-2 sm:mb-3">
                         <div class="flex items-center">
                             <i class="fas fa-tachometer-alt text-purple-600 mr-2"></i>
-                            <span class="text-sm sm:text-base font-bold text-gray-800" data-i18n="dash.cap_title">수당 진행률 (200% 캡)</span>
+                            <span class="text-sm sm:text-base font-bold text-gray-800" data-i18n="dash.cap_title">진행률 (200% 캡)</span>
                         </div>
                         <span id="capPercentText" class="text-sm sm:text-base font-bold text-gray-700">0.00%</span>
                     </div>
