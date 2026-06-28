@@ -23292,7 +23292,7 @@ app.get('/dashboard', (c) => {
                 <!-- Staking Section -->
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
-                        <i class="fas fa-lock mr-2 text-purple-600"></i><span data-i18n="dash.staking_title">QTA 구매 스테이킹</span>
+                        <i class="fas fa-lock mr-2 text-purple-600"></i><span data-i18n="dash.staking_title">QTA 구매 신청</span>
                     </h2>
                     <form onsubmit="handleStaking(event)" class="space-y-4">
                         <div>
@@ -23333,9 +23333,9 @@ app.get('/dashboard', (c) => {
                                 <table class="w-full text-xs sm:text-sm">
                                     <thead class="bg-gray-200">
                                         <tr>
-                                            <th class="px-2 sm:px-3 py-2 text-left text-gray-700" data-i18n="dash.investment_amount">투자금액</th>
-                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.rate">배당률</th>
-                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.period">거치기간</th>
+                                            <th class="px-2 sm:px-3 py-2 text-left text-gray-700" data-i18n="dash.investment_amount">구매금액</th>
+                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.rate">보너스율</th>
+                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.period">보너스기간</th>
                                         </tr>
                                     </thead>
                                     <tbody id="policyTableBody" class="divide-y divide-gray-200">
