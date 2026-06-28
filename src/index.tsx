@@ -23767,7 +23767,7 @@ app.get('/dashboard', (c) => {
                 <!-- My Stakings -->
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
-                        <i class="fas fa-list mr-2 text-purple-600"></i><span data-i18n="dash.my_staking_list">내 스테이킹 목록</span>
+                        <i class="fas fa-list mr-2 text-purple-600"></i><span data-i18n="dash.my_staking_list">QTA 구매 목록</span>
                     </h2>
                     <div id="stakingList" class="space-y-4">
                         <p class="text-gray-500 text-center py-8" data-i18n="common.loading">Loading...</p>
