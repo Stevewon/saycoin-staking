@@ -23397,7 +23397,7 @@ app.get('/dashboard', (c) => {
 
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-3 sm:py-4 rounded-lg font-bold text-base sm:text-lg hover:bg-purple-700 transition">
-                            <i class="fas fa-paper-plane mr-2"></i><span data-i18n="dash.staking_apply">스테이킹 신청</span>
+                            <i class="fas fa-paper-plane mr-2"></i><span data-i18n="dash.staking_apply">구매신청</span>
                         </button>
                     </form>
                 </div>
