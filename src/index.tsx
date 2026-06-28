@@ -22698,7 +22698,7 @@ app.get('/', (c) => {
                 <div class="text-center mb-6 sm:mb-8">
                     <img src="/static/quantarium-logo.png" alt="QUANTARIUM Logo" class="w-24 h-24 sm:w-32 sm:h-32 mx-auto mb-4" onerror="this.style.display='none'">
                     <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 mb-2" data-i18n="app.name">QUANTARIUM STAKING</h1>
-                    <p class="text-sm sm:text-base text-gray-600" data-i18n="app.subtitle">안전한 코인 스테이킹 플랫폼</p>
+                    <p class="text-sm sm:text-base text-gray-600" data-i18n="app.subtitle">퀀타리움 구매 플랫폼</p>
                 </div>
 
                 <!-- 로그인 폼 -->
