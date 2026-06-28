@@ -22673,7 +22673,7 @@ app.get('/', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <meta name="user-country" content="${userCountry}">
-        <title>QUANTARIUM STAKING</title>
+        <title>Quantarium Purchase Platform</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <link rel="stylesheet" href="/static/tailwind.css">
         <link href="/static/fa/all.min.css" rel="stylesheet">
@@ -23148,7 +23148,7 @@ app.get('/dashboard', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <meta name="user-country" content="${userCountry}">
-        <title data-i18n="dash.title">대시보드 - QUANTARIUM STAKING</title>
+        <title data-i18n="dash.title">대시보드 - Quantarium Purchase Platform</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <link rel="stylesheet" href="/static/tailwind.css">
         <link href="/static/fa/all.min.css" rel="stylesheet">
@@ -23220,7 +23220,7 @@ app.get('/dashboard', (c) => {
             <main id="dashPage-main" class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8">
                 <!-- Balance Cards -->
                 <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-4 mb-6 sm:mb-8">
-                    <!-- 퀀타리움 스테이킹 현황 (첫 번째 - full width) -->
+                    <!-- 퀀타리움 구매 현황 (첫 번째 - full width) -->
                     <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-[11px] sm:text-sm opacity-90 leading-tight flex-1 pr-1" data-i18n="dash.purchase_transfer">퀀타리움구매(USDT)</span>
