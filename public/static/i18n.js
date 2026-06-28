@@ -194,7 +194,7 @@ function selectLang(code) {
 // ============================================
 
 I18N._translations['ko'] = {
-  'app.name': 'QUANTARIUM STAKING',
+  'app.name': 'Quantarium Purchase Platform',
   'app.subtitle': '퀀타리움 구매 플랫폼',
   'common.login': '로그인',
   'common.logout': '로그아웃',
@@ -815,7 +815,7 @@ I18N._translations['ko'] = {
 };
 
 I18N._translations['en'] = {
-  'app.name': 'QUANTARIUM STAKING',
+  'app.name': 'Quantarium Purchase Platform',
   'app.subtitle': 'Quantarium Investment & Purchase Platform',
   'common.login': 'Login',
   'common.logout': 'Logout',
@@ -1135,7 +1135,7 @@ I18N._translations['en'] = {
 };
 
 I18N._translations['ja'] = {
-  'app.name': 'QUANTARIUM STAKING',
+  'app.name': 'Quantarium Purchase Platform',
   'app.subtitle': 'Quantarium 投資・購入プラットフォーム',
   'common.login': 'ログイン',
   'common.logout': 'ログアウト',
@@ -1759,7 +1759,7 @@ I18N._translations['ja'] = {
 };
 
 I18N._translations['zh'] = {
-  'app.name': 'QUANTARIUM STAKING',
+  'app.name': 'Quantarium Purchase Platform',
   'app.subtitle': 'Quantarium 投资与购买平台',
   'common.login': '登入',
   'common.logout': '登出',
@@ -2079,7 +2079,7 @@ I18N._translations['zh'] = {
 };
 
 I18N._translations['vi'] = {
-  'app.name': 'QUANTARIUM STAKING',
+  'app.name': 'Quantarium Purchase Platform',
   'app.subtitle': 'Nền tảng Đầu tư & Mua Quantarium',
   'common.login': 'Đăng nhập',
   'common.logout': 'Đăng xuất',
@@ -2399,7 +2399,7 @@ I18N._translations['vi'] = {
 };
 
 I18N._translations['th'] = {
-  'app.name': 'QUANTARIUM STAKING',
+  'app.name': 'Quantarium Purchase Platform',
   'app.subtitle': 'แพลตฟอร์มลงทุนและซื้อ Quantarium',
   'common.login': 'เข้าสู่ระบบ',
   'common.logout': 'ออกจากระบบ',
