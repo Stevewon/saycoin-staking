@@ -503,6 +503,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': '승인 대기 중인 투자를 찾을 수 없습니다',
     'admin.approve_success': '투자가 승인되었습니다. 코인이 지급되었습니다.',
     'admin.approve_error': '투자 승인 중 오류가 발생했습니다',
+    'admin.txid_already_approved': '이미 승인된 TXID입니다. 동일 TXID는 재승인할 수 없습니다.',
+    'admin.sales_delete_not_found': '삭제할 매출건(승인된 투자)을 찾을 수 없습니다',
+    'admin.sales_delete_success': '매출건이 삭제되고 지급된 코인 보상이 원복되었습니다.',
+    'admin.sales_delete_error': '매출건 삭제 중 오류가 발생했습니다.',
     'admin.staking_pending_not_found': '승인 대기 중인 스테이킹을 찾을 수 없습니다',
     'admin.reject_success': '스테이킹이 거절되었습니다.',
     'admin.reject_error': '스테이킹 거절 중 오류가 발생했습니다',
@@ -807,6 +811,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': 'No pending investment found',
     'admin.approve_success': 'Investment approved. Coins have been distributed.',
     'admin.approve_error': 'An error occurred during investment approval',
+    'admin.txid_already_approved': 'This TXID is already approved. The same TXID cannot be re-approved.',
+    'admin.sales_delete_not_found': 'Sales record (approved investment) to delete was not found',
+    'admin.sales_delete_success': 'Sales record deleted and granted coin rewards were reversed.',
+    'admin.sales_delete_error': 'An error occurred while deleting the sales record.',
     'admin.staking_pending_not_found': 'No pending staking found',
     'admin.reject_success': 'Staking has been rejected.',
     'admin.reject_error': 'An error occurred during staking rejection',
@@ -927,6 +935,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': '承認待ちの投資が見つかりません',
     'admin.approve_success': '投資が承認されました。コインが支給されました。',
     'admin.approve_error': '投資承認中にエラーが発生しました',
+    'admin.txid_already_approved': 'すでに承認済みのTXIDです。同じTXIDは再承認できません。',
+    'admin.sales_delete_not_found': '削除する売上（承認済みの投資）が見つかりません',
+    'admin.sales_delete_success': '売上を削除し、支給されたコイン報酬を元に戻しました。',
+    'admin.sales_delete_error': '売上の削除中にエラーが発生しました。',
     'admin.staking_pending_not_found': '承認待ちのステーキングが見つかりません',
     'admin.reject_success': 'ステーキングが拒否されました。',
     'admin.reject_error': 'ステーキング拒否中にエラーが発生しました',
@@ -1047,6 +1059,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': '未找到待审批的投资',
     'admin.approve_success': '投资已批准。代币已发放。',
     'admin.approve_error': '投资审批时发生错误',
+    'admin.txid_already_approved': '此TXID已批准。相同的TXID无法重新批准。',
+    'admin.sales_delete_not_found': '未找到要删除的销售记录（已批准的投资）',
+    'admin.sales_delete_success': '销售记录已删除，已发放的代币奖励已撤销。',
+    'admin.sales_delete_error': '删除销售记录时发生错误。',
     'admin.staking_pending_not_found': '未找到待审批的质押',
     'admin.reject_success': '质押已被拒绝。',
     'admin.reject_error': '质押拒绝时发生错误',
@@ -1167,6 +1183,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': 'Không tìm thấy khoản đầu tư đang chờ duyệt',
     'admin.approve_success': 'Đầu tư đã được phê duyệt. Coin đã được phát.',
     'admin.approve_error': 'Đã xảy ra lỗi khi phê duyệt đầu tư',
+    'admin.txid_already_approved': 'TXID này đã được duyệt. Không thể duyệt lại cùng một TXID.',
+    'admin.sales_delete_not_found': 'Không tìm thấy bản ghi doanh số (khoản đầu tư đã duyệt) để xóa',
+    'admin.sales_delete_success': 'Đã xóa bản ghi doanh số và hoàn lại phần thưởng coin đã cấp.',
+    'admin.sales_delete_error': 'Đã xảy ra lỗi khi xóa bản ghi doanh số.',
     'admin.staking_pending_not_found': 'Không tìm thấy staking đang chờ duyệt',
     'admin.reject_success': 'Staking đã bị từ chối.',
     'admin.reject_error': 'Đã xảy ra lỗi khi từ chối staking',
@@ -1287,6 +1307,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': 'ไม่พบการลงทุนที่รอดำเนินการ',
     'admin.approve_success': 'การลงทุนได้รับอนุมัติแล้ว เหรียญถูกแจกจ่ายแล้ว',
     'admin.approve_error': 'เกิดข้อผิดพลาดในการอนุมัติการลงทุน',
+    'admin.txid_already_approved': 'TXID นี้ได้รับการอนุมัติแล้ว ไม่สามารถอนุมัติ TXID เดิมซ้ำได้',
+    'admin.sales_delete_not_found': 'ไม่พบรายการยอดขาย (การลงทุนที่อนุมัติแล้ว) ที่จะลบ',
+    'admin.sales_delete_success': 'ลบรายการยอดขายและคืนรางวัลเหรียญที่จ่ายไปแล้ว',
+    'admin.sales_delete_error': 'เกิดข้อผิดพลาดในการลบรายการยอดขาย',
     'admin.staking_pending_not_found': 'ไม่พบ staking ที่รอดำเนินการ',
     'admin.reject_success': 'Staking ถูกปฏิเสธแล้ว',
     'admin.reject_error': 'เกิดข้อผิดพลาดในการปฏิเสธ staking',
@@ -2788,6 +2812,23 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
 
     if (!staking) {
       return c.json({ error: t(c, 'admin.pending_not_found') }, 404)
+    }
+
+    // ★★★ [요구사항 #2 / 2026-07-03] 한번 승인된 TXID는 재승인 금지 ★★★
+    //   동일 TXID 로 이미 active/completed 인 건이 있으면 재승인 차단 (중복 지급 방지)
+    const currentTxid = (staking.txid || '').trim()
+    if (currentTxid) {
+      const dupTxid = await db.prepare(`
+        SELECT id, user_id, status FROM staking
+        WHERE TRIM(txid) = ? AND id != ? AND status IN ('active', 'completed')
+        LIMIT 1
+      `).bind(currentTxid, stakingId).first()
+      if (dupTxid) {
+        return c.json({
+          error: t(c, 'admin.txid_already_approved'),
+          detail: { txid: currentTxid, existing_staking_id: dupTxid.id, existing_status: dupTxid.status }
+        }, 409)
+      }
     }
 
     // 승인 시점에 시작일과 종료일 설정 (거치기간: 일 단위)
@@ -4330,6 +4371,180 @@ app.get('/api/admin/sales', async (c) => {
     })
   } catch (error) {
     return c.json({ error: t(c, 'admin.sales_error') }, 500)
+  }
+})
+
+// ★★★ [요구사항 #1 / 2026-07-03] 승인처리되어 활성화된 매출건 삭제 ★★★
+//   삭제 시 이 매출로 지급된 모든 코인을 즉시 회수:
+//   (A) 본인: 승인 코인(QTA/QX/QKEY) 원복 + initial 대칭 차감, staking_reward 거래내역 삭제
+//   (B) 본인: 일일배당(QKEY) 전액 회수(daily_rewards.usdt_amount 합산) + daily_qkey 거래내역/원장 삭제
+//   (C)+(D) 위/아래(추천인): 직접추천수당(level0) + 매칭수당(level1·2) 회수 + 관련 거래내역/원장 삭제
+//   ※ referral_rewards.staking_id 가 NULL 인 legacy row 는 특정 매출 귀속 불가 → 과다회수 방지 위해 회수 제외
+app.delete('/api/admin/sales/:stakingId', async (c) => {
+  try {
+    const db = c.env.DB
+    const stakingId = c.req.param('stakingId')
+
+    // 대상 매출(스테이킹) 조회 — active/completed 만 삭제 대상 (pending 은 reject 사용)
+    const staking = await db.prepare(`
+      SELECT * FROM staking WHERE id = ? AND status IN ('active', 'completed')
+    `).bind(stakingId).first()
+
+    if (!staking) {
+      return c.json({ error: t(c, 'admin.sales_delete_not_found') }, 404)
+    }
+
+    const userId = staking.user_id
+    const qtaReward = staking.qta_reward || 0
+    const qxReward = staking.qx_reward || 0
+    const qkeyReward = staking.qkey_reward || 0
+
+    await ensureWithdrawableSchema(db)
+
+    // 집계용 (응답 리포트)
+    let recoveredDailyQkey = 0
+    let recoveredReferralQkey = 0
+    const referralRecipients: any[] = []
+
+    // ─────────────────────────────────────────────────────────────
+    // (A) 본인 : 승인 시 지급 코인 원복 (QTA/QX/QKEY) — initial 컬럼도 대칭 차감
+    // ─────────────────────────────────────────────────────────────
+    if (qtaReward > 0) {
+      await db.prepare(`
+        UPDATE users
+        SET qta_balance = MAX(0, qta_balance - ?),
+            qta_initial = MAX(0, COALESCE(qta_initial,0) - ?)
+        WHERE id = ?
+      `).bind(qtaReward, qtaReward, userId).run()
+    }
+    if (qxReward > 0) {
+      await db.prepare(`
+        UPDATE users
+        SET qx_balance = MAX(0, qx_balance - ?),
+            qx_initial = MAX(0, COALESCE(qx_initial,0) - ?)
+        WHERE id = ?
+      `).bind(qxReward, qxReward, userId).run()
+    }
+    if (qkeyReward > 0) {
+      await db.prepare(`
+        UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+      `).bind(qkeyReward, userId).run()
+    }
+    // 승인 보상 transactions(staking_reward) 코인별 1건씩 정리 (금액 정확 매칭)
+    async function deleteOneStakingRewardTx(coin: string, amt: number) {
+      if (!(amt > 0)) return
+      try {
+        await db.prepare(`
+          DELETE FROM transactions
+          WHERE ROWID = (
+            SELECT ROWID FROM transactions
+            WHERE user_id = ? AND type = 'staking_reward' AND coin_type = ? AND amount = ?
+            ORDER BY id DESC LIMIT 1
+          )
+        `).bind(userId, coin, amt).run()
+      } catch (e) { }
+    }
+    await deleteOneStakingRewardTx('QTA', qtaReward)
+    await deleteOneStakingRewardTx('QX', qxReward)
+    await deleteOneStakingRewardTx('QKEY', qkeyReward)
+
+    // ─────────────────────────────────────────────────────────────
+    // (B) 본인 : 이 스테이킹 일일배당(QKEY) 전액 회수
+    //     daily_rewards.usdt_amount 에 실제 지급 QKEY 가 저장됨 → 합산해서 본인 잔액에서 차감
+    // ─────────────────────────────────────────────────────────────
+    try {
+      const dailySum = await db.prepare(`
+        SELECT COALESCE(SUM(usdt_amount), 0) as total
+        FROM daily_rewards WHERE staking_id = ?
+      `).bind(stakingId).first()
+      recoveredDailyQkey = (dailySum && (dailySum.total as number)) || 0
+
+      if (recoveredDailyQkey > 0) {
+        await db.prepare(`
+          UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+        `).bind(recoveredDailyQkey, userId).run()
+      }
+
+      // daily_qkey transactions 삭제 (ref_id = daily_rewards.id)
+      await db.prepare(`
+        DELETE FROM transactions
+        WHERE type = 'daily_qkey' AND ref_id IN (
+          SELECT id FROM daily_rewards WHERE staking_id = ?
+        )
+      `).bind(stakingId).run()
+
+      // daily_rewards ledger 삭제
+      await db.prepare(`DELETE FROM daily_rewards WHERE staking_id = ?`).bind(stakingId).run()
+    } catch (e) { }
+
+    // ─────────────────────────────────────────────────────────────
+    // (C)+(D) 위·아래 : 추천/매칭 보상(QKEY) 회수
+    //     referral_rewards where staking_id = X → referrer_id 별로 reward_amount 합산해 각자 회수
+    //     (level 0 = 직접추천수당 / level 1·2 = 매칭수당)  ledger + transactions 함께 삭제
+    // ─────────────────────────────────────────────────────────────
+    try {
+      const rrRows = await db.prepare(`
+        SELECT referrer_id, level, COALESCE(SUM(reward_amount),0) as total
+        FROM referral_rewards
+        WHERE staking_id = ?
+        GROUP BY referrer_id, level
+      `).bind(stakingId).all()
+
+      // referrer_id 별 총 회수액 합산
+      const byRecipient: Record<string, number> = {}
+      for (const r of (rrRows.results as any[])) {
+        const rid = String(r.referrer_id)
+        byRecipient[rid] = (byRecipient[rid] || 0) + (r.total || 0)
+        recoveredReferralQkey += (r.total || 0)
+      }
+
+      // 각 수령인 잔액에서 차감
+      for (const rid of Object.keys(byRecipient)) {
+        const amt = byRecipient[rid]
+        if (amt > 0) {
+          await db.prepare(`
+            UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+          `).bind(amt, rid).run()
+          referralRecipients.push({ userId: Number(rid), recoveredQkey: amt })
+        }
+      }
+
+      // 관련 transactions 삭제 (direct_referral level0 / referral_reward level1·2)
+      //   ref_id = referral_rewards.id 로 1:1 매핑되어 있음
+      await db.prepare(`
+        DELETE FROM transactions
+        WHERE type IN ('direct_referral', 'referral_reward')
+          AND ref_id IN (
+            SELECT id FROM referral_rewards WHERE staking_id = ?
+          )
+      `).bind(stakingId).run()
+
+      // referral_rewards ledger 삭제
+      await db.prepare(`DELETE FROM referral_rewards WHERE staking_id = ?`).bind(stakingId).run()
+    } catch (e) { }
+
+    // ─────────────────────────────────────────────────────────────
+    // 마지막: staking row 삭제
+    // ─────────────────────────────────────────────────────────────
+    await db.prepare(`DELETE FROM staking WHERE id = ?`).bind(stakingId).run()
+
+    return c.json({
+      success: true,
+      message: t(c, 'admin.sales_delete_success'),
+      deleted: {
+        stakingId: stakingId,
+        userId: userId,
+        amount: staking.amount,
+        reversed: {
+          self: { qta: qtaReward, qx: qxReward, qkey: qkeyReward },
+          selfDailyQkey: recoveredDailyQkey,
+          referralQkeyTotal: recoveredReferralQkey,
+          referralRecipients: referralRecipients
+        }
+      }
+    })
+  } catch (error) {
+    return c.json({ error: t(c, 'admin.sales_delete_error') }, 500)
   }
 })
 
@@ -22914,7 +23129,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026062801"></script>
+        <script src="/static/i18n.js?v=2026070301"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23915,7 +24130,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026062801"></script>
+        <script src="/static/i18n.js?v=2026070301"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -26157,7 +26372,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026062801"></script>
+        <script src="/static/i18n.js?v=2026070301"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -26728,10 +26943,11 @@ app.get('/admin/dashboard', (c) => {
                                     <th class="px-2 sm:px-3 py-2 text-center" data-i18n="admin.col_status">상태</th>
                                     <th class="px-2 sm:px-3 py-2 text-center">리셋</th>
                                     <th class="px-2 sm:px-3 py-2 text-left" data-i18n="admin.col_sale_date">판매일</th>
+                                    <th class="px-2 sm:px-3 py-2 text-center" data-i18n="admin.col_manage">관리</th>
                                 </tr>
                             </thead>
                             <tbody id="salesTableBody" class="divide-y divide-gray-200">
-                                <tr><td colspan="7" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
+                                <tr><td colspan="8" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -27179,7 +27395,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026062801"></script>
+        <script src="/static/i18n.js?v=2026070301"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
@@ -28784,7 +29000,7 @@ app.get('/admin/dashboard', (c) => {
 
                     var tbody = document.getElementById('salesTableBody');
                     if (sales.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_sales') + '</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="8" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_sales') + '</td></tr>';
                     } else {
                         tbody.innerHTML = sales.map(function(s) {
                             var stColor = s.status === 'active' ? 'green' : 'gray';
@@ -28793,6 +29009,13 @@ app.get('/admin/dashboard', (c) => {
                             var resetCell = s.reset_at
                                 ? '<span class="px-2 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold" title="' + esc(s.reset_at) + '"><i class="fas fa-undo-alt mr-1"></i>리셋</span>'
                                 : '<span class="text-gray-300 text-xs">-</span>';
+                            // ★ [요구사항 #1] 승인된 매출건 삭제 버튼 (지급 코인 회수 포함)
+                            //   ※ 따옴표 이스케이프 충돌 방지: 인라인 onclick 인자 대신 data-* 속성 + 이벤트위임 사용
+                            var delBtn = '<button type="button" class="deleteSaleBtn px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-xs font-bold" '
+                                + 'data-sid="' + s.staking_id + '" '
+                                + 'data-name="' + esc(s.name) + '" '
+                                + 'data-amount="' + s.amount + '" '
+                                + 'title="' + I18N.t('admin.sales_delete_btn') + '"><i class="fas fa-trash-alt"></i></button>';
                             return '<tr class="' + rowClass + '">' +
                                 '<td class="px-2 sm:px-3 py-2"><span class="text-xs">' + esc(s.email) + '</span></td>' +
                                 '<td class="px-2 sm:px-3 py-2 font-medium">' + esc(s.name) + '</td>' +
@@ -28801,11 +29024,41 @@ app.get('/admin/dashboard', (c) => {
                                 '<td class="px-2 sm:px-3 py-2 text-center"><span class="px-2 py-0.5 bg-' + stColor + '-100 text-' + stColor + '-700 rounded text-xs">' + stText + '</span></td>' +
                                 '<td class="px-2 sm:px-3 py-2 text-center">' + resetCell + '</td>' +
                                 '<td class="px-2 sm:px-3 py-2 whitespace-nowrap text-xs">' + (s.sale_date ? new Date(s.sale_date).toLocaleDateString(I18N.getLang()) : '-') + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-center">' + delBtn + '</td>' +
                             '</tr>';
                         }).join('');
+
+                        // 삭제 버튼 이벤트 위임 (인라인 onclick 대신 data-* 로 안전 처리)
+                        var _delBtns = tbody.querySelectorAll('.deleteSaleBtn');
+                        for (var _i = 0; _i < _delBtns.length; _i++) {
+                            _delBtns[_i].addEventListener('click', function() {
+                                deleteSale(this.getAttribute('data-sid'), this.getAttribute('data-name'), this.getAttribute('data-amount'));
+                            });
+                        }
                     }
                 } catch (error) {
                     console.error('Sales status load failed:', error);
+                }
+            }
+
+            // ★ [요구사항 #1 / 2026-07-03] 승인처리된 매출건 삭제 (2단계 확인 + 코인 회수)
+            async function deleteSale(stakingId, name, amount) {
+                var msg1 = I18N.t('admin.sales_delete_confirm1')
+                    .replace('{name}', name)
+                    .replace('{amount}', '$' + Number(amount).toLocaleString());
+                if (!confirm(msg1)) return;
+                if (!confirm(I18N.t('admin.sales_delete_confirm2'))) return;
+                try {
+                    var res = await axios.delete('/api/admin/sales/' + stakingId);
+                    if (res.data && res.data.success) {
+                        alert(I18N.t('admin.sales_delete_success'));
+                        loadSalesStatus();
+                    } else {
+                        alert((res.data && res.data.error) || I18N.t('admin.sales_delete_error'));
+                    }
+                } catch (error) {
+                    var em = (error.response && error.response.data && error.response.data.error) || I18N.t('admin.sales_delete_error');
+                    alert(em);
                 }
             }
 
