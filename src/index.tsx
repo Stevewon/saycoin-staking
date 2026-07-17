@@ -5047,6 +5047,7 @@ function getKoreanHolidays(year: number): string[] {
       '2026-05-25',                        // ★ 부처님오신날 대체공휴일 (월) — 사장님 영구명령 2026-05-22
       '2026-06-03',                        // ★ 제9회 전국동시지방선거일 (수) 법정공휴일 — 사장님 영구명령 2026-05-29
       '2026-06-06',                        // 현충일
+      '2026-07-17',                        // ★ 임시공휴일 (금) — 사장님 영구명령 2026-07-17 (연휴 아님, 당일 1일)
       '2026-08-15',                        // 광복절(토) → 대체공휴일은 인사처 고시 확인 후 추가
       '2026-09-24','2026-09-25','2026-09-26', // 추석
       '2026-10-03',                        // 개천절(토) → 대체공휴일은 인사처 고시 확인 후 추가
@@ -23129,7 +23130,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026070301"></script>
+        <script src="/static/i18n.js?v=2026071701"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -24130,7 +24131,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026070301"></script>
+        <script src="/static/i18n.js?v=2026071701"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -26372,7 +26373,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026070301"></script>
+        <script src="/static/i18n.js?v=2026071701"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27395,7 +27396,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026070301"></script>
+        <script src="/static/i18n.js?v=2026071701"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
