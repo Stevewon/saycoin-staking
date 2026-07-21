@@ -2611,12 +2611,19 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
 //   - 기존 스테이킹은 staking row에 daily_rate/period_days가 고정 저장되어 영향 없음
 const POLICY_V2_DATE = new Date('2026-04-30T00:00:00+09:00')
 
+// ★ $10,000+ 일일 배당률 변경 (사장님 지시 2026-07-21) ★
+//   ~ 7/21 00:00 KST 이전 진입분 : 1.0% (0.01)
+//   7/21 00:00 KST ~ 신규 진입분  : 0.8% (0.008)  (거치기간 180일은 변동 없음)
+//   기존 스테이킹은 staking row에 daily_rate가 고정 저장되어 소급 영향 없음.
+//   날짜 게이팅으로 처리하여 저장값이 없는 과거 건 재계산 시에도 1.0% 유지.
+const RATE_10K_08_DATE = new Date('2026-07-21T00:00:00+09:00')
+
 // 투자금액별 일일 배당률 계산
 function getDailyRate(amount: number, asOf?: Date): number {
   const now = asOf || new Date()
   const isV2 = now >= POLICY_V2_DATE
 
-  if (amount >= 10000) return 0.01    // $10,000+: 1.0%
+  if (amount >= 10000) return now >= RATE_10K_08_DATE ? 0.008 : 0.01    // $10,000+: 1.0% → 0.8% (2026-07-21~)
   if (amount >= 5000) return 0.007    // $5,000~$9,000: 0.7%
   if (isV2) {
     // [V2 / 2026-04-30~] $1,000~$4,000: 0.5% 통일
@@ -2684,11 +2691,16 @@ app.post('/api/staking/create', async (c) => {
     // ★ QTA 지급 수량 변경 (사장님 지시 2026-06-21) ★
     //   ~ 6/21 24:00 KST : QTA 75,000 / $1,000
     //   6/22 00:00 KST ~ : QTA 50,000 / $1,000  (QX·QKEY 등 그 외 정책은 변동 없음)
+    // ★ QTA 지급 수량 재변경 (사장님 지시 2026-07-21) ★
+    //   7/21 00:00 KST ~ : QTA 40,000 / $1,000  (소급 없음, 이 시점 이후 신규 진입분만)
     const QTA_REDUCE_DATE = new Date('2026-06-22T00:00:00+09:00') // 6/22 00:00 KST 부터 50,000
+    const QTA_40K_DATE = new Date('2026-07-21T00:00:00+09:00')    // 7/21 00:00 KST 부터 40,000
     const now = new Date()
     const isPhase2 = now >= PHASE2_DATE
     const isPhase3 = now >= PHASE3_DATE
-    const qtaPer1000 = now >= QTA_REDUCE_DATE ? 50000 : 75000
+    const qtaPer1000 = now >= QTA_40K_DATE ? 40000
+                     : now >= QTA_REDUCE_DATE ? 50000
+                     : 75000
 
     const qtaReward = (amount / 1000) * qtaPer1000
     // QX: Phase1(~5/10) 10,000 + Phase3(5/22~) 10,000 부활 / Phase2(5/11~5/21) 만 0
@@ -23130,7 +23142,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026071701"></script>
+        <script src="/static/i18n.js?v=2026072101"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -24131,7 +24143,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026071701"></script>
+        <script src="/static/i18n.js?v=2026072101"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -25533,11 +25545,16 @@ app.get('/dashboard', (c) => {
             function isPolicyV2() {
                 return new Date() >= POLICY_V2_DATE;
             }
+            // ★ $10,000+ 일일 배당률 변경 (2026-07-21): 7/21 00:00 KST 부터 1.0% → 0.8%
+            var RATE_10K_08_DATE = new Date('2026-07-21T00:00:00+09:00');
+            function is10k08() { return new Date() >= RATE_10K_08_DATE; }
 
             // 금액별 정책 정보 반환
             function getPolicy(amount) {
                 var v2 = isPolicyV2();
-                if (amount >= 10000) return { rate: '1.0%', rateNum: 0.01, period: 180, periodText: '180' + I18N.t('dash.days') };
+                if (amount >= 10000) return is10k08()
+                    ? { rate: '0.8%', rateNum: 0.008, period: 180, periodText: '180' + I18N.t('dash.days') }
+                    : { rate: '1.0%', rateNum: 0.01, period: 180, periodText: '180' + I18N.t('dash.days') };
                 if (amount >= 5000) return { rate: '0.7%', rateNum: 0.007, period: 120, periodText: '120' + I18N.t('dash.days') };
                 if (v2) {
                     return { rate: '0.5%', rateNum: 0.005, period: 90, periodText: '90' + I18N.t('dash.days') };
@@ -25552,12 +25569,13 @@ app.get('/dashboard', (c) => {
                 if (!tbody) return;
                 var v2 = isPolicyV2();
                 var rows;
+                var rate10k = is10k08() ? '0.8%' : '1.0%'; // $10,000+ 배당률 (2026-07-21~ 0.8%)
                 if (v2) {
                     // V2: 1,000~4,000 통합
                     rows = [
                         { id: 'policyRow1', amount: '$1,000 ~ $4,000', rate: '0.5%', days: '90' },
                         { id: 'policyRow3', amount: '$5,000 ~ $9,000', rate: '0.7%', days: '120' },
-                        { id: 'policyRow4', amount: '$10,000+',         rate: '1.0%', days: '180' }
+                        { id: 'policyRow4', amount: '$10,000+',         rate: rate10k, days: '180' }
                     ];
                 } else {
                     // V1: 기존
@@ -25565,7 +25583,7 @@ app.get('/dashboard', (c) => {
                         { id: 'policyRow1', amount: '$1,000 ~ $2,000', rate: '0.3%', days: '60' },
                         { id: 'policyRow2', amount: '$3,000 ~ $4,000', rate: '0.5%', days: '90' },
                         { id: 'policyRow3', amount: '$5,000 ~ $9,000', rate: '0.7%', days: '120' },
-                        { id: 'policyRow4', amount: '$10,000+',         rate: '1.0%', days: '180' }
+                        { id: 'policyRow4', amount: '$10,000+',         rate: rate10k, days: '180' }
                     ];
                 }
                 var daysLabel = I18N.t('dash.days') || 'days';
@@ -25631,8 +25649,11 @@ app.get('/dashboard', (c) => {
                 var PHASE2 = new Date('2026-05-04T00:00:00+09:00');
                 var isPhase2 = new Date() >= PHASE2;
                 // ★ QTA 수량 변경 (2026-06-21): 6/22 00:00 KST 부터 50,000/$1,000
+                // ★ QTA 수량 재변경 (2026-07-21): 7/21 00:00 KST 부터 40,000/$1,000
                 var QTA_REDUCE = new Date('2026-06-22T00:00:00+09:00');
-                var qtaPer1000 = (new Date() >= QTA_REDUCE) ? 50000 : 75000;
+                var QTA_40K = new Date('2026-07-21T00:00:00+09:00');
+                var _qtaNow = new Date();
+                var qtaPer1000 = (_qtaNow >= QTA_40K) ? 40000 : (_qtaNow >= QTA_REDUCE) ? 50000 : 75000;
                 var qtaReward = (accumulatedAmount / 1000) * qtaPer1000;
                 var qxReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 10000;
                 var qkeyReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 5000;
@@ -25671,8 +25692,11 @@ app.get('/dashboard', (c) => {
                 var _P2 = new Date('2026-05-04T00:00:00+09:00');
                 var _isP2 = new Date() >= _P2;
                 // ★ QTA 수량 변경 (2026-06-21): 6/22 00:00 KST 부터 50,000/$1,000
+                // ★ QTA 수량 재변경 (2026-07-21): 7/21 00:00 KST 부터 40,000/$1,000
                 var _QTA_REDUCE = new Date('2026-06-22T00:00:00+09:00');
-                var _qtaPer1000 = (new Date() >= _QTA_REDUCE) ? 50000 : 75000;
+                var _QTA_40K = new Date('2026-07-21T00:00:00+09:00');
+                var _qtaNow2 = new Date();
+                var _qtaPer1000 = (_qtaNow2 >= _QTA_40K) ? 40000 : (_qtaNow2 >= _QTA_REDUCE) ? 50000 : 75000;
                 const qtaReward = (amount / 1000) * _qtaPer1000;
                 const qxReward = _isP2 ? 0 : (amount / 1000) * 10000;
                 const qkeyReward = _isP2 ? 0 : (amount / 1000) * 5000;
@@ -26373,7 +26397,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026071701"></script>
+        <script src="/static/i18n.js?v=2026072101"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27396,7 +27420,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026071701"></script>
+        <script src="/static/i18n.js?v=2026072101"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
