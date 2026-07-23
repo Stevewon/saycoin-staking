@@ -8521,8 +8521,13 @@ app.get('/api/staking/progress/:userId', async (c) => {
     `).bind(userId).first() as any
     const paidTotal = Number(paidRow?.total || 0)
 
-    const target = stakeTotal * 2 * USD_TO_QKEY
-    const percent = target > 0 ? (paidTotal / target * 100) : 0
+    // ★ 영구룰 #cap200정책 1️⃣ (2026-07-23 사장님 승인 정정)
+    //   산정기준(100%) = amount × 150 (= 투자금), cap_target(200%=CAPPED) = amount × 300 (= 투자금 2배)
+    //   cap_pct = paid_total ÷ 산정기준(amount×150) × 100  ← 분모는 반드시 baseline(150), 2배지점(300) 아님
+    //   (이전 버그: 분모를 amount×300 으로 나눠 269% 가 134.53% 로 절반 낮게 표시됨 → 200% 초과인데 차단 안내 안 뜸)
+    const baseline = stakeTotal * USD_TO_QKEY          // 100% 산정기준 (= 투자금)
+    const target = stakeTotal * 2 * USD_TO_QKEY        // 200% cap_target (= 투자금 2배, 출금/잔여 한도)
+    const percent = baseline > 0 ? (paidTotal / baseline * 100) : 0
 
     // 단계 판정 (사장님 정책 2026-05-10 수정 — 100/150/200 임계값)
     let stage: 'green' | 'orange' | 'red' | 'capped' = 'green'
@@ -8541,6 +8546,7 @@ app.get('/api/staking/progress/:userId', async (c) => {
       success: true,
       user_id: userId,
       stake_total_usd: stakeTotal,
+      baseline_qkey: baseline,
       target_qkey: target,
       paid_total_qkey: paidTotal,
       percent: Math.round(percent * 100) / 100,
@@ -23142,7 +23148,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072101"></script>
+        <script src="/static/i18n.js?v=2026072301"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -24143,7 +24149,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072101"></script>
+        <script src="/static/i18n.js?v=2026072301"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24219,7 +24225,7 @@ app.get('/dashboard', (c) => {
                     card.classList.remove('hidden');
 
                     const pct = Number(d.percent || 0);
-                    const visualPct = Math.min(100, pct / 2 * 100); // 0~200% 를 0~100% 막대 폭으로 매핑
+                    const visualPct = Math.min(100, pct / 2); // 0~200% 를 0~100% 막대 폭으로 매핑 (pct 는 이미 % 값)
 
                     // 사장님 정책: <100 green / 100~150 orange / 150~200 red / >=200 capped(red)
                     let colorCls = 'bg-green-500';
@@ -26397,7 +26403,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072101"></script>
+        <script src="/static/i18n.js?v=2026072301"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27420,7 +27426,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072101"></script>
+        <script src="/static/i18n.js?v=2026072301"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
