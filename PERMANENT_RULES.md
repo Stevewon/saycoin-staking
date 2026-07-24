@@ -1042,3 +1042,38 @@ const COIN_MAP = {
 ---
 
 **이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22, 2026-05-23 두 차례 추가) — 절대 변경/삭제 금지.**
+
+---
+
+## 👑 영구룰 #만기무관cap우선 (2026-07-24 사장님 직접 결재 — B안)
+
+> **90일 거치기간(end_date)이 지나도, cap 200% 도달 전까지는 daily 배당을 계속 지급한다.**
+> **지급 종료 기준은 오직 cap 200%(= amount x 300 QKEY = 투자금 2배)이며, end_date(90일 만기)는 지급 종료 기준이 아니다.**
+
+### 배경 (사고 계기)
+- top2536 (user_id=9) stk#4 ($3,000, period_days=90, start 2026-04-20, end_date 2026-07-19) 이
+  시스템 최초로 90일 만기에 도달.
+- 기존 daily cron 대상 쿼리에 `date(s.end_date,'+9 hours') >= date(yesterdayKst)` 조건이 있어,
+  7/20 부터 이 staking 이 대상에서 자동 제외됨 → daily 4영업일(7/20~7/23) 누락.
+- 당시 cap 진행 = paid_total 319,200 / cap 900,000 = 약 71% (한도 한참 미달).
+- 누락 4일치(u9 daily 9,000 + u2 L1 1,800 + u1 L2 900 = 합계 11,700 QKEY) 는 2026-07-24 재지급 완료.
+
+### 정책 (사장님 결정)
+| 항목 | 값 |
+|---|---|
+| daily 지급 종료 기준 | **cap 200% 도달 시** (staking 별 독립, 영구룰 #cap200정책 2️⃣) |
+| end_date(90일 만기) | **daily 종료 기준 아님** — 지나도 cap 전까지 계속 지급 |
+| cap 도달 시 처리 | 해당 staking 만 `status='capped'`, 다른 staking 은 계속 (영구룰 #스테이킹별독립) |
+
+### 구현 (src/index.tsx)
+- daily 지급 cron 메인 엔드포인트 `/api/rewards/daily` 의 대상 SELECT 2개(totalRow 카운트, activeStakings)
+  에서 `end_date >= yesterdayKst` 조건 **제거** (2026-07-24).
+- start_date 조건은 유지 (어제까지 진입분만 대상, 미래 진입 제외).
+- cap 판정은 루프 내 `isStakingCapped()` 가 staking 별로 수행 → cap 미달이면 계속 지급, 도달 시 skip.
+- 이중지급 방어: `uniq_daily_rewards_paid_per_staking` UNIQUE 인덱스 + accrual EXISTS 가드 유지.
+
+### 주의
+- 이 수정은 **daily 지급 cron 경로에만** 적용. 다른 곳의 `end_date >= date(?)` 조건(출금/조회/미실현
+  계산 등)은 각자 의미가 다르므로 **무차별 변경 금지** (STANDING RULE #3).
+
+**이 영구룰은 사장님 직접 결재 (2026-07-24 B안) — 절대 변경/삭제 금지.**

@@ -5448,13 +5448,19 @@ app.post('/api/rewards/daily', async (c) => {
     //   부작용: 이미 capped된 staking이 매 cron마다 pre-check까지 도달 (cappedSkipCount +1)
     //         하지만 L5189의 UPDATE는 WHERE status='active' 조건이라 capped 행에는 무영향
     //         (idempotent). 잔액/INSERT 영향 0건.
+    // ★★★★★ 영구룰 #만기무관cap우선 (2026-07-24 사장님 B안 결재) ★★★★★
+    //   사장님 결정: 90일 거치기간(end_date)이 지나도 cap 200% 도달 전까지는 daily 계속 지급.
+    //   → daily 지급 대상 조건에서 end_date 필터 제거. cap 도달 여부는 루프 내
+    //     isStakingCapped() 가 staking 별로 판정하여 자동 skip + status='capped' 처리.
+    //   (기존: end_date_kst >= yesterdayKst 조건 → 90일 만기 시 cap 미달이어도 daily 중단되는 버그.
+    //          top2536 stk#4 가 7/20 부터 이 조건으로 누락된 사건이 계기. 4일치는 재지급 완료.)
+    //   start_date 조건은 유지 (어제까지 진입한 staking 만 대상, 미래 진입분 제외).
     const totalRow = await db.prepare(`
       SELECT COUNT(*) as cnt
       FROM staking s
       WHERE s.status IN ('active','capped','completed')
-        AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
-    `).bind(yesterdayKst, yesterdayKst).first() as any
+    `).bind(yesterdayKst).first() as any
     const totalActive = Number(totalRow?.cnt || 0)
 
     const activeStakings = await db.prepare(`
@@ -5473,11 +5479,10 @@ app.post('/api/rewards/daily', async (c) => {
         (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
       FROM staking s
       WHERE s.status IN ('active','capped','completed')
-        AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
       ORDER BY s.id ASC
       LIMIT ? OFFSET ?
-    `).bind(yesterdayKst, yesterdayKst, batchSize, offset).all()
+    `).bind(yesterdayKst, batchSize, offset).all()
 
     if (activeStakings.results.length === 0) {
       return c.json({
