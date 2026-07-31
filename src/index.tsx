@@ -2347,7 +2347,12 @@ app.post('/api/swap/qkey-to-qta', async (c) => {
     if (!userId || !amount || amount <= 0) {
       return c.json({ error: t(c, 'profile.required_fields') }, 400)
     }
-    const requiredQkey = amount // 1:1 비율
+    // ★ 사장님 룰 (2026-07-31 확정): 8월 1일 한국시간(KST) 00:00부터 QKEY→QTA 스왑 비율 1:1 → 3:1 전환
+    //   KST 00:00 (2026-08-01) === UTC 2026-07-31T15:00:00Z (KST = UTC+9)
+    //   컷오프 이전: QKEY 1개 = QTA 1개 (1:1) / 컷오프 이후: QKEY 3개 = QTA 1개 (3:1)
+    const SWAP_3TO1_CUTOFF = new Date('2026-07-31T15:00:00Z')
+    const swapRatioQkeyPerQta = (new Date() >= SWAP_3TO1_CUTOFF) ? 3 : 1
+    const requiredQkey = amount * swapRatioQkeyPerQta // 컷오프 기준 1:1 또는 3:1
 
     const db = c.env.DB
     const user = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first()
@@ -23153,7 +23158,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072301"></script>
+        <script src="/static/i18n.js?v=2026073101"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -24154,7 +24159,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072301"></script>
+        <script src="/static/i18n.js?v=2026073101"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24453,8 +24458,12 @@ app.get('/dashboard', (c) => {
                 }
             }
 
+            // ★ 사장님 룰 (2026-07-31 확정): 8월 1일 KST 00:00부터 QKEY→QTA 스왑 비율 1:1 → 3:1 전환
+            //   KST 00:00 (2026-08-01) === UTC 2026-07-31T15:00:00Z
+            var SWAP_3TO1_CUTOFF = new Date('2026-07-31T15:00:00Z');
+            var qkeyPerQta = (new Date() >= SWAP_3TO1_CUTOFF) ? 3 : 1;
             var swapRates = {
-                qkey: { qta: {need: 1, get: 1}, qx: {need: 5, get: 1}, usdt: {need: 150, get: 1} },
+                qkey: { qta: {need: qkeyPerQta, get: 1}, qx: {need: 5, get: 1}, usdt: {need: 150, get: 1} },
                 usdt: { qkey: {need: 1, get: 150}, qta: {need: 1, get: 150}, qx: {need: 1, get: 30} }
             };
 
@@ -26408,7 +26417,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072301"></script>
+        <script src="/static/i18n.js?v=2026073101"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27431,7 +27440,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026072301"></script>
+        <script src="/static/i18n.js?v=2026073101"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
