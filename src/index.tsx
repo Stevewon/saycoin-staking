@@ -23158,7 +23158,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073102"></script>
+        <script src="/static/i18n.js?v=2026073103"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23676,7 +23676,7 @@ app.get('/dashboard', (c) => {
                             <label class="block text-sm font-bold text-gray-700 mb-2" data-i18n="dash.swap_target">교환 대상</label>
                             <select id="swapQkeyTarget" onchange="updateSwapPreview('qkey')"
                                 class="w-full px-4 py-3 border-2 border-indigo-200 rounded-lg text-sm sm:text-base font-medium focus:outline-none focus:border-indigo-500 bg-white">
-                                <option value="qta">QTA (1 QKEY = 1 QTA)</option>
+                                <option value="qta" id="swapQkeyQtaOpt">QTA (3 QKEY = 1 QTA)</option>
                                 <option value="qx">QX (5 QKEY = 1 QX)</option>
                                 <option value="usdt">USDT (150 QKEY = 1 USDT)</option>
                             </select>
@@ -24147,7 +24147,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073102"></script>
+        <script src="/static/i18n.js?v=2026073103"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24433,6 +24433,8 @@ app.get('/dashboard', (c) => {
                 var usdtTab = document.getElementById('swapTabUsdt');
                 var qkeyPanel = document.getElementById('swapPanelQkey');
                 var usdtPanel = document.getElementById('swapPanelUsdt');
+                // ★ QTA 옵션 비율 라벨 재확인 (컷오프 이후 3:1)
+                try { var _qopt = document.getElementById('swapQkeyQtaOpt'); if (_qopt) _qopt.textContent = 'QTA (' + qkeyPerQta + ' QKEY = 1 QTA)'; } catch(e) {}
                 if (tab === 'qkey') {
                     qkeyTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-indigo-600 text-white';
                     usdtTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-white text-gray-600 hover:bg-gray-50';
@@ -24454,6 +24456,14 @@ app.get('/dashboard', (c) => {
                 qkey: { qta: {need: qkeyPerQta, get: 1}, qx: {need: 5, get: 1}, usdt: {need: 150, get: 1} },
                 usdt: { qkey: {need: 1, get: 150}, qta: {need: 1, get: 150}, qx: {need: 1, get: 30} }
             };
+
+            // ★ QKEY->QTA 스왑 비율 안내 라벨 동적 세팅 (컷오프 이후 3:1). 언어 무관 정확한 비율 표시.
+            (function syncSwapQtaOptionLabel(){
+                try {
+                    var opt = document.getElementById('swapQkeyQtaOpt');
+                    if (opt) opt.textContent = 'QTA (' + qkeyPerQta + ' QKEY = 1 QTA)';
+                } catch(e) {}
+            })();
 
             function updateSwapPreview(from) {
                 if (from === 'qkey') {
@@ -26391,7 +26401,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073102"></script>
+        <script src="/static/i18n.js?v=2026073103"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27414,7 +27424,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073102"></script>
+        <script src="/static/i18n.js?v=2026073103"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
