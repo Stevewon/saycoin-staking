@@ -23158,7 +23158,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073103"></script>
+        <script src="/static/i18n.js?v=2026073104"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -24147,7 +24147,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073103"></script>
+        <script src="/static/i18n.js?v=2026073104"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24470,16 +24470,26 @@ app.get('/dashboard', (c) => {
                     var target = document.getElementById('swapQkeyTarget').value;
                     var v = parseInt(document.getElementById('swapQkeyAmount').value) || 0;
                     var rate = swapRates.qkey[target];
-                    var needAmount = v * rate.need;
-                    var getAmount = v * rate.get;
-                    document.getElementById('swapQkeyNeedText').textContent = needAmount.toLocaleString() + ' QKEY';
-                    document.getElementById('swapQkeyGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
-                    // ★ 사장님 2026-05-15 지시: USDT 스왑 1 단위부터 허용 (출금 시점에만 최소 100 USDT 가드)
                     var label = document.getElementById('swapQkeyInputLabel');
-                    if (target === 'usdt') {
-                        label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' ' + I18N.t('udyn.usdt_min_hint');
+                    if (target === 'qta') {
+                        // ★ 사장님 지시 (2026-08): QTA 스왑은 입력값을 "넣을 QKEY 수량"으로 해석.
+                        //   받을 QTA = floor(입력 QKEY / 비율), 실제 차감 = 받을 QTA * 비율 (3배수만, 나머지 QKEY 잔여)
+                        var qtaGet = Math.floor(v / qkeyPerQta);
+                        var needQkey = qtaGet * qkeyPerQta;
+                        document.getElementById('swapQkeyNeedText').textContent = needQkey.toLocaleString() + ' QKEY';
+                        document.getElementById('swapQkeyGetText').textContent = qtaGet.toLocaleString() + ' QTA';
+                        label.textContent = 'QKEY ' + I18N.t('dash.swap_amount_label');
                     } else {
-                        label.textContent = target.toUpperCase() + ' ' + I18N.t('dash.swap_amount_label');
+                        var needAmount = v * rate.need;
+                        var getAmount = v * rate.get;
+                        document.getElementById('swapQkeyNeedText').textContent = needAmount.toLocaleString() + ' QKEY';
+                        document.getElementById('swapQkeyGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
+                        // ★ 사장님 2026-05-15 지시: USDT 스왑 1 단위부터 허용 (출금 시점에만 최소 100 USDT 가드)
+                        if (target === 'usdt') {
+                            label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' ' + I18N.t('udyn.usdt_min_hint');
+                        } else {
+                            label.textContent = target.toUpperCase() + ' ' + I18N.t('dash.swap_amount_label');
+                        }
                     }
                 } else {
                     var target = document.getElementById('swapUsdtTarget').value;
@@ -25057,11 +25067,21 @@ app.get('/dashboard', (c) => {
                     target = document.getElementById('swapQkeyTarget').value;
                     amt = parseInt(document.getElementById('swapQkeyAmount').value) || 0;
                     if (amt <= 0) { alert(I18N.t('alert.enter_valid_amount')); return; }
-                    // ★ 사장님 2026-05-15 지시: QKEY → USDT 스왑은 QKEY 보유 수량 기준으로 1 단위부터 가능
-                    //   (출금 시점에만 100 USDT 최소 가드 유지)
                     endpoint = '/api/swap/qkey-to-' + target;
                     var rate = swapRates.qkey[target];
-                    confirmMsg = (amt * rate.need).toLocaleString() + ' QKEY → ' + (amt * rate.get).toLocaleString() + ' ' + target.toUpperCase();
+                    if (target === 'qta') {
+                        // ★ 사장님 지시 (2026-08): QTA 스왑 입력값은 "넣을 QKEY 수량".
+                        //   받을 QTA = floor(입력 QKEY / 비율). 백엔드 amount = 받을 QTA (백엔드가 QTA*비율 만큼 QKEY 차감).
+                        var qtaGet = Math.floor(amt / qkeyPerQta);
+                        if (qtaGet < 1) { alert(I18N.t('alert.enter_valid_amount')); return; }
+                        var needQkey = qtaGet * qkeyPerQta;
+                        amt = qtaGet; // 백엔드에는 받을 QTA 수량을 전송
+                        confirmMsg = needQkey.toLocaleString() + ' QKEY → ' + qtaGet.toLocaleString() + ' QTA';
+                    } else {
+                        // ★ 사장님 2026-05-15 지시: QKEY → USDT 스왑은 QKEY 보유 수량 기준으로 1 단위부터 가능
+                        //   (출금 시점에만 100 USDT 최소 가드 유지)
+                        confirmMsg = (amt * rate.need).toLocaleString() + ' QKEY → ' + (amt * rate.get).toLocaleString() + ' ' + target.toUpperCase();
+                    }
                 } else {
                     target = document.getElementById('swapUsdtTarget').value;
                     amt = parseFloat(document.getElementById('swapUsdtAmount').value) || 0;
@@ -26401,7 +26421,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073103"></script>
+        <script src="/static/i18n.js?v=2026073104"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27424,7 +27444,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073103"></script>
+        <script src="/static/i18n.js?v=2026073104"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
