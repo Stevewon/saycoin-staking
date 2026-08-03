@@ -23158,7 +23158,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073104"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -24147,7 +24147,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073104"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24480,15 +24480,17 @@ app.get('/dashboard', (c) => {
                         document.getElementById('swapQkeyGetText').textContent = qtaGet.toLocaleString() + ' QTA';
                         label.textContent = 'QKEY ' + I18N.t('dash.swap_amount_label');
                     } else {
-                        var needAmount = v * rate.need;
-                        var getAmount = v * rate.get;
+                        // ★ 사장님 지시 (2026-08): QX/USDT 스왑도 입력값을 "넣을 QKEY 수량"으로 해석.
+                        //   받을 수량 = floor(입력 QKEY / 비율), 실제 차감 = 받을 수량 * 비율 (비율 배수만, 나머지 QKEY 잔여)
+                        var getAmount = Math.floor(v / rate.need);
+                        var needAmount = getAmount * rate.need;
                         document.getElementById('swapQkeyNeedText').textContent = needAmount.toLocaleString() + ' QKEY';
                         document.getElementById('swapQkeyGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
                         // ★ 사장님 2026-05-15 지시: USDT 스왑 1 단위부터 허용 (출금 시점에만 최소 100 USDT 가드)
                         if (target === 'usdt') {
-                            label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' ' + I18N.t('udyn.usdt_min_hint');
+                            label.textContent = 'QKEY ' + I18N.t('dash.swap_amount_label') + ' ' + I18N.t('udyn.usdt_min_hint');
                         } else {
-                            label.textContent = target.toUpperCase() + ' ' + I18N.t('dash.swap_amount_label');
+                            label.textContent = 'QKEY ' + I18N.t('dash.swap_amount_label');
                         }
                     }
                 } else {
@@ -25078,9 +25080,13 @@ app.get('/dashboard', (c) => {
                         amt = qtaGet; // 백엔드에는 받을 QTA 수량을 전송
                         confirmMsg = needQkey.toLocaleString() + ' QKEY → ' + qtaGet.toLocaleString() + ' QTA';
                     } else {
-                        // ★ 사장님 2026-05-15 지시: QKEY → USDT 스왑은 QKEY 보유 수량 기준으로 1 단위부터 가능
-                        //   (출금 시점에만 100 USDT 최소 가드 유지)
-                        confirmMsg = (amt * rate.need).toLocaleString() + ' QKEY → ' + (amt * rate.get).toLocaleString() + ' ' + target.toUpperCase();
+                        // ★ 사장님 지시 (2026-08): QX/USDT 스왑 입력값도 "넣을 QKEY 수량".
+                        //   받을 수량 = floor(입력 QKEY / 비율). 백엔드 amount = 받을 수량 (백엔드가 수량*비율 만큼 QKEY 차감).
+                        var getAmount = Math.floor(amt / rate.need);
+                        if (getAmount < 1) { alert(I18N.t('alert.enter_valid_amount')); return; }
+                        var needQkeyEx = getAmount * rate.need;
+                        amt = getAmount; // 백엔드에는 받을 QX/USDT 수량을 전송
+                        confirmMsg = needQkeyEx.toLocaleString() + ' QKEY → ' + getAmount.toLocaleString() + ' ' + target.toUpperCase();
                     }
                 } else {
                     target = document.getElementById('swapUsdtTarget').value;
@@ -26421,7 +26427,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073104"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27444,7 +27450,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073104"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
