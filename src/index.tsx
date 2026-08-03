@@ -23158,7 +23158,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073101"></script>
+        <script src="/static/i18n.js?v=2026073102"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -24074,25 +24074,13 @@ app.get('/dashboard', (c) => {
             <div id="inquiryModal" class="fixed inset-0 bg-black/50 z-[100] hidden items-center justify-center p-4">
                 <div class="bg-white rounded-xl shadow-2xl max-w-md w-full p-5">
                     <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-comment-dots text-blue-600 mr-2"></i><span data-i18n="ushop.inquiry_title">쇼핑몰 문의하기</span></h3>
+                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-comment-dots text-blue-600 mr-2"></i><span data-i18n="ushop.inquiry_title">문의하기</span></h3>
                         <button onclick="closeInquiryModal()" class="text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
                     </div>
                     <div class="space-y-3">
-                        <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.inquiry_type">문의 유형</span> <span class="text-red-500">*</span></label>
-                            <select id="inquiryCategory" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
-                                <option value="" data-i18n="ushop.select_please">선택해주세요</option>
-                                <option value="shipping" data-i18n="ushop.inquiry_shipping">배송 문의</option>
-                                <option value="refund" data-i18n="ushop.inquiry_refund">환불 문의</option>
-                                <option value="other" data-i18n="ushop.inquiry_etc">기타 문의</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1" data-i18n="ushop.related_order">관련 주문 (선택)</label>
-                            <select id="inquiryOrderId" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
-                                <option value="" data-i18n="ushop.none">없음</option>
-                            </select>
-                        </div>
+                        <!-- 문의 유형/관련 주문 선택 제거: 바로 제목/내용 작성 (category는 자동 other로 저장) -->
+                        <input type="hidden" id="inquiryCategory" value="other">
+                        <input type="hidden" id="inquiryOrderId" value="">
                         <div>
                             <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.title_label">제목</span> <span class="text-red-500">*</span></label>
                             <input id="inquiryTitle" type="text" maxlength="100" placeholder="문의 제목" data-i18n-placeholder="udyn.inquiry_title_ph" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
@@ -24101,7 +24089,7 @@ app.get('/dashboard', (c) => {
                             <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.content_label">내용</span> <span class="text-red-500">*</span></label>
                             <textarea id="inquiryContent" rows="5" maxlength="2000" placeholder="문의 내용을 자세히 적어주세요" data-i18n-placeholder="udyn.inquiry_content_ph" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
                         </div>
-                        <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i><span data-i18n="ushop.inquiry_private">문의 내용은 본인과 쇼핑몰 관리자만 열람 가능합니다.</span></p>
+                        <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i><span data-i18n="ushop.inquiry_private">문의 내용은 본인과 관리자만 열람 가능합니다.</span></p>
                     </div>
                     <div class="flex gap-2 mt-4">
                         <button onclick="closeInquiryModal()" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium text-gray-700" data-i18n="common.cancel">취소</button>
@@ -24159,7 +24147,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073101"></script>
+        <script src="/static/i18n.js?v=2026073102"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -24808,26 +24796,11 @@ app.get('/dashboard', (c) => {
             // ========== 쇼핑몰 문의 (사용자) ==========
             function openInquiryModal() {
                 if (!currentUser || !currentUser.id) { alert(I18N.t('udyn.login_required')); return; }
-                // 폼 초기화
-                document.getElementById('inquiryCategory').value = '';
+                // 폼 초기화: 유형/관련 주문 선택 제거 - 바로 제목/내용 작성 (category는 항상 other)
+                document.getElementById('inquiryCategory').value = 'other';
+                document.getElementById('inquiryOrderId').value = '';
                 document.getElementById('inquiryTitle').value = '';
                 document.getElementById('inquiryContent').value = '';
-                // 주문 목록 옵션 채우기
-                var sel = document.getElementById('inquiryOrderId');
-                sel.innerHTML = '<option value="">' + I18N.t('udyn.opt_none') + '</option>';
-                (async function() {
-                    try {
-                        var res = await axios.get('/api/shop/orders/' + currentUser.id);
-                        if (res.data.success && Array.isArray(res.data.orders)) {
-                            res.data.orders.slice(0, 30).forEach(function(o) {
-                                var opt = document.createElement('option');
-                                opt.value = o.id;
-                                opt.textContent = '#' + o.id + ' - ' + (o.product_name || '') + ' x' + o.quantity;
-                                sel.appendChild(opt);
-                            });
-                        }
-                    } catch(e) {}
-                })();
                 var m = document.getElementById('inquiryModal');
                 m.classList.remove('hidden');
                 m.classList.add('flex');
@@ -24841,11 +24814,12 @@ app.get('/dashboard', (c) => {
 
             async function submitInquiry() {
                 if (!currentUser || !currentUser.id) { alert(I18N.t('udyn.login_required')); return; }
-                var category = document.getElementById('inquiryCategory').value;
+                var catEl = document.getElementById('inquiryCategory');
+                var category = (catEl && catEl.value) ? catEl.value : 'other';
                 var title = document.getElementById('inquiryTitle').value.trim();
                 var content = document.getElementById('inquiryContent').value.trim();
-                var orderId = document.getElementById('inquiryOrderId').value;
-                if (!category) { alert(I18N.t('udyn.inquiry_type_required')); return; }
+                var orderEl = document.getElementById('inquiryOrderId');
+                var orderId = orderEl ? orderEl.value : '';
                 if (!title) { alert(I18N.t('udyn.inquiry_title_required')); return; }
                 if (!content) { alert(I18N.t('udyn.inquiry_content_required')); return; }
                 try {
@@ -26417,7 +26391,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073101"></script>
+        <script src="/static/i18n.js?v=2026073102"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -27440,7 +27414,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=2026073101"></script>
+        <script src="/static/i18n.js?v=2026073102"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
