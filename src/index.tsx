@@ -5701,9 +5701,12 @@ app.post('/api/rewards/daily', async (c) => {
           //   판정: accrualDate(=reward_date, KST) > end_date_kst 이면 이 staking 은 만기 → 이후 전부 skip.
           //         (accrualDates 는 오름차순이므로 break 로 나머지도 전부 종료)
           const endDateKst = (staking as any).end_date_kst as string
-          if (endDateKst && accrualDate > endDateKst) {
+          // ★ 수정 2026-08-10 (2차) ★ — 사장님: "종료일이 도달하면 그 다음날부터 지급 금지"
+          //   = 종료일 당일(reward_date == end_date)도 지급 금지. 유효 마지막 reward_date = end_date 하루 전.
+          //   기존 '>' 는 종료일 당일을 통과시키는 버그 → '>=' 로 정정.
+          if (endDateKst && accrualDate >= endDateKst) {
             skippedCount++
-            break  // 종료일 초과 — 이 staking 은 더 이상 지급하지 않음
+            break  // 종료일 당일 포함 그 이후 — 이 staking 은 더 이상 지급하지 않음
           }
           // ★★★ 영구룰 #익일처리 (2026-05-19 사장님 D 명령) ★★★
           //   paid_date = nextBusinessDay(accrualDate) — 각 reward 별로 독립 계산
@@ -5819,7 +5822,7 @@ app.post('/api/rewards/daily', async (c) => {
                 WHERE user_id = ?
                   AND status = 'active'
                   AND date(start_date, '+9 hours') <= date(?)
-                  AND date(end_date, '+9 hours') >= date(?)
+                  AND date(end_date, '+9 hours') > date(?)
                 LIMIT 1
               `).bind(level1Referrer.referrer_id, accrualDate, accrualDate).first()
 
@@ -5899,7 +5902,7 @@ app.post('/api/rewards/daily', async (c) => {
                     WHERE user_id = ?
                       AND status = 'active'
                       AND date(start_date, '+9 hours') <= date(?)
-                      AND date(end_date, '+9 hours') >= date(?)
+                      AND date(end_date, '+9 hours') > date(?)
                     LIMIT 1
                   `).bind(level2Referrer.referrer_id, accrualDate, accrualDate).first()
 
