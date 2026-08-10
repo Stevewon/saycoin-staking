@@ -5481,6 +5481,7 @@ app.post('/api/rewards/daily', async (c) => {
         s.end_date,
         s.reset_at,
         date(s.start_date, '+9 hours') as start_date_kst,
+        date(s.end_date, '+9 hours') as end_date_kst,
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
         (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
       FROM staking s
@@ -5692,6 +5693,18 @@ app.post('/api/rewards/daily', async (c) => {
         const stakingProcessed: string[] = []
 
         for (const accrualDate of accrualDates) {
+          // ★★★★★ 영구룰 #종료일지급중단 (2026-08-10 사장님 지상명령) ★★★★★
+          //   사장님 명령 원문: "각 사용자별 종료일이 도달하면 그 다음날부터 무조건 지급하지말라고!!!!
+          //                      쿠키클럽이던 pqcpay던 전부!!!! 지상명령이야!!!"
+          //   → staking 의 end_date(KST) 를 넘어선 reward_date 는 200% cap 미달이어도 무조건 지급 금지.
+          //   → 이 룰이 기존 #만기무관cap우선(2026-07-24) 룰을 완전히 대체(폐기)한다.
+          //   판정: accrualDate(=reward_date, KST) > end_date_kst 이면 이 staking 은 만기 → 이후 전부 skip.
+          //         (accrualDates 는 오름차순이므로 break 로 나머지도 전부 종료)
+          const endDateKst = (staking as any).end_date_kst as string
+          if (endDateKst && accrualDate > endDateKst) {
+            skippedCount++
+            break  // 종료일 초과 — 이 staking 은 더 이상 지급하지 않음
+          }
           // ★★★ 영구룰 #익일처리 (2026-05-19 사장님 D 명령) ★★★
           //   paid_date = nextBusinessDay(accrualDate) — 각 reward 별로 독립 계산
           //   기존: paid_date = today (cron 실행일) → backfill 시 5/8 reward 도 5/12 paid 되는 위반
