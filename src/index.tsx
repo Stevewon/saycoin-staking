@@ -2001,37 +2001,22 @@ app.post('/api/withdrawal/request', async (c) => {
 
     const currentWithdrawable = Number(user[withdrawableField] || 0)
 
-    // ★ 5% 출금 수수료 계산 (사장님 정책 2026-05-11 + #no-decimal 2026-05-26)
-    //   Math.ceil — 수수료 올림 (사용자에게 유리한 방향 아니지만 정수 강제 + 잔액 정합 보장)
-    const fee = Math.ceil(amount * WITHDRAWAL_FEE_RATE)         // 정수
-    const netAmount = amount - fee                              // 정수 - 정수 = 정수
-    // ★★★ 영구룰 #balance↔tx정합 (사장님 정책 2026-05-26) ★★★
-    //   잔액에서 차감할 총량 = 신청액(amount) + 수수료(fee) — 모두 정수
-    const totalRequired = amount + fee
+    // ★★★ (가) 방식 — 사장님 2026-08-14 지시 ★★★
+    //   회원이 입력한 amount = "출금하려는 총 잔액". 그 안에서 5%를 공제한다.
+    //   예) amount=2000 → fee=100(5%) → net=1900(관리자 표시/실지급) → 잔액에서 2000만 1회 차감
+    //   관리자는 net(1900)만큼 테더를 지급한다.
+    const fee = Math.ceil(amount * WITHDRAWAL_FEE_RATE)         // 정수 (총액의 5%)
+    const netAmount = amount - fee                              // 정수 - 정수 = 정수 (실지급/관리자 표시)
+    // ★★★ (가) 방식: 잔액 차감 = 입력액(amount) 전액, 1회만 (수수료를 위에 얹지 않음) ★★★
+    const totalRequired = amount
 
     if (currentWithdrawable < totalRequired) {
       const coinLabel = coinType === 'QTA' ? 'QTA' : coinType === 'QX' ? 'QX' : coinType === 'QKEY' ? 'QKEY' : 'USDT'
-      // 최대 출금 가능액 계산 (수수료 포함하여 잔액 내에서) — 모두 정수
-      //   currentWithdrawable >= amount + ceil(amount*0.05) ≈ amount × 1.05
-      //   amount ≤ floor(currentWithdrawable / 1.05)
-      let maxWithdrawable = Math.floor(currentWithdrawable / (1 + WITHDRAWAL_FEE_RATE))
-      // QTA/QX 의 경우 net 이 1000 배수 되도록 보정
-      if (coinType === 'QTA' || coinType === 'QX') {
-        // net = maxW - ceil(maxW*0.05) 를 1000 배수로 내림 후 gross 재계산
-        const _maxNetRaw = maxWithdrawable - Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)
-        const _maxNet = Math.floor(_maxNetRaw / 1000) * 1000
-        // gross = ceil(net / 0.95) — net 의 1000 배수에서 역산
-        maxWithdrawable = _maxNet > 0 ? Math.ceil(_maxNet / (1 - WITHDRAWAL_FEE_RATE)) : 0
-        // 재검증: 잔액 초과 시 한 단위(1000) 내려서 재시도
-        while (maxWithdrawable > 0 && (maxWithdrawable + Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)) > currentWithdrawable) {
-          const _adjustedNet = _maxNet - 1000
-          maxWithdrawable = _adjustedNet > 0 ? Math.ceil(_adjustedNet / (1 - WITHDRAWAL_FEE_RATE)) : 0
-          if (_adjustedNet <= 0) break
-        }
-      }
+      // ★(가) 방식: 입력 amount = 출금하려는 총 잔액. 최대 = 현재 잔액 그대로.
+      const maxWithdrawable = currentWithdrawable
       const _maxNetDisplay = maxWithdrawable - Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)
       return c.json({
-        error: `출금가능 ${coinLabel} 수량이 부족합니다. 출금가능 잔액 ${currentWithdrawable.toLocaleString()} ${coinLabel} / 신청 ${amount.toLocaleString()} ${coinLabel} + 수수료 5% ${fee.toLocaleString()} ${coinLabel} = 총 필요 ${totalRequired.toLocaleString()} ${coinLabel}. 최대 출금 가능: ${maxWithdrawable.toLocaleString()} ${coinLabel} (실수령 ${_maxNetDisplay.toLocaleString()} ${coinLabel}). 회사 최초 지급분은 출금 대상이 아닙니다.`,
+        error: `출금가능 ${coinLabel} 수량이 부족합니다. 출금가능 잔액 ${currentWithdrawable.toLocaleString()} ${coinLabel} / 신청 ${amount.toLocaleString()} ${coinLabel}. 최대 출금 가능: ${maxWithdrawable.toLocaleString()} ${coinLabel} (5% 공제 후 실지급 ${_maxNetDisplay.toLocaleString()} ${coinLabel}). 회사 최초 지급분은 출금 대상이 아닙니다.`,
         insufficient_with_fee: true,
         current_withdrawable: currentWithdrawable,
         requested_amount: amount,
@@ -2065,20 +2050,21 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
     }
 
-    // 출금 신청 생성 (수수료/실수령액 함께 저장)
+    // 출금 신청 생성 — ★(가) 방식: amount 컬럼(관리자 표시/지급액) = net(5% 공제 후) ★
+    //   관리자는 이 amount(=net) 만큼 테더를 지급한다.
     const withdrawalResult = await db.prepare(`
       INSERT INTO withdrawals (user_id, coin_type, amount, wallet_address, status, fee, net_amount, fee_rate)
       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
-    `).bind(userId, coinType, amount, walletAddress, fee, netAmount, WITHDRAWAL_FEE_RATE).run()
+    `).bind(userId, coinType, netAmount, walletAddress, fee, netAmount, WITHDRAWAL_FEE_RATE).run()
 
-    // ★ 거래내역(transactions) 기록 — 사장님 .md 룰 준수 (사용자 노출 안전 한국어)
-    //   1) 출금 신청 본 거래 (음수 amount, 신청 원본 수량)
+    // ★ 거래내역(transactions) 기록 — (가) 방식: 신청(net) + 수수료(fee) 합계 = 입력액(amount) 정합
+    //   1) 출금 신청 본 거래 (음수 net = 관리자 지급액)
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'withdrawal', ?, ?, ?)
-    `).bind(userId, coinType, -Math.abs(amount), '출금 신청').run()
+    `).bind(userId, coinType, -Math.abs(netAmount), '출금 신청').run()
 
-    //   2) 출금 수수료 공제 거래 (음수 amount, 5%) — 사장님 명시 문구 그대로
+    //   2) 출금 수수료 공제 거래 (음수 fee, 5%) — net + fee = 입력액(amount) 로 잔액 정합
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'withdrawal_fee', ?, ?, ?)
@@ -2090,7 +2076,7 @@ app.post('/api/withdrawal/request', async (c) => {
       withdrawal: {
         id: withdrawalResult.meta.last_row_id,
         coinType: coinType,
-        amount: amount,
+        amount: netAmount,
         fee: fee,
         net_amount: netAmount,
         fee_rate: WITHDRAWAL_FEE_RATE,
@@ -26684,6 +26670,19 @@ app.get('/admin/dashboard', (c) => {
                     <h2 class="text-xl font-bold text-gray-800 mb-4">
                         <i class="fas fa-list text-purple-600 mr-2"></i><span data-i18n="admin.all_title">전체 스테이킹 목록</span>
                     </h2>
+                    <!-- 아이디(이메일/이름) 검색 -->
+                    <div class="mb-4 flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+                        <div class="relative flex-1">
+                            <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm"></i>
+                            <input id="allStakingSearch" type="text" oninput="filterAllStakings()" placeholder="아이디(이메일) 또는 이름으로 검색"
+                                   class="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500 focus:border-purple-500" />
+                        </div>
+                        <button onclick="document.getElementById('allStakingSearch').value='';filterAllStakings()"
+                                class="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg text-sm font-bold transition whitespace-nowrap">
+                            <i class="fas fa-times mr-1"></i>초기화
+                        </button>
+                    </div>
+                    <p id="allStakingCount" class="text-xs text-gray-500 mb-2"></p>
                     <div id="allList" class="space-y-4">
                         <p class="text-center text-gray-500 py-8" data-i18n="admin.loading">로딩 중...</p>
                     </div>
@@ -27654,19 +27653,51 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // 전체 스테이킹 목록 캐시 (아이디 검색 필터링용)
+            let __allStakingsCache = [];
+
             // 전체 스테이킹 목록 로드
             async function loadAllStakings() {
                 try {
                     const response = await axios.get('/api/admin/staking/all');
                     const stakings = response.data.stakings || [];
-                    const listEl = document.getElementById('allList');
+                    __allStakingsCache = stakings;
+                    // 검색어가 있으면 필터 유지, 없으면 전체 렌더
+                    filterAllStakings();
+                } catch (error) {
+                    console.error('All stakings load failed:', error);
+                }
+            }
 
-                    if (stakings.length === 0) {
-                        listEl.innerHTML = '<p class="text-center text-gray-500 py-8">' + I18N.t('admin.no_stakings') + '</p>';
-                        return;
-                    }
+            // 아이디(이메일)/이름 검색 필터
+            function filterAllStakings() {
+                const inputEl = document.getElementById('allStakingSearch');
+                const q = (inputEl ? inputEl.value : '').trim().toLowerCase();
+                const countEl = document.getElementById('allStakingCount');
+                let list = __allStakingsCache || [];
+                if (q) {
+                    list = list.filter(s =>
+                        (s.email && String(s.email).toLowerCase().includes(q)) ||
+                        (s.name && String(s.name).toLowerCase().includes(q))
+                    );
+                }
+                if (countEl) {
+                    countEl.textContent = q
+                        ? ('검색결과 ' + list.length + '건 (전체 ' + (__allStakingsCache || []).length + '건)')
+                        : ('전체 ' + list.length + '건');
+                }
+                renderAllStakingsCards(list);
+            }
 
-                    listEl.innerHTML = stakings.map(s => {
+            // 스테이킹 카드 렌더 (검색 결과 재사용)
+            function renderAllStakingsCards(stakings) {
+                const listEl = document.getElementById('allList');
+                if (!listEl) return;
+                if (!stakings || stakings.length === 0) {
+                    listEl.innerHTML = '<p class="text-center text-gray-500 py-8">' + I18N.t('admin.no_stakings') + '</p>';
+                    return;
+                }
+                listEl.innerHTML = stakings.map(s => {
                         let statusColor, statusText, statusIcon;
                         if (s.status === 'pending') {
                             statusColor = 'yellow';
@@ -27736,9 +27767,6 @@ app.get('/admin/dashboard', (c) => {
                             </div>
                         \`;
                     }).join('');
-                } catch (error) {
-                    console.error('All stakings load failed:', error);
-                }
             }
 
             // 사용자 목록 캐시 (검색 필터링용)
