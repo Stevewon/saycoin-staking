@@ -1956,7 +1956,10 @@ app.post('/api/withdrawal/request', async (c) => {
 
     // ★ 사장님 2026-05-15 (5차) 지시: 출금 신청은 같은 금요일(주간) 내 1회로 제한 ★
     //   기준: 이번 주 월요일 ~ 일요일(KST) 사이에 해당 user_id 의 withdrawals 행이 1건이라도 있으면 추가 신청 차단
-    //   상태(status) 무관 — pending / approved / rejected / completed / cancelled 모두 카운트
+    //   ★ 사장님 2026-08-21 지시: 취소(cancelled)·거부(rejected) 건은 카운트에서 제외 ★
+    //     → 본인이 출금 신청했다가 취소하면 잔액이 즉시 환불되므로, 같은 주라도 다시 출금 신청 가능해야 함.
+    //     → 살아있는 신청(pending / approved / completed)만 "이번 주 1회"로 카운트한다.
+    //     (취소/거부는 잔액이 이미 복구돼 있어 재신청해도 이중차감 없음 → 이중출금 방지 원칙 유지)
     //   다음 주 금요일 이후에는 다시 1회 신청 가능
     //   - 이전(4차) 룰: 계정 평생 1회 → 사장님 5차 지시로 주간 1회로 변경
     //
@@ -1975,6 +1978,7 @@ app.post('/api/withdrawal/request', async (c) => {
     const existingWithdrawal = await db.prepare(`
       SELECT id, coin_type, amount, status, created_at FROM withdrawals
       WHERE user_id = ? AND created_at >= ? AND created_at < ?
+        AND status NOT IN ('cancelled', 'rejected')
       ORDER BY created_at DESC LIMIT 1
     `).bind(userId, weekStartUtc, weekEndUtc).first()
 
