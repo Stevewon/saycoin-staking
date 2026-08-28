@@ -6814,11 +6814,15 @@ app.post('/api/rewards/daily-v2', async (c) => {
 
     const todayDateObjKst = new Date(today + 'T00:00:00+09:00')
     const { isBusinessDay, reason } = isKoreanBusinessDay(todayDateObjKst)
-    if (!isBusinessDay) {
+    // ★ 관리자 수동 복구 우회: force=GO 이면 휴일 게이트를 건너뛴다.
+    //   (누락된 평일 accrual 분을 사후 복구할 때, 실행일이 주말/휴일이어도 처리 가능하게 함.
+    //    reward_date 계산(yesterdayKst = targetDate-1)은 그대로이므로 대상 일자는 targetDate-1 이다.)
+    const forceRun = (c.req.query('force') || '') === 'GO'
+    if (!isBusinessDay && !forceRun) {
       const reasonText = reason === 'saturday' ? '토요일' : reason === 'sunday' ? '일요일' : '공휴일/국경일'
       return c.json({
         success: true,
-        message: `오늘(${today})은 ${reasonText}이므로 배당 처리 불가 (룰 B: 휴일 cron skip).`,
+        message: `오늘(${today})은 ${reasonText}이므로 배당 처리 불가 (룰 B: 휴일 cron skip). 관리자 강제복구는 force=GO.`,
         rewarded: 0, totalQkey: 0, skipped: 0, reason, targetDate: today,
       })
     }
