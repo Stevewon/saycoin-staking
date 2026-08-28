@@ -6254,11 +6254,12 @@ app.get('/api/admin/rewards/cron-lock-status', async (c) => {
     } catch(e) {}
 
     const todayKst = kstDateStr(new Date())
+    // ★ 2026-08-28 재발방지 — watchdog 이 완주여부(last_finished_at) 를 볼 수 있도록 SELECT 에 추가 ★
     const todayLock = await db.prepare(`
-      SELECT lock_date, source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+      SELECT lock_date, source, locked_at, locked_by, note, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
     `).bind(todayKst).first() as any
     const recentLocks = await db.prepare(`
-      SELECT lock_date, source, locked_at, locked_by, note
+      SELECT lock_date, source, locked_at, locked_by, note, last_finished_at
       FROM daily_cron_lock
       ORDER BY lock_date DESC LIMIT 14
     `).all()
@@ -6392,6 +6393,90 @@ app.get('/api/admin/rewards/cron-report', async (c) => {
     return c.json({ success: false, error: error?.message || 'unknown' }, 500)
   }
 })
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//  verify-daily-complete — 배당 완전지급 실측 (2026-08-28 사장님 "재발방지 대책" 이식, qkey-club 동형)
+//  [경로] GET/POST /api/cron/verify-daily-complete?key=<ADMIN_PW>&date=YYYY-MM-DD (미지정 시 어제 KST)
+//  [목적] lock 완주표시만 믿지 말고, 본인배당(daily_qkey tx)+L1/L2 파생(referral_reward tx) 을
+//         '실제 tx 존재' 기준으로 실측 → 고아행(행은 있으나 tx 없음)까지 100% 포착.
+//         watchdog 이 이 결과(total_hole>0)를 보고 daily-v2 자동복구를 트리거.
+//  [부작용 없음] 순수 SELECT (읽기전용). INSERT/UPDATE 전혀 없음.
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+const verifyDailyCompleteHandlerPqc = async (c: any) => {
+  try {
+    const key = c.req.query('key') || c.req.header('X-Cron-Secret') || ''
+    if (key !== ADMIN_PW) {
+      return c.json({ success: false, error: 'unauthorized (key=ADMIN_PW 필요)' }, 401)
+    }
+    const db = c.env.DB
+    const now = new Date()
+    const paramDate = (c.req.query('date') || '').trim()
+    const targetDate = paramDate || kstDateStr(new Date(now.getTime() - 24*60*60*1000))
+
+    // 1) 본인 배당 미지급 (active 인데 실제 daily_qkey tx 없음 — 고아행 포함)
+    const ownRow = await db.prepare(`
+      SELECT COUNT(*) AS c FROM staking s
+      WHERE s.status='active'
+        AND date(s.start_date,'+9 hours') <= ?
+        AND date(s.end_date,'+9 hours')   >  ?
+        AND NOT EXISTS (
+          SELECT 1 FROM daily_rewards dr
+          JOIN transactions t ON t.ref_id = dr.id AND t.type='daily_qkey'
+          WHERE dr.staking_id=s.id AND dr.reward_date=?
+        )
+    `).bind(targetDate, targetDate, targetDate).first() as any
+    const ownUnpaid = Number(ownRow?.c || 0)
+
+    // 2) L1 파생 구멍 — referral_rewards rr + 대응 referral_reward tx 까지 존재해야 지급완료
+    const l1Row = await db.prepare(`
+      WITH child AS (SELECT staking_id AS sid, user_id AS cid, usdt_amount AS own FROM daily_rewards WHERE reward_date=?)
+      SELECT COUNT(*) AS c FROM child c
+      JOIN users u ON u.id=c.cid
+      JOIN staking sp ON sp.user_id=u.referrer_id AND sp.status='active'
+        AND date(sp.start_date,'+9 hours')<=? AND date(sp.end_date,'+9 hours')>=?
+      WHERE u.referrer_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM referral_rewards rr
+          JOIN transactions t ON t.ref_id=rr.id AND t.type='referral_reward'
+          WHERE rr.referrer_id=u.referrer_id AND rr.referee_id=c.cid AND rr.level=1 AND rr.reward_date=?
+            AND (rr.staking_id=c.sid OR (rr.staking_id IS NULL AND rr.original_amount=c.own)))
+    `).bind(targetDate, targetDate, targetDate, targetDate).first() as any
+    const l1Hole = Number(l1Row?.c || 0)
+
+    // 3) L2 파생 구멍
+    const l2Row = await db.prepare(`
+      WITH child AS (SELECT staking_id AS sid, user_id AS cid, usdt_amount AS own FROM daily_rewards WHERE reward_date=?)
+      SELECT COUNT(*) AS c FROM child c
+      JOIN users u ON u.id=c.cid
+      JOIN users p ON p.id=u.referrer_id
+      JOIN staking sg ON sg.user_id=p.referrer_id AND sg.status='active'
+        AND date(sg.start_date,'+9 hours')<=? AND date(sg.end_date,'+9 hours')>=?
+      WHERE u.referrer_id IS NOT NULL AND p.referrer_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM referral_rewards rr
+          JOIN transactions t ON t.ref_id=rr.id AND t.type='referral_reward'
+          WHERE rr.referrer_id=p.referrer_id AND rr.referee_id=c.cid AND rr.level=2 AND rr.reward_date=?
+            AND (rr.staking_id=c.sid OR (rr.staking_id IS NULL AND rr.original_amount=c.own)))
+    `).bind(targetDate, targetDate, targetDate, targetDate).first() as any
+    const l2Hole = Number(l2Row?.c || 0)
+
+    const totalHole = ownUnpaid + l1Hole + l2Hole
+    return c.json({
+      success: true,
+      date: targetDate,
+      own_unpaid: ownUnpaid,
+      l1_hole: l1Hole,
+      l2_hole: l2Hole,
+      total_hole: totalHole,
+      complete: totalHole === 0,
+      message: totalHole === 0
+        ? `${targetDate} 배당 완전 지급 확인 (본인배당+L1+L2 구멍 0).`
+        : `${targetDate} 미완료: 본인배당 ${ownUnpaid} / L1 ${l1Hole} / L2 ${l2Hole} 구멍. daily-v2 로 재실행 필요.`
+    })
+  } catch (e) {
+    return c.json({ success: false, error: 'verify-daily-complete failed: ' + String(e) }, 500)
+  }
+}
+app.post('/api/cron/verify-daily-complete', verifyDailyCompleteHandlerPqc)
+app.get('/api/cron/verify-daily-complete', verifyDailyCompleteHandlerPqc)
 
 // ★★★★★★★★★★★★★★★★★★★★ 휴일진입자 전수 평일 누락 점검 (사장님 영구룰 #휴일진입자) ★★★★★★★★★★★★★★★★★★★★
 //   사장님 명령 (2026-05-13): "휴일진입자 현황 빨리 추출, 지급 안되었으면 즉각 지급, 상위 매칭 반영, 두번다시 잊지말것"
