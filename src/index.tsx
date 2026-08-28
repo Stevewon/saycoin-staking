@@ -6007,6 +6007,19 @@ app.post('/api/rewards/daily', async (c) => {
       } catch(e) {
         console.error('[P3] daily_cron_lock.last_finished_at UPDATE 실패:', e)
       }
+
+      // ★ 2026-08-28 재발방지 SELF-HEAL ★ — 워크플로(watchdog) 없이도 크론 완주 직후
+      //   어제자 L1/L2 파생 홀을 자동복구. daily 는 own skip 이라 파생을 못 채우므로 필수.
+      //   fillReferralHolesPqc 는 5-tuple 중복가드 + tx ref_id 가드로 이중지급 0 보장(멱등).
+      try {
+        const heal = await fillReferralHolesPqc(db, [yesterdayKst])
+        if ((heal?.l1_filled || 0) + (heal?.l2_filled || 0) > 0) {
+          console.log(`[SELF-HEAL] ${yesterdayKst} L1=${heal.l1_filled} L2=${heal.l2_filled} qkey=${heal.qkey}`)
+          message += ` | self_heal: L1+${heal.l1_filled} L2+${heal.l2_filled} (+${heal.qkey} QKEY)`
+        }
+      } catch(e) {
+        console.error('[SELF-HEAL] fillReferralHolesPqc 실패:', e)
+      }
     }
 
     return c.json({
@@ -6393,6 +6406,112 @@ app.get('/api/admin/rewards/cron-report', async (c) => {
     return c.json({ success: false, error: error?.message || 'unknown' }, 500)
   }
 })
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//  fillReferralHolesPqc — L1/L2 파생 자동복구 (qkey-club fillReferralHoles 이식, pqcpay 스키마)
+//  [배경] daily 는 own 이 있으면 skip → 파생(L1/L2)만 누락된 홀을 daily 재실행으로 못 채움.
+//  [해결] 대상일의 daily_rewards(자식) 를 로드해 L1/L2 파생을 5-tuple 중복가드+cap 게이트로 재수행.
+//  [이중지급 0] l1Exists/l2Exists(referral_rewards) + tx ref_id 가드로 이미 있는 건 SKIP.
+//  [스키마] balance=qkey_balance, USD_TO_QKEY=150, tx type='referral_reward', coin_type='QKEY'.
+//  반환: { dates, l1_filled, l2_filled, qkey, errors }
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+async function fillReferralHolesPqc(db: any, dateList: string[]): Promise<any> {
+  const USD_TO_QKEY = 150
+  // referrer 트리
+  const usersRaw = await db.prepare(`SELECT id, referrer_id FROM users`).all()
+  const referrerOf = new Map<number, number | null>()
+  for (const u of (usersRaw.results || []) as any[]) {
+    referrerOf.set(Number(u.id), u.referrer_id != null ? Number(u.referrer_id) : null)
+  }
+  // cap 집계 (200%: stakeTotal×2×150)
+  const stakeTotalsRaw = await db.prepare(`
+    SELECT user_id, COALESCE(SUM(amount),0) AS total FROM staking
+    WHERE status IN ('active','completed','capped') GROUP BY user_id`).all()
+  const stakeTotalByUser = new Map<number, number>()
+  for (const r of (stakeTotalsRaw.results || []) as any[]) stakeTotalByUser.set(Number(r.user_id), Number(r.total)||0)
+  const paidTotalsRaw = await db.prepare(`
+    SELECT user_id, COALESCE(SUM(amount),0) AS total FROM transactions
+    WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward') GROUP BY user_id`).all()
+  const paidTotalByUser = new Map<number, number>()
+  for (const r of (paidTotalsRaw.results || []) as any[]) paidTotalByUser.set(Number(r.user_id), Number(r.total)||0)
+  const targetOf = (uid: number) => (stakeTotalByUser.get(uid)||0) * 2 * USD_TO_QKEY
+  const paidOf = (uid: number) => paidTotalByUser.get(uid)||0
+  const isCapped = (uid: number) => { const t=targetOf(uid); return t>0 && paidOf(uid)>=t }
+  const remainingOf = (uid: number) => Math.max(0, targetOf(uid)-paidOf(uid))
+  const addPaid = (uid: number, amt: number) => paidTotalByUser.set(uid, paidOf(uid)+amt)
+
+  let l1Filled = 0, l2Filled = 0, qkey = 0
+  const errors: any[] = []
+
+  for (const accrualDate of dateList) {
+    const accrualPaidDate = nextBusinessDayKstStr(accrualDate)
+    const drCreatedAt = createdAtUtcForPaidDate(accrualPaidDate, 0)
+    const txCreatedAt = createdAtUtcForPaidDate(accrualPaidDate, 1)
+    const kids = await db.prepare(`
+      SELECT staking_id AS sid, user_id AS cid, usdt_amount AS own
+      FROM daily_rewards WHERE reward_date = ? ORDER BY id ASC`).bind(accrualDate).all()
+    for (const k of (kids.results || []) as any[]) {
+      try {
+        const childUid = Number(k.cid), childOwn = Number(k.own), childStakingId = Number(k.sid)
+        if (childOwn <= 0) continue
+        const parentId = referrerOf.get(childUid)
+        if (parentId == null) continue
+        // L1 — 부모가 그날 active staking 보유 시 지급
+        const parentActive = await db.prepare(`
+          SELECT id FROM staking WHERE user_id=? AND status='active'
+            AND date(start_date,'+9 hours')<=date(?) AND date(end_date,'+9 hours')>=date(?) LIMIT 1
+        `).bind(parentId, accrualDate, accrualDate).first()
+        if (parentActive) {
+          const l1Exists = await db.prepare(`
+            SELECT COUNT(*) AS c FROM referral_rewards
+            WHERE referrer_id=? AND referee_id=? AND level=1 AND reward_date=?
+              AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
+          `).bind(parentId, childUid, accrualDate, childStakingId, childOwn).first() as any
+          if (Number(l1Exists?.c||0) === 0 && !isCapped(parentId)) {
+            let l1 = Math.round(childOwn*0.20)
+            const rem = remainingOf(parentId); if (l1>rem) l1=Math.max(0,Math.floor(rem))
+            if (l1>0) {
+              await db.prepare(`UPDATE users SET qkey_balance=qkey_balance+? WHERE id=?`).bind(l1, parentId).run()
+              const rrIns = await db.prepare(`INSERT INTO referral_rewards (referrer_id,referee_id,level,original_amount,reward_amount,reward_date,paid_date,staking_id,created_at) VALUES (?,?,1,?,?,?,?,?,?)`).bind(parentId,childUid,childOwn,l1,accrualDate,accrualPaidDate,childStakingId,drCreatedAt).run()
+              const rrId = (rrIns as any)?.meta?.last_row_id ?? null
+              const txEx = await db.prepare(`SELECT id FROM transactions WHERE type='referral_reward' AND ref_id=? LIMIT 1`).bind(rrId).first()
+              if (!txEx) await db.prepare(`INSERT INTO transactions (user_id,type,coin_type,amount,description,ref_id,created_at) VALUES (?,'referral_reward','QKEY',?,?,?,?)`).bind(parentId,l1,'추천 보너스 (Level 1)',rrId,txCreatedAt).run()
+              addPaid(parentId,l1); l1Filled++; qkey+=l1
+            }
+          }
+        }
+        // L2 — 부모 active 여부와 무관. 조부모가 그날 active 면 지급.
+        const grandId = referrerOf.get(parentId)
+        if (grandId != null) {
+          const grandActive = await db.prepare(`
+            SELECT id FROM staking WHERE user_id=? AND status='active'
+              AND date(start_date,'+9 hours')<=date(?) AND date(end_date,'+9 hours')>=date(?) LIMIT 1
+          `).bind(grandId, accrualDate, accrualDate).first()
+          if (grandActive) {
+            const l2Exists = await db.prepare(`
+              SELECT COUNT(*) AS c FROM referral_rewards
+              WHERE referrer_id=? AND referee_id=? AND level=2 AND reward_date=?
+                AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
+            `).bind(grandId, childUid, accrualDate, childStakingId, childOwn).first() as any
+            if (Number(l2Exists?.c||0) === 0 && !isCapped(grandId)) {
+              let l2 = Math.round(childOwn*0.10)
+              const rem2 = remainingOf(grandId); if (l2>rem2) l2=Math.max(0,Math.floor(rem2))
+              if (l2>0) {
+                await db.prepare(`UPDATE users SET qkey_balance=qkey_balance+? WHERE id=?`).bind(l2, grandId).run()
+                const rrIns2 = await db.prepare(`INSERT INTO referral_rewards (referrer_id,referee_id,level,original_amount,reward_amount,reward_date,paid_date,staking_id,created_at) VALUES (?,?,2,?,?,?,?,?,?)`).bind(grandId,childUid,childOwn,l2,accrualDate,accrualPaidDate,childStakingId,drCreatedAt).run()
+                const rrId2 = (rrIns2 as any)?.meta?.last_row_id ?? null
+                const txEx2 = await db.prepare(`SELECT id FROM transactions WHERE type='referral_reward' AND ref_id=? LIMIT 1`).bind(rrId2).first()
+                if (!txEx2) await db.prepare(`INSERT INTO transactions (user_id,type,coin_type,amount,description,ref_id,created_at) VALUES (?,'referral_reward','QKEY',?,?,?,?)`).bind(grandId,l2,'추천 보너스 (Level 2)',rrId2,txCreatedAt).run()
+                addPaid(grandId,l2); l2Filled++; qkey+=l2
+              }
+            }
+          }
+        }
+      } catch (e) { errors.push({ date: accrualDate, cid: k.cid, error: String(e) }) }
+    }
+  }
+  return { dates: dateList, l1_filled: l1Filled, l2_filled: l2Filled, qkey, errors }
+}
 
 // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 //  verify-daily-complete — 배당 완전지급 실측 (2026-08-28 사장님 "재발방지 대책" 이식, qkey-club 동형)
