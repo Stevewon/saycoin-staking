@@ -30,7 +30,7 @@ app.use('/static/*', serveStatic({ root: './public' }))
 // Admin Auth Helpers
 // ============================================
 const ADMIN_ID = 'admin'
-const ADMIN_PW = 'Qta@2026!Sec#Admin'
+const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
 
 // ============================================================
 // P0+P2 영구 안전 헬퍼 — 모든 백필/manual INSERT 엔드포인트 의무 사용
@@ -55198,7 +55198,7 @@ app.get('/api/diag/audit-512-rewards', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') {
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 403)
     }
     const db = c.env.DB
@@ -55399,7 +55399,7 @@ app.get('/api/diag/purge-and-recalc-512', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') {
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 403)
     }
     const confirm = c.req.query('confirm') || ''
@@ -55853,7 +55853,7 @@ app.get('/api/diag/resume-512', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'  // dr | rr-l1 | rr-l2 | balance-sync | all
     const isExec = confirm === 'RESUME_512'
@@ -56069,7 +56069,7 @@ app.get('/api/diag/verify-512-bottom-up', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID_DATE = '2026-05-12'
@@ -56396,7 +56396,7 @@ app.get('/api/diag/dup-512-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'DELETE_DUP_512'
     const db = c.env.DB
@@ -56700,7 +56700,7 @@ app.get('/api/diag/insert-511-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_511'
@@ -56944,7 +56944,7 @@ app.get('/api/diag/preview-511-groups', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID_DATE = '2026-05-11'
@@ -57157,7 +57157,7 @@ app.get('/api/diag/insert-511-paid-v2', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_511_V2'
@@ -57432,7 +57432,7 @@ app.get('/api/diag/inspect-511-existing-rr', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 5/11 paid 의 모든 RR 상세 (정확한 컬럼: referrer_id, referee_id, reward_amount, original_amount, staking_id)
@@ -57582,7 +57582,7 @@ app.get('/api/diag/inspect-511-rr-violations', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const VIOLATION_IDS = [1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203]
@@ -57718,7 +57718,7 @@ app.get('/api/diag/delete-511-rr-violations', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'DELETE_511_RR_VIOLATIONS'
     const db = c.env.DB
@@ -57888,7 +57888,7 @@ app.get('/api/diag/verify-511-bottom-up', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 1) DR 집계
@@ -58072,7 +58072,7 @@ app.get('/api/diag/inspect-516-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID_DATE = '2026-05-16'
@@ -58292,7 +58292,7 @@ app.get('/api/diag/scan-516-all-traces', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 1) DR with paid_date=5/16
@@ -58461,7 +58461,7 @@ app.get('/api/diag/delete-516-all-traces', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'DELETE_516_ALL'
     const db = c.env.DB
@@ -58702,7 +58702,7 @@ app.get('/api/diag/check-user44-balance-after-516', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_USER44_516'
     const db = c.env.DB
@@ -58807,7 +58807,7 @@ app.get('/api/diag/fix-user44-balance-516', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_USER44_BALANCE_2475'
     const db = c.env.DB
@@ -58931,7 +58931,7 @@ app.get('/api/diag/scan-519-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID = '2026-05-19'
@@ -59117,7 +59117,7 @@ app.get('/api/diag/purge-519-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'PURGE_519'
     const db = c.env.DB
@@ -59377,7 +59377,7 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_519_V2'
@@ -59642,7 +59642,7 @@ app.get('/api/diag/scan-tx-double-payments', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // ─── 1) DR (user_id, staking_id, paid_date) 중복 ─────────────
@@ -59777,7 +59777,7 @@ app.get('/api/diag/scan-tx-double-payments', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-holiday-tx-double', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const HOLIDAY_USERS = [33, 38, 40, 91, 93]
@@ -59923,7 +59923,7 @@ app.get('/api/diag/scan-holiday-tx-double', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-balance-vs-tx', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60076,7 +60076,7 @@ app.get('/api/diag/scan-balance-vs-tx', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60207,7 +60207,7 @@ app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/snapshot-export', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60325,7 +60325,7 @@ app.get('/api/diag/snapshot-export', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/snapshot-meta', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60376,7 +60376,7 @@ app.get('/api/diag/snapshot-meta', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.post('/api/diag/snapshot-restore', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60536,7 +60536,7 @@ app.post('/api/diag/snapshot-restore', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-balance-to-history', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60702,7 +60702,7 @@ app.get('/api/diag/fix-balance-to-history', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-daily-missing', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -61002,7 +61002,7 @@ app.get('/api/diag/fix-daily-missing', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/sim-option-d', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -61183,7 +61183,7 @@ app.get('/api/diag/sim-option-d', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/purge-holiday-513-legacy', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'PURGE_HOLIDAY_513_LEGACY'
@@ -61322,7 +61322,7 @@ app.get('/api/diag/purge-holiday-513-legacy', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-all-legacy-violation', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -61441,7 +61441,7 @@ app.get('/api/diag/scan-all-legacy-violation', async (c) => {
 // 이 endpoint 는 /api/admin/user/:userId 와 동일 query 를 auth 없이 실행
 app.get('/api/diag/admin-page-mirror', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const userId = parseInt(c.req.query('user_id') || '93')
@@ -61527,7 +61527,7 @@ app.get('/api/diag/admin-page-mirror', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-user-full', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW && c.req.query('key') !== ADMIN_PW) {
     return c.json({ error: 'AUTH' }, 401)
   }
@@ -61816,7 +61816,7 @@ app.get('/api/diag/scan-user-full', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-user-rr-detail', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW && c.req.query('key') !== ADMIN_PW) {
     return c.json({ error: 'AUTH' }, 401)
   }
@@ -61999,7 +61999,7 @@ app.get('/api/diag/scan-user-rr-detail', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-all-tx-double', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const HOLIDAY_USERS = new Set([33, 38, 40, 91, 93])
@@ -62211,7 +62211,7 @@ app.get('/api/diag/scan-holiday-joiners-double', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 1) 휴일진입자 staking 전체
@@ -62452,7 +62452,7 @@ app.get('/api/diag/purge-513-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'PURGE_513'
     const db = c.env.DB
@@ -62666,7 +62666,7 @@ app.get('/api/diag/insert-513-paid-v2', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_513_V2'
@@ -62904,7 +62904,7 @@ app.get('/api/diag/scan-513-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID = '2026-05-13'
@@ -63203,7 +63203,7 @@ app.get('/api/diag/scan-l1l2-desc-mismatch', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
     const filterPaidDate = (c.req.query('paid_date') || '').trim()
     const filterUserIdRaw = (c.req.query('user_id') || '').trim()
@@ -63350,7 +63350,7 @@ app.get('/api/diag/fix-511-tx-description', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_511_TX_DESC'
     const db = c.env.DB
@@ -63521,7 +63521,7 @@ app.get('/api/diag/audit-4item-vs-grandtotal', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
     const limit = Math.max(1, Math.min(2000, Number(c.req.query('limit') || 500)))
     const minDiff = Math.max(0, Number(c.req.query('min_diff') || 1))
@@ -63961,7 +63961,7 @@ app.get('/api/diag/fix-519-tx-description', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_519_TX_DESC'
     const db = c.env.DB
@@ -64119,7 +64119,7 @@ app.get('/api/diag/inspect-tx-desc-history', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 다른 paid_date(5/12~5/18) 의 referral_reward TX description 샘플
@@ -64204,7 +64204,7 @@ app.get('/api/diag/verify-519-bottom-up', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID = '2026-05-19'
@@ -64395,7 +64395,7 @@ app.get('/api/diag/verify-519-bottom-up', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-missing-daily-qkey', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -64661,7 +64661,7 @@ app.get('/api/diag/fix-missing-daily-qkey', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-iinsil2-staking-reward', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -64801,7 +64801,7 @@ app.get('/api/diag/fix-iinsil2-staking-reward', async (c) => {
 // ============================================================================
 app.get('/api/diag/fix-solbat-tree-missing', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'FIX_SOLBAT_TREE_2026_05_19'
 
@@ -65044,7 +65044,7 @@ app.get('/api/diag/fix-solbat-tree-missing', async (c) => {
 // ============================================================================
 app.get('/api/diag/rollback-solbat-tree-partial', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'ROLLBACK_SOLBAT_TREE_PARTIAL'
 
@@ -65136,7 +65136,7 @@ app.get('/api/diag/rollback-solbat-tree-partial', async (c) => {
 // ============================================================================
 app.get('/api/diag/fix-solbat-tree-missing-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'FIX_SOLBAT_V2'
 
@@ -65330,7 +65330,7 @@ app.get('/api/diag/fix-solbat-tree-missing-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/rollback-solbat-tree-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'ROLLBACK_SOLBAT_V2_HOLIDAY'
 
@@ -65477,7 +65477,7 @@ app.get('/api/diag/rollback-solbat-tree-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-weekday-missing-scan', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -65669,7 +65669,7 @@ app.get('/api/diag/solbat-tree-weekday-missing-scan', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-staking-coverage', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -65878,7 +65878,7 @@ app.get('/api/diag/solbat-tree-staking-coverage', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-fix-stage-B', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'STAGE_B_FIX_GO'
   const db = c.env.DB
@@ -66218,7 +66218,7 @@ app.get('/api/diag/solbat-fix-stage-B', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-fix-stage-A', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'STAGE_A_FIX_GO'
   const db = c.env.DB
@@ -66509,7 +66509,7 @@ app.get('/api/diag/solbat-fix-stage-A', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -66810,7 +66810,7 @@ app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-bottomup-audit', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -67096,7 +67096,7 @@ app.get('/api/diag/solbat-tree-bottomup-audit', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -67384,7 +67384,7 @@ app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-fix-stage-A2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'STAGE_A2_FIX_GO'
   const db = c.env.DB
@@ -67675,7 +67675,7 @@ app.get('/api/diag/solbat-fix-stage-A2', async (c) => {
 // ============================================================================
 app.get('/api/diag/snapshot-full', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -67773,7 +67773,7 @@ app.get('/api/diag/snapshot-full', async (c) => {
 // ============================================================================
 app.get('/api/diag/daily-payout-5-19', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'PAYOUT_5_19_GO'
   const db = c.env.DB
@@ -68060,7 +68060,7 @@ app.get('/api/diag/daily-payout-5-19', async (c) => {
 // ============================================================================
 app.get('/api/diag/lock-cron-today', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -68163,7 +68163,7 @@ app.get('/api/diag/lock-cron-today', async (c) => {
 // ============================================================================
 app.get('/api/diag/audit-5-19-full', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -68477,7 +68477,7 @@ app.get('/api/diag/audit-5-19-full', async (c) => {
 // ============================================================================
 app.get('/api/diag/audit-user-5-19', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -68662,7 +68662,7 @@ app.get('/api/diag/fix-usdt-amount-permanent-rule', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') {
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 401)
     }
     const confirm = c.req.query('confirm') || ''
@@ -68891,7 +68891,7 @@ app.get('/api/diag/fix-bangsh-balance', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') {
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 401)
     }
     const confirm = c.req.query('confirm') || ''
@@ -69026,7 +69026,7 @@ app.get('/api/diag/fix-bangsh-swap-tx', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') {
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 401)
     }
     const confirm = c.req.query('confirm') || ''
@@ -69267,7 +69267,7 @@ app.get('/api/diag/daily-payout-5-19-fix-reset', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const isExec = c.req.query('confirm') === 'PAYOUT_5_19_FIX_RESET_GO'
     const db = c.env.DB
 
@@ -69535,7 +69535,7 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
 
@@ -69790,7 +69790,7 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
     const RD = '2026-05-19'
@@ -69924,7 +69924,7 @@ app.get('/api/diag/inspect-referee-stakings', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
     const refs = [42, 45, 49, 58]
@@ -69979,7 +69979,7 @@ app.get('/api/diag/find-ininshil2', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
 
@@ -70058,7 +70058,7 @@ app.get('/api/diag/find-ininshil2', async (c) => {
 app.get('/api/diag/lookup-rr', async (c) => {
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const idsStr = c.req.query('ids') || ''
     const ids = idsStr.split(',').map(x => Number(x.trim())).filter(x => x > 0)
     if (ids.length === 0) return c.json({ error: 'no ids' })
@@ -70081,7 +70081,7 @@ app.get('/api/diag/audit-ininshil2-deep', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
     const UID = 76
@@ -70192,7 +70192,7 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const confirm = c.req.query('confirm')
     const EXEC = confirm === 'REMOVE_5_19_DUP_GO'
@@ -70503,7 +70503,7 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'FIX_TX_CREATED_AT_GO')
     const db = c.env.DB
@@ -70739,7 +70739,7 @@ app.get('/api/diag/audit-solbat-deep', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // 솔밧 모든 TX 의 ref_id 매칭 dr/rr (full join)
@@ -70883,7 +70883,7 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // ========================================================================
@@ -71221,7 +71221,7 @@ app.get('/api/diag/detect-and-remove-5-19-dup', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'REMOVE_5_19_DUP_GO')
     const db = c.env.DB
@@ -71519,7 +71519,7 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // 단일 날짜만 처리 (Worker timeout 회피) — 미지정 시 전부
@@ -71752,7 +71752,7 @@ app.get('/api/diag/audit-user-referral-detail', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     const userId = Number(c.req.query('user_id') || '54')
@@ -71864,7 +71864,7 @@ app.get('/api/diag/fix-missing-tx-5-14-15-18', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'FIX_MISSING_TX_5_14_15_18_GO')
     const db = c.env.DB
@@ -72089,7 +72089,7 @@ app.get('/api/diag/audit-referral-completeness', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // 기본: 5/4 ~ 5/19 평일 (휴일 제외). param 으로 단일 날짜만 처리 가능
@@ -72369,7 +72369,7 @@ app.get('/api/diag/inspect-rr-and-tx', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     const idsParam = c.req.query('ids') || ''
@@ -72428,7 +72428,7 @@ app.get('/api/diag/fix-missing-l12-tx-all', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'FIX_MISSING_L12_TX_ALL_GO')
     const db = c.env.DB
@@ -72627,7 +72627,7 @@ app.get('/api/diag/fix-missing-l12-tx-all', async (c) => {
 app.get('/api/diag/fix-solbat-paid-5-6', async (c) => {
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const dryRun = c.req.query('dry_run') === 'true' || !c.req.query('confirm')
     const confirm = c.req.query('confirm') || ''
     if (!dryRun && confirm !== 'FIX_SOLBAT_PAID_5_6_GO') {
@@ -72812,7 +72812,7 @@ app.get('/api/diag/fix-solbat-paid-5-6', async (c) => {
 app.get('/api/diag/solbat-bottomup-backfill', async (c) => {
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const dryRun = c.req.query('dry_run') === 'true' || !c.req.query('confirm')
     const confirm = c.req.query('confirm') || ''
@@ -73094,7 +73094,7 @@ app.get('/api/diag/fix-l12-createdat-by-user', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const userIdStr = c.req.query('user_id') || ''
     if (!userIdStr) return c.json({ error: 'user_id required (사장님 명령: 솔밧만 우선)' }, 400)
