@@ -5576,29 +5576,72 @@ app.post('/api/rewards/daily', async (c) => {
         WHERE user_id = ? AND coin_type = 'QKEY'
           AND type IN ('daily_qkey','referral_reward','direct_referral')
       `).bind(userId).first() as any
-      let pool = Number(paidRow?.total || 0)
 
-      // FIFO 분배: 진입일 빠른 staking부터 cap_target까지 채움
+      // ★★★★★ 영구룰 #cap-staking별정확귀속 (2026-09-01 사장님 명령 "근본대책") ★★★★★
+      //   [근본 사고 — soo1717(uid116) 사건]
+      //     기존 로직은 pool(= daily_qkey + referral_reward + direct_referral 전체)을
+      //     진입일 빠른 staking 부터 cap_target 까지 "몰아서 FIFO 분배" 했다.
+      //     → 다중 staking 유저에서 앞선 staking(sid117 $10k)에 pool 전체가 몰려
+      //       실제 26.5% 밖에 안 받았는데도 cap 100% 도달로 오판 → 부당 capped/completed.
+      //     (uid116: sid117 실지급 795,000(26.5%) 인데 pool 3,180,000 FIFO 로 100% 오판)
+      //   [근본대책 — 실귀속 우선 + 잔여만 FIFO]
+      //     ① 본인 daily(daily_qkey)는 daily_rewards.staking_id 로 이미 staking 에 1:1 귀속됨
+      //        → staking 별 실제 지급 합계(usdt_amount)를 fill 초기값으로 정확히 세팅.
+      //     ② 매칭(referral_reward L1/L2) + 직판(direct_referral) 만 유저 통합분이므로
+      //        pool 에서 daily 귀속분을 뺀 "매칭/직판 잔여"를 진입일 ASC FIFO 로 추가 배분.
+      //     ③ 이렇게 하면 각 staking 의 fill = (본인 daily 실지급) + (배분된 매칭/직판)
+      //        → 앞 staking 조기 capped 오판 제거, cap 판정 정확.
+      //   [이중지급/누락 위험 0] fill 총합은 기존과 동일(pool), 분배 방식만 정확해짐.
+
+      // 본인 daily(daily_qkey) staking 별 실지급 합계
+      const ownDailyRows = await db.prepare(`
+        SELECT staking_id, COALESCE(SUM(usdt_amount), 0) as own_daily
+        FROM daily_rewards
+        WHERE user_id = ?
+        GROUP BY staking_id
+      `).bind(userId).all()
+      const ownDailyByStaking = new Map<number, number>()
+      let ownDailyTotal = 0
+      for (const r of ownDailyRows.results as any[]) {
+        const v = Number(r.own_daily || 0)
+        ownDailyByStaking.set(Number(r.staking_id), v)
+        ownDailyTotal += v
+      }
+
+      const poolTotal = Number(paidRow?.total || 0)
+      // 매칭/직판 잔여 = 전체 pool - 본인 daily 귀속분 (음수 방지)
+      let matchingPool = Math.max(0, poolTotal - ownDailyTotal)
+
       const stakings: StakingState[] = []
+      // 1차: 각 staking 에 본인 daily 실지급을 정확히 귀속 (cap 초과분은 넘치지 않게 clamp)
       for (const r of stakingRows.results as any[]) {
         const amount = Number(r.amount)
         const capTarget = amount * 2 * USD_TO_QKEY
-        const fill = Math.min(pool, capTarget)
-        pool -= fill
+        const own = Math.min(ownDailyByStaking.get(Number(r.id)) || 0, capTarget)
         stakings.push({
           id: Number(r.id),
           amount,
           capTarget,
-          fill,
-          capped: fill >= capTarget,
+          fill: own,   // 본인 daily 실귀속분으로 초기화
+          capped: own >= capTarget,
           status_db: String(r.status || 'active'),
           start_date_kst: String(r.start_date_kst || '')
         })
       }
+      // 2차: 매칭/직판 잔여만 진입일 ASC FIFO 로 남은 cap 여유에 배분
+      for (const s of stakings) {
+        if (matchingPool <= 0) break
+        const room = s.capTarget - s.fill
+        if (room <= 0) continue
+        const add = Math.min(matchingPool, room)
+        s.fill += add
+        matchingPool -= add
+        if (s.fill >= s.capTarget) s.capped = true
+      }
 
       const state: UserCapState = {
         userId,
-        totalPaid: Number(paidRow?.total || 0),
+        totalPaid: poolTotal,
         stakings
       }
       stakingStateCache.set(userId, state)
