@@ -5301,20 +5301,47 @@ app.post('/api/rewards/daily', async (c) => {
 
     // 기존 lock 확인 — 같은 날 다른 source 가 이미 실행했으면 차단
     const existingLock = await db.prepare(`
-      SELECT source, locked_at, locked_by FROM daily_cron_lock WHERE lock_date = ?
+      SELECT source, locked_at, locked_by, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
     `).bind(todayKstForLock).first() as any
     if (existingLock) {
       const incomingSource = internalManualCall ? 'manual_admin' : 'cron_auto'
+      const alreadyFinished = !!existingLock.last_finished_at
       if (existingLock.source !== incomingSource) {
-        // source 불일치 = 다른 경로(수동/자동)가 이미 같은 날 처리 완료 → 차단
-        return c.json({
-          success: false,
-          error: `오늘(${todayKstForLock}) 데일리 배당은 이미 [${existingLock.source}] 에 의해 ${existingLock.locked_at} 에 실행되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰).`,
-          blocked: true,
-          lock: existingLock
-        }, 423) // 423 Locked
+        // ★★★★★ 영구룰 #완주보장-이어받기 (2026-09-01 사장님 명령 "근본수정") ★★★★★
+        //   [근본 사고 — pqcpay 08-31 재현] 자동 cron 이 락은 잡았는데 완주 while 루프가
+        //     Cloudflare 시간초과로 잘려 last_finished_at 이 NULL(미완주) 로 남으면,
+        //     그 뒤 어떤 다른 source 트리거도 여기서 source 불일치 423 → 영영 미완주 고착.
+        //     (08-31: cron_auto 락이 50초만에 '거짓완주'처럼 종료 → 47명 daily 펑크)
+        //   [근본대책 = qkey-club 옵션C 이식]
+        //     ① 미완주 락(last_finished_at IS NULL) 이면 source 불일치여도 재진입(이어받기) 허용.
+        //        → 다른 source 라도 미완주분 완주를 이어받아 펑크 방지.
+        //     ② 완주 완료(last_finished_at NOT NULL) 락만 source 불일치 시 423 차단.
+        //   [이중지급 위험 0]
+        //     - daily 본체는 staking 별 NOT EXISTS + getStakingAccrualDatesKst 백필(멱등)
+        //     - DB UNIQUE(staking_id, reward_date) 최종 방어
+        //     - cap pre-check(isStakingCapped) 로 cap 200% 도달분 자동 skip
+        if (alreadyFinished) {
+          // source 불일치 + 완주 완료 → 차단 (이중배당 방지, 영구룰 유지)
+          return c.json({
+            success: false,
+            error: `오늘(${todayKstForLock}) 데일리 배당은 이미 [${existingLock.source}] 에 의해 ${existingLock.locked_at} 에 실행 → 완주 완료(${existingLock.last_finished_at})되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
+            blocked: true,
+            lock: existingLock,
+            unlock_hint: '강제 재실행: POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 명령)'
+          }, 423) // 423 Locked
+        }
+        // source 불일치 + 미완주 → 이어받기 허용 (락 source 를 현재 source 로 승계)
+        console.log(`[완주보장-이어받기] ${todayKstForLock} 미완주 락(${existingLock.source} @ ${existingLock.locked_at}) 을 ${incomingSource} 가 이어받아 완주 재개`)
+        try {
+          await db.prepare(`
+            UPDATE daily_cron_lock
+               SET source = ?, note = COALESCE(note,'') || ' [이어받기: ' || ? || ' 재개]'
+             WHERE lock_date = ?
+          `).bind(incomingSource, incomingSource, todayKstForLock).run()
+        } catch(e) {}
       }
       // 같은 source 의 batch 페이지네이션 재호출은 통과
+      // (미완주/완주 무관 — 완주 후 재호출도 멱등 백필이라 이중지급 없음)
     } else {
       // 신규 lock INSERT (cron_auto 또는 manual_admin)
       try {
@@ -6143,17 +6170,31 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
 
     // 기존 lock 체크 — 같은 날 이미 실행되었으면 차단
     const existingLock = await db.prepare(`
-      SELECT source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+      SELECT source, locked_at, locked_by, note, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
     `).bind(todayKst).first() as any
     if (existingLock) {
+      // ★★★★★ 영구룰 #완주보장-이어받기 (2026-09-01 사장님 명령 "근본수정") ★★★★★
+      //   [근본 사고 — pqcpay 08-31 재현] 자동 cron 이 락은 잡았는데 완주 while 루프가
+      //     Cloudflare 시간초과로 잘려 last_finished_at 이 NULL(미완주) 로 남으면,
+      //     그 뒤 이 수동 트리거도 여기서 무조건 423 → 영영 미완주 고착 → daily 펑크.
+      //   [근본대책 = qkey-club 이식]
+      //     ① 완주 완료(last_finished_at NOT NULL) 락 → 423 차단 (이중배당 방지, 영구룰 유지)
+      //     ② 미완주 락(last_finished_at IS NULL) → 재진입(이어받기) 허용 → 미완주분 완주 재개.
+      //   [이중지급 위험 0] daily 본체 NOT EXISTS 백필(멱등) + DB UNIQUE(staking_id,reward_date)
+      //                     + cap pre-check(isStakingCapped) 로 cap 200% 도달분 자동 skip.
+      const alreadyFinished = !!existingLock.last_finished_at
       const srcLabel = existingLock.source === 'cron_auto' ? '자동 cron (KST 08:00)' : '어드민 수동 버튼'
-      return c.json({
-        success: false,
-        error: `오늘(${todayKst}) 데일리 배당은 이미 [${srcLabel}] 에 의해 ${existingLock.locked_at} 에 실행되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
-        blocked: true,
-        lock: existingLock,
-        unlock_hint: '강제 해제: POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 명령)'
-      }, 423)
+      if (alreadyFinished) {
+        return c.json({
+          success: false,
+          error: `오늘(${todayKst}) 데일리 배당은 이미 [${srcLabel}] 에 의해 ${existingLock.locked_at} 에 실행 → 완주 완료(${existingLock.last_finished_at})되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
+          blocked: true,
+          lock: existingLock,
+          unlock_hint: '강제 해제: POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 명령)'
+        }, 423)
+      }
+      // 미완주 락 → 이어받기 허용 (아래 while 루프로 완주 재개). 락은 유지(같은 날 재INSERT 안 함).
+      console.log(`[완주보장-이어받기] ${todayKst} 미완주 락(${existingLock.source} @ ${existingLock.locked_at}) 이어받아 수동 완주 재개`)
     }
 
     // 내부적으로 /api/rewards/daily 를 batch 페이지네이션으로 호출
