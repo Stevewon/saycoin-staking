@@ -6068,7 +6068,57 @@ app.post('/api/rewards/daily', async (c) => {
     //   첫 batch 에서 INSERT, 이후 batch 는 통과만 함. 마지막 batch 가 끝났을 때 finished_at 기록.
     //   → 헬스체크/audit 가 (locked_at 있고 last_finished_at NULL 이고 30분+ 지남) 이면 stale 로 판별.
     let cronFinishedAtKst: string | null = null
+    let fakeFinishGuard: any = null
     if (!hasMore) {
+      // ★★★★★★★★★★ 영구룰 #가짜완주방지 watchdog (2026-09-02 사장님 지상명령 "내일도 또 고장낼꺼야?") ★★★★★★★★★★
+      //   근본원인: 완주(last_finished_at) 마킹은 마지막 batch 도달만 보고 실지급 0건이어도 찍혀
+      //             → 다음날 락(완주완료) 때문에 재처리 차단 → daily 펑크 재발.
+      //   대책: 완주 마킹 직전, "오늘 실제 지급된 daily_rewards(paid_date=today) 건수" 를 검증.
+      //         (a) 오늘은 이미 위(line 5397)에서 평일 확정 (휴일이면 여기 도달 못함).
+      //         (b) 지급 대상 후보(totalActive) 가 있는데 오늘 실지급 0건이면 = 가짜완주.
+      //         → 완주 마킹 REFUSE (last_finished_at NULL 유지) → 락은 '미완주' 로 남아 재처리 가능.
+      //         → 응답에 fake_finish_guard 경고 표출 (사장님/AI 즉시 인지).
+      //   멱등/안전: 실지급이 정상(>0)이면 아무 영향 없이 통과. 데이터 변경 0.
+      try {
+        const paidTodayRow = await db.prepare(`
+          SELECT COUNT(*) as cnt FROM daily_rewards WHERE paid_date = ?
+        `).bind(today).first() as any
+        const paidTodayCnt = Number(paidTodayRow?.cnt || 0)
+        if (totalActive > 0 && paidTodayCnt === 0) {
+          // 가짜완주 감지 → 완주 마킹 거부
+          fakeFinishGuard = {
+            triggered: true,
+            reason: `평일(${today}) 지급대상 ${totalActive}건 존재하나 오늘 실지급 0건 → 가짜완주 차단`,
+            total_active_candidates: totalActive,
+            paid_today_count: paidTodayCnt,
+            action: '완주 마킹 거부 (락 미완주 유지 → 재처리 가능). 즉시 completion loop 재실행 필요.'
+          }
+          console.error(`[FAKE-FINISH-GUARD] ${today} totalActive=${totalActive} paidToday=0 → 완주 마킹 차단`)
+          message += ` | ⚠️FAKE-FINISH-GUARD: 실지급 0건 → 완주 마킹 거부 (재처리 필요)`
+        }
+      } catch(e) {
+        console.error('[FAKE-FINISH-GUARD] 검증 쿼리 실패(무시하고 진행):', e)
+      }
+
+      if (fakeFinishGuard) {
+        // 가짜완주 → last_finished_at 을 찍지 않고 즉시 반환 (락은 미완주=재진입 허용 상태 유지)
+        return c.json({
+          success: false,
+          fake_finish_guard: fakeFinishGuard,
+          message: message,
+          targetDate: yesterdayKst,
+          paidDate: today,
+          rewarded: rewardedCount,
+          totalQkey: totalQkeyRewarded,
+          skipped: skippedCount,
+          cappedSkipCount: cappedSkipCount,
+          total_active: totalActive,
+          has_more: false,
+          cron_finished_at_kst: null,
+          cron_completed: false
+        }, 200)
+      }
+
       try {
         const finishRes = await db.prepare(`
           UPDATE daily_cron_lock

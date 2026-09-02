@@ -1099,3 +1099,27 @@ const COIN_MAP = {
 - qkey-club: 만기경과 active 0건 (정리 불필요).
 
 **이 영구룰은 사장님 직접 A안 결재 (2026-09-02) — 절대 변경/삭제 금지. #만기무관cap우선 부활 금지.**
+
+---
+
+## §#가짜완주방지 watchdog (2026-09-02 사장님 지상명령 "내일도 또 고장낼꺼야?" / "매번 대책 세우면 머하냐고")
+
+### 문제 (재발 근본원인)
+daily 완주 마킹(`daily_cron_lock.last_finished_at`)은 **마지막 batch(has_more=false) 도달만 보고 찍힘** → 실지급 0건이어도 "완주완료"로 표시됨.
+그 결과 다음날 락(완주완료)이 이중배당방지 룰로 재처리를 차단 → **daily 펑크가 재발**. (예: pqcpay 09-01 가짜완주 사고)
+
+### 대책 (코드 내장 가드 — .yml 워크플로 불필요)
+`GET/POST /api/rewards/daily` 완주 마킹 직전(`if (!hasMore)` 블록)에 **실지급 검증 가드** 삽입:
+1. 오늘(today, KST)은 이미 상단 business-day early-exit 로 **평일 확정** (휴일이면 여기 도달 못함).
+2. `SELECT COUNT(*) FROM daily_rewards WHERE paid_date = today` 로 **오늘 실지급 건수** 조회 (전 batch 누적).
+3. **`totalActive > 0` (지급대상 존재) 인데 실지급 0건이면 = 가짜완주** →
+   - `last_finished_at` **마킹 거부** (NULL 유지 → 락은 '미완주' → 재진입/재처리 허용)
+   - 응답에 `fake_finish_guard` 경고 + `success:false` 반환 (사장님/AI 즉시 인지, completion loop 재실행 유도)
+4. 실지급 정상(>0)이면 **아무 영향 없이 통과** — 멱등, 데이터 변경 0.
+
+### 적용
+- pqcpay `/home/user/pqcpay-clone/src/index.tsx` (finish-mark 블록)
+- qkey-club `/home/user/qkey-club/src/index.tsx` (finish-mark 블록)
+- 두 프로젝트 build + deploy 완료 (2026-09-02).
+
+**이 가드는 "가짜완주 → 완주표시 → 다음날 락차단 → 펑크" 연쇄를 코드 레벨에서 끊는다. 절대 삭제 금지.**
