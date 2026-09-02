@@ -5766,6 +5766,12 @@ app.post('/api/rewards/daily', async (c) => {
           //   기존 '>' 는 종료일 당일을 통과시키는 버그 → '>=' 로 정정.
           if (endDateKst && accrualDate >= endDateKst) {
             skippedCount++
+            // ★★★★★ 영구룰 #만기종료status정리 (2026-09-02 사장님 A안 지상명령) ★★★★★
+            //   "cap은 둘 중 하나(만기 OR cap 200%)에 걸리면 무조건 종료" (A안 확정).
+            //   만기(end_date) 도달 staking 은 daily 를 중단할 뿐 아니라 status 도 'completed' 로
+            //   정리한다. (기존: capped 만 status 전이하고 만기는 active 로 방치 → 40건 active 잔존 사고)
+            //   cap 200% 는 별도로 status='capped' 처리됨(영구룰 #cap200정책). 둘 다 daily 종료.
+            try { await db.prepare(`UPDATE staking SET status='completed' WHERE id=? AND status='active'`).bind(staking.staking_id).run() } catch(e) {}
             break  // 종료일 당일 포함 그 이후 — 이 staking 은 더 이상 지급하지 않음
           }
           // ★★★ 영구룰 #익일처리 (2026-05-19 사장님 D 명령) ★★★
