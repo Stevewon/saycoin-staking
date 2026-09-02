@@ -1077,3 +1077,25 @@ const COIN_MAP = {
   계산 등)은 각자 의미가 다르므로 **무차별 변경 금지** (STANDING RULE #3).
 
 **이 영구룰은 사장님 직접 결재 (2026-07-24 B안) — 절대 변경/삭제 금지.**
+
+## 👑 영구룰 #만기OR캡둘중종료 (2026-09-02 사장님 A안 지상명령 — 최종확정)
+
+> **"cap은 둘 중 하나에 걸리면 무조건 종료. 기간(만기 end_date)에 걸리던가 cap 200%에 걸리던가."**
+> **종료 기준 = min(만기, cap200%) — 먼저 도달하는 쪽에서 daily 무조건 종료.**
+
+### 이 룰이 폐기/대체하는 것
+- **#만기무관cap우선 (2026-07-24 B안) → 완전 폐기.** ("만기 지나도 cap 전까지 계속 지급" = 무효)
+- #종료일지급중단 (2026-08-10) 은 이 룰과 동일 취지 → 유지·강화.
+
+### 구현 (src/index.tsx, 양 프로젝트 공통)
+- daily 루프 만기 판정: `if (endDateKst && accrualDate >= endDateKst) { skippedCount++; UPDATE staking SET status='completed'; break }`
+  - 종료일(end_date) 당일 포함 그 이후 reward_date 는 cap 미달이어도 무조건 지급 금지(`>=`).
+  - 만기 도달 시 status 를 'completed' 로 자동 정리 (기존 버그: capped 만 전이, 만기는 active 방치).
+- cap 200% 도달은 별도 status='capped' (영구룰 #cap200정책).
+- 둘 중 어느 쪽이든 daily 종료 = 만고불변.
+
+### 데이터 정리 (2026-09-02)
+- pqcpay: 만기경과 active 42건 → completed (pre-maturity 미지급 0 검증, 만기초과 과지급은 이중지급방지로 회수 안함).
+- qkey-club: 만기경과 active 0건 (정리 불필요).
+
+**이 영구룰은 사장님 직접 A안 결재 (2026-09-02) — 절대 변경/삭제 금지. #만기무관cap우선 부활 금지.**
