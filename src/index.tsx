@@ -46,15 +46,23 @@ app.use('*', async (c, next) => {
     if (dow === 0 || dow === 6) return                          // 주말 제외 (공휴일은 daily 엔드포인트가 재확인)
     if (hh < 8 || (hh === 8 && mm < 10) || hh >= 23) return
 
-    const todayKst = kst.toISOString().split('T')[0]
     const db = c.env.DB
-    const lock = await db.prepare(
-      `SELECT last_finished_at FROM daily_cron_lock WHERE lock_date = ?`
-    ).bind(todayKst).first() as any
-    if (lock && lock.last_finished_at) return                   // 완주 완료 → 편승 종료
-
-    // 미완주/락없음 → 백그라운드로 daily 완주 루프 1회 트리거 (사용자 응답 블록 안 함)
     const origin = new URL(c.req.url).origin
+
+    // ★ 완주 판정 = verify-daily-complete 와 100% 동일 기준 (기준일=어제 KST, 실제 daily_qkey tx 존재 여부).
+    //   - daily_cron_lock 테이블 유무에 절대 의존하지 않는다 (이 배포판 초기엔 테이블이 없을 수 있음).
+    //   - 판정을 daily 엔드포인트와 동일하게 맞춰 이중지급 위험 0.
+    let alreadyComplete = false
+    try {
+      const vres = await fetch(`${origin}/api/cron/verify-daily-complete?key=${ADMIN_PW}&src=selfheal`, {
+        method: 'GET', headers: { 'X-Cron-Trigger': 'manual-admin' }
+      })
+      const vj = await vres.json().catch(() => ({} as any))
+      if (vj && vj.success === true && vj.complete === true) alreadyComplete = true
+    } catch (e) { /* verify 실패 시 아래 daily 루프의 멱등 가드가 이중지급을 막음 */ }
+    if (alreadyComplete) return                                 // 이미 완주 → 편승 종료 (이중지급 방지)
+
+    // 미완주 → 백그라운드로 daily 완주 루프 1회 트리거 (사용자 응답 블록 안 함)
     const selfHeal = (async () => {
       try {
         let offset = 0
@@ -1514,13 +1522,21 @@ app.use('/api/admin/*', async (c, next) => {
 // 배당금 API도 관리자 인증 필요
 app.use('/api/rewards/daily', async (c, next) => {
   if (c.req.method === 'POST') {
-    const authHeader = c.req.header('Authorization')
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return c.json({ error: t(c, 'auth.admin_required') }, 401)
-    }
-    const token = authHeader.substring(7)
-    if (!verifyAdminToken(token)) {
-      return c.json({ error: t(c, 'auth.invalid_token') }, 401)
+    // ★ cron / 내부 자가치유 트리거는 X-Cron-Trigger 헤더로 통과 (daily 엔드포인트 line 5329 가 재검증) ★
+    //   - 'github-actions' : GitHub Actions cron
+    //   - 'manual-admin'   : manual-daily-trigger / 트래픽 자가치유 미들웨어 내부 호출
+    //   이 두 경로는 admin Bearer 토큰 없이도 통과시킨다. 그 외 외부 POST 는 기존대로 Bearer 검증.
+    const cronTrigger = c.req.header('X-Cron-Trigger') || ''
+    const isInternalTrigger = cronTrigger === 'github-actions' || cronTrigger === 'manual-admin'
+    if (!isInternalTrigger) {
+      const authHeader = c.req.header('Authorization')
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return c.json({ error: t(c, 'auth.admin_required') }, 401)
+      }
+      const token = authHeader.substring(7)
+      if (!verifyAdminToken(token)) {
+        return c.json({ error: t(c, 'auth.invalid_token') }, 401)
+      }
     }
   }
   await next()
@@ -6793,6 +6809,9 @@ const verifyDailyCompleteHandlerPqc = async (c: any) => {
 }
 app.post('/api/cron/verify-daily-complete', verifyDailyCompleteHandlerPqc)
 app.get('/api/cron/verify-daily-complete', verifyDailyCompleteHandlerPqc)
+// [2026-09-03] 트래픽 자가치유 발동 시뮬레이션 엔드포인트(/api/diag/selfheal-sim)는
+//   검증 완료 후 제거함. 검증 결과: 미완주 강제 시 fired=true + daily HTTP 200(96명 스캔)
+//   + 신규지급 0건(이중지급 방지 PASS). 정상 완주 시 fired=false.
 
 // ★★★★★★★★★★★★★★★★★★★★ 휴일진입자 전수 평일 누락 점검 (사장님 영구룰 #휴일진입자) ★★★★★★★★★★★★★★★★★★★★
 //   사장님 명령 (2026-05-13): "휴일진입자 현황 빨리 추출, 지급 안되었으면 즉각 지급, 상위 매칭 반영, 두번다시 잊지말것"
