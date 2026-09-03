@@ -20,6 +20,63 @@ app.use('*', async (c, next) => {
   }
 })
 
+// ★★★★★★★★★★ 영구룰 #트래픽자가치유 self-heal (2026-09-03 사장님 지상명령 "내일도 또 망칠꺼야?") ★★★★★★★★★★
+//   [배경] daily 펑크 재발의 진짜 원인 = 외부 cron(GitHub Actions)이 아예 안 돌거나 중간에 끊겨도
+//          아무도 재실행 안 함. .yml 워크플로는 push 불가 → 코드로 자가치유.
+//   [대책] 평소 사용자 HTTP 트래픽에 편승하여, 평일 KST 08:10 이후 daily 미완주면
+//          백그라운드(waitUntil)로 daily 완주 루프(manual-admin 헤더)를 1회 트리거.
+//   [안전] ① in-memory 스로틀(인스턴스당 5분 1회) ② 사용자 요청 절대 블록/오류 안 냄
+//          ③ daily 엔드포인트가 이미지급자 NOT EXISTS SKIP → 이중지급 0 ④ 완주 락이면 재실행 안 함
+//          ⑤ 모든 예외 무시. rewards/cron/static 경로는 편승 제외(무한루프 방지).
+let __lastSelfHealCheckMs = 0
+app.use('*', async (c, next) => {
+  await next()
+  try {
+    const p = c.req.path || ''
+    if (p.startsWith('/api/rewards/daily') || p.startsWith('/api/cron') ||
+        p.startsWith('/api/admin/rewards/manual-daily-trigger') ||
+        p.startsWith('/static') || p === '/favicon.ico') return
+    const nowMs = Date.now()
+    if (nowMs - __lastSelfHealCheckMs < 5 * 60 * 1000) return
+    __lastSelfHealCheckMs = nowMs
+
+    const kst = new Date(nowMs + 9 * 60 * 60 * 1000)
+    const hh = kst.getUTCHours(); const mm = kst.getUTCMinutes()
+    const dow = kst.getUTCDay()
+    if (dow === 0 || dow === 6) return                          // 주말 제외 (공휴일은 daily 엔드포인트가 재확인)
+    if (hh < 8 || (hh === 8 && mm < 10) || hh >= 23) return
+
+    const todayKst = kst.toISOString().split('T')[0]
+    const db = c.env.DB
+    const lock = await db.prepare(
+      `SELECT last_finished_at FROM daily_cron_lock WHERE lock_date = ?`
+    ).bind(todayKst).first() as any
+    if (lock && lock.last_finished_at) return                   // 완주 완료 → 편승 종료
+
+    // 미완주/락없음 → 백그라운드로 daily 완주 루프 1회 트리거 (사용자 응답 블록 안 함)
+    const origin = new URL(c.req.url).origin
+    const selfHeal = (async () => {
+      try {
+        let offset = 0
+        for (let i = 0; i < 10; i++) {                          // pqcpay batch 50 * 10 = 500 커버
+          const res = await fetch(`${origin}/api/rewards/daily?batchSize=50&offset=${offset}`, {
+            method: 'POST',
+            headers: { 'X-Cron-Trigger': 'manual-admin', 'Content-Type': 'application/json' }
+          })
+          const j = await res.json().catch(() => ({} as any))
+          if (!j || j.has_more !== true) break
+          offset = j.next_offset || (offset + 50)
+        }
+      } catch (e) {}
+    })()
+    if (c.executionCtx && typeof c.executionCtx.waitUntil === 'function') {
+      c.executionCtx.waitUntil(selfHeal)
+    }
+  } catch (e) {
+    // 자가치유 실패는 절대 사용자 요청에 영향 주지 않음
+  }
+})
+
 // Enable CORS
 app.use('/api/*', cors())
 

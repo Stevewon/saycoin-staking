@@ -1123,3 +1123,29 @@ daily 완주 마킹(`daily_cron_lock.last_finished_at`)은 **마지막 batch(has
 - 두 프로젝트 build + deploy 완료 (2026-09-02).
 
 **이 가드는 "가짜완주 → 완주표시 → 다음날 락차단 → 펑크" 연쇄를 코드 레벨에서 끊는다. 절대 삭제 금지.**
+
+---
+
+## §#트래픽자가치유 self-heal (2026-09-03 사장님 지상명령 "내일도 또 망칠꺼야?")
+
+### 문제 (가짜완주 watchdog 사각지대)
+가짜완주 watchdog(09-02)은 "0건인데 완주표시"만 막음. 하지만 **cron 자체가 안 돌거나(pqcpay 09-03 락없음) 중간에 끊겨도(qkey-club 09-03 733/1389 미완주) 아무도 재실행 안 하는** 근본문제는 못 막음. .yml 워크플로는 push 불가 → **코드 자가치유** 필요.
+
+### 대책 (외부 cron 비의존, 사용자 트래픽 편승)
+`app.use('*')` 글로벌 미들웨어(no-cache 다음)에 self-heal 삽입:
+1. **스로틀**: in-memory 5분 1회 (인스턴스당). DB 부하 최소.
+2. **시간 게이트**: 평일(주말 제외) & KST 08:10~23:00 에만.
+3. **완주 판정**: `daily_cron_lock(오늘).last_finished_at` NOT NULL 이면 이미 끝 → 아무것도 안 함.
+4. **미완주/락없음 → 백그라운드(waitUntil) 완주 트리거**:
+   - qkey-club: `POST /api/cron/backstop-0800?key=CRON_TRIGGER_SECRET` (기존 완주+이중지급가드 내장)
+   - pqcpay: `POST /api/rewards/daily (X-Cron-Trigger: manual-admin)` offset 루프 완주
+5. **안전**: 사용자 응답 절대 블록/오류 안 냄. 모든 예외 무시. rewards/cron/static 경로 편승 제외(무한루프 방지). 이미지급자 NOT EXISTS SKIP → 이중지급 0.
+
+### 적용/배포
+- qkey-club `src/index.tsx` (backstop-0800 트리거) — deploy 완료
+- pqcpay `src/index.tsx` (daily 완주 루프 트리거) — deploy 완료
+- 검증: 두 사이트 09-03 락 완주 확인 → self-heal 재실행 안 함(정상). 홈 응답 200 정상.
+
+### 3중 방어 완성
+1. GitHub Actions cron (기존, 불안정) → 2. 가짜완주 watchdog (09-02, 0건완주 차단) → 3. **트래픽 self-heal (09-03, cron 미실행/미완주 자동복구)**.
+**cron이 죽어도 사용자가 사이트에 접속하기만 하면 평일 daily 가 자동 완주된다. 절대 삭제 금지.**
