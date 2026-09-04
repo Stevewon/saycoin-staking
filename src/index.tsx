@@ -63,17 +63,22 @@ app.use('*', async (c, next) => {
     if (alreadyComplete) return                                 // 이미 완주 → 편승 종료 (이중지급 방지)
 
     // 미완주 → 백그라운드로 daily 완주 루프 1회 트리거 (사용자 응답 블록 안 함)
+    // ★★★★★ 근본수정 (2026-09-04) — 자가치유 배치 커버리지 상향 + 짧은-요청 유지 ★★★★★
+    //   [기존] batchSize=50 × 10루프 = 500건 커버. 회원 증가 시 501번째부터 통째 누락 위험.
+    //   [수정] batchSize=100 × 최대 30루프 = 3,000건 커버. 각 요청은 daily 엔드포인트가
+    //          배치 하나만 처리하므로 짧게 유지됨(단일요청 시간초과와 무관). has_more=false 까지 완주.
+    //   [이중지급 0] daily 본체 NOT EXISTS + 영구대책 #4 batch 원자화 + DB UNIQUE 로 물리 차단.
     const selfHeal = (async () => {
       try {
         let offset = 0
-        for (let i = 0; i < 10; i++) {                          // pqcpay batch 50 * 10 = 500 커버
-          const res = await fetch(`${origin}/api/rewards/daily?batchSize=50&offset=${offset}`, {
+        for (let i = 0; i < 30; i++) {                          // pqcpay batch 100 * 30 = 3,000 커버
+          const res = await fetch(`${origin}/api/rewards/daily?batchSize=100&offset=${offset}`, {
             method: 'POST',
             headers: { 'X-Cron-Trigger': 'manual-admin', 'Content-Type': 'application/json' }
           })
           const j = await res.json().catch(() => ({} as any))
           if (!j || j.has_more !== true) break
-          offset = j.next_offset || (offset + 50)
+          offset = j.next_offset || (offset + 100)
         }
       } catch (e) {}
     })()
@@ -5920,15 +5925,36 @@ app.post('/api/rewards/daily', async (c) => {
           //   ★ 영구룰 #정규시각 (2026-05-19) — created_at = paid_date KST 08:00 (= UTC prev-day 23:00)
           //     사고 방지: DB default CURRENT_TIMESTAMP 사용 금지 (5/18 사고)
           // [패치 2026-05-11] ref_id 1:1 매핑 — daily_rewards INSERT 후 last_row_id 캡처
-          const drIns = await db.prepare(`
-            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, accrualPaidDate, accrualDailyCreatedAtUtc).run()
-          const drId = (drIns as any)?.meta?.last_row_id ?? null
-
-          await db.prepare(`
-            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-          `).bind(qkeyAmount, staking.user_id).run()
+          //
+          // ★★★★★★★★★★ 영구 대책 #4 (2026-09-04 사장님 명령 "PQC페이도 처리") ★★★★★★★★★★
+          //   [기존 사고] daily_rewards INSERT → balance UPDATE → tx INSERT 가 각각 별도 .run() 이고
+          //     특히 balance UPDATE 가 tx 존재가드(dqExists2) 밖에서 먼저 실행됨 →
+          //       (a) dr INSERT 후 워커가 죽으면 balance/tx 없는 '고아 dr' 발생(=user40 09-04 저지급)
+          //       (b) 재처리 시 balance 가 가드 없이 또 더해질 수 있는 이중크레딧 위험.
+          //   [근본대책]
+          //     1) 같은 (user,staking,paid_date) 고아 dr 이 이미 있으면 재INSERT 말고 그 dr 재사용.
+          //     2) balance UPDATE + tx INSERT 를 '단일 db.batch' 로 원자화 (#이중구조절대금지).
+          //     3) tx 가 아직 없을 때만(NOT EXISTS) batch 실행 → 멱등.
+          //     4) batch 실패 시, 이 호출에서 새로 만든 dr 은 rollback-DELETE (tx 없을 때만) → 고아 미생성.
+          // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+          let drId: number | null = null
+          let drNewlyInserted = false
+          const orphanDr = await db.prepare(`
+            SELECT dr.id FROM daily_rewards dr
+            WHERE dr.user_id = ? AND dr.staking_id = ? AND dr.paid_date = ?
+              AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.type='daily_qkey' AND t.ref_id = dr.id)
+            LIMIT 1
+          `).bind(staking.user_id, staking.staking_id, accrualPaidDate).first() as any
+          if (orphanDr && orphanDr.id) {
+            drId = Number(orphanDr.id)
+          } else {
+            const drIns = await db.prepare(`
+              INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+              VALUES (?, ?, ?, ?, ?, ?)
+            `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, accrualPaidDate, accrualDailyCreatedAtUtc).run()
+            drId = (drIns as any)?.meta?.last_row_id ?? null
+            drNewlyInserted = true
+          }
 
           const newCount = currentRewardedCount + 1
           // EXISTS 가드 (ref_id 1:1) — 동일 daily_rewards.id 에 대응하는 transactions 행 차단
@@ -5938,11 +5964,25 @@ app.post('/api/rewards/daily', async (c) => {
             LIMIT 1
           `).bind(drId).first()
           if (!dqExists2) {
-            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00, accrualPaidDate 기준)
-            await db.prepare(`
-              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
-              VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
-            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId, accrualDailyCreatedAtUtc).run()
+            // ★ balance UPDATE + tx INSERT 원자 batch (#이중구조절대금지) ★
+            try {
+              await db.batch([
+                db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+                  .bind(qkeyAmount, staking.user_id),
+                db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+                            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)`)
+                  .bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId, accrualDailyCreatedAtUtc)
+              ])
+            } catch (batchErr) {
+              // ★ 영구 대책 #4 — 이 호출에서 새로 만든 dr 이고 tx 도 안 들어갔으면 rollback-DELETE (고아 방지) ★
+              if (drNewlyInserted && drId) {
+                const txNow = await db.prepare(`SELECT id FROM transactions WHERE type='daily_qkey' AND ref_id=? LIMIT 1`).bind(drId).first()
+                if (!txNow) {
+                  await db.prepare(`DELETE FROM daily_rewards WHERE id=? AND NOT EXISTS (SELECT 1 FROM transactions WHERE type='daily_qkey' AND ref_id=?)`).bind(drId, drId).run()
+                }
+              }
+              throw batchErr
+            }
           }
 
           rewardedCount++
