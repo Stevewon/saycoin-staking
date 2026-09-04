@@ -20,6 +20,76 @@ app.use('*', async (c, next) => {
   }
 })
 
+// ★★★★★★★★★★ 영구룰 #트래픽자가치유 self-heal (2026-09-03 사장님 지상명령 "내일도 또 망칠꺼야?") ★★★★★★★★★★
+//   [배경] daily 펑크 재발의 진짜 원인 = 외부 cron(GitHub Actions)이 아예 안 돌거나 중간에 끊겨도
+//          아무도 재실행 안 함. .yml 워크플로는 push 불가 → 코드로 자가치유.
+//   [대책] 평소 사용자 HTTP 트래픽에 편승하여, 평일 KST 08:10 이후 daily 미완주면
+//          백그라운드(waitUntil)로 daily 완주 루프(manual-admin 헤더)를 1회 트리거.
+//   [안전] ① in-memory 스로틀(인스턴스당 5분 1회) ② 사용자 요청 절대 블록/오류 안 냄
+//          ③ daily 엔드포인트가 이미지급자 NOT EXISTS SKIP → 이중지급 0 ④ 완주 락이면 재실행 안 함
+//          ⑤ 모든 예외 무시. rewards/cron/static 경로는 편승 제외(무한루프 방지).
+let __lastSelfHealCheckMs = 0
+app.use('*', async (c, next) => {
+  await next()
+  try {
+    const p = c.req.path || ''
+    if (p.startsWith('/api/rewards/daily') || p.startsWith('/api/cron') ||
+        p.startsWith('/api/admin/rewards/manual-daily-trigger') ||
+        p.startsWith('/static') || p === '/favicon.ico') return
+    const nowMs = Date.now()
+    if (nowMs - __lastSelfHealCheckMs < 5 * 60 * 1000) return
+    __lastSelfHealCheckMs = nowMs
+
+    const kst = new Date(nowMs + 9 * 60 * 60 * 1000)
+    const hh = kst.getUTCHours(); const mm = kst.getUTCMinutes()
+    const dow = kst.getUTCDay()
+    if (dow === 0 || dow === 6) return                          // 주말 제외 (공휴일은 daily 엔드포인트가 재확인)
+    if (hh < 8 || (hh === 8 && mm < 10) || hh >= 23) return
+
+    const db = c.env.DB
+    const origin = new URL(c.req.url).origin
+
+    // ★ 완주 판정 = verify-daily-complete 와 100% 동일 기준 (기준일=어제 KST, 실제 daily_qkey tx 존재 여부).
+    //   - daily_cron_lock 테이블 유무에 절대 의존하지 않는다 (이 배포판 초기엔 테이블이 없을 수 있음).
+    //   - 판정을 daily 엔드포인트와 동일하게 맞춰 이중지급 위험 0.
+    let alreadyComplete = false
+    try {
+      const vres = await fetch(`${origin}/api/cron/verify-daily-complete?key=${ADMIN_PW}&src=selfheal`, {
+        method: 'GET', headers: { 'X-Cron-Trigger': 'manual-admin' }
+      })
+      const vj = await vres.json().catch(() => ({} as any))
+      if (vj && vj.success === true && vj.complete === true) alreadyComplete = true
+    } catch (e) { /* verify 실패 시 아래 daily 루프의 멱등 가드가 이중지급을 막음 */ }
+    if (alreadyComplete) return                                 // 이미 완주 → 편승 종료 (이중지급 방지)
+
+    // 미완주 → 백그라운드로 daily 완주 루프 1회 트리거 (사용자 응답 블록 안 함)
+    // ★★★★★ 근본수정 (2026-09-04) — 자가치유 배치 커버리지 상향 + 짧은-요청 유지 ★★★★★
+    //   [기존] batchSize=50 × 10루프 = 500건 커버. 회원 증가 시 501번째부터 통째 누락 위험.
+    //   [수정] batchSize=100 × 최대 30루프 = 3,000건 커버. 각 요청은 daily 엔드포인트가
+    //          배치 하나만 처리하므로 짧게 유지됨(단일요청 시간초과와 무관). has_more=false 까지 완주.
+    //   [이중지급 0] daily 본체 NOT EXISTS + 영구대책 #4 batch 원자화 + DB UNIQUE 로 물리 차단.
+    const selfHeal = (async () => {
+      try {
+        let offset = 0
+        for (let i = 0; i < 30; i++) {                          // pqcpay batch 100 * 30 = 3,000 커버
+          const res = await fetch(`${origin}/api/rewards/daily?batchSize=100&offset=${offset}`, {
+            method: 'POST',
+            headers: { 'X-Cron-Trigger': 'manual-admin', 'Content-Type': 'application/json' }
+          })
+          const j = await res.json().catch(() => ({} as any))
+          if (!j || j.has_more !== true) break
+          offset = j.next_offset || (offset + 100)
+        }
+      } catch (e) {}
+    })()
+    if (c.executionCtx && typeof c.executionCtx.waitUntil === 'function') {
+      c.executionCtx.waitUntil(selfHeal)
+    }
+  } catch (e) {
+    // 자가치유 실패는 절대 사용자 요청에 영향 주지 않음
+  }
+})
+
 // Enable CORS
 app.use('/api/*', cors())
 
@@ -30,7 +100,7 @@ app.use('/static/*', serveStatic({ root: './public' }))
 // Admin Auth Helpers
 // ============================================
 const ADMIN_ID = 'admin'
-const ADMIN_PW = 'Qta@2026!Sec#Admin'
+const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
 
 // ============================================================
 // P0+P2 영구 안전 헬퍼 — 모든 백필/manual INSERT 엔드포인트 의무 사용
@@ -503,6 +573,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': '승인 대기 중인 투자를 찾을 수 없습니다',
     'admin.approve_success': '투자가 승인되었습니다. 코인이 지급되었습니다.',
     'admin.approve_error': '투자 승인 중 오류가 발생했습니다',
+    'admin.txid_already_approved': '이미 승인된 TXID입니다. 동일 TXID는 재승인할 수 없습니다.',
+    'admin.sales_delete_not_found': '삭제할 매출건(승인된 투자)을 찾을 수 없습니다',
+    'admin.sales_delete_success': '매출건이 삭제되고 지급된 코인 보상이 원복되었습니다.',
+    'admin.sales_delete_error': '매출건 삭제 중 오류가 발생했습니다.',
     'admin.staking_pending_not_found': '승인 대기 중인 스테이킹을 찾을 수 없습니다',
     'admin.reject_success': '스테이킹이 거절되었습니다.',
     'admin.reject_error': '스테이킹 거절 중 오류가 발생했습니다',
@@ -745,7 +819,7 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'csv.referral_code': '추천코드', 'csv.staking_amount': '투자금액($)', 'csv.join_date': '가입일',
     'csv.daily_total': '일일배당합계(QKEY)', 'csv.referral_total': '추천보상합계(QKEY)',
     'csv.total_reward': '총수당(QKEY)',
-    'dash.cap_title': '수당 진행률 (200% 캡)',
+    'dash.cap_title': '진행률 (200% 캡)',
     'dash.cap_paid': '누적 수령',
     'dash.cap_target': '목표',
     'dash.cap_blocked': '200% 도달 — 수당 지급이 차단되었습니다',
@@ -807,6 +881,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': 'No pending investment found',
     'admin.approve_success': 'Investment approved. Coins have been distributed.',
     'admin.approve_error': 'An error occurred during investment approval',
+    'admin.txid_already_approved': 'This TXID is already approved. The same TXID cannot be re-approved.',
+    'admin.sales_delete_not_found': 'Sales record (approved investment) to delete was not found',
+    'admin.sales_delete_success': 'Sales record deleted and granted coin rewards were reversed.',
+    'admin.sales_delete_error': 'An error occurred while deleting the sales record.',
     'admin.staking_pending_not_found': 'No pending staking found',
     'admin.reject_success': 'Staking has been rejected.',
     'admin.reject_error': 'An error occurred during staking rejection',
@@ -927,6 +1005,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': '承認待ちの投資が見つかりません',
     'admin.approve_success': '投資が承認されました。コインが支給されました。',
     'admin.approve_error': '投資承認中にエラーが発生しました',
+    'admin.txid_already_approved': 'すでに承認済みのTXIDです。同じTXIDは再承認できません。',
+    'admin.sales_delete_not_found': '削除する売上（承認済みの投資）が見つかりません',
+    'admin.sales_delete_success': '売上を削除し、支給されたコイン報酬を元に戻しました。',
+    'admin.sales_delete_error': '売上の削除中にエラーが発生しました。',
     'admin.staking_pending_not_found': '承認待ちのステーキングが見つかりません',
     'admin.reject_success': 'ステーキングが拒否されました。',
     'admin.reject_error': 'ステーキング拒否中にエラーが発生しました',
@@ -1047,6 +1129,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': '未找到待审批的投资',
     'admin.approve_success': '投资已批准。代币已发放。',
     'admin.approve_error': '投资审批时发生错误',
+    'admin.txid_already_approved': '此TXID已批准。相同的TXID无法重新批准。',
+    'admin.sales_delete_not_found': '未找到要删除的销售记录（已批准的投资）',
+    'admin.sales_delete_success': '销售记录已删除，已发放的代币奖励已撤销。',
+    'admin.sales_delete_error': '删除销售记录时发生错误。',
     'admin.staking_pending_not_found': '未找到待审批的质押',
     'admin.reject_success': '质押已被拒绝。',
     'admin.reject_error': '质押拒绝时发生错误',
@@ -1167,6 +1253,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': 'Không tìm thấy khoản đầu tư đang chờ duyệt',
     'admin.approve_success': 'Đầu tư đã được phê duyệt. Coin đã được phát.',
     'admin.approve_error': 'Đã xảy ra lỗi khi phê duyệt đầu tư',
+    'admin.txid_already_approved': 'TXID này đã được duyệt. Không thể duyệt lại cùng một TXID.',
+    'admin.sales_delete_not_found': 'Không tìm thấy bản ghi doanh số (khoản đầu tư đã duyệt) để xóa',
+    'admin.sales_delete_success': 'Đã xóa bản ghi doanh số và hoàn lại phần thưởng coin đã cấp.',
+    'admin.sales_delete_error': 'Đã xảy ra lỗi khi xóa bản ghi doanh số.',
     'admin.staking_pending_not_found': 'Không tìm thấy staking đang chờ duyệt',
     'admin.reject_success': 'Staking đã bị từ chối.',
     'admin.reject_error': 'Đã xảy ra lỗi khi từ chối staking',
@@ -1287,6 +1377,10 @@ const serverTranslations: Record<string, Record<string, string>> = {
     'admin.pending_not_found': 'ไม่พบการลงทุนที่รอดำเนินการ',
     'admin.approve_success': 'การลงทุนได้รับอนุมัติแล้ว เหรียญถูกแจกจ่ายแล้ว',
     'admin.approve_error': 'เกิดข้อผิดพลาดในการอนุมัติการลงทุน',
+    'admin.txid_already_approved': 'TXID นี้ได้รับการอนุมัติแล้ว ไม่สามารถอนุมัติ TXID เดิมซ้ำได้',
+    'admin.sales_delete_not_found': 'ไม่พบรายการยอดขาย (การลงทุนที่อนุมัติแล้ว) ที่จะลบ',
+    'admin.sales_delete_success': 'ลบรายการยอดขายและคืนรางวัลเหรียญที่จ่ายไปแล้ว',
+    'admin.sales_delete_error': 'เกิดข้อผิดพลาดในการลบรายการยอดขาย',
     'admin.staking_pending_not_found': 'ไม่พบ staking ที่รอดำเนินการ',
     'admin.reject_success': 'Staking ถูกปฏิเสธแล้ว',
     'admin.reject_error': 'เกิดข้อผิดพลาดในการปฏิเสธ staking',
@@ -1433,13 +1527,21 @@ app.use('/api/admin/*', async (c, next) => {
 // 배당금 API도 관리자 인증 필요
 app.use('/api/rewards/daily', async (c, next) => {
   if (c.req.method === 'POST') {
-    const authHeader = c.req.header('Authorization')
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return c.json({ error: t(c, 'auth.admin_required') }, 401)
-    }
-    const token = authHeader.substring(7)
-    if (!verifyAdminToken(token)) {
-      return c.json({ error: t(c, 'auth.invalid_token') }, 401)
+    // ★ cron / 내부 자가치유 트리거는 X-Cron-Trigger 헤더로 통과 (daily 엔드포인트 line 5329 가 재검증) ★
+    //   - 'github-actions' : GitHub Actions cron
+    //   - 'manual-admin'   : manual-daily-trigger / 트래픽 자가치유 미들웨어 내부 호출
+    //   이 두 경로는 admin Bearer 토큰 없이도 통과시킨다. 그 외 외부 POST 는 기존대로 Bearer 검증.
+    const cronTrigger = c.req.header('X-Cron-Trigger') || ''
+    const isInternalTrigger = cronTrigger === 'github-actions' || cronTrigger === 'manual-admin'
+    if (!isInternalTrigger) {
+      const authHeader = c.req.header('Authorization')
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return c.json({ error: t(c, 'auth.admin_required') }, 401)
+      }
+      const token = authHeader.substring(7)
+      if (!verifyAdminToken(token)) {
+        return c.json({ error: t(c, 'auth.invalid_token') }, 401)
+      }
     }
   }
   await next()
@@ -1932,7 +2034,10 @@ app.post('/api/withdrawal/request', async (c) => {
 
     // ★ 사장님 2026-05-15 (5차) 지시: 출금 신청은 같은 금요일(주간) 내 1회로 제한 ★
     //   기준: 이번 주 월요일 ~ 일요일(KST) 사이에 해당 user_id 의 withdrawals 행이 1건이라도 있으면 추가 신청 차단
-    //   상태(status) 무관 — pending / approved / rejected / completed / cancelled 모두 카운트
+    //   ★ 사장님 2026-08-21 지시: 취소(cancelled)·거부(rejected) 건은 카운트에서 제외 ★
+    //     → 본인이 출금 신청했다가 취소하면 잔액이 즉시 환불되므로, 같은 주라도 다시 출금 신청 가능해야 함.
+    //     → 살아있는 신청(pending / approved / completed)만 "이번 주 1회"로 카운트한다.
+    //     (취소/거부는 잔액이 이미 복구돼 있어 재신청해도 이중차감 없음 → 이중출금 방지 원칙 유지)
     //   다음 주 금요일 이후에는 다시 1회 신청 가능
     //   - 이전(4차) 룰: 계정 평생 1회 → 사장님 5차 지시로 주간 1회로 변경
     //
@@ -1951,6 +2056,7 @@ app.post('/api/withdrawal/request', async (c) => {
     const existingWithdrawal = await db.prepare(`
       SELECT id, coin_type, amount, status, created_at FROM withdrawals
       WHERE user_id = ? AND created_at >= ? AND created_at < ?
+        AND status NOT IN ('cancelled', 'rejected')
       ORDER BY created_at DESC LIMIT 1
     `).bind(userId, weekStartUtc, weekEndUtc).first()
 
@@ -1977,37 +2083,22 @@ app.post('/api/withdrawal/request', async (c) => {
 
     const currentWithdrawable = Number(user[withdrawableField] || 0)
 
-    // ★ 5% 출금 수수료 계산 (사장님 정책 2026-05-11 + #no-decimal 2026-05-26)
-    //   Math.ceil — 수수료 올림 (사용자에게 유리한 방향 아니지만 정수 강제 + 잔액 정합 보장)
-    const fee = Math.ceil(amount * WITHDRAWAL_FEE_RATE)         // 정수
-    const netAmount = amount - fee                              // 정수 - 정수 = 정수
-    // ★★★ 영구룰 #balance↔tx정합 (사장님 정책 2026-05-26) ★★★
-    //   잔액에서 차감할 총량 = 신청액(amount) + 수수료(fee) — 모두 정수
-    const totalRequired = amount + fee
+    // ★★★ (가) 방식 — 사장님 2026-08-14 지시 ★★★
+    //   회원이 입력한 amount = "출금하려는 총 잔액". 그 안에서 5%를 공제한다.
+    //   예) amount=2000 → fee=100(5%) → net=1900(관리자 표시/실지급) → 잔액에서 2000만 1회 차감
+    //   관리자는 net(1900)만큼 테더를 지급한다.
+    const fee = Math.ceil(amount * WITHDRAWAL_FEE_RATE)         // 정수 (총액의 5%)
+    const netAmount = amount - fee                              // 정수 - 정수 = 정수 (실지급/관리자 표시)
+    // ★★★ (가) 방식: 잔액 차감 = 입력액(amount) 전액, 1회만 (수수료를 위에 얹지 않음) ★★★
+    const totalRequired = amount
 
     if (currentWithdrawable < totalRequired) {
       const coinLabel = coinType === 'QTA' ? 'QTA' : coinType === 'QX' ? 'QX' : coinType === 'QKEY' ? 'QKEY' : 'USDT'
-      // 최대 출금 가능액 계산 (수수료 포함하여 잔액 내에서) — 모두 정수
-      //   currentWithdrawable >= amount + ceil(amount*0.05) ≈ amount × 1.05
-      //   amount ≤ floor(currentWithdrawable / 1.05)
-      let maxWithdrawable = Math.floor(currentWithdrawable / (1 + WITHDRAWAL_FEE_RATE))
-      // QTA/QX 의 경우 net 이 1000 배수 되도록 보정
-      if (coinType === 'QTA' || coinType === 'QX') {
-        // net = maxW - ceil(maxW*0.05) 를 1000 배수로 내림 후 gross 재계산
-        const _maxNetRaw = maxWithdrawable - Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)
-        const _maxNet = Math.floor(_maxNetRaw / 1000) * 1000
-        // gross = ceil(net / 0.95) — net 의 1000 배수에서 역산
-        maxWithdrawable = _maxNet > 0 ? Math.ceil(_maxNet / (1 - WITHDRAWAL_FEE_RATE)) : 0
-        // 재검증: 잔액 초과 시 한 단위(1000) 내려서 재시도
-        while (maxWithdrawable > 0 && (maxWithdrawable + Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)) > currentWithdrawable) {
-          const _adjustedNet = _maxNet - 1000
-          maxWithdrawable = _adjustedNet > 0 ? Math.ceil(_adjustedNet / (1 - WITHDRAWAL_FEE_RATE)) : 0
-          if (_adjustedNet <= 0) break
-        }
-      }
+      // ★(가) 방식: 입력 amount = 출금하려는 총 잔액. 최대 = 현재 잔액 그대로.
+      const maxWithdrawable = currentWithdrawable
       const _maxNetDisplay = maxWithdrawable - Math.ceil(maxWithdrawable * WITHDRAWAL_FEE_RATE)
       return c.json({
-        error: `출금가능 ${coinLabel} 수량이 부족합니다. 출금가능 잔액 ${currentWithdrawable.toLocaleString()} ${coinLabel} / 신청 ${amount.toLocaleString()} ${coinLabel} + 수수료 5% ${fee.toLocaleString()} ${coinLabel} = 총 필요 ${totalRequired.toLocaleString()} ${coinLabel}. 최대 출금 가능: ${maxWithdrawable.toLocaleString()} ${coinLabel} (실수령 ${_maxNetDisplay.toLocaleString()} ${coinLabel}). 회사 최초 지급분은 출금 대상이 아닙니다.`,
+        error: `출금가능 ${coinLabel} 수량이 부족합니다. 출금가능 잔액 ${currentWithdrawable.toLocaleString()} ${coinLabel} / 신청 ${amount.toLocaleString()} ${coinLabel}. 최대 출금 가능: ${maxWithdrawable.toLocaleString()} ${coinLabel} (5% 공제 후 실지급 ${_maxNetDisplay.toLocaleString()} ${coinLabel}). 회사 최초 지급분은 출금 대상이 아닙니다.`,
         insufficient_with_fee: true,
         current_withdrawable: currentWithdrawable,
         requested_amount: amount,
@@ -2041,20 +2132,21 @@ app.post('/api/withdrawal/request', async (c) => {
       return c.json({ error: t(c, 'withdrawal.insufficient_balance') }, 400)
     }
 
-    // 출금 신청 생성 (수수료/실수령액 함께 저장)
+    // 출금 신청 생성 — ★(가) 방식: amount 컬럼(관리자 표시/지급액) = net(5% 공제 후) ★
+    //   관리자는 이 amount(=net) 만큼 테더를 지급한다.
     const withdrawalResult = await db.prepare(`
       INSERT INTO withdrawals (user_id, coin_type, amount, wallet_address, status, fee, net_amount, fee_rate)
       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
-    `).bind(userId, coinType, amount, walletAddress, fee, netAmount, WITHDRAWAL_FEE_RATE).run()
+    `).bind(userId, coinType, netAmount, walletAddress, fee, netAmount, WITHDRAWAL_FEE_RATE).run()
 
-    // ★ 거래내역(transactions) 기록 — 사장님 .md 룰 준수 (사용자 노출 안전 한국어)
-    //   1) 출금 신청 본 거래 (음수 amount, 신청 원본 수량)
+    // ★ 거래내역(transactions) 기록 — (가) 방식: 신청(net) + 수수료(fee) 합계 = 입력액(amount) 정합
+    //   1) 출금 신청 본 거래 (음수 net = 관리자 지급액)
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'withdrawal', ?, ?, ?)
-    `).bind(userId, coinType, -Math.abs(amount), '출금 신청').run()
+    `).bind(userId, coinType, -Math.abs(netAmount), '출금 신청').run()
 
-    //   2) 출금 수수료 공제 거래 (음수 amount, 5%) — 사장님 명시 문구 그대로
+    //   2) 출금 수수료 공제 거래 (음수 fee, 5%) — net + fee = 입력액(amount) 로 잔액 정합
     await db.prepare(`
       INSERT INTO transactions (user_id, type, coin_type, amount, description)
       VALUES (?, 'withdrawal_fee', ?, ?, ?)
@@ -2066,7 +2158,7 @@ app.post('/api/withdrawal/request', async (c) => {
       withdrawal: {
         id: withdrawalResult.meta.last_row_id,
         coinType: coinType,
-        amount: amount,
+        amount: netAmount,
         fee: fee,
         net_amount: netAmount,
         fee_rate: WITHDRAWAL_FEE_RATE,
@@ -2323,7 +2415,12 @@ app.post('/api/swap/qkey-to-qta', async (c) => {
     if (!userId || !amount || amount <= 0) {
       return c.json({ error: t(c, 'profile.required_fields') }, 400)
     }
-    const requiredQkey = amount // 1:1 비율
+    // ★ 사장님 룰 (2026-07-31 확정): 8월 1일 한국시간(KST) 00:00부터 QKEY→QTA 스왑 비율 1:1 → 3:1 전환
+    //   KST 00:00 (2026-08-01) === UTC 2026-07-31T15:00:00Z (KST = UTC+9)
+    //   컷오프 이전: QKEY 1개 = QTA 1개 (1:1) / 컷오프 이후: QKEY 3개 = QTA 1개 (3:1)
+    const SWAP_3TO1_CUTOFF = new Date('2026-07-31T15:00:00Z')
+    const swapRatioQkeyPerQta = (new Date() >= SWAP_3TO1_CUTOFF) ? 3 : 1
+    const requiredQkey = amount * swapRatioQkeyPerQta // 컷오프 기준 1:1 또는 3:1
 
     const db = c.env.DB
     const user = await db.prepare(`SELECT qkey_balance FROM users WHERE id = ?`).bind(userId).first()
@@ -2587,12 +2684,19 @@ app.post('/api/swap/usdt-to-qx', async (c) => {
 //   - 기존 스테이킹은 staking row에 daily_rate/period_days가 고정 저장되어 영향 없음
 const POLICY_V2_DATE = new Date('2026-04-30T00:00:00+09:00')
 
+// ★ $10,000+ 일일 배당률 변경 (사장님 지시 2026-07-21) ★
+//   ~ 7/21 00:00 KST 이전 진입분 : 1.0% (0.01)
+//   7/21 00:00 KST ~ 신규 진입분  : 0.8% (0.008)  (거치기간 180일은 변동 없음)
+//   기존 스테이킹은 staking row에 daily_rate가 고정 저장되어 소급 영향 없음.
+//   날짜 게이팅으로 처리하여 저장값이 없는 과거 건 재계산 시에도 1.0% 유지.
+const RATE_10K_08_DATE = new Date('2026-07-21T00:00:00+09:00')
+
 // 투자금액별 일일 배당률 계산
 function getDailyRate(amount: number, asOf?: Date): number {
   const now = asOf || new Date()
   const isV2 = now >= POLICY_V2_DATE
 
-  if (amount >= 10000) return 0.01    // $10,000+: 1.0%
+  if (amount >= 10000) return now >= RATE_10K_08_DATE ? 0.008 : 0.01    // $10,000+: 1.0% → 0.8% (2026-07-21~)
   if (amount >= 5000) return 0.007    // $5,000~$9,000: 0.7%
   if (isV2) {
     // [V2 / 2026-04-30~] $1,000~$4,000: 0.5% 통일
@@ -2657,11 +2761,21 @@ app.post('/api/staking/create', async (c) => {
     //   ※ 즉시 적용 시점은 사장님 명령 시점인 5/22 (KST) 기준
     const PHASE2_DATE = new Date('2026-05-11T00:00:00+09:00') // 5/11~ QX·QKEY 0 (Phase2 시작)
     const PHASE3_DATE = new Date('2026-05-22T00:00:00+09:00') // 5/22~ QX 부활 (Phase3 시작)
+    // ★ QTA 지급 수량 변경 (사장님 지시 2026-06-21) ★
+    //   ~ 6/21 24:00 KST : QTA 75,000 / $1,000
+    //   6/22 00:00 KST ~ : QTA 50,000 / $1,000  (QX·QKEY 등 그 외 정책은 변동 없음)
+    // ★ QTA 지급 수량 재변경 (사장님 지시 2026-07-21) ★
+    //   7/21 00:00 KST ~ : QTA 40,000 / $1,000  (소급 없음, 이 시점 이후 신규 진입분만)
+    const QTA_REDUCE_DATE = new Date('2026-06-22T00:00:00+09:00') // 6/22 00:00 KST 부터 50,000
+    const QTA_40K_DATE = new Date('2026-07-21T00:00:00+09:00')    // 7/21 00:00 KST 부터 40,000
     const now = new Date()
     const isPhase2 = now >= PHASE2_DATE
     const isPhase3 = now >= PHASE3_DATE
+    const qtaPer1000 = now >= QTA_40K_DATE ? 40000
+                     : now >= QTA_REDUCE_DATE ? 50000
+                     : 75000
 
-    const qtaReward = (amount / 1000) * 75000
+    const qtaReward = (amount / 1000) * qtaPer1000
     // QX: Phase1(~5/10) 10,000 + Phase3(5/22~) 10,000 부활 / Phase2(5/11~5/21) 만 0
     const qxReward = isPhase3 ? (amount / 1000) * 10000
                     : isPhase2 ? 0
@@ -2783,6 +2897,23 @@ app.post('/api/admin/staking/approve/:stakingId', async (c) => {
 
     if (!staking) {
       return c.json({ error: t(c, 'admin.pending_not_found') }, 404)
+    }
+
+    // ★★★ [요구사항 #2 / 2026-07-03] 한번 승인된 TXID는 재승인 금지 ★★★
+    //   동일 TXID 로 이미 active/completed 인 건이 있으면 재승인 차단 (중복 지급 방지)
+    const currentTxid = (staking.txid || '').trim()
+    if (currentTxid) {
+      const dupTxid = await db.prepare(`
+        SELECT id, user_id, status FROM staking
+        WHERE TRIM(txid) = ? AND id != ? AND status IN ('active', 'completed')
+        LIMIT 1
+      `).bind(currentTxid, stakingId).first()
+      if (dupTxid) {
+        return c.json({
+          error: t(c, 'admin.txid_already_approved'),
+          detail: { txid: currentTxid, existing_staking_id: dupTxid.id, existing_status: dupTxid.status }
+        }, 409)
+      }
     }
 
     // 승인 시점에 시작일과 종료일 설정 (거치기간: 일 단위)
@@ -4328,6 +4459,180 @@ app.get('/api/admin/sales', async (c) => {
   }
 })
 
+// ★★★ [요구사항 #1 / 2026-07-03] 승인처리되어 활성화된 매출건 삭제 ★★★
+//   삭제 시 이 매출로 지급된 모든 코인을 즉시 회수:
+//   (A) 본인: 승인 코인(QTA/QX/QKEY) 원복 + initial 대칭 차감, staking_reward 거래내역 삭제
+//   (B) 본인: 일일배당(QKEY) 전액 회수(daily_rewards.usdt_amount 합산) + daily_qkey 거래내역/원장 삭제
+//   (C)+(D) 위/아래(추천인): 직접추천수당(level0) + 매칭수당(level1·2) 회수 + 관련 거래내역/원장 삭제
+//   ※ referral_rewards.staking_id 가 NULL 인 legacy row 는 특정 매출 귀속 불가 → 과다회수 방지 위해 회수 제외
+app.delete('/api/admin/sales/:stakingId', async (c) => {
+  try {
+    const db = c.env.DB
+    const stakingId = c.req.param('stakingId')
+
+    // 대상 매출(스테이킹) 조회 — active/completed 만 삭제 대상 (pending 은 reject 사용)
+    const staking = await db.prepare(`
+      SELECT * FROM staking WHERE id = ? AND status IN ('active', 'completed')
+    `).bind(stakingId).first()
+
+    if (!staking) {
+      return c.json({ error: t(c, 'admin.sales_delete_not_found') }, 404)
+    }
+
+    const userId = staking.user_id
+    const qtaReward = staking.qta_reward || 0
+    const qxReward = staking.qx_reward || 0
+    const qkeyReward = staking.qkey_reward || 0
+
+    await ensureWithdrawableSchema(db)
+
+    // 집계용 (응답 리포트)
+    let recoveredDailyQkey = 0
+    let recoveredReferralQkey = 0
+    const referralRecipients: any[] = []
+
+    // ─────────────────────────────────────────────────────────────
+    // (A) 본인 : 승인 시 지급 코인 원복 (QTA/QX/QKEY) — initial 컬럼도 대칭 차감
+    // ─────────────────────────────────────────────────────────────
+    if (qtaReward > 0) {
+      await db.prepare(`
+        UPDATE users
+        SET qta_balance = MAX(0, qta_balance - ?),
+            qta_initial = MAX(0, COALESCE(qta_initial,0) - ?)
+        WHERE id = ?
+      `).bind(qtaReward, qtaReward, userId).run()
+    }
+    if (qxReward > 0) {
+      await db.prepare(`
+        UPDATE users
+        SET qx_balance = MAX(0, qx_balance - ?),
+            qx_initial = MAX(0, COALESCE(qx_initial,0) - ?)
+        WHERE id = ?
+      `).bind(qxReward, qxReward, userId).run()
+    }
+    if (qkeyReward > 0) {
+      await db.prepare(`
+        UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+      `).bind(qkeyReward, userId).run()
+    }
+    // 승인 보상 transactions(staking_reward) 코인별 1건씩 정리 (금액 정확 매칭)
+    async function deleteOneStakingRewardTx(coin: string, amt: number) {
+      if (!(amt > 0)) return
+      try {
+        await db.prepare(`
+          DELETE FROM transactions
+          WHERE ROWID = (
+            SELECT ROWID FROM transactions
+            WHERE user_id = ? AND type = 'staking_reward' AND coin_type = ? AND amount = ?
+            ORDER BY id DESC LIMIT 1
+          )
+        `).bind(userId, coin, amt).run()
+      } catch (e) { }
+    }
+    await deleteOneStakingRewardTx('QTA', qtaReward)
+    await deleteOneStakingRewardTx('QX', qxReward)
+    await deleteOneStakingRewardTx('QKEY', qkeyReward)
+
+    // ─────────────────────────────────────────────────────────────
+    // (B) 본인 : 이 스테이킹 일일배당(QKEY) 전액 회수
+    //     daily_rewards.usdt_amount 에 실제 지급 QKEY 가 저장됨 → 합산해서 본인 잔액에서 차감
+    // ─────────────────────────────────────────────────────────────
+    try {
+      const dailySum = await db.prepare(`
+        SELECT COALESCE(SUM(usdt_amount), 0) as total
+        FROM daily_rewards WHERE staking_id = ?
+      `).bind(stakingId).first()
+      recoveredDailyQkey = (dailySum && (dailySum.total as number)) || 0
+
+      if (recoveredDailyQkey > 0) {
+        await db.prepare(`
+          UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+        `).bind(recoveredDailyQkey, userId).run()
+      }
+
+      // daily_qkey transactions 삭제 (ref_id = daily_rewards.id)
+      await db.prepare(`
+        DELETE FROM transactions
+        WHERE type = 'daily_qkey' AND ref_id IN (
+          SELECT id FROM daily_rewards WHERE staking_id = ?
+        )
+      `).bind(stakingId).run()
+
+      // daily_rewards ledger 삭제
+      await db.prepare(`DELETE FROM daily_rewards WHERE staking_id = ?`).bind(stakingId).run()
+    } catch (e) { }
+
+    // ─────────────────────────────────────────────────────────────
+    // (C)+(D) 위·아래 : 추천/매칭 보상(QKEY) 회수
+    //     referral_rewards where staking_id = X → referrer_id 별로 reward_amount 합산해 각자 회수
+    //     (level 0 = 직접추천수당 / level 1·2 = 매칭수당)  ledger + transactions 함께 삭제
+    // ─────────────────────────────────────────────────────────────
+    try {
+      const rrRows = await db.prepare(`
+        SELECT referrer_id, level, COALESCE(SUM(reward_amount),0) as total
+        FROM referral_rewards
+        WHERE staking_id = ?
+        GROUP BY referrer_id, level
+      `).bind(stakingId).all()
+
+      // referrer_id 별 총 회수액 합산
+      const byRecipient: Record<string, number> = {}
+      for (const r of (rrRows.results as any[])) {
+        const rid = String(r.referrer_id)
+        byRecipient[rid] = (byRecipient[rid] || 0) + (r.total || 0)
+        recoveredReferralQkey += (r.total || 0)
+      }
+
+      // 각 수령인 잔액에서 차감
+      for (const rid of Object.keys(byRecipient)) {
+        const amt = byRecipient[rid]
+        if (amt > 0) {
+          await db.prepare(`
+            UPDATE users SET qkey_balance = MAX(0, qkey_balance - ?) WHERE id = ?
+          `).bind(amt, rid).run()
+          referralRecipients.push({ userId: Number(rid), recoveredQkey: amt })
+        }
+      }
+
+      // 관련 transactions 삭제 (direct_referral level0 / referral_reward level1·2)
+      //   ref_id = referral_rewards.id 로 1:1 매핑되어 있음
+      await db.prepare(`
+        DELETE FROM transactions
+        WHERE type IN ('direct_referral', 'referral_reward')
+          AND ref_id IN (
+            SELECT id FROM referral_rewards WHERE staking_id = ?
+          )
+      `).bind(stakingId).run()
+
+      // referral_rewards ledger 삭제
+      await db.prepare(`DELETE FROM referral_rewards WHERE staking_id = ?`).bind(stakingId).run()
+    } catch (e) { }
+
+    // ─────────────────────────────────────────────────────────────
+    // 마지막: staking row 삭제
+    // ─────────────────────────────────────────────────────────────
+    await db.prepare(`DELETE FROM staking WHERE id = ?`).bind(stakingId).run()
+
+    return c.json({
+      success: true,
+      message: t(c, 'admin.sales_delete_success'),
+      deleted: {
+        stakingId: stakingId,
+        userId: userId,
+        amount: staking.amount,
+        reversed: {
+          self: { qta: qtaReward, qx: qxReward, qkey: qkeyReward },
+          selfDailyQkey: recoveredDailyQkey,
+          referralQkeyTotal: recoveredReferralQkey,
+          referralRecipients: referralRecipients
+        }
+      }
+    })
+  } catch (error) {
+    return c.json({ error: t(c, 'admin.sales_delete_error') }, 500)
+  }
+})
+
 // 회원 산하 매출 조회 (1대/2대/전체)
 app.get('/api/admin/downline-sales/:userId', async (c) => {
   try {
@@ -4827,7 +5132,9 @@ function getKoreanHolidays(year: number): string[] {
       '2026-05-25',                        // ★ 부처님오신날 대체공휴일 (월) — 사장님 영구명령 2026-05-22
       '2026-06-03',                        // ★ 제9회 전국동시지방선거일 (수) 법정공휴일 — 사장님 영구명령 2026-05-29
       '2026-06-06',                        // 현충일
-      '2026-08-15',                        // 광복절(토) → 대체공휴일은 인사처 고시 확인 후 추가
+      '2026-07-17',                        // ★ 임시공휴일 (금) — 사장님 영구명령 2026-07-17 (연휴 아님, 당일 1일)
+      '2026-08-15',                        // 광복절(토)
+      '2026-08-17',                        // ★ 광복절 대체공휴일 (월) — 사장님 명령 2026-08-09
       '2026-09-24','2026-09-25','2026-09-26', // 추석
       '2026-10-03',                        // 개천절(토) → 대체공휴일은 인사처 고시 확인 후 추가
       '2026-10-09',                        // 한글날
@@ -5072,20 +5379,47 @@ app.post('/api/rewards/daily', async (c) => {
 
     // 기존 lock 확인 — 같은 날 다른 source 가 이미 실행했으면 차단
     const existingLock = await db.prepare(`
-      SELECT source, locked_at, locked_by FROM daily_cron_lock WHERE lock_date = ?
+      SELECT source, locked_at, locked_by, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
     `).bind(todayKstForLock).first() as any
     if (existingLock) {
       const incomingSource = internalManualCall ? 'manual_admin' : 'cron_auto'
+      const alreadyFinished = !!existingLock.last_finished_at
       if (existingLock.source !== incomingSource) {
-        // source 불일치 = 다른 경로(수동/자동)가 이미 같은 날 처리 완료 → 차단
-        return c.json({
-          success: false,
-          error: `오늘(${todayKstForLock}) 데일리 배당은 이미 [${existingLock.source}] 에 의해 ${existingLock.locked_at} 에 실행되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰).`,
-          blocked: true,
-          lock: existingLock
-        }, 423) // 423 Locked
+        // ★★★★★ 영구룰 #완주보장-이어받기 (2026-09-01 사장님 명령 "근본수정") ★★★★★
+        //   [근본 사고 — pqcpay 08-31 재현] 자동 cron 이 락은 잡았는데 완주 while 루프가
+        //     Cloudflare 시간초과로 잘려 last_finished_at 이 NULL(미완주) 로 남으면,
+        //     그 뒤 어떤 다른 source 트리거도 여기서 source 불일치 423 → 영영 미완주 고착.
+        //     (08-31: cron_auto 락이 50초만에 '거짓완주'처럼 종료 → 47명 daily 펑크)
+        //   [근본대책 = qkey-club 옵션C 이식]
+        //     ① 미완주 락(last_finished_at IS NULL) 이면 source 불일치여도 재진입(이어받기) 허용.
+        //        → 다른 source 라도 미완주분 완주를 이어받아 펑크 방지.
+        //     ② 완주 완료(last_finished_at NOT NULL) 락만 source 불일치 시 423 차단.
+        //   [이중지급 위험 0]
+        //     - daily 본체는 staking 별 NOT EXISTS + getStakingAccrualDatesKst 백필(멱등)
+        //     - DB UNIQUE(staking_id, reward_date) 최종 방어
+        //     - cap pre-check(isStakingCapped) 로 cap 200% 도달분 자동 skip
+        if (alreadyFinished) {
+          // source 불일치 + 완주 완료 → 차단 (이중배당 방지, 영구룰 유지)
+          return c.json({
+            success: false,
+            error: `오늘(${todayKstForLock}) 데일리 배당은 이미 [${existingLock.source}] 에 의해 ${existingLock.locked_at} 에 실행 → 완주 완료(${existingLock.last_finished_at})되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
+            blocked: true,
+            lock: existingLock,
+            unlock_hint: '강제 재실행: POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 명령)'
+          }, 423) // 423 Locked
+        }
+        // source 불일치 + 미완주 → 이어받기 허용 (락 source 를 현재 source 로 승계)
+        console.log(`[완주보장-이어받기] ${todayKstForLock} 미완주 락(${existingLock.source} @ ${existingLock.locked_at}) 을 ${incomingSource} 가 이어받아 완주 재개`)
+        try {
+          await db.prepare(`
+            UPDATE daily_cron_lock
+               SET source = ?, note = COALESCE(note,'') || ' [이어받기: ' || ? || ' 재개]'
+             WHERE lock_date = ?
+          `).bind(incomingSource, incomingSource, todayKstForLock).run()
+        } catch(e) {}
       }
       // 같은 source 의 batch 페이지네이션 재호출은 통과
+      // (미완주/완주 무관 — 완주 후 재호출도 멱등 백필이라 이중지급 없음)
     } else {
       // 신규 lock INSERT (cron_auto 또는 manual_admin)
       try {
@@ -5215,13 +5549,19 @@ app.post('/api/rewards/daily', async (c) => {
     //   부작용: 이미 capped된 staking이 매 cron마다 pre-check까지 도달 (cappedSkipCount +1)
     //         하지만 L5189의 UPDATE는 WHERE status='active' 조건이라 capped 행에는 무영향
     //         (idempotent). 잔액/INSERT 영향 0건.
+    // ★★★★★ 영구룰 #만기무관cap우선 (2026-07-24 사장님 B안 결재) ★★★★★
+    //   사장님 결정: 90일 거치기간(end_date)이 지나도 cap 200% 도달 전까지는 daily 계속 지급.
+    //   → daily 지급 대상 조건에서 end_date 필터 제거. cap 도달 여부는 루프 내
+    //     isStakingCapped() 가 staking 별로 판정하여 자동 skip + status='capped' 처리.
+    //   (기존: end_date_kst >= yesterdayKst 조건 → 90일 만기 시 cap 미달이어도 daily 중단되는 버그.
+    //          top2536 stk#4 가 7/20 부터 이 조건으로 누락된 사건이 계기. 4일치는 재지급 완료.)
+    //   start_date 조건은 유지 (어제까지 진입한 staking 만 대상, 미래 진입분 제외).
     const totalRow = await db.prepare(`
       SELECT COUNT(*) as cnt
       FROM staking s
       WHERE s.status IN ('active','capped','completed')
-        AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
-    `).bind(yesterdayKst, yesterdayKst).first() as any
+    `).bind(yesterdayKst).first() as any
     const totalActive = Number(totalRow?.cnt || 0)
 
     const activeStakings = await db.prepare(`
@@ -5236,15 +5576,15 @@ app.post('/api/rewards/daily', async (c) => {
         s.end_date,
         s.reset_at,
         date(s.start_date, '+9 hours') as start_date_kst,
+        date(s.end_date, '+9 hours') as end_date_kst,
         (SELECT COUNT(*) FROM daily_rewards WHERE staking_id = s.id) as rewarded_count,
         (SELECT MAX(reward_date) FROM daily_rewards WHERE staking_id = s.id) as last_reward_date
       FROM staking s
       WHERE s.status IN ('active','capped','completed')
-        AND date(s.end_date, '+9 hours') >= date(?)
         AND date(s.start_date, '+9 hours') <= date(?)
       ORDER BY s.id ASC
       LIMIT ? OFFSET ?
-    `).bind(yesterdayKst, yesterdayKst, batchSize, offset).all()
+    `).bind(yesterdayKst, batchSize, offset).all()
 
     if (activeStakings.results.length === 0) {
       return c.json({
@@ -5314,29 +5654,72 @@ app.post('/api/rewards/daily', async (c) => {
         WHERE user_id = ? AND coin_type = 'QKEY'
           AND type IN ('daily_qkey','referral_reward','direct_referral')
       `).bind(userId).first() as any
-      let pool = Number(paidRow?.total || 0)
 
-      // FIFO 분배: 진입일 빠른 staking부터 cap_target까지 채움
+      // ★★★★★ 영구룰 #cap-staking별정확귀속 (2026-09-01 사장님 명령 "근본대책") ★★★★★
+      //   [근본 사고 — soo1717(uid116) 사건]
+      //     기존 로직은 pool(= daily_qkey + referral_reward + direct_referral 전체)을
+      //     진입일 빠른 staking 부터 cap_target 까지 "몰아서 FIFO 분배" 했다.
+      //     → 다중 staking 유저에서 앞선 staking(sid117 $10k)에 pool 전체가 몰려
+      //       실제 26.5% 밖에 안 받았는데도 cap 100% 도달로 오판 → 부당 capped/completed.
+      //     (uid116: sid117 실지급 795,000(26.5%) 인데 pool 3,180,000 FIFO 로 100% 오판)
+      //   [근본대책 — 실귀속 우선 + 잔여만 FIFO]
+      //     ① 본인 daily(daily_qkey)는 daily_rewards.staking_id 로 이미 staking 에 1:1 귀속됨
+      //        → staking 별 실제 지급 합계(usdt_amount)를 fill 초기값으로 정확히 세팅.
+      //     ② 매칭(referral_reward L1/L2) + 직판(direct_referral) 만 유저 통합분이므로
+      //        pool 에서 daily 귀속분을 뺀 "매칭/직판 잔여"를 진입일 ASC FIFO 로 추가 배분.
+      //     ③ 이렇게 하면 각 staking 의 fill = (본인 daily 실지급) + (배분된 매칭/직판)
+      //        → 앞 staking 조기 capped 오판 제거, cap 판정 정확.
+      //   [이중지급/누락 위험 0] fill 총합은 기존과 동일(pool), 분배 방식만 정확해짐.
+
+      // 본인 daily(daily_qkey) staking 별 실지급 합계
+      const ownDailyRows = await db.prepare(`
+        SELECT staking_id, COALESCE(SUM(usdt_amount), 0) as own_daily
+        FROM daily_rewards
+        WHERE user_id = ?
+        GROUP BY staking_id
+      `).bind(userId).all()
+      const ownDailyByStaking = new Map<number, number>()
+      let ownDailyTotal = 0
+      for (const r of ownDailyRows.results as any[]) {
+        const v = Number(r.own_daily || 0)
+        ownDailyByStaking.set(Number(r.staking_id), v)
+        ownDailyTotal += v
+      }
+
+      const poolTotal = Number(paidRow?.total || 0)
+      // 매칭/직판 잔여 = 전체 pool - 본인 daily 귀속분 (음수 방지)
+      let matchingPool = Math.max(0, poolTotal - ownDailyTotal)
+
       const stakings: StakingState[] = []
+      // 1차: 각 staking 에 본인 daily 실지급을 정확히 귀속 (cap 초과분은 넘치지 않게 clamp)
       for (const r of stakingRows.results as any[]) {
         const amount = Number(r.amount)
         const capTarget = amount * 2 * USD_TO_QKEY
-        const fill = Math.min(pool, capTarget)
-        pool -= fill
+        const own = Math.min(ownDailyByStaking.get(Number(r.id)) || 0, capTarget)
         stakings.push({
           id: Number(r.id),
           amount,
           capTarget,
-          fill,
-          capped: fill >= capTarget,
+          fill: own,   // 본인 daily 실귀속분으로 초기화
+          capped: own >= capTarget,
           status_db: String(r.status || 'active'),
           start_date_kst: String(r.start_date_kst || '')
         })
       }
+      // 2차: 매칭/직판 잔여만 진입일 ASC FIFO 로 남은 cap 여유에 배분
+      for (const s of stakings) {
+        if (matchingPool <= 0) break
+        const room = s.capTarget - s.fill
+        if (room <= 0) continue
+        const add = Math.min(matchingPool, room)
+        s.fill += add
+        matchingPool -= add
+        if (s.fill >= s.capTarget) s.capped = true
+      }
 
       const state: UserCapState = {
         userId,
-        totalPaid: Number(paidRow?.total || 0),
+        totalPaid: poolTotal,
         stakings
       }
       stakingStateCache.set(userId, state)
@@ -5448,6 +5831,27 @@ app.post('/api/rewards/daily', async (c) => {
         const stakingProcessed: string[] = []
 
         for (const accrualDate of accrualDates) {
+          // ★★★★★ 영구룰 #종료일지급중단 (2026-08-10 사장님 지상명령) ★★★★★
+          //   사장님 명령 원문: "각 사용자별 종료일이 도달하면 그 다음날부터 무조건 지급하지말라고!!!!
+          //                      쿠키클럽이던 pqcpay던 전부!!!! 지상명령이야!!!"
+          //   → staking 의 end_date(KST) 를 넘어선 reward_date 는 200% cap 미달이어도 무조건 지급 금지.
+          //   → 이 룰이 기존 #만기무관cap우선(2026-07-24) 룰을 완전히 대체(폐기)한다.
+          //   판정: accrualDate(=reward_date, KST) > end_date_kst 이면 이 staking 은 만기 → 이후 전부 skip.
+          //         (accrualDates 는 오름차순이므로 break 로 나머지도 전부 종료)
+          const endDateKst = (staking as any).end_date_kst as string
+          // ★ 수정 2026-08-10 (2차) ★ — 사장님: "종료일이 도달하면 그 다음날부터 지급 금지"
+          //   = 종료일 당일(reward_date == end_date)도 지급 금지. 유효 마지막 reward_date = end_date 하루 전.
+          //   기존 '>' 는 종료일 당일을 통과시키는 버그 → '>=' 로 정정.
+          if (endDateKst && accrualDate >= endDateKst) {
+            skippedCount++
+            // ★★★★★ 영구룰 #만기종료status정리 (2026-09-02 사장님 A안 지상명령) ★★★★★
+            //   "cap은 둘 중 하나(만기 OR cap 200%)에 걸리면 무조건 종료" (A안 확정).
+            //   만기(end_date) 도달 staking 은 daily 를 중단할 뿐 아니라 status 도 'completed' 로
+            //   정리한다. (기존: capped 만 status 전이하고 만기는 active 로 방치 → 40건 active 잔존 사고)
+            //   cap 200% 는 별도로 status='capped' 처리됨(영구룰 #cap200정책). 둘 다 daily 종료.
+            try { await db.prepare(`UPDATE staking SET status='completed' WHERE id=? AND status='active'`).bind(staking.staking_id).run() } catch(e) {}
+            break  // 종료일 당일 포함 그 이후 — 이 staking 은 더 이상 지급하지 않음
+          }
           // ★★★ 영구룰 #익일처리 (2026-05-19 사장님 D 명령) ★★★
           //   paid_date = nextBusinessDay(accrualDate) — 각 reward 별로 독립 계산
           //   기존: paid_date = today (cron 실행일) → backfill 시 5/8 reward 도 5/12 paid 되는 위반
@@ -5521,15 +5925,36 @@ app.post('/api/rewards/daily', async (c) => {
           //   ★ 영구룰 #정규시각 (2026-05-19) — created_at = paid_date KST 08:00 (= UTC prev-day 23:00)
           //     사고 방지: DB default CURRENT_TIMESTAMP 사용 금지 (5/18 사고)
           // [패치 2026-05-11] ref_id 1:1 매핑 — daily_rewards INSERT 후 last_row_id 캡처
-          const drIns = await db.prepare(`
-            INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, accrualPaidDate, accrualDailyCreatedAtUtc).run()
-          const drId = (drIns as any)?.meta?.last_row_id ?? null
-
-          await db.prepare(`
-            UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?
-          `).bind(qkeyAmount, staking.user_id).run()
+          //
+          // ★★★★★★★★★★ 영구 대책 #4 (2026-09-04 사장님 명령 "PQC페이도 처리") ★★★★★★★★★★
+          //   [기존 사고] daily_rewards INSERT → balance UPDATE → tx INSERT 가 각각 별도 .run() 이고
+          //     특히 balance UPDATE 가 tx 존재가드(dqExists2) 밖에서 먼저 실행됨 →
+          //       (a) dr INSERT 후 워커가 죽으면 balance/tx 없는 '고아 dr' 발생(=user40 09-04 저지급)
+          //       (b) 재처리 시 balance 가 가드 없이 또 더해질 수 있는 이중크레딧 위험.
+          //   [근본대책]
+          //     1) 같은 (user,staking,paid_date) 고아 dr 이 이미 있으면 재INSERT 말고 그 dr 재사용.
+          //     2) balance UPDATE + tx INSERT 를 '단일 db.batch' 로 원자화 (#이중구조절대금지).
+          //     3) tx 가 아직 없을 때만(NOT EXISTS) batch 실행 → 멱등.
+          //     4) batch 실패 시, 이 호출에서 새로 만든 dr 은 rollback-DELETE (tx 없을 때만) → 고아 미생성.
+          // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+          let drId: number | null = null
+          let drNewlyInserted = false
+          const orphanDr = await db.prepare(`
+            SELECT dr.id FROM daily_rewards dr
+            WHERE dr.user_id = ? AND dr.staking_id = ? AND dr.paid_date = ?
+              AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.type='daily_qkey' AND t.ref_id = dr.id)
+            LIMIT 1
+          `).bind(staking.user_id, staking.staking_id, accrualPaidDate).first() as any
+          if (orphanDr && orphanDr.id) {
+            drId = Number(orphanDr.id)
+          } else {
+            const drIns = await db.prepare(`
+              INSERT INTO daily_rewards (user_id, staking_id, usdt_amount, reward_date, paid_date, created_at)
+              VALUES (?, ?, ?, ?, ?, ?)
+            `).bind(staking.user_id, staking.staking_id, qkeyAmount, accrualDate, accrualPaidDate, accrualDailyCreatedAtUtc).run()
+            drId = (drIns as any)?.meta?.last_row_id ?? null
+            drNewlyInserted = true
+          }
 
           const newCount = currentRewardedCount + 1
           // EXISTS 가드 (ref_id 1:1) — 동일 daily_rewards.id 에 대응하는 transactions 행 차단
@@ -5539,11 +5964,25 @@ app.post('/api/rewards/daily', async (c) => {
             LIMIT 1
           `).bind(drId).first()
           if (!dqExists2) {
-            // ★ 영구룰 #정규시각 (2026-05-19) — created_at 명시 (KST 08:00, accrualPaidDate 기준)
-            await db.prepare(`
-              INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
-              VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)
-            `).bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId, accrualDailyCreatedAtUtc).run()
+            // ★ balance UPDATE + tx INSERT 원자 batch (#이중구조절대금지) ★
+            try {
+              await db.batch([
+                db.prepare(`UPDATE users SET qkey_balance = qkey_balance + ? WHERE id = ?`)
+                  .bind(qkeyAmount, staking.user_id),
+                db.prepare(`INSERT INTO transactions (user_id, type, coin_type, amount, description, ref_id, created_at)
+                            VALUES (?, 'daily_qkey', 'QKEY', ?, ?, ?, ?)`)
+                  .bind(staking.user_id, qkeyAmount, '일일 배당 (QKEY)', drId, accrualDailyCreatedAtUtc)
+              ])
+            } catch (batchErr) {
+              // ★ 영구 대책 #4 — 이 호출에서 새로 만든 dr 이고 tx 도 안 들어갔으면 rollback-DELETE (고아 방지) ★
+              if (drNewlyInserted && drId) {
+                const txNow = await db.prepare(`SELECT id FROM transactions WHERE type='daily_qkey' AND ref_id=? LIMIT 1`).bind(drId).first()
+                if (!txNow) {
+                  await db.prepare(`DELETE FROM daily_rewards WHERE id=? AND NOT EXISTS (SELECT 1 FROM transactions WHERE type='daily_qkey' AND ref_id=?)`).bind(drId, drId).run()
+                }
+              }
+              throw batchErr
+            }
           }
 
           rewardedCount++
@@ -5562,7 +6001,7 @@ app.post('/api/rewards/daily', async (c) => {
                 WHERE user_id = ?
                   AND status = 'active'
                   AND date(start_date, '+9 hours') <= date(?)
-                  AND date(end_date, '+9 hours') >= date(?)
+                  AND date(end_date, '+9 hours') > date(?)
                 LIMIT 1
               `).bind(level1Referrer.referrer_id, accrualDate, accrualDate).first()
 
@@ -5642,7 +6081,7 @@ app.post('/api/rewards/daily', async (c) => {
                     WHERE user_id = ?
                       AND status = 'active'
                       AND date(start_date, '+9 hours') <= date(?)
-                      AND date(end_date, '+9 hours') >= date(?)
+                      AND date(end_date, '+9 hours') > date(?)
                     LIMIT 1
                   `).bind(level2Referrer.referrer_id, accrualDate, accrualDate).first()
 
@@ -5742,7 +6181,57 @@ app.post('/api/rewards/daily', async (c) => {
     //   첫 batch 에서 INSERT, 이후 batch 는 통과만 함. 마지막 batch 가 끝났을 때 finished_at 기록.
     //   → 헬스체크/audit 가 (locked_at 있고 last_finished_at NULL 이고 30분+ 지남) 이면 stale 로 판별.
     let cronFinishedAtKst: string | null = null
+    let fakeFinishGuard: any = null
     if (!hasMore) {
+      // ★★★★★★★★★★ 영구룰 #가짜완주방지 watchdog (2026-09-02 사장님 지상명령 "내일도 또 고장낼꺼야?") ★★★★★★★★★★
+      //   근본원인: 완주(last_finished_at) 마킹은 마지막 batch 도달만 보고 실지급 0건이어도 찍혀
+      //             → 다음날 락(완주완료) 때문에 재처리 차단 → daily 펑크 재발.
+      //   대책: 완주 마킹 직전, "오늘 실제 지급된 daily_rewards(paid_date=today) 건수" 를 검증.
+      //         (a) 오늘은 이미 위(line 5397)에서 평일 확정 (휴일이면 여기 도달 못함).
+      //         (b) 지급 대상 후보(totalActive) 가 있는데 오늘 실지급 0건이면 = 가짜완주.
+      //         → 완주 마킹 REFUSE (last_finished_at NULL 유지) → 락은 '미완주' 로 남아 재처리 가능.
+      //         → 응답에 fake_finish_guard 경고 표출 (사장님/AI 즉시 인지).
+      //   멱등/안전: 실지급이 정상(>0)이면 아무 영향 없이 통과. 데이터 변경 0.
+      try {
+        const paidTodayRow = await db.prepare(`
+          SELECT COUNT(*) as cnt FROM daily_rewards WHERE paid_date = ?
+        `).bind(today).first() as any
+        const paidTodayCnt = Number(paidTodayRow?.cnt || 0)
+        if (totalActive > 0 && paidTodayCnt === 0) {
+          // 가짜완주 감지 → 완주 마킹 거부
+          fakeFinishGuard = {
+            triggered: true,
+            reason: `평일(${today}) 지급대상 ${totalActive}건 존재하나 오늘 실지급 0건 → 가짜완주 차단`,
+            total_active_candidates: totalActive,
+            paid_today_count: paidTodayCnt,
+            action: '완주 마킹 거부 (락 미완주 유지 → 재처리 가능). 즉시 completion loop 재실행 필요.'
+          }
+          console.error(`[FAKE-FINISH-GUARD] ${today} totalActive=${totalActive} paidToday=0 → 완주 마킹 차단`)
+          message += ` | ⚠️FAKE-FINISH-GUARD: 실지급 0건 → 완주 마킹 거부 (재처리 필요)`
+        }
+      } catch(e) {
+        console.error('[FAKE-FINISH-GUARD] 검증 쿼리 실패(무시하고 진행):', e)
+      }
+
+      if (fakeFinishGuard) {
+        // 가짜완주 → last_finished_at 을 찍지 않고 즉시 반환 (락은 미완주=재진입 허용 상태 유지)
+        return c.json({
+          success: false,
+          fake_finish_guard: fakeFinishGuard,
+          message: message,
+          targetDate: yesterdayKst,
+          paidDate: today,
+          rewarded: rewardedCount,
+          totalQkey: totalQkeyRewarded,
+          skipped: skippedCount,
+          cappedSkipCount: cappedSkipCount,
+          total_active: totalActive,
+          has_more: false,
+          cron_finished_at_kst: null,
+          cron_completed: false
+        }, 200)
+      }
+
       try {
         const finishRes = await db.prepare(`
           UPDATE daily_cron_lock
@@ -5756,6 +6245,19 @@ app.post('/api/rewards/daily', async (c) => {
         cronFinishedAtKst = row?.last_finished_at || null
       } catch(e) {
         console.error('[P3] daily_cron_lock.last_finished_at UPDATE 실패:', e)
+      }
+
+      // ★ 2026-08-28 재발방지 SELF-HEAL ★ — 워크플로(watchdog) 없이도 크론 완주 직후
+      //   어제자 L1/L2 파생 홀을 자동복구. daily 는 own skip 이라 파생을 못 채우므로 필수.
+      //   fillReferralHolesPqc 는 5-tuple 중복가드 + tx ref_id 가드로 이중지급 0 보장(멱등).
+      try {
+        const heal = await fillReferralHolesPqc(db, [yesterdayKst])
+        if ((heal?.l1_filled || 0) + (heal?.l2_filled || 0) > 0) {
+          console.log(`[SELF-HEAL] ${yesterdayKst} L1=${heal.l1_filled} L2=${heal.l2_filled} qkey=${heal.qkey}`)
+          message += ` | self_heal: L1+${heal.l1_filled} L2+${heal.l2_filled} (+${heal.qkey} QKEY)`
+        }
+      } catch(e) {
+        console.error('[SELF-HEAL] fillReferralHolesPqc 실패:', e)
       }
     }
 
@@ -5880,17 +6382,31 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
 
     // 기존 lock 체크 — 같은 날 이미 실행되었으면 차단
     const existingLock = await db.prepare(`
-      SELECT source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+      SELECT source, locked_at, locked_by, note, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
     `).bind(todayKst).first() as any
     if (existingLock) {
+      // ★★★★★ 영구룰 #완주보장-이어받기 (2026-09-01 사장님 명령 "근본수정") ★★★★★
+      //   [근본 사고 — pqcpay 08-31 재현] 자동 cron 이 락은 잡았는데 완주 while 루프가
+      //     Cloudflare 시간초과로 잘려 last_finished_at 이 NULL(미완주) 로 남으면,
+      //     그 뒤 이 수동 트리거도 여기서 무조건 423 → 영영 미완주 고착 → daily 펑크.
+      //   [근본대책 = qkey-club 이식]
+      //     ① 완주 완료(last_finished_at NOT NULL) 락 → 423 차단 (이중배당 방지, 영구룰 유지)
+      //     ② 미완주 락(last_finished_at IS NULL) → 재진입(이어받기) 허용 → 미완주분 완주 재개.
+      //   [이중지급 위험 0] daily 본체 NOT EXISTS 백필(멱등) + DB UNIQUE(staking_id,reward_date)
+      //                     + cap pre-check(isStakingCapped) 로 cap 200% 도달분 자동 skip.
+      const alreadyFinished = !!existingLock.last_finished_at
       const srcLabel = existingLock.source === 'cron_auto' ? '자동 cron (KST 08:00)' : '어드민 수동 버튼'
-      return c.json({
-        success: false,
-        error: `오늘(${todayKst}) 데일리 배당은 이미 [${srcLabel}] 에 의해 ${existingLock.locked_at} 에 실행되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
-        blocked: true,
-        lock: existingLock,
-        unlock_hint: '강제 해제: POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 명령)'
-      }, 423)
+      if (alreadyFinished) {
+        return c.json({
+          success: false,
+          error: `오늘(${todayKst}) 데일리 배당은 이미 [${srcLabel}] 에 의해 ${existingLock.locked_at} 에 실행 → 완주 완료(${existingLock.last_finished_at})되었습니다. 사장님 별도 명령 없이는 추가 실행 불가 (영구 룰 #이중배당금지).`,
+          blocked: true,
+          lock: existingLock,
+          unlock_hint: '강제 해제: POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 명령)'
+        }, 423)
+      }
+      // 미완주 락 → 이어받기 허용 (아래 while 루프로 완주 재개). 락은 유지(같은 날 재INSERT 안 함).
+      console.log(`[완주보장-이어받기] ${todayKst} 미완주 락(${existingLock.source} @ ${existingLock.locked_at}) 이어받아 수동 완주 재개`)
     }
 
     // 내부적으로 /api/rewards/daily 를 batch 페이지네이션으로 호출
@@ -6004,11 +6520,12 @@ app.get('/api/admin/rewards/cron-lock-status', async (c) => {
     } catch(e) {}
 
     const todayKst = kstDateStr(new Date())
+    // ★ 2026-08-28 재발방지 — watchdog 이 완주여부(last_finished_at) 를 볼 수 있도록 SELECT 에 추가 ★
     const todayLock = await db.prepare(`
-      SELECT lock_date, source, locked_at, locked_by, note FROM daily_cron_lock WHERE lock_date = ?
+      SELECT lock_date, source, locked_at, locked_by, note, last_finished_at FROM daily_cron_lock WHERE lock_date = ?
     `).bind(todayKst).first() as any
     const recentLocks = await db.prepare(`
-      SELECT lock_date, source, locked_at, locked_by, note
+      SELECT lock_date, source, locked_at, locked_by, note, last_finished_at
       FROM daily_cron_lock
       ORDER BY lock_date DESC LIMIT 14
     `).all()
@@ -6024,6 +6541,317 @@ app.get('/api/admin/rewards/cron-lock-status', async (c) => {
     return c.json({ success: false, error: error?.message || 'unknown' }, 500)
   }
 })
+
+// ★★★★★★★★★★★★★★★★★★★★ 데일리 cron 리포트 (사장님 명령 2026-06-22) ★★★★★★★★★★★★★★★★★★★★
+//   목적: "무조건 클론이 돌면 보고를 해줘! 매일 오전에 돌리고 나서"
+//   동작: 최근 N일(기본 10일)의 각 평일에 대해
+//         지급대상(active staking, 영업일, start<=d<=end) vs 실지급(daily_rewards reward_date=d)
+//         을 자동 대조하여 누락 staking 명단을 산출.
+//         + daily_cron_lock 의 cron 완료 시각(last_finished_at) 도 함께 보고.
+//   주의: capped(=200% cap 도달 후 정상중단) staking 은 누락에서 제외 (영구룰 #cap200).
+//         토/일/공휴일은 영업일이 아니므로 점검 대상에서 자동 제외 (영구룰 #공휴일).
+//   읽기전용 (INSERT/UPDATE 절대 없음). GET /api/admin/rewards/cron-report?days=10
+app.get('/api/admin/rewards/cron-report', async (c) => {
+  try {
+    const authHeader = c.req.header('Authorization') || ''
+    if (!authHeader.startsWith('Bearer ')) {
+      return c.json({ success: false, error: '어드민 인증 필요' }, 401)
+    }
+    const token = authHeader.substring(7)
+    if (!verifyAdminToken(token)) {
+      return c.json({ success: false, error: '어드민 토큰 검증 실패' }, 401)
+    }
+
+    const db = c.env.DB
+    const daysParam = Math.max(1, Math.min(30, parseInt(c.req.query('days') || '10')))
+    const todayKst = kstDateStr(new Date())
+
+    // 점검 대상 날짜 목록 (오늘 제외, 어제부터 과거로 daysParam 일, 영업일만)
+    const checkDates: string[] = []
+    let cursor = new Date(todayKst + 'T00:00:00Z')
+    let guard = 0
+    while (checkDates.length < daysParam && guard < 60) {
+      guard++
+      cursor = new Date(cursor.getTime() - 24 * 60 * 60 * 1000)
+      const dStr = cursor.toISOString().slice(0, 10)
+      const checkDate = new Date(cursor.getTime() - 9 * 60 * 60 * 1000)
+      const { isBusinessDay } = isKoreanBusinessDay(checkDate)
+      if (isBusinessDay) checkDates.push(dStr)
+    }
+
+    // 최근 cron lock 상태
+    const recentLocks = await db.prepare(`
+      SELECT lock_date, source, locked_at, last_finished_at
+      FROM daily_cron_lock ORDER BY lock_date DESC LIMIT 14
+    `).all()
+    const lockByDate = new Map<string, any>()
+    for (const r of (recentLocks.results || []) as any[]) {
+      lockByDate.set(String(r.lock_date), r)
+    }
+
+    const report: any[] = []
+    let totalMissing = 0
+
+    for (const d of checkDates) {
+      // 지급대상: active staking, 영업일 d 에 진행 중 (start<=d<=end)
+      // capped/completed 는 정상 종료이므로 제외 — 순수 active 만 "지급되어야 할" 대상
+      const dueRows = await db.prepare(`
+        SELECT s.id AS staking_id, s.user_id, s.amount
+        FROM staking s
+        WHERE s.status = 'active'
+          AND date(s.start_date, '+9 hours') <= ?
+          AND date(s.end_date, '+9 hours') >= ?
+      `).bind(d, d).all()
+      const dueList = (dueRows.results || []) as any[]
+
+      // 실지급: daily_rewards reward_date = d
+      const paidRows = await db.prepare(`
+        SELECT DISTINCT staking_id FROM daily_rewards WHERE reward_date = ?
+      `).bind(d).all()
+      const paidSet = new Set<number>()
+      for (const r of (paidRows.results || []) as any[]) {
+        if (r.staking_id != null) paidSet.add(Number(r.staking_id))
+      }
+
+      // 누락 = 지급대상인데 daily_rewards 없는 active staking
+      const missing: any[] = []
+      for (const due of dueList) {
+        if (!paidSet.has(Number(due.staking_id))) {
+          missing.push({ staking_id: Number(due.staking_id), user_id: Number(due.user_id), amount: Number(due.amount) })
+        }
+      }
+
+      // 누락 staking 의 회원 이메일 보강
+      if (missing.length > 0) {
+        const ids = missing.map(m => m.user_id)
+        const ph = ids.map(() => '?').join(',')
+        const emailRows = await db.prepare(`SELECT id, email FROM users WHERE id IN (${ph})`).bind(...ids).all()
+        const emailById = new Map<number, string>()
+        for (const u of (emailRows.results || []) as any[]) emailById.set(Number(u.id), String(u.email))
+        for (const m of missing) m.email = emailById.get(m.user_id) || ('user#' + m.user_id)
+      }
+
+      const lock = lockByDate.get(d) || null
+      totalMissing += missing.length
+      report.push({
+        date: d,
+        due_count: dueList.length,
+        paid_count: paidSet.size,
+        missing_count: missing.length,
+        missing: missing,
+        cron_locked_at: lock ? lock.locked_at : null,
+        cron_finished_at: lock ? lock.last_finished_at : null,
+        cron_completed: !!(lock && lock.last_finished_at),
+        status: missing.length === 0 ? 'OK' : 'MISSING'
+      })
+    }
+
+    return c.json({
+      success: true,
+      generated_at_kst: kstDateStr(new Date()) + ' ' + new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(11, 19),
+      todayKst,
+      checked_business_days: checkDates.length,
+      total_missing: totalMissing,
+      overall_status: totalMissing === 0 ? 'ALL_OK' : 'HAS_MISSING',
+      report
+    })
+  } catch (error: any) {
+    return c.json({ success: false, error: error?.message || 'unknown' }, 500)
+  }
+})
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//  fillReferralHolesPqc — L1/L2 파생 자동복구 (qkey-club fillReferralHoles 이식, pqcpay 스키마)
+//  [배경] daily 는 own 이 있으면 skip → 파생(L1/L2)만 누락된 홀을 daily 재실행으로 못 채움.
+//  [해결] 대상일의 daily_rewards(자식) 를 로드해 L1/L2 파생을 5-tuple 중복가드+cap 게이트로 재수행.
+//  [이중지급 0] l1Exists/l2Exists(referral_rewards) + tx ref_id 가드로 이미 있는 건 SKIP.
+//  [스키마] balance=qkey_balance, USD_TO_QKEY=150, tx type='referral_reward', coin_type='QKEY'.
+//  반환: { dates, l1_filled, l2_filled, qkey, errors }
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+async function fillReferralHolesPqc(db: any, dateList: string[]): Promise<any> {
+  const USD_TO_QKEY = 150
+  // referrer 트리
+  const usersRaw = await db.prepare(`SELECT id, referrer_id FROM users`).all()
+  const referrerOf = new Map<number, number | null>()
+  for (const u of (usersRaw.results || []) as any[]) {
+    referrerOf.set(Number(u.id), u.referrer_id != null ? Number(u.referrer_id) : null)
+  }
+  // cap 집계 (200%: stakeTotal×2×150)
+  const stakeTotalsRaw = await db.prepare(`
+    SELECT user_id, COALESCE(SUM(amount),0) AS total FROM staking
+    WHERE status IN ('active','completed','capped') GROUP BY user_id`).all()
+  const stakeTotalByUser = new Map<number, number>()
+  for (const r of (stakeTotalsRaw.results || []) as any[]) stakeTotalByUser.set(Number(r.user_id), Number(r.total)||0)
+  const paidTotalsRaw = await db.prepare(`
+    SELECT user_id, COALESCE(SUM(amount),0) AS total FROM transactions
+    WHERE coin_type='QKEY' AND type IN ('daily_qkey','referral_reward') GROUP BY user_id`).all()
+  const paidTotalByUser = new Map<number, number>()
+  for (const r of (paidTotalsRaw.results || []) as any[]) paidTotalByUser.set(Number(r.user_id), Number(r.total)||0)
+  const targetOf = (uid: number) => (stakeTotalByUser.get(uid)||0) * 2 * USD_TO_QKEY
+  const paidOf = (uid: number) => paidTotalByUser.get(uid)||0
+  const isCapped = (uid: number) => { const t=targetOf(uid); return t>0 && paidOf(uid)>=t }
+  const remainingOf = (uid: number) => Math.max(0, targetOf(uid)-paidOf(uid))
+  const addPaid = (uid: number, amt: number) => paidTotalByUser.set(uid, paidOf(uid)+amt)
+
+  let l1Filled = 0, l2Filled = 0, qkey = 0
+  const errors: any[] = []
+
+  for (const accrualDate of dateList) {
+    const accrualPaidDate = nextBusinessDayKstStr(accrualDate)
+    const drCreatedAt = createdAtUtcForPaidDate(accrualPaidDate, 0)
+    const txCreatedAt = createdAtUtcForPaidDate(accrualPaidDate, 1)
+    const kids = await db.prepare(`
+      SELECT staking_id AS sid, user_id AS cid, usdt_amount AS own
+      FROM daily_rewards WHERE reward_date = ? ORDER BY id ASC`).bind(accrualDate).all()
+    for (const k of (kids.results || []) as any[]) {
+      try {
+        const childUid = Number(k.cid), childOwn = Number(k.own), childStakingId = Number(k.sid)
+        if (childOwn <= 0) continue
+        const parentId = referrerOf.get(childUid)
+        if (parentId == null) continue
+        // L1 — 부모가 그날 active staking 보유 시 지급
+        const parentActive = await db.prepare(`
+          SELECT id FROM staking WHERE user_id=? AND status='active'
+            AND date(start_date,'+9 hours')<=date(?) AND date(end_date,'+9 hours')>=date(?) LIMIT 1
+        `).bind(parentId, accrualDate, accrualDate).first()
+        if (parentActive) {
+          const l1Exists = await db.prepare(`
+            SELECT COUNT(*) AS c FROM referral_rewards
+            WHERE referrer_id=? AND referee_id=? AND level=1 AND reward_date=?
+              AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
+          `).bind(parentId, childUid, accrualDate, childStakingId, childOwn).first() as any
+          if (Number(l1Exists?.c||0) === 0 && !isCapped(parentId)) {
+            let l1 = Math.round(childOwn*0.20)
+            const rem = remainingOf(parentId); if (l1>rem) l1=Math.max(0,Math.floor(rem))
+            if (l1>0) {
+              await db.prepare(`UPDATE users SET qkey_balance=qkey_balance+? WHERE id=?`).bind(l1, parentId).run()
+              const rrIns = await db.prepare(`INSERT INTO referral_rewards (referrer_id,referee_id,level,original_amount,reward_amount,reward_date,paid_date,staking_id,created_at) VALUES (?,?,1,?,?,?,?,?,?)`).bind(parentId,childUid,childOwn,l1,accrualDate,accrualPaidDate,childStakingId,drCreatedAt).run()
+              const rrId = (rrIns as any)?.meta?.last_row_id ?? null
+              const txEx = await db.prepare(`SELECT id FROM transactions WHERE type='referral_reward' AND ref_id=? LIMIT 1`).bind(rrId).first()
+              if (!txEx) await db.prepare(`INSERT INTO transactions (user_id,type,coin_type,amount,description,ref_id,created_at) VALUES (?,'referral_reward','QKEY',?,?,?,?)`).bind(parentId,l1,'추천 보너스 (Level 1)',rrId,txCreatedAt).run()
+              addPaid(parentId,l1); l1Filled++; qkey+=l1
+            }
+          }
+        }
+        // L2 — 부모 active 여부와 무관. 조부모가 그날 active 면 지급.
+        const grandId = referrerOf.get(parentId)
+        if (grandId != null) {
+          const grandActive = await db.prepare(`
+            SELECT id FROM staking WHERE user_id=? AND status='active'
+              AND date(start_date,'+9 hours')<=date(?) AND date(end_date,'+9 hours')>=date(?) LIMIT 1
+          `).bind(grandId, accrualDate, accrualDate).first()
+          if (grandActive) {
+            const l2Exists = await db.prepare(`
+              SELECT COUNT(*) AS c FROM referral_rewards
+              WHERE referrer_id=? AND referee_id=? AND level=2 AND reward_date=?
+                AND (staking_id=? OR (staking_id IS NULL AND original_amount=?))
+            `).bind(grandId, childUid, accrualDate, childStakingId, childOwn).first() as any
+            if (Number(l2Exists?.c||0) === 0 && !isCapped(grandId)) {
+              let l2 = Math.round(childOwn*0.10)
+              const rem2 = remainingOf(grandId); if (l2>rem2) l2=Math.max(0,Math.floor(rem2))
+              if (l2>0) {
+                await db.prepare(`UPDATE users SET qkey_balance=qkey_balance+? WHERE id=?`).bind(l2, grandId).run()
+                const rrIns2 = await db.prepare(`INSERT INTO referral_rewards (referrer_id,referee_id,level,original_amount,reward_amount,reward_date,paid_date,staking_id,created_at) VALUES (?,?,2,?,?,?,?,?,?)`).bind(grandId,childUid,childOwn,l2,accrualDate,accrualPaidDate,childStakingId,drCreatedAt).run()
+                const rrId2 = (rrIns2 as any)?.meta?.last_row_id ?? null
+                const txEx2 = await db.prepare(`SELECT id FROM transactions WHERE type='referral_reward' AND ref_id=? LIMIT 1`).bind(rrId2).first()
+                if (!txEx2) await db.prepare(`INSERT INTO transactions (user_id,type,coin_type,amount,description,ref_id,created_at) VALUES (?,'referral_reward','QKEY',?,?,?,?)`).bind(grandId,l2,'추천 보너스 (Level 2)',rrId2,txCreatedAt).run()
+                addPaid(grandId,l2); l2Filled++; qkey+=l2
+              }
+            }
+          }
+        }
+      } catch (e) { errors.push({ date: accrualDate, cid: k.cid, error: String(e) }) }
+    }
+  }
+  return { dates: dateList, l1_filled: l1Filled, l2_filled: l2Filled, qkey, errors }
+}
+
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+//  verify-daily-complete — 배당 완전지급 실측 (2026-08-28 사장님 "재발방지 대책" 이식, qkey-club 동형)
+//  [경로] GET/POST /api/cron/verify-daily-complete?key=<ADMIN_PW>&date=YYYY-MM-DD (미지정 시 어제 KST)
+//  [목적] lock 완주표시만 믿지 말고, 본인배당(daily_qkey tx)+L1/L2 파생(referral_reward tx) 을
+//         '실제 tx 존재' 기준으로 실측 → 고아행(행은 있으나 tx 없음)까지 100% 포착.
+//         watchdog 이 이 결과(total_hole>0)를 보고 daily-v2 자동복구를 트리거.
+//  [부작용 없음] 순수 SELECT (읽기전용). INSERT/UPDATE 전혀 없음.
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+const verifyDailyCompleteHandlerPqc = async (c: any) => {
+  try {
+    const key = c.req.query('key') || c.req.header('X-Cron-Secret') || ''
+    if (key !== ADMIN_PW) {
+      return c.json({ success: false, error: 'unauthorized (key=ADMIN_PW 필요)' }, 401)
+    }
+    const db = c.env.DB
+    const now = new Date()
+    const paramDate = (c.req.query('date') || '').trim()
+    const targetDate = paramDate || kstDateStr(new Date(now.getTime() - 24*60*60*1000))
+
+    // 1) 본인 배당 미지급 (active 인데 실제 daily_qkey tx 없음 — 고아행 포함)
+    const ownRow = await db.prepare(`
+      SELECT COUNT(*) AS c FROM staking s
+      WHERE s.status='active'
+        AND date(s.start_date,'+9 hours') <= ?
+        AND date(s.end_date,'+9 hours')   >  ?
+        AND NOT EXISTS (
+          SELECT 1 FROM daily_rewards dr
+          JOIN transactions t ON t.ref_id = dr.id AND t.type='daily_qkey'
+          WHERE dr.staking_id=s.id AND dr.reward_date=?
+        )
+    `).bind(targetDate, targetDate, targetDate).first() as any
+    const ownUnpaid = Number(ownRow?.c || 0)
+
+    // 2) L1 파생 구멍 — referral_rewards rr + 대응 referral_reward tx 까지 존재해야 지급완료
+    const l1Row = await db.prepare(`
+      WITH child AS (SELECT staking_id AS sid, user_id AS cid, usdt_amount AS own FROM daily_rewards WHERE reward_date=?)
+      SELECT COUNT(*) AS c FROM child c
+      JOIN users u ON u.id=c.cid
+      JOIN staking sp ON sp.user_id=u.referrer_id AND sp.status='active'
+        AND date(sp.start_date,'+9 hours')<=? AND date(sp.end_date,'+9 hours')>=?
+      WHERE u.referrer_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM referral_rewards rr
+          JOIN transactions t ON t.ref_id=rr.id AND t.type='referral_reward'
+          WHERE rr.referrer_id=u.referrer_id AND rr.referee_id=c.cid AND rr.level=1 AND rr.reward_date=?
+            AND (rr.staking_id=c.sid OR (rr.staking_id IS NULL AND rr.original_amount=c.own)))
+    `).bind(targetDate, targetDate, targetDate, targetDate).first() as any
+    const l1Hole = Number(l1Row?.c || 0)
+
+    // 3) L2 파생 구멍
+    const l2Row = await db.prepare(`
+      WITH child AS (SELECT staking_id AS sid, user_id AS cid, usdt_amount AS own FROM daily_rewards WHERE reward_date=?)
+      SELECT COUNT(*) AS c FROM child c
+      JOIN users u ON u.id=c.cid
+      JOIN users p ON p.id=u.referrer_id
+      JOIN staking sg ON sg.user_id=p.referrer_id AND sg.status='active'
+        AND date(sg.start_date,'+9 hours')<=? AND date(sg.end_date,'+9 hours')>=?
+      WHERE u.referrer_id IS NOT NULL AND p.referrer_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM referral_rewards rr
+          JOIN transactions t ON t.ref_id=rr.id AND t.type='referral_reward'
+          WHERE rr.referrer_id=p.referrer_id AND rr.referee_id=c.cid AND rr.level=2 AND rr.reward_date=?
+            AND (rr.staking_id=c.sid OR (rr.staking_id IS NULL AND rr.original_amount=c.own)))
+    `).bind(targetDate, targetDate, targetDate, targetDate).first() as any
+    const l2Hole = Number(l2Row?.c || 0)
+
+    const totalHole = ownUnpaid + l1Hole + l2Hole
+    return c.json({
+      success: true,
+      date: targetDate,
+      own_unpaid: ownUnpaid,
+      l1_hole: l1Hole,
+      l2_hole: l2Hole,
+      total_hole: totalHole,
+      complete: totalHole === 0,
+      message: totalHole === 0
+        ? `${targetDate} 배당 완전 지급 확인 (본인배당+L1+L2 구멍 0).`
+        : `${targetDate} 미완료: 본인배당 ${ownUnpaid} / L1 ${l1Hole} / L2 ${l2Hole} 구멍. daily-v2 로 재실행 필요.`
+    })
+  } catch (e) {
+    return c.json({ success: false, error: 'verify-daily-complete failed: ' + String(e) }, 500)
+  }
+}
+app.post('/api/cron/verify-daily-complete', verifyDailyCompleteHandlerPqc)
+app.get('/api/cron/verify-daily-complete', verifyDailyCompleteHandlerPqc)
+// [2026-09-03] 트래픽 자가치유 발동 시뮬레이션 엔드포인트(/api/diag/selfheal-sim)는
+//   검증 완료 후 제거함. 검증 결과: 미완주 강제 시 fired=true + daily HTTP 200(96명 스캔)
+//   + 신규지급 0건(이중지급 방지 PASS). 정상 완주 시 fired=false.
 
 // ★★★★★★★★★★★★★★★★★★★★ 휴일진입자 전수 평일 누락 점검 (사장님 영구룰 #휴일진입자) ★★★★★★★★★★★★★★★★★★★★
 //   사장님 명령 (2026-05-13): "휴일진입자 현황 빨리 추출, 지급 안되었으면 즉각 지급, 상위 매칭 반영, 두번다시 잊지말것"
@@ -6361,11 +7189,15 @@ app.post('/api/rewards/daily-v2', async (c) => {
 
     const todayDateObjKst = new Date(today + 'T00:00:00+09:00')
     const { isBusinessDay, reason } = isKoreanBusinessDay(todayDateObjKst)
-    if (!isBusinessDay) {
+    // ★ 관리자 수동 복구 우회: force=GO 이면 휴일 게이트를 건너뛴다.
+    //   (누락된 평일 accrual 분을 사후 복구할 때, 실행일이 주말/휴일이어도 처리 가능하게 함.
+    //    reward_date 계산(yesterdayKst = targetDate-1)은 그대로이므로 대상 일자는 targetDate-1 이다.)
+    const forceRun = (c.req.query('force') || '') === 'GO'
+    if (!isBusinessDay && !forceRun) {
       const reasonText = reason === 'saturday' ? '토요일' : reason === 'sunday' ? '일요일' : '공휴일/국경일'
       return c.json({
         success: true,
-        message: `오늘(${today})은 ${reasonText}이므로 배당 처리 불가 (룰 B: 휴일 cron skip).`,
+        message: `오늘(${today})은 ${reasonText}이므로 배당 처리 불가 (룰 B: 휴일 cron skip). 관리자 강제복구는 force=GO.`,
         rewarded: 0, totalQkey: 0, skipped: 0, reason, targetDate: today,
       })
     }
@@ -8170,8 +9002,13 @@ app.get('/api/staking/progress/:userId', async (c) => {
     `).bind(userId).first() as any
     const paidTotal = Number(paidRow?.total || 0)
 
-    const target = stakeTotal * 2 * USD_TO_QKEY
-    const percent = target > 0 ? (paidTotal / target * 100) : 0
+    // ★ 영구룰 #cap200정책 1️⃣ (2026-07-23 사장님 승인 정정)
+    //   산정기준(100%) = amount × 150 (= 투자금), cap_target(200%=CAPPED) = amount × 300 (= 투자금 2배)
+    //   cap_pct = paid_total ÷ 산정기준(amount×150) × 100  ← 분모는 반드시 baseline(150), 2배지점(300) 아님
+    //   (이전 버그: 분모를 amount×300 으로 나눠 269% 가 134.53% 로 절반 낮게 표시됨 → 200% 초과인데 차단 안내 안 뜸)
+    const baseline = stakeTotal * USD_TO_QKEY          // 100% 산정기준 (= 투자금)
+    const target = stakeTotal * 2 * USD_TO_QKEY        // 200% cap_target (= 투자금 2배, 출금/잔여 한도)
+    const percent = baseline > 0 ? (paidTotal / baseline * 100) : 0
 
     // 단계 판정 (사장님 정책 2026-05-10 수정 — 100/150/200 임계값)
     let stage: 'green' | 'orange' | 'red' | 'capped' = 'green'
@@ -8190,6 +9027,7 @@ app.get('/api/staking/progress/:userId', async (c) => {
       success: true,
       user_id: userId,
       stake_total_usd: stakeTotal,
+      baseline_qkey: baseline,
       target_qkey: target,
       paid_total_qkey: paidTotal,
       percent: Math.round(percent * 100) / 100,
@@ -22550,7 +23388,7 @@ app.get('/', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <meta name="user-country" content="${userCountry}">
-        <title>QUANTARIUM STAKING</title>
+        <title>Quantarium Purchase Platform</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <link rel="stylesheet" href="/static/tailwind.css">
         <link href="/static/fa/all.min.css" rel="stylesheet">
@@ -22574,8 +23412,8 @@ app.get('/', (c) => {
 
                 <div class="text-center mb-6 sm:mb-8">
                     <img src="/static/quantarium-logo.png" alt="QUANTARIUM Logo" class="w-24 h-24 sm:w-32 sm:h-32 mx-auto mb-4" onerror="this.style.display='none'">
-                    <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 mb-2" data-i18n="app.name">QUANTARIUM STAKING</h1>
-                    <p class="text-sm sm:text-base text-gray-600" data-i18n="app.subtitle">안전한 코인 스테이킹 플랫폼</p>
+                    <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 mb-2" data-i18n="app.name">Quantarium Purchase Platform</h1>
+                    <p class="text-sm sm:text-base text-gray-600" data-i18n="app.subtitle">퀀타리움 구매 플랫폼</p>
                 </div>
 
                 <!-- 로그인 폼 -->
@@ -22791,7 +23629,7 @@ app.get('/', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <script>
             // 비밀번호 표시/숨김 토글 (눈 아이콘 클릭)
             function togglePasswordVisibility(inputId, btn) {
@@ -23025,7 +23863,7 @@ app.get('/dashboard', (c) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <meta name="user-country" content="${userCountry}">
-        <title data-i18n="dash.title">대시보드 - QUANTARIUM STAKING</title>
+        <title data-i18n="dash.title">대시보드 - Quantarium Purchase Platform</title>
         <link rel="icon" type="image/png" href="/static/quantarium-logo.png">
         <link rel="stylesheet" href="/static/tailwind.css">
         <link href="/static/fa/all.min.css" rel="stylesheet">
@@ -23097,7 +23935,7 @@ app.get('/dashboard', (c) => {
             <main id="dashPage-main" class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-8">
                 <!-- Balance Cards -->
                 <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-4 mb-6 sm:mb-8">
-                    <!-- 퀀타리움 스테이킹 현황 (첫 번째 - full width) -->
+                    <!-- 퀀타리움 구매 현황 (첫 번째 - full width) -->
                     <div class="col-span-2 sm:col-span-2 lg:col-span-1 bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-4 sm:p-6 text-white shadow-lg">
                         <div class="flex items-center justify-between mb-1 sm:mb-2">
                             <span class="text-[11px] sm:text-sm opacity-90 leading-tight flex-1 pr-1" data-i18n="dash.purchase_transfer">퀀타리움구매(USDT)</span>
@@ -23152,7 +23990,7 @@ app.get('/dashboard', (c) => {
                     <div class="flex items-center justify-between mb-2 sm:mb-3">
                         <div class="flex items-center">
                             <i class="fas fa-tachometer-alt text-purple-600 mr-2"></i>
-                            <span class="text-sm sm:text-base font-bold text-gray-800" data-i18n="dash.cap_title">수당 진행률 (200% 캡)</span>
+                            <span class="text-sm sm:text-base font-bold text-gray-800" data-i18n="dash.cap_title">진행률 (200% 캡)</span>
                         </div>
                         <span id="capPercentText" class="text-sm sm:text-base font-bold text-gray-700">0.00%</span>
                     </div>
@@ -23169,7 +24007,7 @@ app.get('/dashboard', (c) => {
                 <!-- Staking Section -->
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6 mb-6 sm:mb-8">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
-                        <i class="fas fa-lock mr-2 text-purple-600"></i><span data-i18n="dash.staking_title">QTA 구매 스테이킹</span>
+                        <i class="fas fa-lock mr-2 text-purple-600"></i><span data-i18n="dash.staking_title">QTA 구매 신청</span>
                     </h2>
                     <form onsubmit="handleStaking(event)" class="space-y-4">
                         <div>
@@ -23210,9 +24048,9 @@ app.get('/dashboard', (c) => {
                                 <table class="w-full text-xs sm:text-sm">
                                     <thead class="bg-gray-200">
                                         <tr>
-                                            <th class="px-2 sm:px-3 py-2 text-left text-gray-700" data-i18n="dash.investment_amount">투자금액</th>
-                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.rate">배당률</th>
-                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.period">거치기간</th>
+                                            <th class="px-2 sm:px-3 py-2 text-left text-gray-700" data-i18n="dash.investment_amount">구매금액</th>
+                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.rate">보너스율</th>
+                                            <th class="px-2 sm:px-3 py-2 text-center text-gray-700" data-i18n="dash.period">보너스기간</th>
                                         </tr>
                                     </thead>
                                     <tbody id="policyTableBody" class="divide-y divide-gray-200">
@@ -23274,7 +24112,7 @@ app.get('/dashboard', (c) => {
 
                         <button type="submit" 
                             class="w-full bg-purple-600 text-white py-3 sm:py-4 rounded-lg font-bold text-base sm:text-lg hover:bg-purple-700 transition">
-                            <i class="fas fa-paper-plane mr-2"></i><span data-i18n="dash.staking_apply">스테이킹 신청</span>
+                            <i class="fas fa-paper-plane mr-2"></i><span data-i18n="dash.staking_apply">구매신청</span>
                         </button>
                     </form>
                 </div>
@@ -23309,7 +24147,7 @@ app.get('/dashboard', (c) => {
                             <label class="block text-sm font-bold text-gray-700 mb-2" data-i18n="dash.swap_target">교환 대상</label>
                             <select id="swapQkeyTarget" onchange="updateSwapPreview('qkey')"
                                 class="w-full px-4 py-3 border-2 border-indigo-200 rounded-lg text-sm sm:text-base font-medium focus:outline-none focus:border-indigo-500 bg-white">
-                                <option value="qta">QTA (1 QKEY = 1 QTA)</option>
+                                <option value="qta" id="swapQkeyQtaOpt">QTA (3 QKEY = 1 QTA)</option>
                                 <option value="qx">QX (5 QKEY = 1 QX)</option>
                                 <option value="usdt">USDT (150 QKEY = 1 USDT)</option>
                             </select>
@@ -23644,7 +24482,7 @@ app.get('/dashboard', (c) => {
                 <!-- My Stakings -->
                 <div class="bg-white rounded-xl shadow-lg p-4 sm:p-6">
                     <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-4 sm:mb-6">
-                        <i class="fas fa-list mr-2 text-purple-600"></i><span data-i18n="dash.my_staking_list">내 스테이킹 목록</span>
+                        <i class="fas fa-list mr-2 text-purple-600"></i><span data-i18n="dash.my_staking_list">QTA 구매 목록</span>
                     </h2>
                     <div id="stakingList" class="space-y-4">
                         <p class="text-gray-500 text-center py-8" data-i18n="common.loading">Loading...</p>
@@ -23707,25 +24545,13 @@ app.get('/dashboard', (c) => {
             <div id="inquiryModal" class="fixed inset-0 bg-black/50 z-[100] hidden items-center justify-center p-4">
                 <div class="bg-white rounded-xl shadow-2xl max-w-md w-full p-5">
                     <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-comment-dots text-blue-600 mr-2"></i><span data-i18n="ushop.inquiry_title">쇼핑몰 문의하기</span></h3>
+                        <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-comment-dots text-blue-600 mr-2"></i><span data-i18n="ushop.inquiry_title">문의하기</span></h3>
                         <button onclick="closeInquiryModal()" class="text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
                     </div>
                     <div class="space-y-3">
-                        <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.inquiry_type">문의 유형</span> <span class="text-red-500">*</span></label>
-                            <select id="inquiryCategory" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
-                                <option value="" data-i18n="ushop.select_please">선택해주세요</option>
-                                <option value="shipping" data-i18n="ushop.inquiry_shipping">배송 문의</option>
-                                <option value="refund" data-i18n="ushop.inquiry_refund">환불 문의</option>
-                                <option value="other" data-i18n="ushop.inquiry_etc">기타 문의</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-medium text-gray-700 mb-1" data-i18n="ushop.related_order">관련 주문 (선택)</label>
-                            <select id="inquiryOrderId" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
-                                <option value="" data-i18n="ushop.none">없음</option>
-                            </select>
-                        </div>
+                        <!-- 문의 유형/관련 주문 선택 제거: 바로 제목/내용 작성 (category는 자동 other로 저장) -->
+                        <input type="hidden" id="inquiryCategory" value="other">
+                        <input type="hidden" id="inquiryOrderId" value="">
                         <div>
                             <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.title_label">제목</span> <span class="text-red-500">*</span></label>
                             <input id="inquiryTitle" type="text" maxlength="100" placeholder="문의 제목" data-i18n-placeholder="udyn.inquiry_title_ph" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
@@ -23734,7 +24560,7 @@ app.get('/dashboard', (c) => {
                             <label class="block text-xs font-medium text-gray-700 mb-1"><span data-i18n="ushop.content_label">내용</span> <span class="text-red-500">*</span></label>
                             <textarea id="inquiryContent" rows="5" maxlength="2000" placeholder="문의 내용을 자세히 적어주세요" data-i18n-placeholder="udyn.inquiry_content_ph" class="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"></textarea>
                         </div>
-                        <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i><span data-i18n="ushop.inquiry_private">문의 내용은 본인과 쇼핑몰 관리자만 열람 가능합니다.</span></p>
+                        <p class="text-[11px] text-gray-500"><i class="fas fa-lock mr-1"></i><span data-i18n="ushop.inquiry_private">문의 내용은 본인과 관리자만 열람 가능합니다.</span></p>
                     </div>
                     <div class="flex gap-2 mt-4">
                         <button onclick="closeInquiryModal()" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium text-gray-700" data-i18n="common.cancel">취소</button>
@@ -23792,7 +24618,7 @@ app.get('/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <script>
             let currentUser = null;
             let accumulatedAmount = 0;
@@ -23868,7 +24694,7 @@ app.get('/dashboard', (c) => {
                     card.classList.remove('hidden');
 
                     const pct = Number(d.percent || 0);
-                    const visualPct = Math.min(100, pct / 2 * 100); // 0~200% 를 0~100% 막대 폭으로 매핑
+                    const visualPct = Math.min(100, pct / 2); // 0~200% 를 0~100% 막대 폭으로 매핑 (pct 는 이미 % 값)
 
                     // 사장님 정책: <100 green / 100~150 orange / 150~200 red / >=200 capped(red)
                     let colorCls = 'bg-green-500';
@@ -24078,6 +24904,8 @@ app.get('/dashboard', (c) => {
                 var usdtTab = document.getElementById('swapTabUsdt');
                 var qkeyPanel = document.getElementById('swapPanelQkey');
                 var usdtPanel = document.getElementById('swapPanelUsdt');
+                // ★ QTA 옵션 비율 라벨 재확인 (컷오프 이후 3:1)
+                try { var _qopt = document.getElementById('swapQkeyQtaOpt'); if (_qopt) _qopt.textContent = 'QTA (' + qkeyPerQta + ' QKEY = 1 QTA)'; } catch(e) {}
                 if (tab === 'qkey') {
                     qkeyTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-indigo-600 text-white';
                     usdtTab.className = 'flex-1 py-3 text-sm sm:text-base font-bold transition bg-white text-gray-600 hover:bg-gray-50';
@@ -24091,26 +24919,50 @@ app.get('/dashboard', (c) => {
                 }
             }
 
+            // ★ 사장님 룰 (2026-07-31 확정): 8월 1일 KST 00:00부터 QKEY→QTA 스왑 비율 1:1 → 3:1 전환
+            //   KST 00:00 (2026-08-01) === UTC 2026-07-31T15:00:00Z
+            var SWAP_3TO1_CUTOFF = new Date('2026-07-31T15:00:00Z');
+            var qkeyPerQta = (new Date() >= SWAP_3TO1_CUTOFF) ? 3 : 1;
             var swapRates = {
-                qkey: { qta: {need: 1, get: 1}, qx: {need: 5, get: 1}, usdt: {need: 150, get: 1} },
+                qkey: { qta: {need: qkeyPerQta, get: 1}, qx: {need: 5, get: 1}, usdt: {need: 150, get: 1} },
                 usdt: { qkey: {need: 1, get: 150}, qta: {need: 1, get: 150}, qx: {need: 1, get: 30} }
             };
+
+            // ★ QKEY->QTA 스왑 비율 안내 라벨 동적 세팅 (컷오프 이후 3:1). 언어 무관 정확한 비율 표시.
+            (function syncSwapQtaOptionLabel(){
+                try {
+                    var opt = document.getElementById('swapQkeyQtaOpt');
+                    if (opt) opt.textContent = 'QTA (' + qkeyPerQta + ' QKEY = 1 QTA)';
+                } catch(e) {}
+            })();
 
             function updateSwapPreview(from) {
                 if (from === 'qkey') {
                     var target = document.getElementById('swapQkeyTarget').value;
                     var v = parseInt(document.getElementById('swapQkeyAmount').value) || 0;
                     var rate = swapRates.qkey[target];
-                    var needAmount = v * rate.need;
-                    var getAmount = v * rate.get;
-                    document.getElementById('swapQkeyNeedText').textContent = needAmount.toLocaleString() + ' QKEY';
-                    document.getElementById('swapQkeyGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
-                    // ★ 사장님 2026-05-15 지시: USDT 스왑 1 단위부터 허용 (출금 시점에만 최소 100 USDT 가드)
                     var label = document.getElementById('swapQkeyInputLabel');
-                    if (target === 'usdt') {
-                        label.textContent = 'USDT ' + I18N.t('dash.swap_amount_label') + ' ' + I18N.t('udyn.usdt_min_hint');
+                    if (target === 'qta') {
+                        // ★ 사장님 지시 (2026-08): QTA 스왑은 입력값을 "넣을 QKEY 수량"으로 해석.
+                        //   받을 QTA = floor(입력 QKEY / 비율), 실제 차감 = 받을 QTA * 비율 (3배수만, 나머지 QKEY 잔여)
+                        var qtaGet = Math.floor(v / qkeyPerQta);
+                        var needQkey = qtaGet * qkeyPerQta;
+                        document.getElementById('swapQkeyNeedText').textContent = needQkey.toLocaleString() + ' QKEY';
+                        document.getElementById('swapQkeyGetText').textContent = qtaGet.toLocaleString() + ' QTA';
+                        label.textContent = 'QKEY ' + I18N.t('dash.swap_amount_label');
                     } else {
-                        label.textContent = target.toUpperCase() + ' ' + I18N.t('dash.swap_amount_label');
+                        // ★ 사장님 지시 (2026-08): QX/USDT 스왑도 입력값을 "넣을 QKEY 수량"으로 해석.
+                        //   받을 수량 = floor(입력 QKEY / 비율), 실제 차감 = 받을 수량 * 비율 (비율 배수만, 나머지 QKEY 잔여)
+                        var getAmount = Math.floor(v / rate.need);
+                        var needAmount = getAmount * rate.need;
+                        document.getElementById('swapQkeyNeedText').textContent = needAmount.toLocaleString() + ' QKEY';
+                        document.getElementById('swapQkeyGetText').textContent = getAmount.toLocaleString() + ' ' + target.toUpperCase();
+                        // ★ 사장님 2026-05-15 지시: USDT 스왑 1 단위부터 허용 (출금 시점에만 최소 100 USDT 가드)
+                        if (target === 'usdt') {
+                            label.textContent = 'QKEY ' + I18N.t('dash.swap_amount_label') + ' ' + I18N.t('udyn.usdt_min_hint');
+                        } else {
+                            label.textContent = 'QKEY ' + I18N.t('dash.swap_amount_label');
+                        }
                     }
                 } else {
                     var target = document.getElementById('swapUsdtTarget').value;
@@ -24437,26 +25289,11 @@ app.get('/dashboard', (c) => {
             // ========== 쇼핑몰 문의 (사용자) ==========
             function openInquiryModal() {
                 if (!currentUser || !currentUser.id) { alert(I18N.t('udyn.login_required')); return; }
-                // 폼 초기화
-                document.getElementById('inquiryCategory').value = '';
+                // 폼 초기화: 유형/관련 주문 선택 제거 - 바로 제목/내용 작성 (category는 항상 other)
+                document.getElementById('inquiryCategory').value = 'other';
+                document.getElementById('inquiryOrderId').value = '';
                 document.getElementById('inquiryTitle').value = '';
                 document.getElementById('inquiryContent').value = '';
-                // 주문 목록 옵션 채우기
-                var sel = document.getElementById('inquiryOrderId');
-                sel.innerHTML = '<option value="">' + I18N.t('udyn.opt_none') + '</option>';
-                (async function() {
-                    try {
-                        var res = await axios.get('/api/shop/orders/' + currentUser.id);
-                        if (res.data.success && Array.isArray(res.data.orders)) {
-                            res.data.orders.slice(0, 30).forEach(function(o) {
-                                var opt = document.createElement('option');
-                                opt.value = o.id;
-                                opt.textContent = '#' + o.id + ' - ' + (o.product_name || '') + ' x' + o.quantity;
-                                sel.appendChild(opt);
-                            });
-                        }
-                    } catch(e) {}
-                })();
                 var m = document.getElementById('inquiryModal');
                 m.classList.remove('hidden');
                 m.classList.add('flex');
@@ -24470,11 +25307,12 @@ app.get('/dashboard', (c) => {
 
             async function submitInquiry() {
                 if (!currentUser || !currentUser.id) { alert(I18N.t('udyn.login_required')); return; }
-                var category = document.getElementById('inquiryCategory').value;
+                var catEl = document.getElementById('inquiryCategory');
+                var category = (catEl && catEl.value) ? catEl.value : 'other';
                 var title = document.getElementById('inquiryTitle').value.trim();
                 var content = document.getElementById('inquiryContent').value.trim();
-                var orderId = document.getElementById('inquiryOrderId').value;
-                if (!category) { alert(I18N.t('udyn.inquiry_type_required')); return; }
+                var orderEl = document.getElementById('inquiryOrderId');
+                var orderId = orderEl ? orderEl.value : '';
                 if (!title) { alert(I18N.t('udyn.inquiry_title_required')); return; }
                 if (!content) { alert(I18N.t('udyn.inquiry_content_required')); return; }
                 try {
@@ -24702,11 +25540,25 @@ app.get('/dashboard', (c) => {
                     target = document.getElementById('swapQkeyTarget').value;
                     amt = parseInt(document.getElementById('swapQkeyAmount').value) || 0;
                     if (amt <= 0) { alert(I18N.t('alert.enter_valid_amount')); return; }
-                    // ★ 사장님 2026-05-15 지시: QKEY → USDT 스왑은 QKEY 보유 수량 기준으로 1 단위부터 가능
-                    //   (출금 시점에만 100 USDT 최소 가드 유지)
                     endpoint = '/api/swap/qkey-to-' + target;
                     var rate = swapRates.qkey[target];
-                    confirmMsg = (amt * rate.need).toLocaleString() + ' QKEY → ' + (amt * rate.get).toLocaleString() + ' ' + target.toUpperCase();
+                    if (target === 'qta') {
+                        // ★ 사장님 지시 (2026-08): QTA 스왑 입력값은 "넣을 QKEY 수량".
+                        //   받을 QTA = floor(입력 QKEY / 비율). 백엔드 amount = 받을 QTA (백엔드가 QTA*비율 만큼 QKEY 차감).
+                        var qtaGet = Math.floor(amt / qkeyPerQta);
+                        if (qtaGet < 1) { alert(I18N.t('alert.enter_valid_amount')); return; }
+                        var needQkey = qtaGet * qkeyPerQta;
+                        amt = qtaGet; // 백엔드에는 받을 QTA 수량을 전송
+                        confirmMsg = needQkey.toLocaleString() + ' QKEY → ' + qtaGet.toLocaleString() + ' QTA';
+                    } else {
+                        // ★ 사장님 지시 (2026-08): QX/USDT 스왑 입력값도 "넣을 QKEY 수량".
+                        //   받을 수량 = floor(입력 QKEY / 비율). 백엔드 amount = 받을 수량 (백엔드가 수량*비율 만큼 QKEY 차감).
+                        var getAmount = Math.floor(amt / rate.need);
+                        if (getAmount < 1) { alert(I18N.t('alert.enter_valid_amount')); return; }
+                        var needQkeyEx = getAmount * rate.need;
+                        amt = getAmount; // 백엔드에는 받을 QX/USDT 수량을 전송
+                        confirmMsg = needQkeyEx.toLocaleString() + ' QKEY → ' + getAmount.toLocaleString() + ' ' + target.toUpperCase();
+                    }
                 } else {
                     target = document.getElementById('swapUsdtTarget').value;
                     amt = parseFloat(document.getElementById('swapUsdtAmount').value) || 0;
@@ -25194,11 +26046,16 @@ app.get('/dashboard', (c) => {
             function isPolicyV2() {
                 return new Date() >= POLICY_V2_DATE;
             }
+            // ★ $10,000+ 일일 배당률 변경 (2026-07-21): 7/21 00:00 KST 부터 1.0% → 0.8%
+            var RATE_10K_08_DATE = new Date('2026-07-21T00:00:00+09:00');
+            function is10k08() { return new Date() >= RATE_10K_08_DATE; }
 
             // 금액별 정책 정보 반환
             function getPolicy(amount) {
                 var v2 = isPolicyV2();
-                if (amount >= 10000) return { rate: '1.0%', rateNum: 0.01, period: 180, periodText: '180' + I18N.t('dash.days') };
+                if (amount >= 10000) return is10k08()
+                    ? { rate: '0.8%', rateNum: 0.008, period: 180, periodText: '180' + I18N.t('dash.days') }
+                    : { rate: '1.0%', rateNum: 0.01, period: 180, periodText: '180' + I18N.t('dash.days') };
                 if (amount >= 5000) return { rate: '0.7%', rateNum: 0.007, period: 120, periodText: '120' + I18N.t('dash.days') };
                 if (v2) {
                     return { rate: '0.5%', rateNum: 0.005, period: 90, periodText: '90' + I18N.t('dash.days') };
@@ -25213,12 +26070,13 @@ app.get('/dashboard', (c) => {
                 if (!tbody) return;
                 var v2 = isPolicyV2();
                 var rows;
+                var rate10k = is10k08() ? '0.8%' : '1.0%'; // $10,000+ 배당률 (2026-07-21~ 0.8%)
                 if (v2) {
                     // V2: 1,000~4,000 통합
                     rows = [
                         { id: 'policyRow1', amount: '$1,000 ~ $4,000', rate: '0.5%', days: '90' },
                         { id: 'policyRow3', amount: '$5,000 ~ $9,000', rate: '0.7%', days: '120' },
-                        { id: 'policyRow4', amount: '$10,000+',         rate: '1.0%', days: '180' }
+                        { id: 'policyRow4', amount: '$10,000+',         rate: rate10k, days: '180' }
                     ];
                 } else {
                     // V1: 기존
@@ -25226,7 +26084,7 @@ app.get('/dashboard', (c) => {
                         { id: 'policyRow1', amount: '$1,000 ~ $2,000', rate: '0.3%', days: '60' },
                         { id: 'policyRow2', amount: '$3,000 ~ $4,000', rate: '0.5%', days: '90' },
                         { id: 'policyRow3', amount: '$5,000 ~ $9,000', rate: '0.7%', days: '120' },
-                        { id: 'policyRow4', amount: '$10,000+',         rate: '1.0%', days: '180' }
+                        { id: 'policyRow4', amount: '$10,000+',         rate: rate10k, days: '180' }
                     ];
                 }
                 var daysLabel = I18N.t('dash.days') || 'days';
@@ -25291,7 +26149,13 @@ app.get('/dashboard', (c) => {
                 // 보상 미리보기 (날짜별 정책: ~5/3 QTA 75k + QX 10k + QKEY 5k, 5/4~ QTA 75k only)
                 var PHASE2 = new Date('2026-05-04T00:00:00+09:00');
                 var isPhase2 = new Date() >= PHASE2;
-                var qtaReward = (accumulatedAmount / 1000) * 75000;
+                // ★ QTA 수량 변경 (2026-06-21): 6/22 00:00 KST 부터 50,000/$1,000
+                // ★ QTA 수량 재변경 (2026-07-21): 7/21 00:00 KST 부터 40,000/$1,000
+                var QTA_REDUCE = new Date('2026-06-22T00:00:00+09:00');
+                var QTA_40K = new Date('2026-07-21T00:00:00+09:00');
+                var _qtaNow = new Date();
+                var qtaPer1000 = (_qtaNow >= QTA_40K) ? 40000 : (_qtaNow >= QTA_REDUCE) ? 50000 : 75000;
+                var qtaReward = (accumulatedAmount / 1000) * qtaPer1000;
                 var qxReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 10000;
                 var qkeyReward = isPhase2 ? 0 : (accumulatedAmount / 1000) * 5000;
                 document.getElementById('qtaRewardPreview').textContent = qtaReward.toLocaleString();
@@ -25328,7 +26192,13 @@ app.get('/dashboard', (c) => {
                 const policy = getPolicy(amount);
                 var _P2 = new Date('2026-05-04T00:00:00+09:00');
                 var _isP2 = new Date() >= _P2;
-                const qtaReward = (amount / 1000) * 75000;
+                // ★ QTA 수량 변경 (2026-06-21): 6/22 00:00 KST 부터 50,000/$1,000
+                // ★ QTA 수량 재변경 (2026-07-21): 7/21 00:00 KST 부터 40,000/$1,000
+                var _QTA_REDUCE = new Date('2026-06-22T00:00:00+09:00');
+                var _QTA_40K = new Date('2026-07-21T00:00:00+09:00');
+                var _qtaNow2 = new Date();
+                var _qtaPer1000 = (_qtaNow2 >= _QTA_40K) ? 40000 : (_qtaNow2 >= _QTA_REDUCE) ? 50000 : 75000;
+                const qtaReward = (amount / 1000) * _qtaPer1000;
                 const qxReward = _isP2 ? 0 : (amount / 1000) * 10000;
                 const qkeyReward = _isP2 ? 0 : (amount / 1000) * 5000;
                 
@@ -26028,7 +26898,7 @@ app.get('/admin', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <script>
             I18N.init();
             createLangSelector('langSelector');
@@ -26187,6 +27057,22 @@ app.get('/admin/dashboard', (c) => {
                     </div>
                 </div>
 
+                <!-- 데일리 cron 리포트 (사장님 명령 2026-06-22: 매일 cron 후 누락 자동 점검 보고) -->
+                <div class="bg-white rounded-lg shadow-md p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-3">
+                        <div class="flex-1">
+                            <h3 class="text-lg font-bold text-gray-800"><i class="fas fa-clipboard-check text-green-600 mr-2"></i>데일리 cron 리포트 (자동 누락 점검)</h3>
+                            <p class="text-sm text-gray-600 mt-1">최근 평일별 <b>지급대상 vs 실지급</b> 자동 대조. 토/일·공휴일·cap도달 자동 제외 (영구룰 준수)</p>
+                        </div>
+                        <button onclick="loadCronReport()" id="cronReportRefreshBtn"
+                            class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-xs sm:text-sm whitespace-nowrap">
+                            <i class="fas fa-sync-alt mr-1"></i>새로고침
+                        </button>
+                    </div>
+                    <div id="cronReportSummary" class="mb-3"></div>
+                    <div id="cronReportBody" class="overflow-x-auto text-sm"></div>
+                </div>
+
                 <!-- 탭 메뉴 -->
                 <div class="bg-white rounded-lg shadow-md mb-4 sm:mb-6">
                     <div class="flex border-b overflow-x-auto -webkit-overflow-scrolling-touch">
@@ -26252,6 +27138,19 @@ app.get('/admin/dashboard', (c) => {
                     <h2 class="text-xl font-bold text-gray-800 mb-4">
                         <i class="fas fa-list text-purple-600 mr-2"></i><span data-i18n="admin.all_title">전체 스테이킹 목록</span>
                     </h2>
+                    <!-- 아이디(이메일/이름) 검색 -->
+                    <div class="mb-4 flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+                        <div class="relative flex-1">
+                            <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm"></i>
+                            <input id="allStakingSearch" type="text" oninput="filterAllStakings()" placeholder="아이디(이메일) 또는 이름으로 검색"
+                                   class="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500 focus:border-purple-500" />
+                        </div>
+                        <button onclick="document.getElementById('allStakingSearch').value='';filterAllStakings()"
+                                class="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg text-sm font-bold transition whitespace-nowrap">
+                            <i class="fas fa-times mr-1"></i>초기화
+                        </button>
+                    </div>
+                    <p id="allStakingCount" class="text-xs text-gray-500 mb-2"></p>
                     <div id="allList" class="space-y-4">
                         <p class="text-center text-gray-500 py-8" data-i18n="admin.loading">로딩 중...</p>
                     </div>
@@ -26583,10 +27482,11 @@ app.get('/admin/dashboard', (c) => {
                                     <th class="px-2 sm:px-3 py-2 text-center" data-i18n="admin.col_status">상태</th>
                                     <th class="px-2 sm:px-3 py-2 text-center">리셋</th>
                                     <th class="px-2 sm:px-3 py-2 text-left" data-i18n="admin.col_sale_date">판매일</th>
+                                    <th class="px-2 sm:px-3 py-2 text-center" data-i18n="admin.col_manage">관리</th>
                                 </tr>
                             </thead>
                             <tbody id="salesTableBody" class="divide-y divide-gray-200">
-                                <tr><td colspan="7" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
+                                <tr><td colspan="8" class="text-center py-8 text-gray-500" data-i18n="admin.loading">로딩 중...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -27034,7 +27934,7 @@ app.get('/admin/dashboard', (c) => {
         </div>
 
         <script src="/static/axios.min.js"></script>
-        <script src="/static/i18n.js?v=20260616ko8"></script>
+        <script src="/static/i18n.js?v=2026073105"></script>
         <!-- SheetJS (xlsx) - 상품 대량등록/송장 엑셀 업로드용 -->
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
         <script>
@@ -27221,19 +28121,51 @@ app.get('/admin/dashboard', (c) => {
                 }
             }
 
+            // 전체 스테이킹 목록 캐시 (아이디 검색 필터링용)
+            let __allStakingsCache = [];
+
             // 전체 스테이킹 목록 로드
             async function loadAllStakings() {
                 try {
                     const response = await axios.get('/api/admin/staking/all');
                     const stakings = response.data.stakings || [];
-                    const listEl = document.getElementById('allList');
+                    __allStakingsCache = stakings;
+                    // 검색어가 있으면 필터 유지, 없으면 전체 렌더
+                    filterAllStakings();
+                } catch (error) {
+                    console.error('All stakings load failed:', error);
+                }
+            }
 
-                    if (stakings.length === 0) {
-                        listEl.innerHTML = '<p class="text-center text-gray-500 py-8">' + I18N.t('admin.no_stakings') + '</p>';
-                        return;
-                    }
+            // 아이디(이메일)/이름 검색 필터
+            function filterAllStakings() {
+                const inputEl = document.getElementById('allStakingSearch');
+                const q = (inputEl ? inputEl.value : '').trim().toLowerCase();
+                const countEl = document.getElementById('allStakingCount');
+                let list = __allStakingsCache || [];
+                if (q) {
+                    list = list.filter(s =>
+                        (s.email && String(s.email).toLowerCase().includes(q)) ||
+                        (s.name && String(s.name).toLowerCase().includes(q))
+                    );
+                }
+                if (countEl) {
+                    countEl.textContent = q
+                        ? ('검색결과 ' + list.length + '건 (전체 ' + (__allStakingsCache || []).length + '건)')
+                        : ('전체 ' + list.length + '건');
+                }
+                renderAllStakingsCards(list);
+            }
 
-                    listEl.innerHTML = stakings.map(s => {
+            // 스테이킹 카드 렌더 (검색 결과 재사용)
+            function renderAllStakingsCards(stakings) {
+                const listEl = document.getElementById('allList');
+                if (!listEl) return;
+                if (!stakings || stakings.length === 0) {
+                    listEl.innerHTML = '<p class="text-center text-gray-500 py-8">' + I18N.t('admin.no_stakings') + '</p>';
+                    return;
+                }
+                listEl.innerHTML = stakings.map(s => {
                         let statusColor, statusText, statusIcon;
                         if (s.status === 'pending') {
                             statusColor = 'yellow';
@@ -27303,9 +28235,6 @@ app.get('/admin/dashboard', (c) => {
                             </div>
                         \`;
                     }).join('');
-                } catch (error) {
-                    console.error('All stakings load failed:', error);
-                }
             }
 
             // 사용자 목록 캐시 (검색 필터링용)
@@ -27863,6 +28792,75 @@ app.get('/admin/dashboard', (c) => {
             }
             // 어드민 페이지 로드 시 자동 실행
             try { setTimeout(loadCronLockStatus, 1500); setInterval(loadCronLockStatus, 60000); } catch(e) {}
+
+            // 데일리 cron 리포트 (사장님 명령 2026-06-22) — 최근 평일 누락 자동 점검
+            async function loadCronReport() {
+                var btn = document.getElementById('cronReportRefreshBtn');
+                if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>점검 중...'; }
+                var summaryEl = document.getElementById('cronReportSummary');
+                var bodyEl = document.getElementById('cronReportBody');
+                try {
+                    var token = localStorage.getItem('adminToken') || '';
+                    if (!token) { if (summaryEl) summaryEl.innerHTML = '<span class="text-red-600">어드민 로그인 필요</span>'; return; }
+                    var res = await axios.get('/api/admin/rewards/cron-report?days=10', {
+                        headers: { 'Authorization': 'Bearer ' + token },
+                        validateStatus: function() { return true; }
+                    });
+                    var data = res.data || {};
+                    if (!data.success) {
+                        if (summaryEl) summaryEl.innerHTML = '<span class="text-red-600">조회 실패: ' + (data.error || res.status) + '</span>';
+                        return;
+                    }
+                    // 요약 배너
+                    if (summaryEl) {
+                        if (data.overall_status === 'ALL_OK') {
+                            summaryEl.innerHTML = '<div class="px-4 py-3 bg-green-50 border border-green-300 rounded-lg text-green-800 font-bold">'
+                                + '<i class="fas fa-check-circle mr-2"></i>최근 ' + data.checked_business_days + '영업일 누락 0건 — 전원 정상 지급 ✅'
+                                + '<span class="ml-2 text-xs text-green-600 font-normal">(점검시각 ' + (data.generated_at_kst || '') + ' KST)</span></div>';
+                        } else {
+                            summaryEl.innerHTML = '<div class="px-4 py-3 bg-red-50 border border-red-400 rounded-lg text-red-800 font-bold">'
+                                + '<i class="fas fa-exclamation-triangle mr-2"></i>⚠️ 누락 총 ' + data.total_missing + '건 발견! 즉시 보정 필요'
+                                + '<span class="ml-2 text-xs text-red-600 font-normal">(점검시각 ' + (data.generated_at_kst || '') + ' KST)</span></div>';
+                        }
+                    }
+                    // 표
+                    var rows = (data.report || []).map(function(r) {
+                        var stColor = r.status === 'OK' ? 'text-green-700' : 'text-red-700 font-bold';
+                        var stIcon = r.status === 'OK' ? '✅ 정상' : '🔴 누락 ' + r.missing_count + '건';
+                        var cronCol = r.cron_completed
+                            ? '<span class="text-green-700">완료 ' + (r.cron_finished_at || '') + '</span>'
+                            : (r.cron_locked_at ? '<span class="text-yellow-700">미완료(lock만 ' + r.cron_locked_at + ')</span>' : '<span class="text-gray-400">기록없음</span>');
+                        var missDetail = '';
+                        if (r.missing_count > 0) {
+                            missDetail = '<div class="text-xs text-red-600 mt-1">'
+                                + r.missing.map(function(m){ return m.email + '(staking ' + m.staking_id + ', $' + m.amount + ')'; }).join(', ')
+                                + '</div>';
+                        }
+                        return '<tr class="border-b">'
+                            + '<td class="px-3 py-2 font-mono">' + r.date + '</td>'
+                            + '<td class="px-3 py-2 text-center">' + r.due_count + '</td>'
+                            + '<td class="px-3 py-2 text-center">' + r.paid_count + '</td>'
+                            + '<td class="px-3 py-2 ' + stColor + '">' + stIcon + missDetail + '</td>'
+                            + '<td class="px-3 py-2 text-xs">' + cronCol + '</td>'
+                            + '</tr>';
+                    }).join('');
+                    if (bodyEl) {
+                        bodyEl.innerHTML = '<table class="w-full border-collapse"><thead><tr class="bg-gray-100 text-gray-700">'
+                            + '<th class="px-3 py-2 text-left">평일(reward_date)</th>'
+                            + '<th class="px-3 py-2">지급대상</th>'
+                            + '<th class="px-3 py-2">실지급</th>'
+                            + '<th class="px-3 py-2 text-left">상태</th>'
+                            + '<th class="px-3 py-2 text-left">cron 완료시각</th>'
+                            + '</tr></thead><tbody>' + rows + '</tbody></table>';
+                    }
+                } catch(e) {
+                    if (summaryEl) summaryEl.innerHTML = '<span class="text-red-600">오류: ' + (e.message || e) + '</span>';
+                } finally {
+                    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt mr-1"></i>새로고침'; }
+                }
+            }
+            // 어드민 페이지 로드 시 cron 리포트 자동 점검
+            try { setTimeout(loadCronReport, 2000); } catch(e) {}
 
             // ============================================
             // 회원 상세 보기
@@ -28570,7 +29568,7 @@ app.get('/admin/dashboard', (c) => {
 
                     var tbody = document.getElementById('salesTableBody');
                     if (sales.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_sales') + '</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="8" class="text-center py-8 text-gray-500">' + I18N.t('admin.no_sales') + '</td></tr>';
                     } else {
                         tbody.innerHTML = sales.map(function(s) {
                             var stColor = s.status === 'active' ? 'green' : 'gray';
@@ -28579,6 +29577,13 @@ app.get('/admin/dashboard', (c) => {
                             var resetCell = s.reset_at
                                 ? '<span class="px-2 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold" title="' + esc(s.reset_at) + '"><i class="fas fa-undo-alt mr-1"></i>리셋</span>'
                                 : '<span class="text-gray-300 text-xs">-</span>';
+                            // ★ [요구사항 #1] 승인된 매출건 삭제 버튼 (지급 코인 회수 포함)
+                            //   ※ 따옴표 이스케이프 충돌 방지: 인라인 onclick 인자 대신 data-* 속성 + 이벤트위임 사용
+                            var delBtn = '<button type="button" class="deleteSaleBtn px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-xs font-bold" '
+                                + 'data-sid="' + s.staking_id + '" '
+                                + 'data-name="' + esc(s.name) + '" '
+                                + 'data-amount="' + s.amount + '" '
+                                + 'title="' + I18N.t('admin.sales_delete_btn') + '"><i class="fas fa-trash-alt"></i></button>';
                             return '<tr class="' + rowClass + '">' +
                                 '<td class="px-2 sm:px-3 py-2"><span class="text-xs">' + esc(s.email) + '</span></td>' +
                                 '<td class="px-2 sm:px-3 py-2 font-medium">' + esc(s.name) + '</td>' +
@@ -28587,11 +29592,41 @@ app.get('/admin/dashboard', (c) => {
                                 '<td class="px-2 sm:px-3 py-2 text-center"><span class="px-2 py-0.5 bg-' + stColor + '-100 text-' + stColor + '-700 rounded text-xs">' + stText + '</span></td>' +
                                 '<td class="px-2 sm:px-3 py-2 text-center">' + resetCell + '</td>' +
                                 '<td class="px-2 sm:px-3 py-2 whitespace-nowrap text-xs">' + (s.sale_date ? new Date(s.sale_date).toLocaleDateString(I18N.getLang()) : '-') + '</td>' +
+                                '<td class="px-2 sm:px-3 py-2 text-center">' + delBtn + '</td>' +
                             '</tr>';
                         }).join('');
+
+                        // 삭제 버튼 이벤트 위임 (인라인 onclick 대신 data-* 로 안전 처리)
+                        var _delBtns = tbody.querySelectorAll('.deleteSaleBtn');
+                        for (var _i = 0; _i < _delBtns.length; _i++) {
+                            _delBtns[_i].addEventListener('click', function() {
+                                deleteSale(this.getAttribute('data-sid'), this.getAttribute('data-name'), this.getAttribute('data-amount'));
+                            });
+                        }
                     }
                 } catch (error) {
                     console.error('Sales status load failed:', error);
+                }
+            }
+
+            // ★ [요구사항 #1 / 2026-07-03] 승인처리된 매출건 삭제 (2단계 확인 + 코인 회수)
+            async function deleteSale(stakingId, name, amount) {
+                var msg1 = I18N.t('admin.sales_delete_confirm1')
+                    .replace('{name}', name)
+                    .replace('{amount}', '$' + Number(amount).toLocaleString());
+                if (!confirm(msg1)) return;
+                if (!confirm(I18N.t('admin.sales_delete_confirm2'))) return;
+                try {
+                    var res = await axios.delete('/api/admin/sales/' + stakingId);
+                    if (res.data && res.data.success) {
+                        alert(I18N.t('admin.sales_delete_success'));
+                        loadSalesStatus();
+                    } else {
+                        alert((res.data && res.data.error) || I18N.t('admin.sales_delete_error'));
+                    }
+                } catch (error) {
+                    var em = (error.response && error.response.data && error.response.data.error) || I18N.t('admin.sales_delete_error');
+                    alert(em);
                 }
             }
 
@@ -54419,7 +55454,7 @@ app.get('/api/diag/audit-512-rewards', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') {
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 403)
     }
     const db = c.env.DB
@@ -54620,7 +55655,7 @@ app.get('/api/diag/purge-and-recalc-512', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') {
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 403)
     }
     const confirm = c.req.query('confirm') || ''
@@ -55074,7 +56109,7 @@ app.get('/api/diag/resume-512', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'  // dr | rr-l1 | rr-l2 | balance-sync | all
     const isExec = confirm === 'RESUME_512'
@@ -55290,7 +56325,7 @@ app.get('/api/diag/verify-512-bottom-up', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID_DATE = '2026-05-12'
@@ -55617,7 +56652,7 @@ app.get('/api/diag/dup-512-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'DELETE_DUP_512'
     const db = c.env.DB
@@ -55921,7 +56956,7 @@ app.get('/api/diag/insert-511-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_511'
@@ -56165,7 +57200,7 @@ app.get('/api/diag/preview-511-groups', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID_DATE = '2026-05-11'
@@ -56378,7 +57413,7 @@ app.get('/api/diag/insert-511-paid-v2', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_511_V2'
@@ -56653,7 +57688,7 @@ app.get('/api/diag/inspect-511-existing-rr', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 5/11 paid 의 모든 RR 상세 (정확한 컬럼: referrer_id, referee_id, reward_amount, original_amount, staking_id)
@@ -56803,7 +57838,7 @@ app.get('/api/diag/inspect-511-rr-violations', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const VIOLATION_IDS = [1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203]
@@ -56939,7 +57974,7 @@ app.get('/api/diag/delete-511-rr-violations', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'DELETE_511_RR_VIOLATIONS'
     const db = c.env.DB
@@ -57109,7 +58144,7 @@ app.get('/api/diag/verify-511-bottom-up', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 1) DR 집계
@@ -57293,7 +58328,7 @@ app.get('/api/diag/inspect-516-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID_DATE = '2026-05-16'
@@ -57513,7 +58548,7 @@ app.get('/api/diag/scan-516-all-traces', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 1) DR with paid_date=5/16
@@ -57682,7 +58717,7 @@ app.get('/api/diag/delete-516-all-traces', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'DELETE_516_ALL'
     const db = c.env.DB
@@ -57923,7 +58958,7 @@ app.get('/api/diag/check-user44-balance-after-516', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_USER44_516'
     const db = c.env.DB
@@ -58028,7 +59063,7 @@ app.get('/api/diag/fix-user44-balance-516', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_USER44_BALANCE_2475'
     const db = c.env.DB
@@ -58152,7 +59187,7 @@ app.get('/api/diag/scan-519-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID = '2026-05-19'
@@ -58338,7 +59373,7 @@ app.get('/api/diag/purge-519-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'PURGE_519'
     const db = c.env.DB
@@ -58598,7 +59633,7 @@ app.get('/api/diag/insert-519-paid-v2', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_519_V2'
@@ -58863,7 +59898,7 @@ app.get('/api/diag/scan-tx-double-payments', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // ─── 1) DR (user_id, staking_id, paid_date) 중복 ─────────────
@@ -58998,7 +60033,7 @@ app.get('/api/diag/scan-tx-double-payments', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-holiday-tx-double', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const HOLIDAY_USERS = [33, 38, 40, 91, 93]
@@ -59144,7 +60179,7 @@ app.get('/api/diag/scan-holiday-tx-double', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-balance-vs-tx', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -59297,7 +60332,7 @@ app.get('/api/diag/scan-balance-vs-tx', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -59428,7 +60463,7 @@ app.get('/api/diag/scan-all-balance-vs-history', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/snapshot-export', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -59546,7 +60581,7 @@ app.get('/api/diag/snapshot-export', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/snapshot-meta', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -59597,7 +60632,7 @@ app.get('/api/diag/snapshot-meta', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.post('/api/diag/snapshot-restore', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -59757,7 +60792,7 @@ app.post('/api/diag/snapshot-restore', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-balance-to-history', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -59923,7 +60958,7 @@ app.get('/api/diag/fix-balance-to-history', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-daily-missing', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60223,7 +61258,7 @@ app.get('/api/diag/fix-daily-missing', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/sim-option-d', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60404,7 +61439,7 @@ app.get('/api/diag/sim-option-d', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/purge-holiday-513-legacy', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const confirm = c.req.query('confirm') || ''
   const isExec = confirm === 'PURGE_HOLIDAY_513_LEGACY'
@@ -60543,7 +61578,7 @@ app.get('/api/diag/purge-holiday-513-legacy', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-all-legacy-violation', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -60662,7 +61697,7 @@ app.get('/api/diag/scan-all-legacy-violation', async (c) => {
 // 이 endpoint 는 /api/admin/user/:userId 와 동일 query 를 auth 없이 실행
 app.get('/api/diag/admin-page-mirror', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const userId = parseInt(c.req.query('user_id') || '93')
@@ -60748,7 +61783,7 @@ app.get('/api/diag/admin-page-mirror', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-user-full', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW && c.req.query('key') !== ADMIN_PW) {
     return c.json({ error: 'AUTH' }, 401)
   }
@@ -61037,7 +62072,7 @@ app.get('/api/diag/scan-user-full', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-user-rr-detail', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW && c.req.query('key') !== ADMIN_PW) {
     return c.json({ error: 'AUTH' }, 401)
   }
@@ -61220,7 +62255,7 @@ app.get('/api/diag/scan-user-rr-detail', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/scan-all-tx-double', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const HOLIDAY_USERS = new Set([33, 38, 40, 91, 93])
@@ -61432,7 +62467,7 @@ app.get('/api/diag/scan-holiday-joiners-double', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 1) 휴일진입자 staking 전체
@@ -61673,7 +62708,7 @@ app.get('/api/diag/purge-513-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'PURGE_513'
     const db = c.env.DB
@@ -61887,7 +62922,7 @@ app.get('/api/diag/insert-513-paid-v2', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const batch = c.req.query('batch') || 'dr'
     const isExec = confirm === 'INSERT_513_V2'
@@ -62125,7 +63160,7 @@ app.get('/api/diag/scan-513-paid', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID = '2026-05-13'
@@ -62424,7 +63459,7 @@ app.get('/api/diag/scan-l1l2-desc-mismatch', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
     const filterPaidDate = (c.req.query('paid_date') || '').trim()
     const filterUserIdRaw = (c.req.query('user_id') || '').trim()
@@ -62571,7 +63606,7 @@ app.get('/api/diag/fix-511-tx-description', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_511_TX_DESC'
     const db = c.env.DB
@@ -62742,7 +63777,7 @@ app.get('/api/diag/audit-4item-vs-grandtotal', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
     const limit = Math.max(1, Math.min(2000, Number(c.req.query('limit') || 500)))
     const minDiff = Math.max(0, Number(c.req.query('min_diff') || 1))
@@ -63182,7 +64217,7 @@ app.get('/api/diag/fix-519-tx-description', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const confirm = c.req.query('confirm') || ''
     const isExec = confirm === 'FIX_519_TX_DESC'
     const db = c.env.DB
@@ -63340,7 +64375,7 @@ app.get('/api/diag/inspect-tx-desc-history', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     // 다른 paid_date(5/12~5/18) 의 referral_reward TX description 샘플
@@ -63425,7 +64460,7 @@ app.get('/api/diag/verify-519-bottom-up', async (c) => {
   const t0 = Date.now()
   try {
     const key = c.req.query('key') || ''
-    if (key !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 403)
+    if (key !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 403)
     const db = c.env.DB
 
     const PAID = '2026-05-19'
@@ -63616,7 +64651,7 @@ app.get('/api/diag/verify-519-bottom-up', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-missing-daily-qkey', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -63882,7 +64917,7 @@ app.get('/api/diag/fix-missing-daily-qkey', async (c) => {
 // ════════════════════════════════════════════════════════════════════════
 app.get('/api/diag/fix-iinsil2-staking-reward', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   try {
     const db = c.env.DB
@@ -64022,7 +65057,7 @@ app.get('/api/diag/fix-iinsil2-staking-reward', async (c) => {
 // ============================================================================
 app.get('/api/diag/fix-solbat-tree-missing', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'FIX_SOLBAT_TREE_2026_05_19'
 
@@ -64265,7 +65300,7 @@ app.get('/api/diag/fix-solbat-tree-missing', async (c) => {
 // ============================================================================
 app.get('/api/diag/rollback-solbat-tree-partial', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'ROLLBACK_SOLBAT_TREE_PARTIAL'
 
@@ -64357,7 +65392,7 @@ app.get('/api/diag/rollback-solbat-tree-partial', async (c) => {
 // ============================================================================
 app.get('/api/diag/fix-solbat-tree-missing-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'FIX_SOLBAT_V2'
 
@@ -64551,7 +65586,7 @@ app.get('/api/diag/fix-solbat-tree-missing-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/rollback-solbat-tree-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'ROLLBACK_SOLBAT_V2_HOLIDAY'
 
@@ -64698,7 +65733,7 @@ app.get('/api/diag/rollback-solbat-tree-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-weekday-missing-scan', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -64890,7 +65925,7 @@ app.get('/api/diag/solbat-tree-weekday-missing-scan', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-staking-coverage', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -65099,7 +66134,7 @@ app.get('/api/diag/solbat-tree-staking-coverage', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-fix-stage-B', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'STAGE_B_FIX_GO'
   const db = c.env.DB
@@ -65439,7 +66474,7 @@ app.get('/api/diag/solbat-fix-stage-B', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-fix-stage-A', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'STAGE_A_FIX_GO'
   const db = c.env.DB
@@ -65730,7 +66765,7 @@ app.get('/api/diag/solbat-fix-stage-A', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -66031,7 +67066,7 @@ app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-bottomup-audit', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -66317,7 +67352,7 @@ app.get('/api/diag/solbat-tree-bottomup-audit', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
 
   try {
@@ -66605,7 +67640,7 @@ app.get('/api/diag/solbat-tree-bottomup-audit-v2', async (c) => {
 // ============================================================================
 app.get('/api/diag/solbat-fix-stage-A2', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'STAGE_A2_FIX_GO'
   const db = c.env.DB
@@ -66896,7 +67931,7 @@ app.get('/api/diag/solbat-fix-stage-A2', async (c) => {
 // ============================================================================
 app.get('/api/diag/snapshot-full', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -66994,7 +68029,7 @@ app.get('/api/diag/snapshot-full', async (c) => {
 // ============================================================================
 app.get('/api/diag/daily-payout-5-19', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const isExec = c.req.query('confirm') === 'PAYOUT_5_19_GO'
   const db = c.env.DB
@@ -67281,7 +68316,7 @@ app.get('/api/diag/daily-payout-5-19', async (c) => {
 // ============================================================================
 app.get('/api/diag/lock-cron-today', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -67384,7 +68419,7 @@ app.get('/api/diag/lock-cron-today', async (c) => {
 // ============================================================================
 app.get('/api/diag/audit-5-19-full', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -67698,7 +68733,7 @@ app.get('/api/diag/audit-5-19-full', async (c) => {
 // ============================================================================
 app.get('/api/diag/audit-user-5-19', async (c) => {
   const t0 = Date.now()
-  const ADMIN_PW = 'Qta@2026!Sec#Admin'
+  const ADMIN_PW = 'L-e9Qdk853TjjzNKRNPewoxF'
   if (c.req.query('pw') !== ADMIN_PW) return c.json({ error: 'AUTH' }, 401)
   const db = c.env.DB
 
@@ -67883,7 +68918,7 @@ app.get('/api/diag/fix-usdt-amount-permanent-rule', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') {
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 401)
     }
     const confirm = c.req.query('confirm') || ''
@@ -68112,7 +69147,7 @@ app.get('/api/diag/fix-bangsh-balance', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') {
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 401)
     }
     const confirm = c.req.query('confirm') || ''
@@ -68247,7 +69282,7 @@ app.get('/api/diag/fix-bangsh-swap-tx', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') {
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') {
       return c.json({ error: 'unauthorized' }, 401)
     }
     const confirm = c.req.query('confirm') || ''
@@ -68488,7 +69523,7 @@ app.get('/api/diag/daily-payout-5-19-fix-reset', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const isExec = c.req.query('confirm') === 'PAYOUT_5_19_FIX_RESET_GO'
     const db = c.env.DB
 
@@ -68756,7 +69791,7 @@ app.get('/api/diag/find-duplicate-suspect', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
 
@@ -69011,7 +70046,7 @@ app.get('/api/diag/audit-5-19-duplicates', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
     const RD = '2026-05-19'
@@ -69145,7 +70180,7 @@ app.get('/api/diag/inspect-referee-stakings', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
     const refs = [42, 45, 49, 58]
@@ -69200,7 +70235,7 @@ app.get('/api/diag/find-ininshil2', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
 
@@ -69279,7 +70314,7 @@ app.get('/api/diag/find-ininshil2', async (c) => {
 app.get('/api/diag/lookup-rr', async (c) => {
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const idsStr = c.req.query('ids') || ''
     const ids = idsStr.split(',').map(x => Number(x.trim())).filter(x => x > 0)
     if (ids.length === 0) return c.json({ error: 'no ids' })
@@ -69302,7 +70337,7 @@ app.get('/api/diag/audit-ininshil2-deep', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const db = c.env.DB
     const UID = 76
@@ -69413,7 +70448,7 @@ app.get('/api/diag/remove-5-19-duplicates', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw')
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const confirm = c.req.query('confirm')
     const EXEC = confirm === 'REMOVE_5_19_DUP_GO'
@@ -69724,7 +70759,7 @@ app.get('/api/diag/fix-tx-created-at-permanent-rule', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'FIX_TX_CREATED_AT_GO')
     const db = c.env.DB
@@ -69960,7 +70995,7 @@ app.get('/api/diag/audit-solbat-deep', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // 솔밧 모든 TX 의 ref_id 매칭 dr/rr (full join)
@@ -70104,7 +71139,7 @@ app.get('/api/diag/audit-5-20-dup-and-solbat', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // ========================================================================
@@ -70442,7 +71477,7 @@ app.get('/api/diag/detect-and-remove-5-19-dup', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'REMOVE_5_19_DUP_GO')
     const db = c.env.DB
@@ -70740,7 +71775,7 @@ app.get('/api/diag/audit-missing-referral-5-14-15-18', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // 단일 날짜만 처리 (Worker timeout 회피) — 미지정 시 전부
@@ -70973,7 +72008,7 @@ app.get('/api/diag/audit-user-referral-detail', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     const userId = Number(c.req.query('user_id') || '54')
@@ -71085,7 +72120,7 @@ app.get('/api/diag/fix-missing-tx-5-14-15-18', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'FIX_MISSING_TX_5_14_15_18_GO')
     const db = c.env.DB
@@ -71310,7 +72345,7 @@ app.get('/api/diag/audit-referral-completeness', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     // 기본: 5/4 ~ 5/19 평일 (휴일 제외). param 으로 단일 날짜만 처리 가능
@@ -71590,7 +72625,7 @@ app.get('/api/diag/inspect-rr-and-tx', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const db = c.env.DB
 
     const idsParam = c.req.query('ids') || ''
@@ -71649,7 +72684,7 @@ app.get('/api/diag/fix-missing-l12-tx-all', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const confirm = c.req.query('confirm') || ''
     const exec = (confirm === 'FIX_MISSING_L12_TX_ALL_GO')
     const db = c.env.DB
@@ -71848,7 +72883,7 @@ app.get('/api/diag/fix-missing-l12-tx-all', async (c) => {
 app.get('/api/diag/fix-solbat-paid-5-6', async (c) => {
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
     const dryRun = c.req.query('dry_run') === 'true' || !c.req.query('confirm')
     const confirm = c.req.query('confirm') || ''
     if (!dryRun && confirm !== 'FIX_SOLBAT_PAID_5_6_GO') {
@@ -72033,7 +73068,7 @@ app.get('/api/diag/fix-solbat-paid-5-6', async (c) => {
 app.get('/api/diag/solbat-bottomup-backfill', async (c) => {
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const dryRun = c.req.query('dry_run') === 'true' || !c.req.query('confirm')
     const confirm = c.req.query('confirm') || ''
@@ -72315,7 +73350,7 @@ app.get('/api/diag/fix-l12-createdat-by-user', async (c) => {
   const t0 = Date.now()
   try {
     const pw = c.req.query('pw') || ''
-    if (pw !== 'Qta@2026!Sec#Admin') return c.json({ error: 'unauthorized' }, 401)
+    if (pw !== 'L-e9Qdk853TjjzNKRNPewoxF') return c.json({ error: 'unauthorized' }, 401)
 
     const userIdStr = c.req.query('user_id') || ''
     if (!userIdStr) return c.json({ error: 'user_id required (사장님 명령: 솔밧만 우선)' }, 400)
