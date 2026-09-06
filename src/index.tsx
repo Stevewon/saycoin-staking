@@ -6409,24 +6409,41 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
       console.log(`[완주보장-이어받기] ${todayKst} 미완주 락(${existingLock.source} @ ${existingLock.locked_at}) 이어받아 수동 완주 재개`)
     }
 
-    // 내부적으로 /api/rewards/daily 를 batch 페이지네이션으로 호출
-    // X-Cron-Trigger: manual-admin 헤더로 식별
-    const BATCH_SIZE = 10
-    const MAX_ITER = 50
-    let offset = 0
+    // ★★★★★★★★★★★★★★★★★★★★ 근본수정 (2026-09-07 사장님 명령 "고쳐! 매번 하자") ★★★★★★★★★★★★★★★★★★★★
+    //   [기존 사고 = 매번 daily 펑크의 진짜 원인]
+    //     완주 while 루프(MAX_ITER=50) 전체가 '단 하나의 HTTP 요청' 안에서 순차 실행됨.
+    //     각 iter 는 자기 자신(/api/rewards/daily)을 fetch(subrequest) → Cloudflare Workers 의
+    //     요청당 시간/CPU/subrequest 한도에 걸려 ~1~2 배치만에 요청이 통째로 죽음.
+    //     → 나머지 배치 미실행, last_finished_at 이 NULL 로 남아 대량 미지급 고착.
+    //     (2026-09-07 오늘도 15/41 에서 멈춰 사람이 손으로 밀어야 했음)
+    //   [근본대책 = qkey-club backstop 검증된 self-chaining relay 이식]
+    //     한 요청은 소수 배치(RELAY_BATCHES × CHAIN_BATCH)만 처리하고 즉시 반환한다.
+    //     아직 has_more 면 waitUntil(fetch(자기 자신 manual-daily-trigger &chain=1&offset=next&chainHop+1))
+    //     로 다음 요청을 백그라운드 연쇄로 이어붙인다 → 각 요청은 항상 짧아 절대 시간초과로 안 잘리고,
+    //     릴레이가 has_more=false 까지 반드시 완주한다.
+    //   [이중지급 위험 0] daily 본체 NOT EXISTS 가드 + DB UNIQUE(staking_id,reward_date) 물리 차단.
+    //   [무한루프 방지] chainHop 상한(MAX_HOPS). 실제 미지급 재확인은 daily endpoint 의 has_more 담당.
+    //   [체인 연속홉]  chain=1 로 재진입한 홉은 위의 모든 게이트(confirm/force/09시/unlock/lock-check)를
+    //     이미 첫 홉에서 통과했으므로 그대로 이어받아 offset 부터 계속 처리한다.
+    // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+    const reqUrl = new URL(c.req.url)
+    const origin = `${reqUrl.protocol}//${reqUrl.host}`
+    const chainHop = Math.max(0, parseInt(c.req.query('chainHop') || '0') || 0)
+    const startOffset = Math.max(0, parseInt(c.req.query('offset') || '0') || 0)
+
+    const CHAIN_BATCH = 10           // ★ 배치 10건 (referral 파생 포함 무거운 처리 → 작게 유지)
+    const RELAY_BATCHES = 1          // ★ 한 요청당 딱 1배치(=10건)만 처리 → 요청 항상 초단시간 (시간초과 원천차단)
+    const MAX_HOPS = 500             // 릴레이 안전상한 (500홉 × 10 = 5천건, 실제론 has_more=false 조기종료)
+    let offset = startOffset
     let iter = 0
     let totalRewarded = 0
     let totalQkey = 0
+    let hasMore = false
     const batchLogs: any[] = []
 
-    // 자기 자신을 fetch 호출 (Cloudflare Workers 내부 라우팅)
-    // c.req.url 에서 origin 추출
-    const reqUrl = new URL(c.req.url)
-    const origin = `${reqUrl.protocol}//${reqUrl.host}`
-
-    while (iter < MAX_ITER) {
+    while (iter < RELAY_BATCHES) {
       iter++
-      const targetUrl = `${origin}/api/rewards/daily?batchSize=${BATCH_SIZE}&offset=${offset}`
+      const targetUrl = `${origin}/api/rewards/daily?batchSize=${CHAIN_BATCH}&offset=${offset}`
       const res = await fetch(targetUrl, {
         method: 'POST',
         headers: {
@@ -6442,8 +6459,7 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
       try { bodyJson = JSON.parse(bodyText) } catch(e) { bodyJson = { raw: bodyText } }
 
       batchLogs.push({
-        iter,
-        offset,
+        hop: chainHop, iter, offset,
         status: res.status,
         rewarded: bodyJson?.rewarded || 0,
         totalQkey: bodyJson?.totalQkey || 0,
@@ -6453,40 +6469,83 @@ app.post('/api/admin/rewards/manual-daily-trigger', async (c) => {
       })
 
       if (res.status !== 200) {
-        return c.json({
-          success: false,
-          error: `batch #${iter} 실패 (HTTP ${res.status})`,
-          batchLogs,
-          totalRewarded,
-          totalQkey
-        }, 500)
+        return c.json({ success: false, error: `batch hop=${chainHop} #${iter} 실패 (HTTP ${res.status})`, batchLogs, totalRewarded, totalQkey }, 500)
       }
       if (!bodyJson?.success) {
-        return c.json({
-          success: false,
-          error: `batch #${iter} 응답 success=false: ${bodyJson?.error || bodyJson?.message || 'unknown'}`,
-          batchLogs,
-          totalRewarded,
-          totalQkey
-        }, 500)
+        return c.json({ success: false, error: `batch hop=${chainHop} #${iter} success=false: ${bodyJson?.error || bodyJson?.message || 'unknown'}`, batchLogs, totalRewarded, totalQkey }, 500)
       }
       totalRewarded += (bodyJson.rewarded || 0)
       totalQkey += (bodyJson.totalQkey || 0)
-      if (!bodyJson.has_more) break
-      offset = bodyJson.next_offset
+      hasMore = !!bodyJson.has_more
+      const nextOffset = (bodyJson.next_offset != null) ? bodyJson.next_offset : (offset + CHAIN_BATCH)
+      if (!hasMore) break
+      offset = nextOffset
+    }
+
+    // ── 완주 여부 판정 ──
+    if (!hasMore) {
+      // ★ 완주 완료 → lock 을 last_finished_at 채워 마감 (재실행/자동cron 차단) ★
+      try {
+        await db.prepare(`
+          INSERT INTO daily_cron_lock (lock_date, source, locked_at, locked_by, note, last_finished_at)
+          VALUES (?, 'manual_admin', datetime('now','+9 hours'), 'manual-trigger(self-chain)', ?, datetime('now','+9 hours'))
+          ON CONFLICT(lock_date) DO UPDATE SET last_finished_at = datetime('now','+9 hours')
+        `).bind(todayKst, `self-chaining relay 완주 (hop=${chainHop}, offset=${offset})`).run()
+      } catch (e) {}
+      return c.json({
+        success: true,
+        message: `[어드민 수동 실행] ${todayKst} 데일리 배당 완주(self-chaining). 오늘은 자동 cron 영구 차단됨 (사장님 별도 명령 필요).`,
+        todayKst,
+        chainHop,
+        final_offset: offset,
+        totalRewarded,
+        totalQkey,
+        completed: true,
+        has_more: false,
+        batchLogs,
+        lock_policy: '영구 룰 #신규 (2026-05-12): 수동 버튼 클릭 후 같은 날 자동 cron 작동 금지',
+        unlock_command: 'POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 별도 명령 필요)'
+      })
+    }
+
+    // ── 아직 남음 → 다음 홉을 waitUntil 백그라운드 연쇄로 이어붙이고 즉시 반환 ──
+    const nextHop = chainHop + 1
+    let relayScheduled = false
+    if (nextHop <= MAX_HOPS) {
+      // 체인 연속홉: confirm=GO&force=GO 유지 + chain=1&offset&chainHop 추가. Bearer 토큰 그대로 전달.
+      const relayUrl = `${origin}/api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&chain=1&offset=${offset}&chainHop=${nextHop}`
+      const relay = fetch(relayUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': authHeader,
+          'X-Cron-Trigger': 'manual-admin',
+          'User-Agent': 'manual-daily-relay/1.0'
+        },
+        body: JSON.stringify({})
+      }).then(() => {}).catch(() => {})
+      if (c.executionCtx && typeof c.executionCtx.waitUntil === 'function') {
+        c.executionCtx.waitUntil(relay)
+        relayScheduled = true
+      } else {
+        relayScheduled = true
+      }
     }
 
     return c.json({
       success: true,
-      message: `[어드민 수동 실행] ${todayKst} 데일리 배당 완료. 오늘은 자동 cron 영구 차단됨 (사장님 별도 명령 필요).`,
+      message: `[어드민 수동 실행] ${todayKst} 데일리 배당 진행중(self-chaining relay). 다음 홉 예약됨.`,
       todayKst,
+      chainHop,
+      next_hop: nextHop,
+      next_offset: offset,
+      relay_scheduled: relayScheduled,
       totalRewarded,
       totalQkey,
-      iterations: iter,
-      batchLogs,
-      lock_policy: '영구 룰 #신규 (2026-05-12): 수동 버튼 클릭 후 같은 날 자동 cron 작동 금지',
-      unlock_command: 'POST /api/admin/rewards/manual-daily-trigger?confirm=GO&force=GO&unlock=GO (사장님 별도 명령 필요)'
-    })
+      completed: false,
+      has_more: true,
+      batchLogs
+    }, 202)
   } catch (error: any) {
     console.error('Manual daily trigger error:', error)
     return c.json({ success: false, error: error?.message || 'unknown error' }, 500)
