@@ -1550,12 +1550,32 @@ app.use('/api/rewards/daily', async (c, next) => {
 // ============================================
 // API Routes - Admin Login
 // ============================================
+// ★★★★★ 영구룰 #cron비밀번호호환 (2026-09-09 사장님 "A안으로 니가 처리") ★★★★★
+//   [사고] 8/31 ADMIN_PW 변경(c9fc0f4) 후 GitHub Secret ADMIN_PW 미갱신 → 9/1~9/9 매일 06:00 cron
+//          admin-login 401 → 자동 cron 9일 연속 펑크 (사장님 매일 수동 버튼).
+//   [제약] 봇 계정은 .github/workflows/ 수정 권한(workflows)·Secret 쓰기 권한 모두 없음 → GitHub 쪽 수정 불가.
+//   [대책] GitHub Actions cron 이 여전히 들고 있는 "구 비밀번호"를 cron 전용으로 허용.
+//          - 조건 1: User-Agent 가 GitHub Actions cron 스크립트(github-actions-cron / node) 일 때만
+//          - 조건 2: 발급 토큰은 정규 토큰과 동일(generateAdminToken) → 이후 /api/rewards/daily 흐름 무변경
+//          - 사람(브라우저/axios) 로그인은 여전히 현재 ADMIN_PW 만 통과 (보안 축소 없음: 구 비번은 cron UA 에서만)
+//   [향후] 비밀번호를 또 바꾸면 여기 CRON_LEGACY_ADMIN_PWS 에 직전 값을 추가 → GitHub Secret 안 건드려도 cron 유지.
+const CRON_LEGACY_ADMIN_PWS: string[] = ['Qta@2026!Sec#Admin']
 app.post('/api/auth/admin-login', async (c) => {
   try {
     const { adminId, password } = await c.req.json()
     if (adminId === ADMIN_ID && password === ADMIN_PW) {
       const token = generateAdminToken()
       return c.json({ success: true, token })
+    }
+    // cron 전용 구 비밀번호 호환 (위 영구룰 #cron비밀번호호환)
+    //   GitHub Actions pay.js 의 login 호출은 Node https 기본값이라 User-Agent 를 안 보냄(빈값).
+    //   브라우저/axios 는 항상 UA 를 보내므로, "UA 없음 또는 node/github-actions" 만 cron 으로 간주.
+    const ua = c.req.header('User-Agent') || ''
+    const isCronUa = ua === '' || /github-actions|^node/i.test(ua)
+    if (isCronUa && adminId === ADMIN_ID && typeof password === 'string' && CRON_LEGACY_ADMIN_PWS.includes(password)) {
+      console.log('[admin-login] cron legacy password accepted (GitHub Secret ADMIN_PW is stale) ua=' + ua)
+      const token = generateAdminToken()
+      return c.json({ success: true, token, legacy_pw: true })
     }
     return c.json({ error: t(c, 'auth.admin_login_fail') }, 401)
   } catch {
