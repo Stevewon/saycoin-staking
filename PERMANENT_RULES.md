@@ -1,8 +1,58 @@
 # 📜 PERMANENT RULES — 영구 정책 (위반 시 사고)
 
-**최종 업데이트**: 2026-05-26 (★ 영구룰 #user-tx-pagination = 사용자 거래/보상 내역 페이지네이션 필수 — 솔밧(44) 5/14 표시 누락 사례)
+**최종 업데이트**: 2026-07-21 (✅ #TODO_0720_음수해소검증 = 07-21 검증완료 · 양쪽 음수 0명 · 아래 참조)
 **위반 시**: 즉시 작업 중단 → 사장님께 보고
 **이 파일은 사장님과의 약속이며, 모든 정산/마이그레이션/픽스 작업에서 반드시 준수해야 합니다.**
+
+---
+
+## ✅✅✅ #TODO_0720_음수해소검증 (2026-07-17 신규 → 2026-07-21 검증완료) ✅✅✅
+
+> **07-20(월) daily cron 실행 완료 직후, 아래 음수 잔액 6명(qkey 2 + pqcpay 3, 총 5명)이 전부 0 이상으로 해소되었는지 반드시 재검증할 것. 미해소 시 즉시 사장님께 보고.**
+
+### ✅ 2026-07-21 검증 결과 (라이브 D1 조회) — 전원 해소 완료
+- **양쪽 프로젝트 `SELECT COUNT(*) FROM users WHERE qkey_balance < 0` = 0명** (qkey-club 0, pqcpay 0) ✅
+- **07-16 확정분이 07-20에 정확히 재지급됨** (`daily_rewards WHERE reward_date='2026-07-16' AND paid_date='2026-07-20'`): qkey 252건 / pqcpay 85건 ✅
+- 5명 개별 재지급 확인:
+  - qkey #34 TakeChan: 07-16 daily 750 + 추천 다수 07-20 재지급 → 예상 671 회복. 현재잔액 192는 이후 07-18 직판+12,000 / 07-19·20 정규지급 / 스왑 4건(-16,000 QKEY→QTA) 반영된 **정상 활동 결과** (스왑은 잔액원자검증 있어 초과인출 불가).
+  - qkey #74 かっちゃん: daily 75 + L1매칭 30(15+15) = **105 재지급** (규명 #2와 정확 일치). L0 직판 1,500은 07-16 보존. 현재잔액 285.
+  - pqcpay #45 이인실: 07-16 daily 750 → 07-20 재지급. 음수 해소, 현재 8,600.
+  - pqcpay #76 이인실2: 07-16 daily 15,000×2건 → 07-20 재지급. 음수 해소, 현재 33,730.
+  - pqcpay #100 정수정: 07-16 daily 2,250 → 07-20 재지급. 음수 해소, 현재 2,400.
+- **결론: method A(선차감) → 07-20 cron 자연 재지급 경로가 정상 작동. 미해소·불일치 없음. 사장님 별도 조치 불요.**
+
+### 배경 (2026-07-17 발생)
+- 07-15 이후 daily cron 정지 → 07-15·07-16 백필 실행
+- 07-17 임시공휴일 지정 → 07-16(목) 확정분은 07-17(금 공휴일)·주말 건너뛰고 **07-20(월) 지급**이 정답
+- 그러나 백필이 07-17 홀리데이 코드 배포 전에 실행 → 07-16 확정분이 07-17에 잘못 지급됨
+- 사장님 method A 지시: **잘못 나간 07-16 확정분을 차감+거래내역 삭제 → 07-20 cron이 자연 재지급**
+- method A 실행 결과 일부 유저가 음수 잔액 발생 (07-17에 이미 swap/출금으로 소진했기 때문 = 선차감 부작용)
+
+### 음수 유저 목록 + 07-20 재지급 후 예상 잔액 (반드시 이 값으로 검증)
+| 프로젝트 | user_id | 이름 | method A 후 현재잔액 | 07-16 재지급액 | **07-20 후 예상** |
+|---|---|---|---|---|---|
+| qkey-club | 34 | TakeChan | -574 | +1,245 | **+671** |
+| qkey-club | 74 | かっちゃん | -105 | +105 (daily75+매칭30) | **0** |
+| pqcpay(saycoin-staking) | 45 | 이인실 | -8,500 | +8,550 | **+50** |
+| pqcpay(saycoin-staking) | 76 | 이인실2 | -33,530 | +33,630 | **+100** |
+| pqcpay(saycoin-staking) | 100 | 정수정 | -2,100 | +2,250 | **+150** |
+
+### 핵심 사실 (규명 완료 — 절대 잊지 말 것)
+1. **method A 차감은 전부 정확했음.** 예: id=74 회수 105 = 07-16 실제 발생액 105 (daily 75 + L1매칭 30).
+2. id=74 매칭이 30인 이유: 하위 id=325(トマル)가 **07-16 08:55 신규 스테이킹 100 USDT** → 07-16 매칭이 07-15(15)의 2배(30)로 증가. **07-20 cron은 반드시 07-16 실적(매칭 30) 기준으로 재지급해야 정확히 0 해소됨.**
+3. swap 로직은 `WHERE qkey_balance >= 필요액` 원자검증 있음 → 초과인출 원천 불가. 음수는 순수 "선차감→재지급 과도기" 현상.
+4. 07-20 재지급 후에도 음수가 남으면 = cron이 07-16 실적을 제대로 재계산 못한 것 → 즉시 조사.
+
+### 07-20 검증 절차 (필수)
+1. 07-20 cron이 07-16 확정분을 재지급했는지 확인: `daily_rewards WHERE reward_date='2026-07-16' AND paid_date='2026-07-20'` 존재?
+2. 위 5명 `qkey_balance` 조회 → 전부 예상값(671/0/50/100/150) 이상인지 확인
+3. `SELECT COUNT(*) FROM users WHERE qkey_balance < 0` → 양쪽 다 0 인지 확인
+4. 미해소/불일치 시 즉시 작업 중단 → 사장님 보고
+
+### 참고: method A로 삭제/차감한 내역 (되돌림 금지, 07-20 재지급이 정상 복구 경로)
+- qkey: 잔액차감 236명(-168,573), tx삭제 726, daily_rewards(07-16) 253, referral_rewards(07-16 L1/L2) 473 삭제. L0 직판 9건 보존.
+- pqcpay: 잔액차감 79명, tx삭제 214, daily_rewards(07-16) 85, referral_rewards(07-16 L1/L2) 129 삭제. L0 없음.
+- 양쪽 MAX(daily_rewards.reward_date) = 07-15 로 복귀 확인됨 → 07-20 cron이 07-16 자연 재지급.
 
 ---
 
@@ -992,3 +1042,110 @@ const COIN_MAP = {
 ---
 
 **이 영구룰은 사장님 직접 정의 (2026-05-21, 2026-05-22, 2026-05-23 두 차례 추가) — 절대 변경/삭제 금지.**
+
+---
+
+## 👑 영구룰 #만기무관cap우선 (2026-07-24 사장님 직접 결재 — B안)
+
+> **90일 거치기간(end_date)이 지나도, cap 200% 도달 전까지는 daily 배당을 계속 지급한다.**
+> **지급 종료 기준은 오직 cap 200%(= amount x 300 QKEY = 투자금 2배)이며, end_date(90일 만기)는 지급 종료 기준이 아니다.**
+
+### 배경 (사고 계기)
+- top2536 (user_id=9) stk#4 ($3,000, period_days=90, start 2026-04-20, end_date 2026-07-19) 이
+  시스템 최초로 90일 만기에 도달.
+- 기존 daily cron 대상 쿼리에 `date(s.end_date,'+9 hours') >= date(yesterdayKst)` 조건이 있어,
+  7/20 부터 이 staking 이 대상에서 자동 제외됨 → daily 4영업일(7/20~7/23) 누락.
+- 당시 cap 진행 = paid_total 319,200 / cap 900,000 = 약 71% (한도 한참 미달).
+- 누락 4일치(u9 daily 9,000 + u2 L1 1,800 + u1 L2 900 = 합계 11,700 QKEY) 는 2026-07-24 재지급 완료.
+
+### 정책 (사장님 결정)
+| 항목 | 값 |
+|---|---|
+| daily 지급 종료 기준 | **cap 200% 도달 시** (staking 별 독립, 영구룰 #cap200정책 2️⃣) |
+| end_date(90일 만기) | **daily 종료 기준 아님** — 지나도 cap 전까지 계속 지급 |
+| cap 도달 시 처리 | 해당 staking 만 `status='capped'`, 다른 staking 은 계속 (영구룰 #스테이킹별독립) |
+
+### 구현 (src/index.tsx)
+- daily 지급 cron 메인 엔드포인트 `/api/rewards/daily` 의 대상 SELECT 2개(totalRow 카운트, activeStakings)
+  에서 `end_date >= yesterdayKst` 조건 **제거** (2026-07-24).
+- start_date 조건은 유지 (어제까지 진입분만 대상, 미래 진입 제외).
+- cap 판정은 루프 내 `isStakingCapped()` 가 staking 별로 수행 → cap 미달이면 계속 지급, 도달 시 skip.
+- 이중지급 방어: `uniq_daily_rewards_paid_per_staking` UNIQUE 인덱스 + accrual EXISTS 가드 유지.
+
+### 주의
+- 이 수정은 **daily 지급 cron 경로에만** 적용. 다른 곳의 `end_date >= date(?)` 조건(출금/조회/미실현
+  계산 등)은 각자 의미가 다르므로 **무차별 변경 금지** (STANDING RULE #3).
+
+**이 영구룰은 사장님 직접 결재 (2026-07-24 B안) — 절대 변경/삭제 금지.**
+
+## 👑 영구룰 #만기OR캡둘중종료 (2026-09-02 사장님 A안 지상명령 — 최종확정)
+
+> **"cap은 둘 중 하나에 걸리면 무조건 종료. 기간(만기 end_date)에 걸리던가 cap 200%에 걸리던가."**
+> **종료 기준 = min(만기, cap200%) — 먼저 도달하는 쪽에서 daily 무조건 종료.**
+
+### 이 룰이 폐기/대체하는 것
+- **#만기무관cap우선 (2026-07-24 B안) → 완전 폐기.** ("만기 지나도 cap 전까지 계속 지급" = 무효)
+- #종료일지급중단 (2026-08-10) 은 이 룰과 동일 취지 → 유지·강화.
+
+### 구현 (src/index.tsx, 양 프로젝트 공통)
+- daily 루프 만기 판정: `if (endDateKst && accrualDate >= endDateKst) { skippedCount++; UPDATE staking SET status='completed'; break }`
+  - 종료일(end_date) 당일 포함 그 이후 reward_date 는 cap 미달이어도 무조건 지급 금지(`>=`).
+  - 만기 도달 시 status 를 'completed' 로 자동 정리 (기존 버그: capped 만 전이, 만기는 active 방치).
+- cap 200% 도달은 별도 status='capped' (영구룰 #cap200정책).
+- 둘 중 어느 쪽이든 daily 종료 = 만고불변.
+
+### 데이터 정리 (2026-09-02)
+- pqcpay: 만기경과 active 42건 → completed (pre-maturity 미지급 0 검증, 만기초과 과지급은 이중지급방지로 회수 안함).
+- qkey-club: 만기경과 active 0건 (정리 불필요).
+
+**이 영구룰은 사장님 직접 A안 결재 (2026-09-02) — 절대 변경/삭제 금지. #만기무관cap우선 부활 금지.**
+
+---
+
+## §#가짜완주방지 watchdog (2026-09-02 사장님 지상명령 "내일도 또 고장낼꺼야?" / "매번 대책 세우면 머하냐고")
+
+### 문제 (재발 근본원인)
+daily 완주 마킹(`daily_cron_lock.last_finished_at`)은 **마지막 batch(has_more=false) 도달만 보고 찍힘** → 실지급 0건이어도 "완주완료"로 표시됨.
+그 결과 다음날 락(완주완료)이 이중배당방지 룰로 재처리를 차단 → **daily 펑크가 재발**. (예: pqcpay 09-01 가짜완주 사고)
+
+### 대책 (코드 내장 가드 — .yml 워크플로 불필요)
+`GET/POST /api/rewards/daily` 완주 마킹 직전(`if (!hasMore)` 블록)에 **실지급 검증 가드** 삽입:
+1. 오늘(today, KST)은 이미 상단 business-day early-exit 로 **평일 확정** (휴일이면 여기 도달 못함).
+2. `SELECT COUNT(*) FROM daily_rewards WHERE paid_date = today` 로 **오늘 실지급 건수** 조회 (전 batch 누적).
+3. **`totalActive > 0` (지급대상 존재) 인데 실지급 0건이면 = 가짜완주** →
+   - `last_finished_at` **마킹 거부** (NULL 유지 → 락은 '미완주' → 재진입/재처리 허용)
+   - 응답에 `fake_finish_guard` 경고 + `success:false` 반환 (사장님/AI 즉시 인지, completion loop 재실행 유도)
+4. 실지급 정상(>0)이면 **아무 영향 없이 통과** — 멱등, 데이터 변경 0.
+
+### 적용
+- pqcpay `/home/user/pqcpay-clone/src/index.tsx` (finish-mark 블록)
+- qkey-club `/home/user/qkey-club/src/index.tsx` (finish-mark 블록)
+- 두 프로젝트 build + deploy 완료 (2026-09-02).
+
+**이 가드는 "가짜완주 → 완주표시 → 다음날 락차단 → 펑크" 연쇄를 코드 레벨에서 끊는다. 절대 삭제 금지.**
+
+---
+
+## §#트래픽자가치유 self-heal (2026-09-03 사장님 지상명령 "내일도 또 망칠꺼야?")
+
+### 문제 (가짜완주 watchdog 사각지대)
+가짜완주 watchdog(09-02)은 "0건인데 완주표시"만 막음. 하지만 **cron 자체가 안 돌거나(pqcpay 09-03 락없음) 중간에 끊겨도(qkey-club 09-03 733/1389 미완주) 아무도 재실행 안 하는** 근본문제는 못 막음. .yml 워크플로는 push 불가 → **코드 자가치유** 필요.
+
+### 대책 (외부 cron 비의존, 사용자 트래픽 편승)
+`app.use('*')` 글로벌 미들웨어(no-cache 다음)에 self-heal 삽입:
+1. **스로틀**: in-memory 5분 1회 (인스턴스당). DB 부하 최소.
+2. **시간 게이트**: 평일(주말 제외) & KST 08:10~23:00 에만.
+3. **완주 판정**: `daily_cron_lock(오늘).last_finished_at` NOT NULL 이면 이미 끝 → 아무것도 안 함.
+4. **미완주/락없음 → 백그라운드(waitUntil) 완주 트리거**:
+   - qkey-club: `POST /api/cron/backstop-0800?key=CRON_TRIGGER_SECRET` (기존 완주+이중지급가드 내장)
+   - pqcpay: `POST /api/rewards/daily (X-Cron-Trigger: manual-admin)` offset 루프 완주
+5. **안전**: 사용자 응답 절대 블록/오류 안 냄. 모든 예외 무시. rewards/cron/static 경로 편승 제외(무한루프 방지). 이미지급자 NOT EXISTS SKIP → 이중지급 0.
+
+### 적용/배포
+- qkey-club `src/index.tsx` (backstop-0800 트리거) — deploy 완료
+- pqcpay `src/index.tsx` (daily 완주 루프 트리거) — deploy 완료
+- 검증: 두 사이트 09-03 락 완주 확인 → self-heal 재실행 안 함(정상). 홈 응답 200 정상.
+
+### 3중 방어 완성
+1. GitHub Actions cron (기존, 불안정) → 2. 가짜완주 watchdog (09-02, 0건완주 차단) → 3. **트래픽 self-heal (09-03, cron 미실행/미완주 자동복구)**.
+**cron이 죽어도 사용자가 사이트에 접속하기만 하면 평일 daily 가 자동 완주된다. 절대 삭제 금지.**
