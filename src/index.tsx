@@ -5,6 +5,7 @@ import { PLAN_138_MAY11, PLAN_138_MAY11_COUNT, PLAN_138_MAY11_TOTAL_QKEY } from 
 
 type Bindings = {
   DB: D1Database;
+  OWNER_APPROVE_PIN?: string;  // ★ 2026-10-09 사장님 전용 출금 승인 PIN (Cloudflare Pages secret)
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -3708,11 +3709,43 @@ app.get('/api/admin/withdrawals', async (c) => {
   }
 })
 
-// 관리자: 출금 승인
+// ★ 2026-10-09 사장님 명령 — 출금 승인 통제
+//  [사고] 10/9 관리자 계정으로 출금 11건이 승인됨 → 누가·언제 눌렀는지 기록 없음 (관리자 계정 1개 공유 구조). 사장님 명령으로 전부 원복.
+//  [대책] 1) 승인·거절 시 처리시각(processed_at)·처리자(processed_by)·IP·브라우저 기록
+//         2) 승인은 사장님 전용 승인 PIN 이 있어야만 가능 (Cloudflare secret OWNER_APPROVE_PIN, 코드·저장소에 없음)
+//            PIN 미설정이면 승인 자체 불가 → 사장님이 PIN 설정해야 승인 시작
+async function ensureWithdrawalAuditSchema(db: any) {
+  for (const col of ['processed_at', 'processed_by', 'processed_ip', 'processed_ua']) {
+    try { await db.prepare(`ALTER TABLE withdrawals ADD COLUMN ${col} TEXT`).run() } catch (e) {}
+  }
+}
+function withdrawalAuditInfo(c: any) {
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || ''
+  const ua = (c.req.header('User-Agent') || '').slice(0, 200)
+  return { ip, ua }
+}
+function ownerPinMatches(input: string, secret: string): boolean {
+  if (!secret || !input || input.length !== secret.length) return false
+  let diff = 0
+  for (let i = 0; i < secret.length; i++) diff |= input.charCodeAt(i) ^ secret.charCodeAt(i)
+  return diff === 0
+}
+
+// 관리자: 출금 승인 (사장님 승인 PIN 필수)
 app.post('/api/admin/withdrawal/approve/:withdrawalId', async (c) => {
   try {
     const db = c.env.DB
     const withdrawalId = c.req.param('withdrawalId')
+
+    const secret = String((c.env as any).OWNER_APPROVE_PIN || '')
+    if (!secret) {
+      return c.json({ error: '출금 승인 PIN이 아직 설정되지 않았습니다. 사장님이 승인 PIN을 설정한 뒤 승인할 수 있습니다.', code: 'OWNER_PIN_NOT_SET' }, 403)
+    }
+    let body: any = {}
+    try { body = await c.req.json() } catch (e) {}
+    if (!ownerPinMatches(String(body?.ownerPin || ''), secret)) {
+      return c.json({ error: '사장님 승인 PIN이 올바르지 않습니다. 출금 승인은 사장님만 가능합니다.', code: 'OWNER_PIN_INVALID' }, 403)
+    }
 
     const withdrawal = await db.prepare(`
       SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'
@@ -3722,9 +3755,12 @@ app.post('/api/admin/withdrawal/approve/:withdrawalId', async (c) => {
       return c.json({ error: t(c, 'admin.wd_pending_not_found') }, 404)
     }
 
+    await ensureWithdrawalAuditSchema(db)
+    const audit = withdrawalAuditInfo(c)
     await db.prepare(`
-      UPDATE withdrawals SET status = 'approved' WHERE id = ?
-    `).bind(withdrawalId).run()
+      UPDATE withdrawals SET status = 'approved', processed_at = datetime('now'), processed_by = 'owner(pin)', processed_ip = ?, processed_ua = ?
+      WHERE id = ? AND status = 'pending'
+    `).bind(audit.ip, audit.ua, withdrawalId).run()
 
     return c.json({ success: true, message: t(c, 'admin.wd_approve_success') })
   } catch (error) {
@@ -3778,9 +3814,12 @@ app.post('/api/admin/withdrawal/reject/:withdrawalId', async (c) => {
       `).bind(refundAmount, withdrawal.user_id).run()
     }
 
+    // ★ 2026-10-09: 거절도 처리시각·처리자·IP·브라우저 기록
+    await ensureWithdrawalAuditSchema(db)
+    const rejAudit = withdrawalAuditInfo(c)
     await db.prepare(`
-      UPDATE withdrawals SET status = 'rejected' WHERE id = ?
-    `).bind(withdrawalId).run()
+      UPDATE withdrawals SET status = 'rejected', processed_at = datetime('now'), processed_by = 'admin', processed_ip = ?, processed_ua = ? WHERE id = ?
+    `).bind(rejAudit.ip, rejAudit.ua, withdrawalId).run()
 
     // ★ 거래내역(transactions) reverse 행 INSERT — 사용자 노출 안전 한국어
     //   1) 출금 신청 본 거래 환불 (양수 amount, 신청 원본 수량)
@@ -28764,15 +28803,24 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 출금 승인
+            // 2026-10-09 사장님 명령: 출금 승인은 사장님 승인 PIN 필수 (PIN 은 이 화면을 닫으면 잊음)
+            var _ownerApprovePin = '';
             async function approveWithdrawal(withdrawalId) {
                 if (!confirm(I18N.t('admin.wd_approve_confirm'))) return;
+                var pin = _ownerApprovePin;
+                if (!pin) {
+                    pin = window.prompt('사장님 승인 PIN을 입력하세요 (출금 승인은 사장님만 가능합니다)');
+                    if (!pin) return;
+                }
                 try {
-                    const response = await axios.post('/api/admin/withdrawal/approve/' + withdrawalId);
+                    const response = await axios.post('/api/admin/withdrawal/approve/' + withdrawalId, { ownerPin: pin });
                     if (response.data.success) {
+                        _ownerApprovePin = pin;
                         alert(response.data.message);
                         loadWithdrawals();
                     }
                 } catch (error) {
+                    if (error.response && error.response.status === 403) _ownerApprovePin = '';
                     alert(error.response?.data?.error || I18N.t('admin.wd_approve_fail'));
                 }
             }
