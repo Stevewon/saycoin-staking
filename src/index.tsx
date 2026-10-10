@@ -28911,26 +28911,22 @@ app.get('/admin/dashboard', (c) => {
             }
 
             // 출금 승인
-            // 2026-10-09 사장님 명령: 출금 승인은 사장님 승인 PIN 필수 (PIN 은 이 화면을 닫으면 잊음)
-            var _ownerApprovePin = '';
+            // 2026-10-09 사장님 명령: 출금 승인은 사장님 승인 PIN 필수
+            // 2026-10-10 사장님 명령: 승인할 때마다 매번 PIN 입력 (화면에 PIN 을 기억하지 않음)
             async function approveWithdrawal(withdrawalId) {
                 if (!confirm(I18N.t('admin.wd_approve_confirm'))) return;
-                var pin = _ownerApprovePin;
-                if (!pin) {
-                    pin = window.prompt('사장님 승인 PIN을 입력하세요 (출금 승인은 사장님만 가능합니다)');
-                    if (!pin) return;
-                }
+                var pin = window.prompt('사장님 승인 PIN을 입력하세요 (출금 승인 1건마다 입력)');
+                if (!pin) return;
                 try {
                     const response = await axios.post('/api/admin/withdrawal/approve/' + withdrawalId, { ownerPin: pin });
                     if (response.data.success) {
-                        _ownerApprovePin = pin;
                         alert(response.data.message);
                         loadWithdrawals();
                     }
                 } catch (error) {
-                    if (error.response && error.response.status === 403) _ownerApprovePin = '';
                     alert(error.response?.data?.error || I18N.t('admin.wd_approve_fail'));
                 }
+                pin = '';
             }
 
             // 출금 거절 (환불)
