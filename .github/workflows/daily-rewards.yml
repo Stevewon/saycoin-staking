@@ -74,48 +74,103 @@ jobs:
                 process.exit(1);
               }
               const token = loginJson.token;console.log('Admin login OK (token length=' + token.length + ')');
-              console.log('[2/2] Pay daily rewards (batched)');
+              console.log('[2/2] Pay daily rewards (batched, resilient)');
+              // ============================================================
+              // ★ 재발방지 영구패치 (2026-06-22 사장님 명령) ★
+              //   배경: 기존 루프는 배치 1건이라도 non-200/failure 면 process.exit(1)
+              //         → 뒤쪽 배치(=staking_id 큰 신규회원)가 통째로 누락됨
+              //         (실사고: 6/19 staking 112~126 미지급)
+              //   수정: (1) 각 배치 최대 RETRY_MAX 회 재시도 (backoff)
+              //         (2) 재시도 모두 실패해도 즉시 종료 금지 — 해당 offset 기록 후
+              //             offset 을 수동 전진시켜 다음 배치 계속 (뒤쪽 신규회원 보호)
+              //         (3) 모든 배치 처리 후 failedOffsets 가 있으면 그때 비정상 종료(알림용)
+              //   EXISTS 가드는 서버(/api/rewards/daily)에 있으므로 재시도/재실행해도
+              //   중복지급 없음 (영구룰 #중복지급금지 준수)
+              // ============================================================
               const BATCH_SIZE = 10;
+              const RETRY_MAX = 3;        // 배치당 최대 시도 횟수
               let offset = 0;
               let totalRewarded = 0;
               let totalQkey = 0;
               let iter = 0;
-              const MAX_ITER = 50;
+              const MAX_ITER = 100;       // 신규회원 증가 대비 여유 상향
+              const failedOffsets = [];   // 3회 재시도 후에도 실패한 offset 목록
+              let sawHasMoreFalse = false;
+
               while (iter < MAX_ITER) {
                 iter++;
                 const url = apiBase + '/api/rewards/daily?batchSize=' + BATCH_SIZE + '&offset=' + offset;
                 console.log('--- batch #' + iter + ' offset=' + offset + ' ---');
-                const rewardRes = await post(url, {}, {
-                  'Authorization': 'Bearer ' + token,
-                  'X-Cron-Trigger': 'github-actions',
-                  'User-Agent': 'github-actions-cron/1.0 node'
-                });
-                console.log('Reward HTTP', rewardRes.status);
-                console.log('Reward response:', rewardRes.body);
-                if (rewardRes.status !== 200) {
-                  console.error('Non-200 (HTTP ' + rewardRes.status + ')');
-                  process.exit(1);
+
+                let rewardJson = null;
+                let attempt = 0;
+                let batchOk = false;
+                while (attempt < RETRY_MAX) {
+                  attempt++;
+                  try {
+                    const rewardRes = await post(url, {}, {
+                      'Authorization': 'Bearer ' + token,
+                      'X-Cron-Trigger': 'github-actions',
+                      'User-Agent': 'github-actions-cron/1.0 node'
+                    });
+                    console.log('  attempt ' + attempt + ' HTTP', rewardRes.status);
+                    if (rewardRes.status !== 200) {
+                      console.error('  Non-200 (HTTP ' + rewardRes.status + ') body:', rewardRes.body);
+                    } else {
+                      const parsed = JSON.parse(rewardRes.body);
+                      if (!parsed.success) {
+                        console.error('  API success=false body:', rewardRes.body);
+                      } else {
+                        rewardJson = parsed;
+                        batchOk = true;
+                        break;
+                      }
+                    }
+                  } catch (e) {
+                    console.error('  attempt ' + attempt + ' threw:', e.message);
+                  }
+                  // backoff: 2s, 4s, 6s
+                  if (attempt < RETRY_MAX) {
+                    await new Promise(function(r){ setTimeout(r, 2000 * attempt); });
+                  }
                 }
-                const rewardJson = JSON.parse(rewardRes.body);
-                if (!rewardJson.success) {
-                  console.error('Daily reward API returned failure');
-                  process.exit(1);
+
+                if (!batchOk) {
+                  // ★ 핵심: 즉시 종료하지 않고 이 offset 만 실패 기록 후 다음 배치로 전진
+                  console.error('!! batch offset=' + offset + ' FAILED after ' + RETRY_MAX + ' attempts — skip & continue');
+                  failedOffsets.push(offset);
+                  offset += BATCH_SIZE;   // 뒤쪽 신규회원이 누락되지 않도록 수동 전진
+                  await new Promise(function(r){ setTimeout(r, 500); });
+                  continue;
                 }
+
                 totalRewarded += (rewardJson.rewarded || 0);
                 totalQkey += (rewardJson.totalQkey || 0);
                 if (!rewardJson.has_more) {
-                  console.log('===== ALL BATCHES DONE =====');
+                  sawHasMoreFalse = true;
+                  console.log('===== reached has_more=false at offset=' + offset + ' =====');
                   break;
                 }
                 offset = rewardJson.next_offset;
                 await new Promise(function(r){ setTimeout(r, 500); });
               }
-              if (iter >= MAX_ITER) {
-                console.error('Safety MAX_ITER reached');
+
+              if (iter >= MAX_ITER && !sawHasMoreFalse) {
+                console.error('Safety MAX_ITER reached without has_more=false — possible incomplete run');
+                failedOffsets.push('MAX_ITER');
+              }
+
+              console.log('TOTAL: rewarded=' + totalRewarded + ', QKEY=' + totalQkey);
+
+              if (failedOffsets.length > 0) {
+                // ★ 정상 배치는 모두 처리된 뒤, 실패가 있었음을 알림용으로 비정상 종료
+                //   (다음 평일 cron 의 EXISTS 가드가 누락분을 자동 백필하지만,
+                //    실패 자체는 반드시 알림 받아 즉시 수동 백필(daily-v2)로 보정)
+                console.error('!! RUN COMPLETED WITH FAILURES — failed offsets: ' + JSON.stringify(failedOffsets));
+                console.error('!! 수동 보정: POST /api/rewards/daily-v2?key=ADMIN_PW&targetDate=<today>&confirm=GO');
                 process.exit(1);
               }
-              console.log('Daily QKEY rewards distribution succeeded');
-              console.log('TOTAL: rewarded=' + totalRewarded + ', QKEY=' + totalQkey);
+              console.log('Daily QKEY rewards distribution succeeded (all batches OK)');
 
             } catch (err) {
               console.error('ERROR:', err.message);
