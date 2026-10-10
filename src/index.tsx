@@ -126,6 +126,19 @@ app.use('*', async (c, next) => {
   const newDev = !dev
   if (newDev) dev = crypto.randomUUID()
   const exempt = /^\/(?:admin|api\/admin|api\/cron|api\/diag|static)(?:\/|$)/.test(path)
+  // ★ 2026-10-10: 관리자 경로도 차단 IP 는 막음 (10/9 인도네시아 IP 103.146.185.176 이 관리자 계정으로 지갑 20건 변경·출금 거절·부당 증액)
+  if (exempt && !path.startsWith('/static') && (c.env as any)?.DB) {
+    try {
+      const db = (c.env as any).DB
+      await ensureBlocklist(db)
+      const aip = c.req.header('CF-Connecting-IP') || ''
+      if (aip) {
+        // 자동 학습(auto:)된 IP 는 관리자 경로에 적용 안 함 → 사장님이 같은 망을 쓰다 잠기는 사고 방지. 수동 등록 IP 만 관리자 차단.
+        const bad = await db.prepare(`SELECT 1 FROM blocklist WHERE kind = 'ip' AND value = ? AND COALESCE(reason,'') NOT LIKE 'auto:%' LIMIT 1`).bind(aip).first()
+        if (bad) return path.startsWith('/api/') ? c.json({ error: 'Access denied', code: 'BLOCKED' }, 403) : c.text('Access denied', 403)
+      }
+    } catch (e) {}
+  }
   if (!exempt && (c.env as any)?.DB) {
     try {
       const db = (c.env as any).DB
@@ -1641,7 +1654,8 @@ app.use('/api/rewards/daily', async (c, next) => {
 //          - 조건 2: 발급 토큰은 정규 토큰과 동일(generateAdminToken) → 이후 /api/rewards/daily 흐름 무변경
 //          - 사람(브라우저/axios) 로그인은 여전히 현재 ADMIN_PW 만 통과 (보안 축소 없음: 구 비번은 cron UA 에서만)
 //   [향후] 비밀번호를 또 바꾸면 여기 CRON_LEGACY_ADMIN_PWS 에 직전 값을 추가 → GitHub Secret 안 건드려도 cron 유지.
-const CRON_LEGACY_ADMIN_PWS: string[] = ['Qta@2026!Sec#Admin']
+// ★ 2026-10-10: GitHub Secret ADMIN_PW 를 새 비번으로 변경(사장님 확인) → cron 구 비밀번호 폐기 (무단 관리자 로그인 경로 차단)
+const CRON_LEGACY_ADMIN_PWS: string[] = []
 // ★ 2026-10-10 사장님 명령: 관리자 로그인 기록 (시각·IP·브라우저·방식) — 부당 증액 사건 이후 추적용.
 //   method: password(현재 비번) / cron-legacy(cron 전용 구 비번) / fail(실패). 비밀번호 값은 기록하지 않음.
 async function logAdminLogin(c: any, method: string) {
