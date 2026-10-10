@@ -99,6 +99,76 @@ app.use('*', async (c, next) => {
   }
 })
 
+// ★★★ 2026-10-10 사장님 명령 — 영구 차단 (계정·지갑·IP·기기) ★★★
+//  [사건] rajasawer(uid 147, 지갑 0x12b9…F3a2) 10/9 가입 당일 관리자 계정으로 +100,000 QKEY 증액 → 즉시 USDT 스왑.
+//  [구조] blocklist(kind, value): kind = user | wallet | email | ip | device
+//    - 모든 방문자에게 기기 식별 쿠키 qk_dev(10년) 부여 → 같은 폰은 계정을 새로 만들어도 차단
+//    - 차단 대상이 접속·로그인·가입·회원 API 를 시도하면 그때의 IP·기기도 자동으로 영구 차단 목록에 추가
+//    - 관리자(/admin, /api/admin)·cron·diag 경로는 검사 제외 (관리자 잠김 방지)
+let _blocklistReady = false
+async function ensureBlocklist(db: any) {
+  if (_blocklistReady) return
+  await db.prepare(`CREATE TABLE IF NOT EXISTS blocklist (kind TEXT NOT NULL, value TEXT NOT NULL, reason TEXT, created_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (kind, value))`).run()
+  _blocklistReady = true
+}
+function readCookie(c: any, name: string): string {
+  const h = c.req.header('Cookie') || ''
+  for (const part of h.split(';')) {
+    const i = part.indexOf('=')
+    if (i > 0 && part.slice(0, i).trim() === name) { try { return decodeURIComponent(part.slice(i + 1).trim()) } catch (e) { return '' } }
+  }
+  return ''
+}
+const BLOCK_UID_PATH = /^\/api\/(?:user|staking\/list|staking\/progress|rewards\/history|transactions|referrals|referral-tree|referral-rewards|shop\/orders|shop\/inquiries|withdrawal\/list)\/(\d+)$/
+app.use('*', async (c, next) => {
+  const path = new URL(c.req.url).pathname
+  let dev = readCookie(c, 'qk_dev')
+  const newDev = !dev
+  if (newDev) dev = crypto.randomUUID()
+  const exempt = /^\/(?:admin|api\/admin|api\/cron|api\/diag|static)(?:\/|$)/.test(path)
+  if (!exempt && (c.env as any)?.DB) {
+    try {
+      const db = (c.env as any).DB
+      await ensureBlocklist(db)
+      const ip = c.req.header('CF-Connecting-IP') || ''
+      let uid = ''; let email = ''; let wallet = ''
+      const pm = BLOCK_UID_PATH.exec(path)
+      if (pm) uid = pm[1]
+      if (c.req.method !== 'GET' && (c.req.header('content-type') || '').includes('application/json')) {
+        try {
+          const b: any = await c.req.json()
+          if (b && b.userId != null) uid = String(b.userId)
+          if (b && b.email) email = String(b.email).toLowerCase().trim()
+          if (b && (b.walletAddress || b.usdtWalletAddress)) wallet = String(b.walletAddress || b.usdtWalletAddress).toLowerCase().trim()
+        } catch (e) {}
+      }
+      if (email && !uid) {
+        const u = await db.prepare(`SELECT id, lower(wallet_address) w FROM users WHERE lower(email) = ? LIMIT 1`).bind(email).first() as any
+        if (u) { uid = String(u.id); if (!wallet) wallet = String(u.w || '') }
+      }
+      const keys: string[][] = [['ip', ip], ['device', dev], ['user', uid], ['wallet', wallet], ['email', email]].filter(k => k[1])
+      const where = keys.map(() => '(kind = ? AND value = ?)').join(' OR ')
+      const hit = keys.length ? await db.prepare(`SELECT kind, value FROM blocklist WHERE ${where} LIMIT 1`).bind(...keys.flat()).first() as any : null
+      if (hit) {
+        // 차단 대상의 접속 IP·기기도 영구 차단 목록에 자동 추가
+        const why = 'auto: ' + hit.kind + '=' + hit.value + ' 접속 시도 ' + path
+        const learn: any[] = []
+        if (ip) learn.push(db.prepare(`INSERT OR IGNORE INTO blocklist (kind, value, reason) VALUES ('ip', ?, ?)`).bind(ip, why))
+        if (dev) learn.push(db.prepare(`INSERT OR IGNORE INTO blocklist (kind, value, reason) VALUES ('device', ?, ?)`).bind(dev, why))
+        if (uid) learn.push(db.prepare(`INSERT OR IGNORE INTO blocklist (kind, value, reason) VALUES ('user', ?, ?)`).bind(uid, why))
+        if (learn.length) { try { await db.batch(learn) } catch (e) {} }
+        const res = path.startsWith('/api/')
+          ? c.json({ error: 'Access denied / 접근이 차단되었습니다', code: 'BLOCKED' }, 403)
+          : c.text('Access denied', 403)
+        if (newDev) res.headers.append('Set-Cookie', 'qk_dev=' + dev + '; Path=/; Max-Age=315360000; SameSite=Lax; Secure; HttpOnly')
+        return res
+      }
+    } catch (e) {}
+  }
+  await next()
+  if (newDev) { try { c.res.headers.append('Set-Cookie', 'qk_dev=' + dev + '; Path=/; Max-Age=315360000; SameSite=Lax; Secure; HttpOnly') } catch (e) {} }
+})
+
 // Enable CORS
 app.use('/api/*', cors())
 
