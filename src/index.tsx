@@ -119,7 +119,17 @@ function readCookie(c: any, name: string): string {
   }
   return ''
 }
-const BLOCK_UID_PATH = /^\/api\/(?:user|staking\/list|staking\/progress|rewards\/history|transactions|referrals|referral-tree|referral-rewards|shop\/orders|shop\/inquiries|withdrawal\/list)\/(\d+)$/
+// 요청 본문에서 지갑 주소 후보를 모두 추출 (회원가입·회원 지갑수정·관리자 지갑수정 필드명 전부)
+function blockWalletsFromBody(b: any): string[] {
+  if (!b || typeof b !== 'object') return []
+  const out: string[] = []
+  for (const k of ['walletAddress', 'usdtWalletAddress', 'wallet_address', 'usdt_wallet_address', 'new_wallet', 'newWallet', 'wallet']) {
+    const v = b[k]
+    if (typeof v === 'string' && v.trim()) out.push(v.toLowerCase().trim())
+  }
+  return Array.from(new Set(out))
+}
+const BLOCK_UID_PATH =/^\/api\/(?:user|staking\/list|staking\/progress|rewards\/history|transactions|referrals|referral-tree|referral-rewards|shop\/orders|shop\/inquiries|withdrawal\/list)\/(\d+)$/
 app.use('*', async (c, next) => {
   const path = new URL(c.req.url).pathname
   let dev = readCookie(c, 'qk_dev')
@@ -137,6 +147,15 @@ app.use('*', async (c, next) => {
         const bad = await db.prepare(`SELECT 1 FROM blocklist WHERE kind = 'ip' AND value = ? AND COALESCE(reason,'') NOT LIKE 'auto:%' LIMIT 1`).bind(aip).first()
         if (bad) return path.startsWith('/api/') ? c.json({ error: 'Access denied', code: 'BLOCKED' }, 403) : c.text('Access denied', 403)
       }
+      // ★ 2026-10-10 사장님 명령: 관리자 경로라도 차단 지갑으로 변경·등록 불가 (10/9 관리자 계정으로 공격자 지갑 20개 무단 등록)
+      //   자동학습 없음(관리자 잠김 방지). 본문에 차단 지갑이 있을 때만 거부 — 10/1 정상 지갑 원복 등은 영향 없음.
+      if (c.req.method !== 'GET' && (c.req.header('content-type') || '').includes('application/json')) {
+        const aw = blockWalletsFromBody(await c.req.json().catch(() => null))
+        if (aw.length) {
+          const badW = await db.prepare(`SELECT value FROM blocklist WHERE kind = 'wallet' AND value IN (${aw.map(() => '?').join(',')}) LIMIT 1`).bind(...aw).first()
+          if (badW) return c.json({ success: false, error: '차단된 지갑 주소입니다 (Blocked wallet address)', code: 'BLOCKED_WALLET' }, 403)
+        }
+      }
     } catch (e) {}
   }
   if (!exempt && (c.env as any)?.DB) {
@@ -144,7 +163,7 @@ app.use('*', async (c, next) => {
       const db = (c.env as any).DB
       await ensureBlocklist(db)
       const ip = c.req.header('CF-Connecting-IP') || ''
-      let uid = ''; let email = ''; let wallet = ''
+      let uid = ''; let email = ''; let wallets: string[] = []
       const pm = BLOCK_UID_PATH.exec(path)
       if (pm) uid = pm[1]
       if (c.req.method !== 'GET' && (c.req.header('content-type') || '').includes('application/json')) {
@@ -152,14 +171,17 @@ app.use('*', async (c, next) => {
           const b: any = await c.req.json()
           if (b && b.userId != null) uid = String(b.userId)
           if (b && b.email) email = String(b.email).toLowerCase().trim()
-          if (b && (b.walletAddress || b.usdtWalletAddress)) wallet = String(b.walletAddress || b.usdtWalletAddress).toLowerCase().trim()
+          // ★ 2026-10-10: QKEY·USDT 지갑을 모두 검사 (기존: walletAddress 가 있으면 usdtWalletAddress 미검사 → 우회 가능)
+          wallets = blockWalletsFromBody(b)
         } catch (e) {}
       }
       if (email && !uid) {
-        const u = await db.prepare(`SELECT id, lower(wallet_address) w FROM users WHERE lower(email) = ? LIMIT 1`).bind(email).first() as any
-        if (u) { uid = String(u.id); if (!wallet) wallet = String(u.w || '') }
+        try {
+          const u = await db.prepare(`SELECT id, lower(wallet_address) w, lower(COALESCE(usdt_wallet_address,'')) uw FROM users WHERE lower(email) = ? LIMIT 1`).bind(email).first() as any
+          if (u) { uid = String(u.id); if (!wallets.length) wallets = [String(u.w || ''), String(u.uw || '')].filter(Boolean) }
+        } catch (e) {}   // 조회 실패해도 지갑·IP·기기 검사는 계속
       }
-      const keys: string[][] = [['ip', ip], ['device', dev], ['user', uid], ['wallet', wallet], ['email', email]].filter(k => k[1])
+      const keys: string[][] = [['ip', ip], ['device', dev], ['user', uid], ['email', email], ...wallets.map(w => ['wallet', w])].filter(k => k[1])
       const where = keys.map(() => '(kind = ? AND value = ?)').join(' OR ')
       const hit = keys.length ? await db.prepare(`SELECT kind, value FROM blocklist WHERE ${where} LIMIT 1`).bind(...keys.flat()).first() as any : null
       if (hit) {
