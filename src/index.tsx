@@ -1642,11 +1642,22 @@ app.use('/api/rewards/daily', async (c, next) => {
 //          - 사람(브라우저/axios) 로그인은 여전히 현재 ADMIN_PW 만 통과 (보안 축소 없음: 구 비번은 cron UA 에서만)
 //   [향후] 비밀번호를 또 바꾸면 여기 CRON_LEGACY_ADMIN_PWS 에 직전 값을 추가 → GitHub Secret 안 건드려도 cron 유지.
 const CRON_LEGACY_ADMIN_PWS: string[] = ['Qta@2026!Sec#Admin']
+// ★ 2026-10-10 사장님 명령: 관리자 로그인 기록 (시각·IP·브라우저·방식) — 부당 증액 사건 이후 추적용.
+//   method: password(현재 비번) / cron-legacy(cron 전용 구 비번) / fail(실패). 비밀번호 값은 기록하지 않음.
+async function logAdminLogin(c: any, method: string) {
+  try {
+    const db = c.env.DB
+    await db.prepare(`CREATE TABLE IF NOT EXISTS admin_login_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT DEFAULT (datetime('now')), method TEXT, ip TEXT, ua TEXT)`).run()
+    await db.prepare(`INSERT INTO admin_login_log (method, ip, ua) VALUES (?, ?, ?)`)
+      .bind(method, c.req.header('CF-Connecting-IP') || '', (c.req.header('User-Agent') || '').slice(0, 200)).run()
+  } catch (e) {}
+}
 app.post('/api/auth/admin-login', async (c) => {
   try {
     const { adminId, password } = await c.req.json()
     if (adminId === ADMIN_ID && password === ADMIN_PW) {
       const token = generateAdminToken()
+      await logAdminLogin(c, 'password')
       return c.json({ success: true, token })
     }
     // cron 전용 구 비밀번호 호환 (위 영구룰 #cron비밀번호호환)
@@ -1657,8 +1668,10 @@ app.post('/api/auth/admin-login', async (c) => {
     if (isCronUa && adminId === ADMIN_ID && typeof password === 'string' && CRON_LEGACY_ADMIN_PWS.includes(password)) {
       console.log('[admin-login] cron legacy password accepted (GitHub Secret ADMIN_PW is stale) ua=' + ua)
       const token = generateAdminToken()
+      await logAdminLogin(c, 'cron-legacy')
       return c.json({ success: true, token, legacy_pw: true })
     }
+    await logAdminLogin(c, 'fail')
     return c.json({ error: t(c, 'auth.admin_login_fail') }, 401)
   } catch {
     return c.json({ error: t(c, 'auth.login_error') }, 500)
